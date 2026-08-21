@@ -1,0 +1,27 @@
+﻿{
+    "generated_at":  "2026-08-22T07:40:50.8083193+08:00",
+    "source_root":  "D:\\cohermes",
+    "source_branch":  "main",
+    "source_head":  "5f358137309d7670e7ad615c8af9d1aa679a49e3",
+    "ticket_100_status":  "resolved",
+    "ticket_100_answer_count":  1,
+    "ready_can_tickets":  [
+                              {
+                                  "file":  "102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md",
+                                  "title":  "【CAN】重建七个健康 Skill 交互合同后的完整能力链与追溯关系"
+                              }
+                          ],
+    "allowlisted_roots":  [
+                              "AGENTS.md",
+                              "CONTEXT.md",
+                              "docs\\agents",
+                              "docs\\adr",
+                              ".scratch\\partner-health-steward",
+                              "ops\\partner-health-steward",
+                              "ops\\weixin-skill-disclosure",
+                              "ops\\hermes-v2026.8.3-local-adaptations.patch"
+                          ],
+    "file_count":  257,
+    "total_bytes":  7802209,
+    "github_repository":  "findjoin/cohermes-partner-health-steward"
+}

@@ -1,0 +1,60 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 1d65799..0c70c9a 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4303,6 +4303,14 @@ class TurnRunner:
+         # Map platform enum to the platform hint key the agent understands.
+         # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
+         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
++
++        # Weixin has no editable progress surface.  For explicitly enabled
++        # profiles, collect successful Skill loads for a deterministic footer
++        # on this turn's final reply.  The collector never reads tool args.
++        from gateway.skill_disclosure import SkillDisclosureCollector
++        skill_disclosure = SkillDisclosureCollector.for_platform(
++            ctx.user_config, platform_key
++        )
+         
+         # Combine platform context, YAML channel_prompts hint for this chat,
+         # channel_overrides system_prompt (or global ephemeral), and gateway
+@@ -4747,6 +4755,11 @@ class TurnRunner:
+         agent.tool_start_callback = (
+             ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
+         )
++        agent.tool_complete_callback = (
++            skill_disclosure.on_tool_complete
++            if skill_disclosure.enabled
++            else None
++        )
+         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
+         agent.stream_delta_callback = _stream_delta_cb
+         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+@@ -5596,6 +5609,28 @@ class TurnRunner:
+             except Exception:
+                 pass
+ 
++        # Add observability after transcript persistence/title generation so
++        # the disclosure remains UI metadata, not conversational memory.  This
++        # is also early enough for the queued-follow-up direct-send branch,
++        # which consumes this returned final_response before the outer handler.
++        _skill_disclosure_line = skill_disclosure.build_line()
++        if _skill_disclosure_line:
++            try:
++                from gateway.response_filters import is_intentional_silence_agent_result
++                _skill_disclosure_silence = is_intentional_silence_agent_result(
++                    result, final_response
++                )
++            except Exception:
++                _skill_disclosure_silence = False
++            from gateway.skill_disclosure import append_skill_disclosure
++            final_response = append_skill_disclosure(
++                final_response,
++                _skill_disclosure_line,
++                intentional_silence=_skill_disclosure_silence,
++                failed=bool(result.get("failed")),
++                interrupted=bool(result.get("interrupted")),
++            )
++
+         return {
+             "final_response": final_response,
+             "last_reasoning": result.get("last_reasoning"),

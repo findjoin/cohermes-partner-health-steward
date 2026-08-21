@@ -1,0 +1,161 @@
+﻿ M .scratch/partner-health-steward/issues/14-package-isolated-linux-deployment.md
+ M .scratch/partner-health-steward/issues/15-run-acceptance-and-cut-over-partner.md
+ M .scratch/partner-health-steward/issues/23-wire-production-health-job-adapters.md
+ M .scratch/partner-health-steward/issues/24-deploy-independent-health-operations-monitor.md
+ M .scratch/partner-health-steward/map.md
+ M .scratch/partner-health-steward/spec.md
+ M CONTEXT.md
+ M docs/adr/0001-health-sidecar-and-fixed-jobs.md
+ M docs/adr/0003-render-due-tasks-from-current-snapshot.md
+ M docs/adr/0004-use-a-controlled-same-host-production-canary.md
+ M docs/adr/0005-classify-every-authorized-inbound-message.md
+ M docs/adr/0006-isolate-the-inbound-receipt-signer.md
+ M docs/adr/0008-pin-a-separate-health-model-configuration.md
+ M docs/adr/0009-inject-health-context-only-on-health-related-turns.md
+ M docs/adr/0010-require-explicit-owner-consent-and-owner-controlled-recovery.md
+ M docs/adr/0011-allow-the-current-provider-through-a-separate-health-configuration.md
+ M docs/adr/0012-bypass-the-chat-llm-for-full-health-views.md
+ M docs/adr/0013-answer-health-turns-with-the-pinned-health-model.md
+ M ops/partner-health-steward/DEPLOY.md
+ M ops/partner-health-steward/LINUX_DEPLOYMENT.md
+ M ops/partner-health-steward/deployment.py
+ M ops/partner-health-steward/health_model.py
+ M ops/partner-health-steward/hermes_jobs.py
+ M ops/partner-health-steward/plugin/health-steward/__init__.py
+ M ops/partner-health-steward/scripts/install_health_steward_jobs.py
+ M ops/partner-health-steward/scripts/verify_health_steward_job_smoke.py
+ M ops/partner-health-steward/sidecar/adapter.py
+ M ops/partner-health-steward/sidecar/client.py
+AM ops/partner-health-steward/sidecar/production_ports.py
+ M ops/partner-health-steward/sidecar/protocol.py
+ M ops/partner-health-steward/sidecar/server.py
+ M ops/partner-health-steward/sidecar/store.py
+ M ops/partner-health-steward/sidecar/tasks.py
+ M ops/partner-health-steward/tests/test_daily_review.py
+ M ops/partner-health-steward/tests/test_dispatch.py
+ M ops/partner-health-steward/tests/test_health_plugin_wiring.py
+ M ops/partner-health-steward/tests/test_health_sidecar.py
+ M ops/partner-health-steward/tests/test_hermes_jobs.py
+ M ops/partner-health-steward/tests/test_linux_deployment.py
+AM ops/partner-health-steward/tests/test_production_ports.py
+ M ops/partner-health-steward/tests/test_weekly_report.py
+?? .scratch/partner-health-steward/evidence/02-target-hermes-extension-baseline-20260816.md
+?? .scratch/partner-health-steward/evidence/03-channel-owner-provenance-capabilities-20260816.md
+?? .scratch/partner-health-steward/evidence/04-scheduling-delivery-recovery-runtime-status-capabilities-20260816.md
+?? .scratch/partner-health-steward/evidence/05-health-record-data-rights-and-protection-capabilities-20260816.md
+?? .scratch/partner-health-steward/evidence/06-diagnostic-reasoning-knowledge-safety-capabilities-20260816.md
+?? .scratch/partner-health-steward/evidence/07-weixin-ilink-inbound-contract-and-replay-semantics-20260816.md
+?? .scratch/partner-health-steward/evidence/08-weixin-ilink-target-hermes-interface-capabilities-20260816.md
+?? .scratch/partner-health-steward/evidence/09-scientific-health-portrait-structure-20260817.md
+?? .scratch/partner-health-steward/evidence/10-health-data-plane-tools-and-interfaces-20260817.md
+?? .scratch/partner-health-steward/evidence/11-health-model-routing-and-recipient-preflight-20260817.md
+?? .scratch/partner-health-steward/evidence/12-medical-knowledge-and-safety-enforcement-tools-20260817.md
+?? .scratch/partner-health-steward/evidence/13-owner-identity-migration-recovery-capabilities-20260818.md
+?? .scratch/partner-health-steward/evidence/14-daily-review-delivery-recovery-cross-fault-status-tools-20260818.md
+?? .scratch/partner-health-steward/evidence/15-health-capability-discovery-invocation-result-contract-20260818.md
+?? .scratch/partner-health-steward/evidence/16-health-model-context-capacity-token-accounting-overflow-20260818.md
+?? .scratch/partner-health-steward/evidence/17-owner-identity-authority-anchor-capabilities-20260818.md
+?? .scratch/partner-health-steward/evidence/18-external-owner-generation-authority-candidates-20260818.md
+?? .scratch/partner-health-steward/evidence/19-current-partner-hermes-baseline-plugin-lifecycle-trust-20260820.md
+?? .scratch/partner-health-steward/evidence/20-health-capability-entry-initialization-gate-result-contract-20260820.md
+?? .scratch/partner-health-steward/evidence/21-unique-weixin-admission-routing-provenance-replay-results-20260820.md
+?? .scratch/partner-health-steward/evidence/22-managed-health-state-plane-protection-and-single-authority-20260820.md
+?? .scratch/partner-health-steward/evidence/23-six-domain-portrait-and-three-class-evidence-capabilities-20260820.md
+?? .scratch/partner-health-steward/evidence/24-first-hop-model-route-owner-derived-query-isolation-nondiagnostic-answer-results-20260820.md
+?? .scratch/partner-health-steward/evidence/25-named-diagnostic-scope-governance-and-full-chain-capabilities-20260820.md
+?? .scratch/partner-health-steward/evidence/26-health-task-managed-runtime-state-journey-capabilities-20260820.md
+?? .scratch/partner-health-steward/evidence/27-adult-hypertension-measurement-confirmation-and-urgent-referral-chain-20260820.md
+?? .scratch/partner-health-steward/evidence/28-complete-current-capability-and-constraint-report-20260820.md
+?? .scratch/partner-health-steward/evidence/29-hermes-seven-health-skill-context-loading-and-token-efficiency-20260821.md
+?? .scratch/partner-health-steward/issues/100-define-seven-health-skill-interaction-entry-document-and-capability-boundaries.md
+?? .scratch/partner-health-steward/issues/101-define-danger-escalation-owner-prompt-and-support-contact-alert-contract.md
+?? .scratch/partner-health-steward/issues/102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md
+?? .scratch/partner-health-steward/issues/25-verify-partner-hermes-authoritative-baseline.md
+?? .scratch/partner-health-steward/issues/26-audit-hermes-weixin-conversation-plugin-capabilities.md
+?? .scratch/partner-health-steward/issues/27-audit-hermes-cron-session-recovery-capabilities.md
+?? .scratch/partner-health-steward/issues/28-audit-hermes-state-security-operations-capabilities.md
+?? .scratch/partner-health-steward/issues/29-choose-health-reasoning-and-data-recipient-boundary.md
+?? .scratch/partner-health-steward/issues/30-choose-message-recording-danger-owner-control-route.md
+?? .scratch/partner-health-steward/issues/31-choose-health-record-data-rights-route.md
+?? .scratch/partner-health-steward/issues/32-choose-review-task-delivery-recovery-route.md
+?? .scratch/partner-health-steward/issues/33-choose-health-knowledge-verification-route.md
+?? .scratch/partner-health-steward/issues/34-audit-reusable-history-against-selected-route.md
+?? .scratch/partner-health-steward/issues/35-define-layered-acceptance-and-no-go.md
+?? .scratch/partner-health-steward/issues/36-define-implementation-dependencies-and-sequence.md
+?? .scratch/partner-health-steward/issues/37-define-production-cutover-rollback-plan.md
+?? .scratch/partner-health-steward/issues/38-define-owner-identity-continuity-boundary.md
+?? .scratch/partner-health-steward/issues/39-define-permanent-deletion-backup-promise.md
+?? .scratch/partner-health-steward/issues/40-define-diagnostic-physician-handoff-boundary.md
+?? .scratch/partner-health-steward/issues/41-define-stable-operation-observation-promise.md
+?? .scratch/partner-health-steward/issues/42-verify-target-hermes-baseline-and-supported-extension-surface.md
+?? .scratch/partner-health-steward/issues/43-verify-channel-owner-identity-and-message-provenance-capabilities.md
+?? .scratch/partner-health-steward/issues/44-verify-scheduling-delivery-recovery-and-runtime-status-capabilities.md
+?? .scratch/partner-health-steward/issues/45-verify-health-record-data-rights-and-protection-capabilities.md
+?? .scratch/partner-health-steward/issues/46-verify-diagnostic-reasoning-knowledge-and-safety-capabilities.md
+?? .scratch/partner-health-steward/issues/47-choose-hermes-health-execution-and-authority-route.md
+?? .scratch/partner-health-steward/issues/48-choose-channel-identity-and-provenance-route.md
+?? .scratch/partner-health-steward/issues/49-choose-health-record-rights-and-protection-route.md
+?? .scratch/partner-health-steward/issues/50-choose-diagnostic-knowledge-and-safety-route.md
+?? .scratch/partner-health-steward/issues/51-choose-daily-review-delivery-recovery-and-status-route.md
+?? .scratch/partner-health-steward/issues/52-verify-weixin-ilink-and-target-hermes-interface-capabilities.md
+?? .scratch/partner-health-steward/issues/53-confirm-foundational-product-capabilities-and-boundaries.md
+?? .scratch/partner-health-steward/issues/54-research-scientific-health-portrait-structure.md
+?? .scratch/partner-health-steward/issues/55-choose-health-capability-entrypoints-and-skill-tool-contract.md
+?? .scratch/partner-health-steward/issues/56-verify-health-data-plane-tools-and-interfaces.md
+?? .scratch/partner-health-steward/issues/57-verify-health-model-routing-and-recipient-preflight-capabilities.md
+?? .scratch/partner-health-steward/issues/58-decide-health-model-recipient-lock-gap-boundary.md
+?? .scratch/partner-health-steward/issues/59-verify-medical-knowledge-and-safety-enforcement-tools.md
+?? .scratch/partner-health-steward/issues/60-decide-medical-source-gap-boundary.md
+?? .scratch/partner-health-steward/issues/61-verify-owner-identity-migration-and-recovery-capabilities.md
+?? .scratch/partner-health-steward/issues/62-verify-daily-review-delivery-recovery-and-cross-fault-status-tools.md
+?? .scratch/partner-health-steward/issues/63-verify-health-capability-discovery-invocation-and-result-contract.md
+?? .scratch/partner-health-steward/issues/64-define-diagnostic-scope-and-safe-unavailable-result.md
+?? .scratch/partner-health-steward/issues/65-define-diagnostic-evidence-recipients-and-retention-boundary.md
+?? .scratch/partner-health-steward/issues/66-define-diagnostic-judgment-change-and-traceability-contract.md
+?? .scratch/partner-health-steward/issues/67-decide-owner-recovery-anti-rollback-launch-promise.md
+?? .scratch/partner-health-steward/issues/68-verify-non-rollback-owner-identity-authority-anchor-capabilities.md
+?? .scratch/partner-health-steward/issues/69-verify-health-model-context-capacity-token-accounting-and-overflow-behavior.md
+?? .scratch/partner-health-steward/issues/70-decide-diagnostic-launch-boundary-under-unverifiable-context-capacity.md
+?? .scratch/partner-health-steward/issues/71-verify-external-owner-generation-authority-candidates.md
+?? .scratch/partner-health-steward/issues/72-choose-owner-identity-migration-recovery-and-external-generation-authority-route.md
+?? .scratch/partner-health-steward/issues/73-define-health-task-generation-dispatch-and-lifecycle-contract.md
+?? .scratch/partner-health-steward/issues/74-confirm-owner-binding-message-admission-and-trust-boundary.md
+?? .scratch/partner-health-steward/issues/75-close-first-release-health-steward-product-contract.md
+?? .scratch/partner-health-steward/issues/76-rebuild-complete-to-capability-chain-and-traceability.md
+?? .scratch/partner-health-steward/issues/77-close-complete-capability-and-constraint-report.md
+?? .scratch/partner-health-steward/issues/78-verify-current-partner-hermes-baseline-plugin-lifecycle-and-trust-boundary.md
+?? .scratch/partner-health-steward/issues/79-verify-health-capability-entry-initialization-gate-and-result-contract.md
+?? .scratch/partner-health-steward/issues/80-verify-unique-weixin-admission-routing-provenance-and-replay-results.md
+?? .scratch/partner-health-steward/issues/81-verify-managed-health-state-plane-protection-and-single-authority.md
+?? .scratch/partner-health-steward/issues/82-verify-six-domain-portrait-and-three-class-evidence-capabilities.md
+?? .scratch/partner-health-steward/issues/83-verify-open-health-task-lifecycle-dispatch-acceptance-and-scope-approval.md
+?? .scratch/partner-health-steward/issues/84-verify-local-day-review-notification-delivery-unknown-and-recovery.md
+?? .scratch/partner-health-steward/issues/85-verify-first-hop-model-route-and-owner-derived-query-isolation.md
+?? .scratch/partner-health-steward/issues/86-verify-medical-content-governance-and-diagnostic-scope-candidates.md
+?? .scratch/partner-health-steward/issues/87-verify-diagnostic-context-capacity-and-structured-finality.md
+?? .scratch/partner-health-steward/issues/88-verify-diagnostic-safety-enforcement-and-unavailable-results.md
+?? .scratch/partner-health-steward/issues/89-verify-diagnostic-revision-chain-and-current-authority.md
+?? .scratch/partner-health-steward/issues/90-verify-owner-rights-control-deletion-and-non-resurrection.md
+?? .scratch/partner-health-steward/issues/91-verify-runtime-three-state-observation-and-fault-isolation.md
+?? .scratch/partner-health-steward/issues/92-verify-authoritative-assets-and-managed-state-portability.md
+?? .scratch/partner-health-steward/issues/93-verify-evidence-grounded-nondiagnostic-health-answer-capabilities.md
+?? .scratch/partner-health-steward/issues/94-consolidate-current-can-investigations-by-coherent-route.md
+?? .scratch/partner-health-steward/issues/95-verify-adult-hypertension-measurement-confirmation-and-urgent-referral-chain.md
+?? .scratch/partner-health-steward/issues/96-verify-adult-depressive-episode-symptom-function-and-self-harm-chain.md
+?? .scratch/partner-health-steward/issues/97-correct-can-preimplementation-feasibility-and-diagnostic-scope-gate.md
+?? .scratch/partner-health-steward/issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md
+?? .scratch/partner-health-steward/issues/99-define-required-health-skill-use-visible-disclosure-and-reply-contract.md
+?? docs/adr/0014-let-partner-hermes-be-the-health-steward.md
+?? docs/adr/0015-restart-health-steward-from-product-goals.md
+?? docs/adr/0016-define-a-single-owner-nondiagnostic-proactive-health-steward.md
+?? docs/adr/0017-require-informed-enablement-minimal-recording-and-an-owner-only-first-release.md
+?? docs/adr/0018-use-one-trusted-partner-hermes-and-stop-health-capabilities-with-it.md
+?? docs/adr/0019-require-per-message-health-review-trusted-provenance-and-a-dedicated-record.md
+?? docs/adr/0020-encrypt-health-records-and-separate-evidence-from-inference.md
+?? docs/adr/0021-use-one-plugin-owned-health-core-and-governed-authority-stack.md
+?? docs/research/
+?? "docs/\345\267\245\344\275\234\346\265\201.md"
+?? ops/partner-health-steward/job_authorization.py
+?? ops/partner-health-steward/sidecar/daily_runner.py
+?? ops/partner-health-steward/tests/test_daily_retry_runner.py
+?? ops/partner-health-steward/tests/test_job_authorization.py

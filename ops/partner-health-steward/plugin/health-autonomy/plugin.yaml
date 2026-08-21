@@ -1,0 +1,9 @@
+name: health-autonomy
+version: 0.2.0
+description: "Partner-only structured health profile, interaction learning, and reversible low-risk task autonomy."
+author: coHermes local
+hooks:
+  - pre_gateway_dispatch
+  - pre_llm_call
+  - pre_tool_call
+

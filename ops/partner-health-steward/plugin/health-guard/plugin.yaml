@@ -1,0 +1,10 @@
+name: health-guard
+version: 0.1.0
+description: "Partner-only health safety guard: deterministic urgent routing, non-diagnostic guidance, privacy controls, and reminder authorization."
+author: coHermes local
+hooks:
+  - pre_gateway_dispatch
+  - pre_llm_call
+  - pre_tool_call
+  - transform_llm_output
+

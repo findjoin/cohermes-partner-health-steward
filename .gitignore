@@ -1,0 +1,26 @@
+﻿# Never add credentials, runtime data, or generated artifacts.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*token*.txt
+secrets/
+credentials/
+health-data/
+health-sidecar-data/
+health-steward-data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.venv/
+venv/
+*.log
+output/

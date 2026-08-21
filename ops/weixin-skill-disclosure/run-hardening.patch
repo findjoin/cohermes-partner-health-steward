@@ -1,0 +1,108 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 0c70c9a..ea5b10b 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5609,27 +5609,12 @@ class TurnRunner:
+             except Exception:
+                 pass
+ 
+-        # Add observability after transcript persistence/title generation so
+-        # the disclosure remains UI metadata, not conversational memory.  This
+-        # is also early enough for the queued-follow-up direct-send branch,
+-        # which consumes this returned final_response before the outer handler.
++        # Carry disclosure as result metadata.  Normal delivery appends it only
++        # after transcript persistence; the queued direct-send branch appends it
++        # to a local send-only copy.  The model-authored response stays pristine.
+         _skill_disclosure_line = skill_disclosure.build_line()
+         if _skill_disclosure_line:
+-            try:
+-                from gateway.response_filters import is_intentional_silence_agent_result
+-                _skill_disclosure_silence = is_intentional_silence_agent_result(
+-                    result, final_response
+-                )
+-            except Exception:
+-                _skill_disclosure_silence = False
+-            from gateway.skill_disclosure import append_skill_disclosure
+-            final_response = append_skill_disclosure(
+-                final_response,
+-                _skill_disclosure_line,
+-                intentional_silence=_skill_disclosure_silence,
+-                failed=bool(result.get("failed")),
+-                interrupted=bool(result.get("interrupted")),
+-            )
++            result["skill_disclosure_line"] = _skill_disclosure_line
+ 
+         return {
+             "final_response": final_response,
+@@ -5644,6 +5629,7 @@ class TurnRunner:
+             "interrupted": ctx.result_holder[0].get("interrupted", False) if ctx.result_holder[0] else False,
+             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
+             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
++            "skill_disclosure_line": _skill_disclosure_line,
+             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
+             # Soft lock-contention defer (#69870 consumer): distinct from
+             # compression_exhausted so the gateway never auto-resets a
+@@ -17982,6 +17968,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 session_key, session_entry.session_id
+             )
+ 
++            # Skill disclosure is outbound UI metadata.  Append only after all
++            # transcript writes so even the no-new-messages fallback persists
++            # the original assistant response rather than this display footer.
++            _skill_disclosure_line = agent_result.get("skill_disclosure_line") or ""
++            if _skill_disclosure_line:
++                from gateway.skill_disclosure import append_skill_disclosure
++                response = append_skill_disclosure(
++                    response,
++                    _skill_disclosure_line,
++                    already_sent=bool(agent_result.get("already_sent")),
++                    intentional_silence=_intentional_silence,
++                    failed=bool(agent_result.get("failed")),
++                    interrupted=bool(agent_result.get("interrupted")),
++                    partial=bool(agent_result.get("partial")),
++                    completed=agent_result.get("completed"),
++                    error=agent_result.get("error"),
++                )
++
+             # Intentional silence is a delivery decision, not a transcript
+             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
+             # still persisted in session history so later turns keep normal
+@@ -25386,11 +25390,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     _delivery_result = response if isinstance(response, dict) else (result or {})
+                     _previewed = bool(_delivery_result.get("response_previewed"))
+                     first_response = _delivery_result.get("final_response", "")
+-                    _already_streamed = _stream_confirmed_final_delivery(
+-                        _sc,
+-                        first_response,
+-                        previewed=_previewed,
+-                    )
+                     # Apply the same predicate as the normal completed-turn path.
+                     # This direct queued-send branch predates intentional-silence
+                     # filtering, so without this check it leaks the literal marker.
+@@ -25401,6 +25400,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         )
+                     except Exception:
+                         _intentional_silence = False
++                    _skill_disclosure_line = (
++                        _delivery_result.get("skill_disclosure_line") or ""
++                    )
++                    if _skill_disclosure_line:
++                        from gateway.skill_disclosure import append_skill_disclosure
++                        first_response = append_skill_disclosure(
++                            first_response,
++                            _skill_disclosure_line,
++                            intentional_silence=_intentional_silence,
++                            failed=bool(_delivery_result.get("failed")),
++                            interrupted=bool(_delivery_result.get("interrupted")),
++                            partial=bool(_delivery_result.get("partial")),
++                            completed=_delivery_result.get("completed"),
++                            error=_delivery_result.get("error"),
++                        )
++                    _already_streamed = _stream_confirmed_final_delivery(
++                        _sc,
++                        first_response,
++                        previewed=_previewed,
++                    )
+                     if _intentional_silence:
+                         logger.info(
+                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",

@@ -1,0 +1,7 @@
+name: health-steward
+version: 1.0.0
+description: "Partner-only fixed Hermes Jobs for the isolated health sidecar."
+author: coHermes local
+provides_tools:
+  - health_daily_review
+  - health_dispatch_due_tasks
