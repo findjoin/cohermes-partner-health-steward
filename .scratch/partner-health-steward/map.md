@@ -16,7 +16,7 @@ Type: wayfinder:map
 - `Destination` 固定 Partner Hermes 中的 Plugin 产品载体、稳健运行结果、健康画像与健康任务两项核心职责，以及把分散健康信息转化为主人可控制且可追溯的理解与行动这一价值；完整【TO】继续拥有具体产品结果、边界、不变量、失败结果和成功条件，【CAN】和【HOW】不得反向替代或缩小。实现与目标 Hermes 部署仍在本努力的抵达范围内，但关闭 TO、CAN、HOW 或交接 Spec 都只是中间条件；到达显式 Matt 阶段边界时必须停止，等待主人启动下一流程，所有后续产物继续返回同一条权威链。
 - `【TO】`、`【CAN】`、`【HOW】` 表示 Ticket 实际 `Question` 的性质；`research`、`prototype`、`grilling`、`task` 表示解决该 Question 的原生 `Type`。两者完全正交，任一 TO、CAN 或 HOW 都可以按问题需要使用任一原生 Type。每张 Ticket 只能有一个性质前缀；不新增 `Stage:`、混合 `TO-CAN`、新 Type、新 Status 或第二套 Frontier。
 - 本 Map 另外执行项目级工作门禁 `TO → CAN → HOW`。门禁通过原生 `Blocked by`、Ticket 状态和延迟出票落实，不靠新的脚本、字段或 Frontier 算法；后继阶段只有在前一阶段的闭合 Ticket 已 `resolved` 后才能工作或解决。
-- 完整 TO 原已由[【TO】闭合首发健康管家的完整产品合同与成功条件](issues/75-close-first-release-health-steward-product-contract.md)闭合，完整 CAN 原已由[【CAN】闭合完整能力与约束事实并形成当前 CAN 报告](issues/77-close-complete-capability-and-constraint-report.md)审计 C01—C17，统一 HOW 原已由[【HOW】选择健康管家的统一技术路线、权威职责与分层验证架构](issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md)闭合。后继的[【TO】确定健康 Skill 的必经使用、主人可见披露与回复结果](issues/99-define-required-health-skill-use-visible-disclosure-and-reply-contract.md)、[【TO】确定七个健康 Skill 的主人交互入口、文档结构与能力边界](issues/100-define-seven-health-skill-interaction-entry-document-and-capability-boundaries.md)与[【TO】确定危险升级时主人提示、预设支持联系人通知、记录与失败结果](issues/101-define-danger-escalation-owner-prompt-and-support-contact-alert-contract.md)现已实质改变 Skill 交互、接收方、安全和失败合同，旧 CAN 闭合与统一 HOW 因此不再代表完整最新 TO；当前由[【CAN】重建七个健康 Skill 交互合同后的完整能力链与追溯关系](issues/102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md)重新拆分并审计完整能力链，实施与验收 Spec 继续暂停。
+- 完整 TO 原已由[【TO】闭合首发健康管家的完整产品合同与成功条件](issues/75-close-first-release-health-steward-product-contract.md)闭合，完整 CAN 原已由[【CAN】闭合完整能力与约束事实并形成当前 CAN 报告](issues/77-close-complete-capability-and-constraint-report.md)审计 C01—C17，旧统一 HOW [【HOW】选择健康管家的统一技术路线、权威职责与分层验证架构](issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md)已因后继 TO 变更失效。后继的[【TO】确定健康 Skill 的必经使用、主人可见披露与回复结果](issues/99-define-required-health-skill-use-visible-disclosure-and-reply-contract.md)、[【TO】确定七个健康 Skill 的主人交互入口、文档结构与能力边界](issues/100-define-seven-health-skill-interaction-entry-document-and-capability-boundaries.md)与[【TO】确定危险升级时主人提示、预设支持联系人通知、记录与失败结果](issues/101-define-danger-escalation-owner-prompt-and-support-contact-alert-contract.md)实质改变了 Skill 交互、接收方、安全和失败合同；[【CAN】重建七个健康 Skill 交互合同后的完整能力链与追溯关系](issues/102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md)和[【CAN】闭合七个健康 Skill 与支持联系人重建后的当前 CAN 能力与约束审计](issues/108-close-current-can-after-seven-skill-contact-investigations.md)已完成当前 TO/CAN 交接，HOW 109 现已闭合并形成新的路线权威。开放票与当前 Frontier 只通过本地 tracker 查询，实施与验收 Spec 继续暂停。
 - 一个可出票的 `Question` 必须明确对应的目标或上游节点、要解决的决定或事实、直接前提、可判定的解决条件，并能在一个 Ticket 会话内完成。问题尚不能如此准确表述时留在 `Not yet specified`，不得用宽泛标题预生成空票。对 HOW 而言，只有 CAN 已给出有证据的候选能力与约束后，其技术路线问题才算准确；CAN 闭合前不生成、认领或解决 HOW Ticket。
 
 - `【TO】Target Outcome` 必须先完整对齐这个产品最终要成为什么样，包括目标、价值、产品功能、主人可见结果、必须成立的边界与不变量、失败结果和成功条件。除 Destination 已固定的产品载体、核心职责与价值外，TO 不得选择或预写候选工具、供应商、版本、接口、存储、算法、模块职责、部署方法或其他技术细节，也不得让当前工具能力静默缩小目标。
@@ -66,8 +66,8 @@ Type: wayfinder:map
 
 ### CAN
 
-- [【CAN】重建完整 TO 的能力链与追溯关系](issues/76-rebuild-complete-to-capability-chain-and-traceability.md) — 完整 TO 已拆为十七个能力节点并建立 TO 双向追溯、链内依赖及旧 CAN/HOW 权威分类；后继连贯调查压缩决定只改变当前调查票粒度，不改变这些能力节点。
-- [【CAN】按连贯技术问题压缩并重接剩余能力调查](issues/94-consolidate-current-can-investigations-by-coherent-route.md) — 保持十七个能力节点和 `TO → CAN → HOW` 规则不变，把十一张尚未研究的细分 CAN 压缩为受管运行框架、模型与非诊断问答、明确范围与诊断全链三张连贯调查票；八张被吸收票保留为 `wontfix` 历史输入，最终仍由唯一 CAN 闭合票逐节点审计，CAN 不选择技术路线。
+- [【CAN】重建完整 TO 的能力链与追溯关系](issues/76-rebuild-complete-to-capability-chain-and-traceability.md) — 2026-08-20 旧 TO 曾拆为 C01—C17 并建立当时的双向追溯；七 Skill 与支持联系人合同生效后，该十七节点链不再是当前完整能力链，仅作为[【CAN】重建七个健康 Skill 交互合同后的完整能力链与追溯关系](issues/102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md)的历史输入。
+- [【CAN】按连贯技术问题压缩并重接剩余能力调查](issues/94-consolidate-current-can-investigations-by-coherent-route.md) — 2026-08-20 旧 TO 下曾把 C01—C17 的剩余调查压缩为三张连贯票；其调查粒度与依赖已被最新 K01—K21 链和五张后继调查票取代，旧票只保留为历史编排输入。
 - [【CAN】核验当前 Partner Hermes 基线、Plugin 生命周期与可信执行边界](issues/78-verify-current-partner-hermes-baseline-plugin-lifecycle-and-trust-boundary.md) — 2026-08-20 现场仍为带定制的 Hermes v0.20.0 / `3c27eb…` root 基座：原生 Plugin 扩展与基础资产枚举能力存在，但健康 Plugin/Cron 尚不存在，加载、Hook/Middleware、卸载、权限与日志也不保证失败关闭或隔离，完整权威资产迁移闭包仍未证明。
 - [【CAN】核验健康能力入口、初始化门禁与真实结果返回能力](issues/79-verify-health-capability-entry-initialization-gate-and-result-contract.md) — 当前 Hermes 提供 Skill、Tool/Command、Platform、自然语言和内部调用承载面；通用入口及历史候选不天然保证旁路收敛、完整初始化、权威业务结果或主人实际到达。正式 Partner 尚无健康入口是待实现状态，固定源码限制和未执行 canary 构成 HOW 约束与未来验证义务，不单独证明路线不可行。
 - [【CAN】核验唯一微信准入、排他分流、逐次来源与重投结果能力](issues/80-verify-unique-weixin-admission-routing-provenance-and-replay-results.md) — 当前 Weixin 静态配置已收敛为单值私聊 allowlist、关闭全开放且 `group_policy=disabled`，同时仍有 Telegram configured/enabled；内置路径在准入前读取正文并去重、在业务前推进 cursor、合批丢失后续来源，接口成功也不证明主人看到。这些确定性事实约束入口接管、重投和交付 HOW；健康 Plugin 尚不存在只形成实现义务。
@@ -78,9 +78,16 @@ Type: wayfinder:map
 - [【CAN】核验成人疑似原发性高血压规范测量确认与同日转诊分流的完整诊断链](issues/95-verify-adult-hypertension-measurement-confirmation-and-urgent-referral-chain.md) — 跨日/跨场景血压确认、来源规则差异、严重数值—急性症状/体征分流及判断修订事实继续约束未来路线；项目许可、医学审核、实现、验收与激活尚未发生，不再被归类为第二条不可行路线，也不要求继续更换病种才能闭合 CAN。
 - [【CAN】核验健康任务与受管运行框架的生命周期、复盘投递、主人控制、三态观测及迁移能力](issues/83-verify-open-health-task-lifecycle-dispatch-acceptance-and-scope-approval.md) — 旧候选已有任务、当地日、投递未知、控制、组件监控和字节恢复的局部原语；暂停或停止记录直接取消任务、删除附加倒计时与回执、验收阻塞仍报告服务健康、恢复只覆盖主状态 blob 等确定性反例约束 HOW。正式 Partner 尚未实现统一受管运行框架只形成后继实现与验证义务。
 - [【CAN】修正未实现系统的能力判定、诊断范围门禁与负向研究计数](issues/97-correct-can-preimplementation-feasibility-and-diagnostic-scope-gate.md) — 修正“未实现 → 零激活范围 → CAN 不能闭合”的阶段循环：CAN 判断是否已有足够事实支撑一条可交给 HOW 选择的实施路线，不验收已工作的产品；BMI 与高血压事实保留为路线约束，但不计负向轮次，第三个病种调查停止。
-- [【CAN】闭合完整能力与约束事实并形成当前 CAN 报告](issues/77-close-complete-capability-and-constraint-report.md) — C01—C17 已全部追溯到当前能力事实、确定性限制、外部前提与未来验证义务；Hermes 存在未被证据排除的连贯实现路线空间，当前没有决定 HOW 是否存在的 CAN fog。未实现、未许可、未审核和未验收仍是后继硬门槛，不再被误作 CAN 不可行；下一阶段只由一张统一 HOW 选择实际技术路线。
+- [【CAN】闭合完整能力与约束事实并形成当前 CAN 报告](issues/77-close-complete-capability-and-constraint-report.md) — 2026-08-20 旧 TO 下的 C01—C17 报告；在七 Skill 与支持联系人 TO 实质变更后，已失效为当前完整 CAN 权威，只保留为历史事实索引。
+- [【CAN】重建七个健康 Skill 交互合同后的完整能力链与追溯关系](issues/102-rebuild-complete-capability-chain-after-seven-health-skill-interaction-contract.md) — 最新完整 TO 已归一为 T01—T36 并双向追溯到 K01—K21；旧 C01—C17、Evidence 01—29、旧统一 HOW 与 ADR 0021 已逐项完成有界继承／重查／失效分类，后继压缩为 Skill 与权威底座、路由与独立最低安全、受管领域状态、模型／医学／诊断、支持联系人五张连续 CAN 调查票，并由后继闭合审计票完成当前 CAN 交接。
+- [【CAN】闭合七个健康 Skill 与支持联系人重建后的当前 CAN 能力与约束审计](issues/108-close-current-can-after-seven-skill-contact-investigations.md) — Ticket 102 的 T01—T36／K01—K21 追溯、Evidence 30—34 的四类证据边界和五张连续调查已闭合；现有事实支持至少一类没有已知根本矛盾的可实施空间，后继技术路线选择转入新的 HOW Frontier，旧 Ticket 98 与 ADR 0021 仅保留为历史候选。
+- [【CAN】核验当前 Partner、七个健康 Skill 资产加载与受管权威底座](issues/103-verify-current-partner-seven-health-skill-assets-loading-and-managed-authority-foundation.md) — 仓库仅证明历史候选资产与固定 Hermes 扩展表面；七 Skill 当前运行资产、实际加载/使用、旧 `medical` 物理隔离和统一受管权威仍需现场重核，未实现不等于平台不可行。
+- [【CAN】核验唯一准入、两级健康路由、职责组合、权威结果与独立最低安全能力](issues/104-verify-admission-two-stage-routing-duty-composition-authoritative-result-and-minimum-safety.md) — 固定入口与 Skill 扩展原语存在，但唯一准入、初始化门禁、两级路由、steward 职责组合、权威提交、唯一回复和独立最低安全结果仍未实现或未证明；历史现场与候选需重核或已失效。
+- [【CAN】核验受管领域状态、任务时序、主人控制、删除、观测与迁移能力](issues/105-verify-managed-domain-state-tasks-controls-local-day-deletion-observation-and-migration.md) — 固定原语和局部历史机制可有界继承；当前六域状态、三类证据、任务控制、业务三态、全对象删除防复活与完整迁移闭包仍未实现或未证明，模型／诊断与联系人专属对象交给后继调查。
+- [【CAN】核验首跳路线、查询隔离、医学治理、诊断完整性、安全与修订能力](issues/106-verify-first-hop-query-isolation-medical-governance-diagnostic-integrity-safety-and-revision.md) — 固定扩展面和历史医学候选可有界继承；当前首跳同意与出站隔离、医学权利/审核/范围激活、诊断完整终态、可信危险治理、修订链及诊断侧删除/观测/迁移均未实现或未证明，联系人对象交给后继调查。
+- [【CAN】核验危险支持联系人的批准、最小警报、分层交付、纠正、删除与防复活能力](issues/107-verify-support-contact-approval-minimal-alert-delivery-correction-deletion-and-non-resurrection.md) — 产品合同已固定单一联系人、主人批准、可信危险门、最小警报、分层交付、未知冻结、必要纠正、独立控制和删除边界；当前 Partner 仅有有限平台/历史传输与删除原语，K16、K17 及联系人侧 K18—K21 仍未实现或未证明。
 
-#### 历史事实输入（已由当前能力链分类）
+#### 历史事实输入（当前权威边界以能力链重建 Answer 为准）
 
 - [【CAN】核验目标 Hermes 基线与受支持的健康扩展面](issues/42-verify-target-hermes-baseline-and-supported-extension-surface.md) — 2026-08-16 目标现场固定为带未提交定制的 Hermes v0.20.0 / commit `3c27eb…`；Skill 是按需知识文档，Plugin 才是受支持的执行扩展面，现场尚无健康 Plugin/Cron，通用 Hook/Middleware 的默认失效语义也不能视为安全失败关闭。
 - [【CAN】核验聊天接口、主人身份与逐条消息来源能力](issues/43-verify-channel-owner-identity-and-message-provenance-capabilities.md) — 内置微信路径的单值 allowlist 可承担唯一技术消息准入，但不能代替健康管家初始化；其在健康入口前按正文去重、合批并丢失逐次来源的缺口仍是有效历史事实，接口无报错也不等于主人真实收到，完整 iLink 契约由后继微信接口能力核验补充。
@@ -100,11 +107,15 @@ Type: wayfinder:map
 
 ### HOW
 
-- [【HOW】选择健康管家的统一技术路线、权威职责与分层验证架构](issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md) — 选择一个 Partner Health Plugin、自定义 `health_weixin`、私有低权限 `health-core`、单一加密 SQLite、DynamoDB current head、`StrictHealthLLM` 与本地不可变知识/安全包；以同一任务、复盘、outbox、控制、三态及迁移状态机落实 C01—C17，首发诊断范围目标为 BMI，实际内容许可、医学审核和真实主人微信验收继续作为后继实施与验收硬门槛。
+- [【HOW】选择首发健康管家 Plugin 的统一端到端实现路线](issues/109-choose-unified-end-to-end-how-route-after-current-can-closure.md) — 选择一个 `health_weixin` 前置准入、单一低权限 `health-core`、加密本地状态、单区域 DynamoDB 不透明 current head、严格同一 Partner 首跳模型接口、离线受治理知识、确定性安全／诊断门禁、事务 outbox、分层微信／联系人投递和 writer-fence 删除／迁移的统一 Plugin 路线；七个 Skill 是 Plugin 内部的交互／职责资源，不是独立插件；所有实现、外部许可、医学审核、真实模型／微信和验收仍是下游硬门槛，详见 [ADR 0022](../../docs/adr/0022-select-current-health-steward-route-after-seven-skill-can-closure.md)。
+
+### 历史 HOW（当前失效）
+
+- [【HOW】选择健康管家的统一技术路线、权威职责与分层验证架构](issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md) — 2026-08-20 旧合同下曾选择 Partner Health Plugin、`health_weixin`、`health-core`、SQLite、DynamoDB current head 与 `StrictHealthLLM` 等候选组合；在最新 TO 和本轮能力链重建后已失效为当前选定路线，只保留历史候选、设计理由和验证清单。
 
 ## Not yet specified
 
-- 具体 CAN 调查 Tickets、CAN 闭合审计及 HOW 修订问题须待当前后继能力链拆分结果后才能准确表述；在新的完整 CAN/HOW 权威链闭合前，实施与验收 Spec／计划继续暂停，之后也只形成一份统一承接实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚的权威产物，不建立竞争计划。
+- 统一 HOW 已完成路线选择；当前实现承接已发布为[首发健康管家 Plugin 实现 Spec](spec.md)，覆盖实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚，不建立竞争计划。实现 Tickets 110—119 已按依赖顺序发布；当前唯一未阻塞 Frontier 为 [Ticket 110：建立 Plugin/core 受信边界与合成验证骨架](issues/110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)。本 Map 继续作为路线索引，不直接承载代码实现。
 
 ## Out of scope
 

@@ -1,281 +1,276 @@
-# Partner Hermes 自主健康管家
+# 首发健康管家 Plugin 实现 Spec
 
 Type: spec
-Status: historical
-Authority: historical-input-only; the active planning authority is [`map.md`](map.md)
+Status: ready-for-agent
+Authority: current implementation handoff; `map.md` remains the single Wayfinder index
+
+本 Spec 是当前健康管家 Plugin 的实现承接文档。它由[唯一权威 Map](map.md)、最新 TO/CAN、[【HOW】选择首发健康管家 Plugin 的统一端到端实现路线](issues/109-choose-unified-end-to-end-how-route-after-current-can-closure.md)和 [ADR 0022](../../docs/adr/0022-select-current-health-steward-route-after-seven-skill-can-closure.md)综合而成。
+
+替换前的旧 `spec.md`、Ticket 98、ADR 0021、`ops/` 下的实现和测试只作为历史输入，不是当前路线或当前实现证明。本文不读取、保存或要求提交真实健康资料、聊天、联系人、密钥、Token、服务器配置、运行数据库、日志或备份。
 
 ## Problem Statement
 
-画像主人目前只有一个通过微信与她交流的 partner Hermes，但没有一个可靠的长期健康支持系统。单纯安装 Health Skill 只能影响某次对话，不能持续维护有依据的健康画像，不能根据画像自动创建和撤销关心任务，也不能保证定时任务在 fresh session、上下文压缩、资料更新、授权撤回或证据失效后仍使用当前状态。
+当前仓库已经完成最新产品合同的 TO、完整能力链的 CAN 重建以及统一 HOW 路线选择，但目标 Partner Hermes 中还没有一条完成实现、运行和验收的健康能力链。历史 `ops/` 代码包含可参考的扩展、状态、任务、投递和测试原语，却采用过时的产品边界或未证明的权威关系，不能直接作为生产实现。
 
-用户需要的是一个自主健康管家：它能从画像主人的直接陈述、测量和本人转述的医生意见中维护紧凑健康画像；能从受控权威资料库获得参考；每天复核画像并生成即时或未来派生任务；任务到期后结合当前上下文重新调用 LLM 决定发送或跳过；能学习交互偏好；能与 Hermes memory 单向联动；同时具备可追溯、可暂停、可撤权、可删除、可导出和可验收的边界。
+需要交付的是一个部署在单人专用 Partner Hermes 中的**健康管家 Plugin**。它必须把唯一消息准入、初始化、七个健康 Skill、最小上下文、受管健康状态、画像与证据、任务、模型、医学知识、安全、危险支持联系人、主人控制、删除、防复活、迁移和分层投递组合为一个可追溯产品。Plugin 必须能在能力不可证明、结果不完整、外部效果未知或可信前提丢失时诚实失败关闭，而不是把模型自述、Skill 加载、接口接受或进程存活冒充业务成功。
 
-现有 v0.2 健康自治代码只是历史原型。它使用与 Hermes 相同的权限域、确定性派发器和已被本设计放弃的固定门禁，且没有在真实 partner 服务器完成部署与验收，因此不能直接作为生产实现。
-
-当前仓库虽已具备 sidecar、画像、证据、资料、任务、授权、删除、审计和固定 Job 的主体能力，但最近一次同机上线准备仍为 `no-go`：真实微信入站尚未形成可验证收据，普通对话尚未接入主人控制工具，健康专用 LLM、资料下载、幂等微信发送和独立运维告警也尚未完成生产装配。规格必须覆盖这段真实运行链路，不能把库级测试或插件已加载误称为已部署。
+当前技术路线已经选择，但以下事项仍未完成：正式 Plugin 和 `health-core`、七个 Skill 的当前资产与运行时证明、真实 Hermes/Weixin 适配、受管状态和密钥边界、current-head 资源、模型严格终态、知识权利与医学审核、联系人外发、删除与迁移、分层测试、部署和主人/联系人验收。本 Spec 将路线压缩为可拆解、可测试、可逐票实现的工程合同。
 
 ## Solution
 
-在 partner Hermes 所在服务器上部署独立 `health-sidecar`。sidecar 由受限服务账户持有加密 SQLite 健康档案、资料卡和原始资料缓存，通过不监听 TCP 的 Unix domain socket 向受限的 partner Hermes 提供最小能力。Hermes 核心保持不变。
+### 产品形态
 
-partner Hermes 负责实时对话和调用 sidecar；sidecar 负责结构化校验、画像版本、证据簿、资料库、任务表、授权和审计。Hermes 只保留两个固定原生 Job：每日 04:00 的日检，以及每 5 分钟运行一次的到期任务派发器。派生任务保存在 sidecar，不各自创建原生 Cron。
+交付一个 Partner Hermes 健康 Plugin，而不是七个插件。Plugin 是唯一可部署产品单元，负责准入适配、确定性边界、Skill 加载和使用证明、健康命令编排、`health-core` 接口、模型/投递适配、安全门禁、受管状态、任务、outbox、主人控制、删除、迁移和状态投影。
 
-实时对话只提出候选写入；日检维护画像、资料卡并创建派生任务，但不直接发送消息；派发器读取到期任务和当前健康快照，在 fresh session 中再次调用 LLM，输出 `send` 或 `skip`，并在发送前复核授权、任务、结论和资料的新鲜度。
+七个 Skill 是随 Plugin 绑定的交互和职责资源：
 
-系统通过画像主人身份、完整查看授权、主动触达暂停、无内容审计、加密存储、备份删除传播、运行熔断和完整上线验收控制风险。普通 Hermes memory 只接收档案指针和授权长期交互偏好的单向投影，不成为第二份健康数据库。
+- A 类：`health-init`、`health-steward`、`health-settings`。
+- B 类：`health-portrait`、`health-evidence`、`health-owner-inquiry`、`health-literature`。
 
-partner-only 微信适配层在认证后、消息合批前形成精确临时入站信封；独立的窄权限签发服务把真实 sender、message ID、UTC 时间和当前动作签入收据，sidecar 只持验证公钥。健康判断、健康相关轮次回答、日检和派发使用单独固定的健康模型配置；查看和导出由 sidecar 直接发往微信，不经过普通聊天 LLM 或普通会话历史。
+Skill 提供版本化说明、目的限定的最小只读上下文和候选结果。Skill 不拥有数据库写权、最终业务提交权、发送权、任务完成权或独立主人回复权。`health-steward` 是唯一健康协调 Skill；B 类 Skill 只向它返回候选。所有候选必须回到 Plugin 的权威执行边界，由 `health-core` 作最终裁决和提交。
 
-独立 Monitor 不依赖 Gateway 或 LLM 做故障判断。它读取真实无内容审计、Job 心跳和受控时间，向操作者微信、系统日志、外部 dead-man 心跳和指定邮箱报告运行、故障与恢复。Gateway 故障时健康对话、LLM 和主动任务停止；Monitor 的职责仅是继续检测并发出故障信号，而不是维持健康管家业务。
+### 端到端拓扑
+
+```text
+唯一获准主人消息或自动事件
+  -> health_weixin 前置准入与保真 envelope
+  -> Partner Health Plugin
+       -> 确定性初始化/粗分流/健康路由
+       -> 七 Skill 运行时与真实使用证明
+       -> 受限 Plugin/core 接口
+  -> 同机、低权限、Plugin 私有 health-core
+       -> 加密本地受管状态域
+       -> 不透明的单区域 current-head 资源
+       -> StrictHealthLLM 首跳模型接口
+       -> 离线 KnowledgePublisher 版本发布
+       -> 确定性安全与诊断门禁
+       -> transactional outbox 与分层 Weixin/联系人适配
+       -> 唯一主人回复和可证明的业务状态
+```
+
+`health-core` 是 Plugin 的受管基础设施，不是第二个 Agent、第二人格、第二画像或独立模型 Gateway。它没有普通聊天入口、独立微信凭据、独立模型供应商配置、独立定时器或直接外发权。任何 Gateway、Plugin、core、密钥、current head 或 contract probe 无法证明时，健康路径停止；普通 Hermes 仍可运行，但不得报告健康能力可用。
+
+### 统一业务流程
+
+1. `health_weixin` 在 Hermes 原生去重、合批和 cursor 推进前收敛唯一获准私聊入口，只形成保留逐条来源、因果 ID、时间、Partner 身份和必要正文的临时 envelope；来源 receipt、重投关系和受管 cursor 由 Plugin/core 持久化，原生 cursor 只有在业务提交确认后才推进。准入白名单是技术准入条件，不是现实身份核验或知情同意。准入外、群聊、无法证明来源或旧 `medical` 入口不得进入健康处理。
+2. 初始化前只有明确初始化意图可进入 `health-init`。健康正文、危险分流、画像、证据和任务不倒填初始化前历史。初始化必须完成说明、主人同意、首跳模型路线同意、时区/偏好、联系人边界、初始画像、密钥、版本和 current-head 的 prepare、条件提交、finalize；中断或未知不启用健康管家。
+3. 初始化后，明确非健康消息进入普通 Hermes；健康、混合或无法确定的消息一次性进入 `health-steward`。`health-steward` 规划目的、获取最小投影、选择零项或多项职责、形成唯一候选提交请求和唯一主人回复。
+4. Plugin 在运行时证明必需 Skill 的实际动作后，才记录最小 Skill 使用事实并追加系统生成的真实披露。发现、安装、全文加载、模型自述或回复中的名称不等于使用事实。
+5. `health-core` 对候选执行当前启用、主人控制、证据引用、版本、权限、能力、代际和安全校验，原子提交画像/证据/任务/控制/诊断/状态等业务事实以及 outbox/回复意图。`health-steward` 负责本轮候选整合，Plugin 负责把 core 已提交的唯一业务结果和回复意图适配为唯一主人回复。候选、模型草稿和 Skill 文本不成为权威状态。
+6. 外部模型、Weixin 和联系人发送均在业务提交后执行，并记录形成、提交、尝试、接口接受、送达、已读或实际行动等独立事实。未知效果不被改写成失败，也不盲目重发。
+
+### 权威状态与并发
+
+本地加密受管状态域是健康内容和业务事实的唯一权威，统一承载来源 receipt、初始化、画像、三类证据、任务、批准、控制、诊断修订、危险事件、outbox、交付、运行状态、删除和迁移事实。普通 Session、Memory、FTS、日志、cache、模型 transcript、通用备份或外部快照不得成为第二份健康真相。
+
+外部 current-head 资源只保存不透明 installation/generation、最终 revision digest、transition ID、active writer fence、站点和不可逆 terminal-deletion 标记，不保存健康正文、联系人身份、凭据或可推断医学值。每次跨实例状态变化使用 prepared local revision -> 条件推进 current head -> local finalize。远端响应未知时按 transition ID 读取回查；本地和 current head 未达成一致前停止健康读写、模型工作和外部效果。
+
+### 模型、知识、诊断与安全
+
+模型只能通过窄的 `StrictHealthLLM` host interface 使用同一 Partner 的获准首跳路线。接口在最终 wire payload 上绑定 provider、canonical base URL、API mode、model、配置代际、同意指纹、容量 profile、结构和终态；禁止跨首跳 fallback、路线外 Web Search、MCP、普通 Tool、任意 HTTP 或主人派生医学查询。`completed`、`incomplete`、`failed` 及原因必须可证明，不能用静态窗口、粗略 token 估算或事后 usage 冒充完整性。
+
+通用医学知识由不读取主人数据的离线 `KnowledgePublisher` 生成不可变 release，带来源、版本、许可、中文状态、适用范围、专业审核状态和 hash。主人消息不能触发任意网络检索；知识缺失或过期形成知识缺口。
+
+非诊断回答是受管候选，不是模型直接回复。Plugin 校验证据/知识卡、来源、时间、用途、支持/反对/未知、限制和批准 claim/template 后再确定性渲染。首发诊断只保留窄 BMI 候选范围并保持 staged，直至内容权利、冻结中文 bundle、医学专业审核、实现兼容、安全审查和真实主人验收全部完成。每次诊断执行模型前、模型后、提交前三段门禁；安全不可用、可信危险、危险未明、范围外和范围内具有固定优先级，不能用关键词缺失或模型猜测越过门禁。
+
+### 任务、联系人、控制、删除和迁移
+
+`TaskEngine` 独占任务目标、阶段、验收、四类主标签、批准和后继关系。Cron、启动恢复或 tick 只唤醒 core；当地日账本决定复盘是否发生，`sent`、进程存活或 API accepted 不能成为 `solved` 或主人已看到。
+
+危险支持联系人是单一、单向、最小数据接收者。只有当前可信危险、当前批准和适用安全规则同时成立时才可生成警报候选。警报只包含主人可识别称呼、事件时间和固定求助语义，不包含诊断、原消息、症状、位置、画像或证据。联系人批准、暂停、撤回、更换、警报、纠正和投递未知各自独立记录。
+
+暂停主动支持、停止新增记录、取消任务、撤回外部批准、联系人专门暂停和永久删除是独立控制。永久删除先冻结健康效果、任务、模型和 outbox，再条件推进不可逆 terminal generation，随后销毁密钥并清除所有受管对象、索引、备份、导出、迁移暂存、联系人和警报事实；站外已经交付的内容不能被宣称已撤回。迁移使用同一 writer fence，源端冻结并生成语义完整 manifest，目标离线校验后一次 CAS 接管，旧 VM 和旧 fence 立即失去健康写入、模型和发送资格。
 
 ## User Stories
 
-1. As a 画像主人, I want Hermes to recognize health-related facts in my messages, so that my health profile is maintained without a special command prefix.
-2. As a 画像主人, I want ordinary conversation to remain ordinary, so that unrelated chat is not copied into my health record.
-3. As a 画像主人, I want my direct health statements to become traceable personal evidence, so that the profile does not rely on model impressions.
-4. As a 画像主人, I want measurements to retain value, unit, observation time, and source message, so that they remain meaningful historical facts.
-5. As a 画像主人, I want relayed medical advice to be labelled as my relay of a clinician's advice, so that it is not presented as a verified diagnosis.
-6. As a 画像主人, I want each profile conclusion to cite evidence, so that I can understand why it exists.
-7. As a 画像主人, I want the model-visible health profile to remain within 300 characters, so that it stays compact in every Hermes context.
-8. As a 画像主人, I want the 300-character profile rebuilt by priority instead of cut mid-sentence, so that it stays coherent.
-9. As a 画像主人, I want resolved, expired, and lower-priority conclusions removed or deferred before higher-priority conclusions, so that the summary preserves useful current state.
-10. As a 画像主人, I want facts, tendencies, and unverified hypotheses distinguished, so that uncertainty is visible.
-11. As a 画像主人, I want only facts and tendencies to create ordinary automatic tasks, so that hypotheses do not silently become assumed health facts.
-12. As a 画像主人, I want an unverified hypothesis to create at most one completion question, so that uncertainty does not trigger repeated intervention.
-13. As a 画像主人, I want newer direct statements to update older time-sensitive statements, so that the profile follows my current state.
-14. As a 画像主人, I want measurements from different times to coexist, so that later measurements do not erase history.
-15. As a 画像主人, I want persistent high-impact contradictions downgraded to an unverified hypothesis, so that Hermes asks rather than guesses.
-16. As a 画像主人, I want acute-state conclusions to expire after 24 hours without a new direct confirmation, so that yesterday's discomfort is not treated as current indefinitely.
-17. As a 画像主人, I want habit and goal conclusions to expire after 30 days without new evidence, so that stale routines do not keep generating tasks.
-18. As a 画像主人, I want explicit communication feedback to take effect immediately, so that Hermes can adapt to how I prefer to interact.
-19. As a 画像主人, I want an implicit interaction preference to require three independent same-direction behaviors within 60 days, so that a single event does not overfit the assistant.
-20. As a 画像主人, I want interaction preferences to stop guiding proactive contact after 60 days without new evidence, so that old preferences do not become permanent.
-21. As a 画像主人, I want silence, reply speed, and one-off emotion excluded as preference evidence, so that Hermes does not misread me.
-22. As a 画像主人, I want the daily review to examine my current profile, evidence, task feedback, and relevant source cards, so that it can autonomously decide whether action is useful.
-23. As a 画像主人, I want the daily review to be allowed to produce `no_action`, so that autonomy does not imply mandatory messaging.
-24. As a 画像主人, I want the daily review to create completion questions, status follow-ups, care messages, and authorized low-risk reminders, so that tasks reflect the current profile.
-25. As a 画像主人, I want a future task to store its purpose rather than stale final copy, so that the message is generated from current context at delivery time.
-26. As a 画像主人, I want the dispatcher to evaluate due tasks every five minutes, so that future contact has a defined maximum scheduling granularity.
-27. As a 画像主人, I want due tasks rendered in a fresh LLM session using a controlled health snapshot, so that old chat sessions are not treated as current truth.
-28. As a 画像主人, I want the current health snapshot to include the task purpose, time window, evidence references, current profile, relevant conclusions, authorized preferences, and my latest three messages, so that delivery decisions have enough current context.
-29. As a 画像主人, I want the latest three messages used ephemerally unless a relevant excerpt becomes evidence, so that the sidecar does not retain complete chat history.
-30. As a 画像主人, I want due tasks skipped when their evidence, conclusion, authorization, or time window is no longer valid, so that stale care is not sent.
-31. As a 画像主人, I want LLM and channel failures retried exactly once after 15 minutes, so that transient failures can recover without duplicate-message loops.
-32. As a 画像主人, I want a failed retry to end as failed without automatic duplicate sending, so that uncertain delivery does not cause message floods.
-33. As a 画像主人, I want unfinished tasks with the same purpose deduplicated, so that the system does not create repeated equivalent contact.
-34. As a 画像主人, I want the same unanswered topic to wait at least 72 hours before another proactive contact, so that no response is not treated as an invitation to chase me.
-35. As a 画像主人, I want proactive messages allowed at model-selected times, including night when justified, so that the assistant can adapt timing instead of following a fixed quiet period.
-36. As a 画像主人, I want every night contact to record why that time was selected, so that timing remains reviewable.
-37. As a 画像主人, I want a rolling 24-hour hard ceiling of 100 automatic messages, so that a task loop cannot produce unlimited contact.
-38. As a 画像主人, I want the 100-message ceiling treated as a circuit breaker rather than a target, so that the system never tries to use the quota.
-39. As a 画像主人, I want tasks blocked by the capacity ceiling to be re-evaluated instead of blindly queued for later, so that old messages are not released in a flood.
-40. As a 画像主人, I want to pause all proactive health contact for a duration or indefinitely, so that I control interruptions without deleting my record.
-41. As a 画像主人, I want Hermes to keep responding to my messages and maintaining evidence while proactive contact is paused, so that pausing does not disable support.
-42. As a 画像主人, I want explicit resumption to be required after an indefinite pause, so that the system does not restart contact on its own.
-43. As a 画像主人, I want to view my complete profile, evidence ledger, and unfinished tasks, so that I can inspect my own data.
-44. As a 画像主人, I want to export my complete health record, so that my access does not depend on the operator's authorization.
-45. As a 画像主人, I want to delete my health record, so that profile versions, personal evidence, and unfinished tasks are removed.
-46. As a 画像主人, I want deletion to immediately destroy the record-specific encryption key and make backup copies unreadable, so that backup rotation does not preserve usable health content.
-47. As a 画像主人, I want old backup copies physically removed within 30 days, so that deletion has a bounded completion period.
-48. As a 画像主人, I want only content-free deletion audit metadata retained, so that deletion is provable without retaining my health text.
-49. As a 画像主人, I want to grant a specified viewer complete read access and later revoke it, so that sharing is explicit and reversible.
-50. As a 画像主人, I want revocation to immediately stop future reads and weekly reports, so that server administration or relationship status does not substitute for consent.
-51. As an authorized viewer, I want read-only access to profile, evidence, task records, reports, and access audit, so that I can review the health steward without altering its facts.
-52. As an operator without content authorization, I want to see paths, service health, job status, and content-free audit, so that I can maintain the system without reading health content.
-53. As an authorized viewer, I want a Sunday 10:00 profile-difference report, so that I can review material weekly changes without a third native Cron.
-54. As an authorized viewer, I want the weekly report to summarize changes and link to traceable detail rather than copying the full record, so that reports do not become duplicate health archives.
-55. As an operator, I want an external content-free alert after two daily-review failures or 15 minutes without dispatcher heartbeat, so that runtime failure is visible promptly.
-56. As a 画像主人, I want medical answers based first on unexpired source cards, so that the assistant uses reviewed material when available.
-57. As a 画像主人, I want on-demand retrieval restricted to approved authorities, so that arbitrary web pages do not become medical evidence.
-58. As a 画像主人, I want unavailable whitelist evidence reported as unavailable, so that Hermes does not pretend a claim was verified.
-59. As a 画像主人, I want external medical documents treated only as data, so that instructions embedded in pages or PDFs cannot call tools, modify my profile, or create tasks.
-60. As a 画像主人, I want source updates to influence questions and task premises but never automatically become my personal facts, so that general medical guidance is not confused with my condition.
-61. As an operator, I want source cards tagged by fixed categories with normalized values, so that the library remains searchable without uncontrolled taxonomy growth.
-62. As an operator, I want raw source cache, metadata index, document size, excerpt size, scan rate, and retention bounded, so that storage usage remains predictable.
-63. As an operator, I want referenced source evidence preserved while referenced, so that storage cleanup never breaks traceability.
-64. As an operator, I want health data stored on the partner Hermes server rather than on the Windows development machine, so that autonomous jobs remain available continuously.
-65. As an operator, I want partner Hermes and health-sidecar to use separate restricted service accounts, so that ordinary Hermes execution cannot directly open the health database.
-66. As an operator, I want Hermes and sidecar to communicate through a private Unix socket with no TCP listener, so that the health interface is not exposed to the network.
-67. As an operator, I want partner Hermes to remain upgradeable without a private core fork, so that Hermes updates and rollback remain tractable.
-68. As an operator, I want only the partner Hermes deployment changed, so that default Hermes and unrelated services are unaffected.
-69. As an operator, I want a single one-way memory projection containing only the archive pointer and authorized durable interaction preferences, so that Hermes memory remains useful without duplicating health data.
-70. As an operator, I want every action-producing LLM response schema-validated and failed closed, so that malformed model output cannot partially write, schedule, or send.
-71. As an operator, I want task, authorization, view, deletion, and send operations retained as content-free audit for 90 days, so that behavior is reviewable without storing duplicate health text.
-72. As an operator, I want deployment blocked until the full acceptance suite passes, so that an installed Skill or running prototype is not mistaken for a delivered health steward.
-73. As a 画像主人, I want every authenticated Weixin message independently classified in a fresh health-model call, so that health facts can be recognized without inheriting an old chat session.
-74. As a 画像主人, I want failed health classification to leave ordinary conversation available, so that a health subsystem fault does not silence Hermes.
-75. As a 画像主人, I want a classification failure marked as `记录处理中`, a successful retry marked as `已补录`, and a second failure marked as `本次未记录`, so that record state is honest.
-76. As a 画像主人, I want the trusted inbound envelope retained for at most ten minutes and retried at most once, so that recovery does not create a shadow chat archive.
-77. As a 画像主人, I want health processing disabled until I explicitly opt in, so that server ownership or relationship status cannot substitute for my consent.
-78. As a 画像主人, I want only my first trusted message after opt-in to bind the preconfigured owner identity, so that another sender cannot claim my record.
-79. As a 画像主人, I want to stop health recording without deleting the existing record, so that I can suspend classification and new writes while keeping view, export, resume, and deletion rights.
-80. As a 画像主人, I want stop-recording to cancel pending classification retries and derived tasks and pause proactive contact, so that processing really stops.
-81. As a 画像主人, I want resuming health recording to require an explicit current-turn action, so that processing cannot restart implicitly.
-82. As a 画像主人, I want view and export requests tied to my authenticated current turn, so that a model cannot replay an old request.
-83. As a 画像主人, I want grant, revoke, pause, resume, and stop-recording actions tied to the exact target, duration, and current message, so that Hermes cannot alter their meaning.
-84. As a 画像主人, I want permanent deletion to require a second confirmation within ten minutes, so that a single misunderstood utterance cannot destroy my record.
-85. As a 画像主人, I want deletion to cover profile, evidence, versions, tasks, reports, grants, and memory projection, so that no active health copy remains in the steward.
-86. As a 画像主人, I want deletion to leave Weixin and ordinary Hermes chat history untouched, so that the deletion boundary is explicit rather than falsely broad.
-87. As a 画像主人, I want to know that already delivered or exported copies cannot be recalled, so that deletion is not represented as retroactive erasure.
-88. As a 画像主人, I want my JSON export delivered as a Weixin attachment from a strict-permission temporary file, so that export does not pass through ordinary chat generation.
-89. As a 画像主人, I want export plaintext created only on private tmpfs and removed after sending, with cleanup no later than 24 hours, so that temporary files do not become a durable copy.
-90. As an authorized viewer, I want full views delivered directly from sidecar without ordinary chat LLM processing or session persistence, so that authorized access does not create an uncontrolled duplicate.
-91. As an authorized viewer, I want export forbidden, so that the owner's grant remains read-only rather than becoming redistribution authority.
-92. As a 画像主人, I want full health content sent to a model only after I explicitly request analysis in the current turn, so that viewing alone does not disclose it to a provider.
-93. As a 画像主人, I want the health model provider and model configured independently from the partner chat model, so that later chat-model changes do not silently change health-data processing.
-94. As a 画像主人, I want the initially selected current partner provider explicitly recorded as an accepted third-party processor, so that model provenance is not overstated.
-95. As a 画像主人, I want only health-related turns to receive my current compact profile and relevant references, so that ordinary conversation does not expose health context.
-96. As a 画像主人, I want the health turn to use the post-write current profile, so that an accepted update is not followed by stale advice.
-97. As a 画像主人, I want the latest three ordinary messages kept only in memory for at most 72 hours and cleared on restart, so that short-term context is bounded.
-98. As a 画像主人, I want Hermes to say `正在核验资料` when a health answer lacks a fresh source card, so that a delayed answer is explained.
-99. As a 画像主人, I want whitelist retrieval given at most 20 additional seconds, so that source checking cannot indefinitely block the conversation.
-100. As a 画像主人, I want unavailable or timed-out verification stated explicitly, so that neither model memory nor an unverified source is presented as authority.
-101. As a 画像主人, I want a health-action tail marker only when the sidecar actually changed profile/evidence or completed a control action, so that tool use is visible without false positives.
-102. As a 画像主人, I want no health tail marker on ordinary chat or rejected/no-op candidates, so that the marker remains meaningful.
-103. As a 画像主人, I want one high-entropy recovery code shown only to me, so that I can recover from a lost Weixin sender identity without giving the administrator content authority.
-104. As a 画像主人, I want the recovery code stored only as a verifier, rotated after use, and never available to the viewer or administrator, so that recovery cannot become a standing bypass.
-105. As a 画像主人, I want identity recovery to fail closed if both my old identity and recovery code are unavailable, so that convenience does not override ownership.
-106. As an operator, I want the receipt signer isolated from sidecar data keys and inaccessible to health tool subprocesses, so that a compromised tool cannot forge owner actions or decrypt health data.
-107. As an operator, I want Weixin delivery to use a stable delivery key and content-free ledger, so that retries cannot duplicate an uncertain send.
-108. As an operator, I want the partner Weixin adapter pinned to an accepted Hermes version and revalidated on every Hermes upgrade, so that an upstream change cannot silently break identity or idempotency.
-109. As an operator, I want the first runtime failure alert immediately, repeated failure reminders no more often than every six hours, and one recovery alert, so that failures are visible without alert flooding.
-110. As an operator, I want operational alerts excluded from the owner's 100-message health-contact ceiling, so that a circuit breaker does not hide a system failure.
-111. As an operator, I want a content-free external HTTPS dead-man heartbeat, so that an independent service can detect whole-host or network loss.
-112. As an operator, I want whole-host or network-loss alerts sent to a separately configured email address, so that an outage is visible when local Weixin and syslog cannot send.
-113. As an operator, I want Monitor behavior to remain deterministic without LLM access, so that Gateway failure can still be detected even though health conversations and tasks stop.
+1. 作为唯一画像主人，我希望健康管家以一个 Plugin 部署在我的 Partner Hermes 中，以便所有健康能力共享同一受管边界。
+2. 作为主人，我希望七个 Skill 只是 Plugin 内的角色资源，以便不会出现多个健康入口或多个健康真相。
+3. 作为主人，我希望只有唯一获准的单人私聊入口进入健康处理，以便准入外消息、群聊和不明来源不会读取或写入健康资料。
+4. 作为主人，我希望初始化前只有明确的初始化意图可用，以便普通健康文字不会被倒填成初始化或健康记录。
+5. 作为主人，我希望初始化说明清楚资料范围、首跳模型、联系人、主动支持和数据权利，以便我能作出知情同意。
+6. 作为主人，我希望初始化只有在全部权威提交成功后才显示已启用，以便中断、失败或未知不会造成虚假启用。
+7. 作为主人，我希望正常重启和完整迁移不会要求重复同意，以便启用事实在可验证时持续成立。
+8. 作为主人，我希望永久删除后旧启用事实不会复活，以便新的空白重建确实从未初始化开始。
+9. 作为主人，我希望明确非健康消息仍进入普通 Hermes，以便健康故障不会吞掉普通聊天。
+10. 作为主人，我希望健康、混合或无法确定的消息统一进入 `health-steward`，以便不会因粗分流遗漏健康内容。
+11. 作为主人，我希望日常健康处理实际使用 `health-steward`，以便系统不会只复制说明或依赖模型自称。
+12. 作为主人，我希望只有本轮实际使用的 Skill 出现在系统生成的披露中，以便未使用 Skill 不被冒充。
+13. 作为主人，我希望 B 类职责不能直接写入、发送或回复，以便所有业务结果经过统一权威执行边界。
+14. 作为主人，我希望每个 Skill 只拿到完成当前目的所需的最小只读上下文，以便无关健康正文不会被扩大暴露。
+15. 作为主人，我希望 Skill 版本和实际使用事实可追溯，但不长期保存完整提示词、草稿或全文回复。
+16. 作为主人，我希望每条来源保留真实发送者、消息 ID、时间和重投关系，以便重复消息不会直接造成重复健康结果。
+17. 作为主人，我希望健康画像只有一个当前权威版本，以便普通会话、缓存或导出不会形成第二个当前真相。
+18. 作为主人，我希望个人健康证据、通用权威知识和任务过程证据严格分开，以便知识或任务完成不会冒充个人事实。
+19. 作为主人，我希望每张证据卡保留来源、时间、用途、限制和纠正关系，以便我能理解画像或任务为何存在。
+20. 作为主人，我希望待澄清或被拒绝的候选不会支持画像、诊断或任务，以便不完整材料不会悄悄生效。
+21. 作为主人，我希望压缩旧证据时仍保留覆盖时期、数量、转折、例外、不确定性和谱系，以便历史不会被压成虚假的确定结论。
+22. 作为主人，我希望健康任务记录目的、允许资料、批准、验收和后继关系，以便任务状态可解释且不依赖模型记忆。
+23. 作为主人，我希望每天按我的当前时区最多形成一次复盘，时区变化从下一个有效当地日开始，以便不会补做或重复旧日复盘。
+24. 作为主人，我希望没有行动时复盘保持安静，以便自动支持不会变成强制打扰。
+25. 作为主人，我希望任务的 `active`、`solved`、`failed` 和 `cancelled` 由业务事实决定，以便发送接口成功不被误报为任务完成。
+26. 作为主人，我希望投递形成、提交、尝试、接口接受、送达和已读分层显示，以便“接口接受”不会冒充“我已经看到”。
+27. 作为主人，我希望外部效果未知时不自动重复发送，以便不确定结果不会造成重复联系。
+28. 作为主人，我希望可以独立暂停主动支持、停止新增记录、取消任务和撤回批准，以便“关闭”不会掩盖不同的控制意图。
+29. 作为主人，我希望可以查看、纠正、导出和永久删除受管健康对象，以便我保有真实的数据权利。
+30. 作为主人，我希望停止新增记录期间不倒填恢复后的健康正文，以便控制边界在时间上真实有效。
+31. 作为主人，我希望删除先阻断新效果再销毁密钥和对象，以便旧本地副本不能继续被读取或复活。
+32. 作为主人，我希望迁移复制完整语义状态、版本、未知和控制事实，而不是只复制一个数据库文件，以便迁移后仍保持同一权威链。
+33. 作为主人，我希望旧实例在 writer-fence 转移后失去写入、模型和发送资格，以便不会出现双写或双发。
+34. 作为主人，我希望模型只使用我已经同意的同一 Partner 首跳路线，以便模型服务商或路由变化不会静默扩大接收方。
+35. 作为主人，我希望模型输出必须有可证明的完整终态和严格结构，以便截断或失败候选不会形成健康业务结果。
+36. 作为主人，我希望普通健康问答区分个人事实、通用知识、支持、反对和未知，以便不把模型推测说成诊断。
+37. 作为主人，我希望诊断范围在权利、中文版本、专业审核、实现和验收都完成前保持 staged，以便未获准范围不会被当作已上线能力。
+38. 作为主人，我希望危险、安全不可用、危险未明和范围外按固定优先级处理，以便模型猜测不能越过安全边界。
+39. 作为主人，我希望危险时先收到固定的主人求助提示，以便联系人缺失不会阻断最低安全结果。
+40. 作为主人，我希望联系人警报只发送最小必要信息，以便联系人不会收到诊断、症状、位置、画像或证据正文。
+41. 作为主人，我希望联系人批准随联系人或联系方法变化而失效，以便旧批准不会自动沿用到新接收方。
+42. 作为主人，我希望联系人警报纠正追加历史而不覆盖原警报，以便外部事实和未知状态可追溯。
+43. 作为维护者，我希望 Plugin、core、密钥、current head 和 contract probe 任一不可证明时健康路径失败关闭，以便普通 Hermes 存活不掩盖健康不可用。
+44. 作为维护者，我希望运行状态由业务事实投影而非进程 heartbeat 决定，以便活着的进程不会冒充产品 active。
+45. 作为维护者，我希望迁移、删除、模型、投递和未知结果都有可定位的无正文事实，以便排障不会读取真实健康正文。
+46. 作为实现者，我希望现有历史 `ops/` 代码只作为审计输入，以便新实现不会继承已失效的产品边界或第二权威。
+47. 作为实现者，我希望核心业务逻辑可在合成依赖上验证，以便不使用真实健康资料、真实密钥或真实外部服务也能覆盖主要状态机。
+48. 作为验收者，我希望静态、合成、本机故障、宿主合同、模型、医学、云端 current head、迁移、合成渠道和真实主人/联系人验收逐层推进，以便任一失败都能停在明确门槛。
+49. 作为验收者，我希望未完成、未授权、未知和未证明的结果保持这些真实状态，以便不会把测试通过、接口接受或安装成功宣传为上线。
+50. 作为项目维护者，我希望所有后续实现 Ticket 都回到本 Spec 和现有 Map，以便不会重新建立竞争的计划、地图或状态系统。
 
 ## Implementation Decisions
 
-- The production design consists of one partner Hermes instance and one `health-sidecar` on the same Linux server. The Windows workspace is a development and documentation location only.
-- The partner Hermes process runs as restricted account `hermes-partner`; the sidecar runs as restricted account `health-sidecar`. Before migration, deployment work must read-only verify the actual partner service account, profile paths, unit configuration, channel state, and current runtime.
-- The sidecar owns encrypted SQLite state, encrypted source cache, per-record data-encryption keys, source metadata, task state, and content-free audit. Hermes does not receive direct file or key access.
-- The sidecar exposes a local Unix domain socket owned by the sidecar and accessible only to the partner Hermes account. It does not bind a TCP port or expose a public API.
-- Hermes core source is not modified. Integration uses partner-only configuration, a version-pinned partner Weixin adapter/plugin, two native fixed Jobs, and the sidecar socket contract. The accepted Hermes commit/version is a deployment invariant; every Hermes or health-model change requires the affected integration and Linux acceptance suites to pass again. If native extension points cannot satisfy the contract, work remains in acceptance and does not introduce a private core patch.
-- The partner Weixin adapter observes the authenticated real-format event after channel admission and before text batching. It forms a temporary envelope containing the exact sender ID, message ID, UTC event time, channel/profile identity, message kind, and necessary plaintext. A batched message cannot borrow only the first event's ID or time as evidence for later text.
-- A narrow receipt-signer service is the only holder of the Weixin action-signing private key. Only the partner Gateway main process can request a signature; plugin tool subprocesses cannot read the private key. The receipt binds action, sender, target, message ID, UTC time, and action-specific parameters such as pause deadline. The sidecar holds only the public verification key; this key is separate from all health-data encryption keys.
-- The initially approved health model may use the current partner provider, including a third-party provider explicitly accepted by the user, but provider, endpoint, model ID, and relevant privacy mode are snapshotted in a separate health-model configuration. They never silently inherit later partner-chat configuration changes and are not described as official or direct unless independently verified.
-- Each health classification, health-related reactive answer, daily review, due-task render, and explicitly requested full-record analysis uses a fresh health-model invocation with only the allowed structured input. A fresh call does not inherit ordinary Hermes chat history.
-- Existing v0.2 autonomy, guard, dispatcher, and integration code is prior art only. It is not patched in place or deployed as production. Its SQLite, audit, authorization, deletion, and fixed-Job experience may inform the new implementation where it matches this spec.
-- The sidecar is the only authoritative store for the health profile, profile versions, conclusions, evidence ledger, source cards, authorization, derived tasks, task decisions, and deletion state.
-- Ordinary Hermes memory stores only a one-way projection: a health-record pointer and authorized durable interaction preferences. It cannot write back into sidecar state, and deletion removes the projection.
-- Deployment preconfigures the expected owner Weixin sender identifier, but this alone neither binds the record nor grants consent. Health classification and record creation remain disabled until the owner explicitly opts in; only her first trusted message after opt-in can complete binding. The operator, server administrator, and relationship owner are not automatically the profile owner or viewer.
-- Every authenticated bound-owner Weixin message is independently classified by a fresh health-model call with a structured result. The classification has a 15-second pre-response budget. A health fact, measurement, owner-relayed clinician advice, explicit preference, or owner control request may create a candidate; ordinary chat creates no candidate and its trusted plaintext is discarded after the bounded recent-message window.
-- Classification failure does not block the ordinary Hermes reply. The first failure shows `记录处理中`; the exact trusted inbound envelope may remain encrypted/in memory for at most ten minutes and is retried once. Retry success reports `已补录`; a second failure reports `本次未记录` and destroys the retry material. These reactive status messages do not count against proactive-contact capacity.
-- Candidate writes are structured model outputs. The sidecar validates identity, action role, schema, evidence links, lengths, state transitions, authorization, deduplication, and current version before atomically committing a new immutable profile version.
-- Action-producing output fails closed. Missing fields, parsing failure, invalid evidence, unauthorized role, illegal state transition, or profile-summary overflow means no write, no schedule, or no proactive send. Reactive conversation may continue, but the assistant cannot claim that a failed action was saved.
-- A health-action tail marker appears only after the sidecar confirms an actual profile/evidence change or a completed owner control action. Ordinary chat, rejected candidates, model-only reasoning, failed tool calls, and no-op writes have no health marker.
-- `profile_summary_zh` counts Chinese characters, Latin letters, digits, spaces, and punctuation and must contain no Markdown. It is hard-limited to 300 characters at write and context-injection boundaries.
-- A profile exposes at most eight active conclusions to the compact summary: up to two active states, three habits/goals, two interaction preferences, and one task context. Overflow handling first removes resolved or expired conclusions, merges synonymous values in the same field, and defers the lowest-priority conclusion that has no live task dependency. Mid-string truncation is forbidden; remaining overflow rejects the write as `summary_overflow`.
-- Conclusions have status `fact`, `tendency`, or `unverified_hypothesis`. Facts and tendencies may create automatic tasks. An unverified hypothesis may create only one profile-completion question.
-- Personal evidence includes direct owner statements; measurements with type, value, unit, and observation time; and clinician advice relayed by the owner and labelled as owner-relayed. A source card or model inference is not personal evidence.
-- Evidence excerpts preserve only the necessary original span, maximum 300 characters, plus channel message ID and UTC timestamp. Outside admitted evidence, at most the latest three ordinary owner messages are held in process memory for at most 72 hours and are cleared on restart; they are never persisted as sidecar profile data.
-- General time-sensitive statement conflicts prefer the newer direct owner statement. Measurements coexist as time-indexed observations. Persistent high-impact conflicts become an unverified hypothesis and generate at most one clarification question.
-- When evidence does not specify a shorter validity period, an acute-state conclusion expires 24 hours after the last direct confirmation, a habit or goal expires 30 days after the last evidence, and an interaction preference stops guiding proactive contact after 60 days without new preference evidence. Measurements remain historical observations rather than current state.
-- Explicit interaction feedback takes effect immediately. An implicit preference requires at least three independent same-direction owner behaviors within 60 days. Silence, reply speed, and one-off emotion are excluded.
-- Daily review runs at 04:00 in the profile owner's timezone, default `Asia/Shanghai`. It reviews current profile, evidence, task feedback, and relevant source cards and produces `no_action` or candidate derived tasks.
-- Derived tasks may represent a profile-completion question, status follow-up, care message, authorized low-risk reminder, immediate conversation, or future contact. Diagnosis, medication change, and external third-party notification are not task types.
-- Future tasks persist purpose, evidence references, time window, validity, deduplication key, and policy constraints, not final message copy.
-- Task lifecycle is `candidate`, `scheduled`, `due_for_render`, `sent`, `skipped`, `failed`, or `cancelled`, with `capacity_exhausted` recorded as a skip/failure reason. Invalidated conclusions, superseding evidence, authorization revocation, pause, deletion, and expired time windows cancel or skip before send.
-- There are exactly two native health Jobs: daily review and due-task dispatcher. No derived task creates or modifies a native Cron Job.
-- The due-task dispatcher runs every five minutes. Five minutes is the scheduling and delivery polling granularity, not a promise of exact-to-the-second delivery.
-- A due Job starts a fresh agent session. The effective context remains normal Hermes native context plus the fixed Job prompt plus a controlled health snapshot. Native Hermes context can affect language style and tool behavior but is not authoritative health state.
-- The health snapshot contains task purpose, time window, evidence IDs, current 300-character profile, relevant conclusions, authorized interaction preferences, and the latest three messages from the same owner sender identifier. The snapshot is the sole authority for whether the current health premise still holds.
-- Due rendering can output only `send` or `skip`. It cannot modify the profile, source cards, task plan, or native Cron. A skip returns the matter to the next daily review rather than planning inside the dispatcher.
-- Before rendering, the dispatcher revalidates current authorization, pause state, claim validity, source freshness, task deduplication, contact capacity, and time window. A stale or downgraded premise skips the task.
-- A model or channel failure is retried exactly once after 15 minutes. A second failure marks the task failed without blind duplicate sending; the next daily review may re-evaluate the purpose.
-- Daily review failure is retried once after 10 minutes. A second failure produces no new tasks for that day, records the failure, and appears in the next operational report.
-- A monitor outside the health planning flow alerts the specified operator without health content after two daily-review failures or 15 minutes without a successful dispatcher heartbeat.
-- The independent Monitor reads real content-free audit and Job heartbeat state without invoking an LLM. The first active fault alerts immediately, an unresolved fault is reminded at most every six hours, and recovery emits exactly one recovery alert. Its channels are the specified operator Weixin identity, system log, a content-free external HTTPS dead-man heartbeat, and a separately specified outage-alert email. Gateway or whole-host failure stops health LLM work; the Monitor only detects and reports the loss, and the external dead-man service covers cases where the local host cannot transmit.
-- Operational fault and recovery messages are not health contact and do not consume the owner's rolling 100-message capacity.
-- Contact capacity is a rolling-24-hour hard limit of 100 automatic messages. It is a circuit breaker, never a target or quota. Each proactive contact requires a purpose, evidence reference, and deduplication key.
-- The same purpose cannot repeat while an unfinished task exists. An unanswered topic cannot be proactively repeated for at least 72 hours; daily review may select a longer delay or no repeat and must record its rationale.
-- There is no fixed quiet period. The model chooses timing within the task window, but every night contact records a reviewable timing rationale.
-- When capacity is exhausted, no message is sent and old messages are not queued for automatic catch-up. The next daily review may create a new task only if evidence and timing still make it useful.
-- The profile owner can pause all proactive contact for a fixed duration or indefinitely. Pause cancels waiting proactive tasks but does not block reactive replies or evidence maintenance. Explicit owner action is required to resume an indefinite pause.
-- Health recording consent is separate from proactive-contact pause. `recording_stopped` disables new health classification and writes, cancels pending classification retries and derived tasks, and pauses proactive contact while retaining the encrypted record for owner view, export, explicit resume, or deletion. Resume requires a verified current-turn owner action.
-- Full viewer access requires a one-time explicit owner grant naming the single preconfigured viewer sender ID and covering profile, evidence ledger, task records, and profile-difference reports. No arbitrary additional viewers are supported in the first release. Revocation immediately blocks future content reads and report delivery. Previously delivered copies cannot be recalled.
-- View/export, grant/revoke, pause/resume, stop/resume recording, recovery, and deletion are accepted only with a fresh action-bound receipt from the current authenticated owner turn. Grant/revoke binds the target; finite pause binds the normalized deadline. Permanent deletion requires a second action-bound owner confirmation within ten minutes.
-- The profile owner always retains full self-view and export rights. The viewer is read-only and cannot export. Server administrator status alone reveals only paths, service state, and content-free audit, not health content.
-- Complete owner/viewer views are projected directly from sidecar to Weixin and are not inserted into the ordinary chat LLM prompt or ordinary Hermes session history. Full content enters the approved health model only when the authorized requester explicitly asks in the current turn for model analysis, and only the required scope is supplied.
-- Owner export is a JSON Weixin attachment. Plaintext is created only in a strict-permission private tmpfs location, removed after confirmed send, and swept no later than 24 hours. It does not pass through ordinary chat generation.
-- Owner identity recovery uses either a verified transfer from the old identity or a one-time high-entropy recovery code shown only to the owner. The sidecar stores only a verifier/hash and rotates it after use. Administrators and viewers cannot rebind; loss of both the old identity and recovery code fails closed.
-- Every successful profile write creates an immutable profile version. The current profile is the latest effective version. Weekly difference reports compare adjacent versions.
-- Daily review creates a weekly profile-difference report as a derived task due Sunday 10:00 in the owner's timezone. It is not a third native Job. The report includes profile changes, evidence additions/revocations, task sent/skipped/failed events, authorization/deletion operations, and daily-review failures, with references rather than copied full content.
-- Approved source origins are the National Health Commission of China, China CDC, WHO, US CDC, NICE, and vetted medical-specialty clinical guidelines. Automated discovery, retrieval, refresh, and tagging remain inside this whitelist.
-- Source cards have six fixed tag categories: topic, symptom/behavior, target population, evidence type, region/language, and freshness. Values are normalized against existing synonyms; only an unmergeable value creates a new normalized value. Categories do not grow dynamically.
-- Current-reference review intervals are seven days for public-health alerts, 180 days for clinical guidelines, and 365 days for general health education. A shorter source-declared validity period overrides these defaults.
-- On-demand health questions use a current source card first. If none fits, Hermes first sends `正在核验资料` and gives the production source fetcher at most 20 additional seconds to retrieve a whitelist source and create a card. If the source is unavailable or times out, the response explicitly states that verification was unavailable and does not expand to arbitrary web sources or treat model memory as authority.
-- Source documents and extracts are untrusted data. Embedded text cannot issue instructions, call tools, write sidecar data, or create tasks. Source updates cannot become personal facts; they may invalidate a task premise or create one completion question for a personal evidence gap.
-- The raw-document cache is limited to 200MB; index and metadata are limited to 100MB; an individual raw document is limited to 5MB; a retained evidence excerpt from a source is limited to 8KB.
-- Each daily review downloads at most 20 raw documents, one at a time, with at least one minute between downloads from the same domain. Excess candidates remain queued for later review.
-- At raw-cache capacity, cleanup removes the least-recently-used raw content that is not referenced by a current conclusion or unfinished task. URL, version hash, and key excerpt remain. Referenced content is not deleted to admit a new download; the new raw download is rejected if necessary.
-- Evidence supporting a current profile conclusion is retained for the conclusion's lifetime plus 180 days after expiry. Task creation, delivery, revocation, and content-free audit logs are retained for 90 days. A source-card reference remains while any retained object cites it. Owner deletion overrides ordinary retention.
-- Health data and backups are encrypted at rest. Keys do not enter prompts or ordinary Hermes configuration. Encryption protects storage and backups but does not claim to defeat an active server root administrator.
-- Each owner health record uses a distinct encryption key. Confirmed deletion immediately destroys the key and removes active profile, profile versions, personal evidence, tasks, reports, grants, delivery state, and memory projection. Encrypted backup remnants become unreadable immediately and are physically purged within 30 days. Content-free deletion audit remains; Weixin/ordinary Hermes chat history and copies already delivered or exported are outside this deletion boundary.
-- All stored timestamps are UTC. Owner-facing schedules and time windows use the explicit owner timezone, default `Asia/Shanghai`; the system does not infer timezone from conversational location.
-- Health-related reactive turns are diverted before ordinary text batching. Only the independently pinned health-answer invocation receives the current compact profile, relevant evidence IDs, and relevant source-card summaries as ephemeral input through a one-time turn-bound receipt; the turn and projection do not enter the ordinary chat model or ordinary session history. Once classification has confirmed the turn is health-related, later admission, context, source, or answer failure and timeout fail closed on the health route and cannot fall back to ordinary chat. If the current turn admitted a write, the health answer uses the newly committed current profile rather than the pre-write snapshot. Ordinary turns receive no health projection.
-- Weixin sends use a stable sidecar-derived delivery key and content-free delivery ledger. An adapter without an idempotent `send_once` contract fails closed for retryable health delivery. The adapter is tied to the accepted Hermes version and must be revalidated before an upgrade is activated.
-- The application has no RMB-denominated daily LLM cost cutoff. Message, task, retry, source-fetch, and storage bounds still apply.
+### 1. 产品和权限边界
+
+- 只实现一个 Partner Health Plugin；七个 Skill 随 Plugin 版本化、加载和迁移，不拆成独立插件。
+- Plugin 负责适配、准入、粗分流、Skill 运行时、Skill 使用证明、core 调用、模型/投递适配、状态、任务、控制、安全、删除和迁移。
+- `health-core` 是 Plugin 私有的低权限同机权威服务，只接受受限健康命令和受管候选，不拥有普通聊天入口、模型供应商配置或直接外发权。
+- 普通 Hermes、旧 `medical`、普通 Agent、Tool、Command、Cron、Skill 文本、模型输出和外部服务都不是健康权威写入者。
+
+### 2. Plugin 与 Skill 运行时
+
+- A 类 Skill 允许主人发现或表达意图，但不绕过 `health-steward` 的完整协调；只有初始化未启用时 `health-init` 可作为独立进入能力。
+- B 类 Skill 只能由总路由按目的采用，返回候选、缺口或无合格资料，不直接相互调用、写入、发送或回复。
+- 每次使用绑定规范名、版本指纹、披露版本、目的和因果 ID；只有运行时证明必需动作成功后才记录最小使用事实。
+- 缺少必需 Skill、加载失败、版本无法确认或实际使用无法证明时，受影响的初始化/健康业务结果停止形成；非 Skill 最低安全结果仍按独立安全边界运行。
+- Skill 上下文只读、最小、按目的限定；动态个人状态不写入 Skill 文档，完整提示词、模型草稿和完整回复不作为长期状态。
+- 六域画像的显示预算、三类证据不可互换、四类证据关系、近期明细/受保护例外/滚动摘要、`health-init` 禁止读取初始化前或已删除状态、`health-settings` 的五类普通通知偏好和所有独立控制，以 `CONTEXT.md` 与最新 TO Tickets 为准；实现 Tickets 必须逐项覆盖，不得用本 Spec 的概括替代这些合同。
+
+### 3. 入站、准入和路由
+
+- `health_weixin` 在原生去重、合批和 cursor 推进前接管唯一获准入口，只生成保真 envelope；Plugin/core 持久化逐条 receipt、重投关系和受管 cursor，并在业务提交确认后推进原生 cursor。准入 allowlist 不替代现实身份核验或知情同意。
+- 准入外来源、群聊、无法证明发送者或旧 `medical` 不进入健康、安全、诊断、记录或 Skill 使用事实。
+- 初始化前只识别明确初始化意图；初始化后的每条消息只作一次保守粗分流，再由 `health-steward` 作完整健康路由。
+- 原生路径或普通 Hermes 不能旁路 Plugin；Plugin 无法证明可信入口、当前启用、控制或 core 时，健康处理停止并显示不可用/无法确认。
+
+### 4. Plugin/core 深接口
+
+- 只保留三类稳定深接口：带来源/因果 ID/generation/允许范围的健康命令；由 core 生成、由适配器执行并回交完整终态的受控模型/投递效果；以及按权利和迁移 manifest 限定的受管读取/迁移快照。
+- 接口返回完整业务终态和未知事实，不能只返回无错误、进程存活或 API accepted。
+- core 生成唯一业务回复与 outbox 意图，Plugin 只负责受控适配和回交结果；外部适配器不得直接写入健康状态。
+- 任何状态变化必须具备幂等因果 ID、版本/generation 检查、权限范围和明确的失败/未知分支。
+
+### 5. 受管状态与加密
+
+- 首发本地状态域使用 Plugin/core 单一拥有的加密 SQLite，统一保存 receipt、来源、初始化、六域画像、三类证据、任务、批准、控制、诊断、安全、outbox、交付、状态、删除和迁移对象。
+- 每个权威对象只保留一份当前语义实体；画像、任务、诊断和安全结果通过稳定证据身份/版本引用，不复制第二份正文真相。
+- 使用专用数据密钥和独立凭据边界；普通 Hermes Session/Memory/FTS、日志、cache、模型 transcript、通用备份和导出不成为健康副本。
+- 候选、准备版本、最终版本和未知结果必须可区分；事务失败不得部分写入、静默丢弃旧依据或宣称已提交。
+
+### 6. Current head、恢复和并发
+
+- 外部单区域 DynamoDB current-head item 只存不透明 installation/generation、revision digest、transition ID、writer fence、站点和 terminal-delete 标志。
+- 每次变化执行 prepared local revision -> current-head 条件推进 -> local finalize；两端不一致时只允许回查或停止，不猜测继续。
+- current-head 的账号、区域、资源、最小 IAM、凭据注入、配额、费用和旧快照 canary 是实现/部署前提，不把仓库中的候选配置当作已完成。
+- 只有持有当前 writer fence 的实例可写入、调用模型或发送外部效果；旧 fence 立即失败关闭。
+
+### 7. 任务、复盘和业务三态
+
+- `TaskEngine` 独占任务目的、承担者、允许资料、阶段、批准、验收、四类主标签、重复判断和后继关系。
+- Hermes Cron、启动恢复和 Plugin tick 只唤醒 core；当地日、当前时区和业务事实决定复盘，不重放过期 backlog。
+- 业务状态至少区分 active、abnormal 和 cannot-confirm，并从入口、启用、密钥/状态、证据、任务、控制、模型、投递、安全和 current head 的事实聚合。
+- observer 只能写无正文观察事实，不能写健康状态、发送健康效果或把 heartbeat 宣称为 active。
+
+### 8. 模型与知识
+
+- `StrictHealthLLM` 使用同一 Partner 的获准首跳路线，锁定 provider、canonical base URL、API mode、model、配置代际和主人同意指纹。
+- 首跳 provider、canonical base URL、API mode、model、配置代际或接收方路线变化时，先暂停受影响健康处理，向主人重新说明并取得当前同意；旧同意不能自动沿用。
+- 禁止跨首跳 fallback、任意 provider/base URL、路线外 Web Search、MCP、普通 Tool、任意 HTTP 和主人派生医学查询。
+- 在最终 wire payload 上检查共同容量下界、输出预留、严格结构和 `completed`/`incomplete`/`failed` 终态；不使用静态窗口或事后 token 估算代替完整性。
+- `KnowledgePublisher` 离线产生不可变 staged release，release 绑定来源、版本、许可、中文状态、适用范围、专业审核状态和 hash；没有合格知识时返回知识缺口。
+
+### 9. 非诊断回答与诊断门禁
+
+- 非诊断模型输出只产生受管候选，必须区分主人事实、一般知识、支持、反对、未知、限制和允许的下一步；core 校验卡、claim/template 和版本后确定性渲染主人回复。
+- 任何疾病排序、诊断标签、排除结论或个体化处方调整不得从非诊断原子产生。
+- 首发诊断范围只保留窄 BMI staged 候选；内容权利、中文 bundle、医学专业审核、实现兼容、安全审查和真实主人验收全部完成前不得激活。
+- 同一问题、事件和适用时期最多有一个 current 诊断判断；依据失效、主人纠正、范围撤回或审核失效时，旧判断先退出 current，再形成降级、撤回、替代或一次必要纠正，模型重跑本身不能覆盖旧判断或改变修订链。
+- 诊断模型前门禁验证启用、控制、current head、首跳同意、范围、最小输入、容量、安全和知识；模型后门禁验证完整终态、结构、当前证据、支持/反对/未知和确定性重算；提交前门禁再次验证代际、控制、证据、bundle hash、同意和删除状态。
+- 安全不可用、可信危险、危险未明、范围外和范围内按固定优先级处理；危险未明不能被模型猜成安全，范围外不能生成部分诊断。
+
+### 10. 支持联系人和投递
+
+- 只支持一个当前危险支持联系人，联系人不是主人、健康入口或画像查看者。
+- 联系人或联系方法变化立即使旧批准失效，首发不配置备用联系人；停止新增记录期间仍可进行临时危险判断和最小警报，但不得新增健康事件或健康正文，只保留防重复、当前批准引用和投递未知所需的无正文事实。
+- 初始化时披露联系人、方法、目的和最小警报；主人启用后取得当前批准。联系人/方法变化、撤回、专门暂停或删除会使未发送效果停止。
+- 最小警报只含主人可识别称呼、事件时间和固定求助语义，不含诊断、原消息、症状、位置、画像、证据或模型草稿。
+- 主人和联系人投递统一分为形成、业务提交、发送尝试、接口接受、送达、已读/实际行动和未知；未知外部效果不盲重发，必要纠正只能按当前批准和一次性规则追加。
+
+### 11. 主人控制、删除和迁移
+
+- 时区、表达、主动支持、普通通知、停止新增记录、任务取消、批准撤回、联系人暂停/更换、查看、纠正、导出和删除均是独立命令。
+- 永久删除先冻结任务、模型、outbox、外发和状态推进，条件推进不可逆 terminal generation，确认后销毁密钥并清除所有受管对象、备份、导出、迁移暂存、联系人、警报、未知和索引。
+- 删除未知时保持健康关闭并不宣称全部旧副本已阻止；站外已交付内容不承诺可召回。
+- 迁移生成覆盖产品/Plugin/core/Skill/适配器/模型接口/知识/安全/诊断 bundle、语义状态、控制、任务、投递、未知、删除和迁移事实的 hash-checked manifest；秘密只重新配置，不写入 manifest。
+- 目标在 manifest、密钥、路线、bundle 和 current-head 验证前保持离线；一次 writer-fence CAS 转移后，源端、旧 VM 和旧 fence 失去健康写入、模型和发送资格；转移未知时两端均停止，不重放未知外部效果。
+
+### 12. 版本、发布和历史代码边界
+
+- Plugin、core、Skill bundle、模型接口、知识 release、安全/诊断 bundle、Hermes 适配合同和迁移 manifest 都必须有可验证版本/摘要。
+- 旧 `ops/` 代码和替换前的旧 spec 不直接 patch 成生产实现；只有经过当前 Spec 的边界、数据模型、失败语义和测试门槛审查后，才可选择性复用无冲突原语。
+- 任何实现研究若发现会改变“是否存在可实施路线”的新事实，立即停止实现并建立一张新的 CAN 前提 Ticket，不在 Spec 或实现代码中静默改写 TO/HOW。
 
 ## Testing Decisions
 
-- Tests assert externally observable behavior rather than SQLite tables, private helper functions, prompt wording, or implementation-specific class structure.
-- The primary runtime acceptance seam starts with a real-format authenticated partner Weixin event or a real fixed-Job tick. It passes through the production partner adapter/plugin, pre-batch trusted envelope, receipt signer, fresh health-model port, Unix socket, sidecar, source-fetch port, and idempotent Weixin delivery port. Tests observe only Weixin-visible replies/attachments/tail markers, authorized sidecar views, task disposition, delivery outcome, and content-free audit.
-- The primary runtime seam substitutes only controlled external boundaries: health-model result, whitelist HTTP response, Weixin network acknowledgement, time, and cryptographic key material. It does not bypass the production adapter, signer, plugin handlers, protocol, authorization, sidecar state machine, delivery ledger, or view/export renderer.
-- A second independent operations seam starts with the real audit file format, real Job heartbeat records, controlled time progression, and external heartbeat state. It passes through the production Monitor and observes operator Weixin alerts, system-log events, external dead-man heartbeat, outage email, reminder cadence, and recovery. It proves that no LLM is required for detection and that Gateway failure is reported rather than misrepresented as continued service.
-- Deterministic tests use a fake clock and controlled LLM, source-fetch, Weixin-network, email/dead-man, and key-management adapters. This makes 15-second classification, 20-second source fetch, 10-minute retry/confirmation, 5-minute polling, 10-minute daily retry, 15-minute send retry, 6-hour fault reminder, 72-hour context/backoff, rolling 24-hour capacity, 24-hour export cleanup, and 30-day backup deletion reproducible.
-- The real Hermes integration suite verifies that the production partner adapter/plugin loads against the pinned Hermes version, the main Gateway alone can reach the signer, tool subprocesses cannot read its private key, both fixed Jobs invoke fresh health-model sessions, only the two allowed health Jobs exist, derived tasks do not create Cron, and Hermes core remains unmodified.
-- Existing autonomy tests provide prior art for authorization, task lifecycle, deduplication, deletion, audit, and fail-closed state changes. Existing Hermes integration tests provide prior art for loading a partner plugin/adapter and exercising Cron integration. Existing fixed health-guard tests are not behavior requirements because the custom gate was explicitly excluded.
-- Profile tests cover character counting, no-Markdown output, category caps, synonym merging, priority deferral, overflow rejection, immutable versions, evidence citations, status classification, conflict handling, and category-specific expiry.
-- Evidence tests cover direct owner statements, structured measurements, owner-relayed clinician advice, non-owner rejection, excerpt minimization, source message linkage, latest-three-message ephemerality, and ordinary-chat exclusion.
-- Inbound tests cover post-auth/pre-batch event identity, multi-message batches, explicit consent before binding, first-trusted-message binding, fresh per-message classification, 15-second non-blocking timeout, ten-minute one-retry envelope retention, and the three user-visible processing states.
-- Recording-control tests cover stop-without-delete, cancellation of retries/tasks, proactive pause, retained view/export, explicit resume, no classification while stopped, and separation from ordinary proactive-contact pause.
-- Interaction preference tests cover immediate explicit feedback, three independent same-direction behaviors within 60 days, exclusion of silence/reply speed/one-off emotion, and 60-day expiry.
-- Daily-review tests cover `no_action`, allowed task types, evidence-linked rationale, immediate and future tasks, no direct message send, source refresh prioritization, source-scan throughput, and one retry after 10 minutes.
-- Dispatcher tests cover current-snapshot rendering, `send` and `skip`, evidence/source/authorization revalidation, no profile or source writes, no Cron creation, one retry after 15 minutes, uncertain-delivery duplicate prevention, and five-minute polling.
-- Weixin-delivery tests cover stable delivery keys, repeated acknowledgements, success followed by local-state failure, network uncertainty, no non-idempotent fallback, content-free ledger state, and fail-closed behavior under an unaccepted Hermes adapter version.
-- Contact-governance tests cover deduplication, one unfinished task per purpose, 72-hour unanswered-topic backoff, night timing rationale, pause/resume, rolling-24-hour count, `capacity_exhausted`, and no catch-up flood.
-- Authorization tests cover owner self-view/export, viewer grant, viewer read-only access, revocation, operator metadata-only access, weekly report suppression after revocation, and access audit.
-- Owner-control tests cover action/target/duration/message/time binding, ten-minute second deletion confirmation, replay rejection, one configured viewer, viewer export denial, old-identity transfer, one-time recovery-code rotation, administrator/viewer rebind denial, and fail-closed unrecoverable identity loss.
-- Privacy-path tests prove that full view/export bypasses the ordinary chat LLM and session history, ordinary turns receive no health context, only the pinned health-answer invocation receives the bounded current projection, post-write reasoning uses the new profile, and model analysis of a full view requires an explicit current-turn request.
-- Health-model configuration tests prove the accepted provider/endpoint/model/profile snapshot is separate from partner chat configuration, every response reports the exact accepted model ID, health answers have no ordinary history, tools, or provider fallback, ordinary chat-model changes do not alter it, and health-provider changes require explicit configuration plus revalidation.
-- Tail-marker tests prove the marker appears only after confirmed sidecar mutation/control completion and is absent for ordinary chat, rejected candidates, failures, and no-op writes.
-- Source-library tests cover the exact whitelist, source-card precedence, unavailable verification, six fixed tag categories, synonym normalization, freshness intervals, prompt-instruction isolation, personal-fact separation, cache limits, LRU cleanup, reference preservation, and download refusal when necessary.
-- Reactive source tests cover `正在核验资料`, the 20-second additional budget, successful card admission, timeout/unavailable wording, and prohibition on arbitrary-web or model-memory substitution.
-- Deletion tests cover active-record deletion, task cancellation, profile-version removal, memory-projection removal, immediate per-record key destruction, content-free deletion audit, and physical backup purge by day 30.
-- Export tests cover JSON attachment shape, owner-only access, strict tmpfs permissions, deletion after confirmed send, 24-hour orphan cleanup, and absence from ordinary LLM/session history.
-- Process-boundary tests verify separate service accounts, socket ownership and permissions, absence of TCP listeners, denial of direct database access to partner Hermes, and unchanged default Hermes/unrelated services.
-- Operational tests cover dispatcher heartbeat loss, daily-review failures, immediate first alert, six-hour reminder ceiling, one recovery alert, operator Weixin and syslog delivery, external heartbeat loss, outage email, no health content in any alert, encrypted backups, restore behavior before deletion, and undecryptability after key destruction.
-- Acceptance requires every behavior named in `上线验收门槛` to pass in the primary seam. Because the owner has only the active DMIT Linux host, the thin Hermes integration smoke uses a two-phase same-host production canary: phase A completes backup, offline regressions, immutable install, and static isolation checks without stopping the legacy partner; phase B starts only after explicit interruption-and-rollback authorization, stops only the legacy partner, starts sidecar then restricted partner, and immediately rolls back on any critical failure. Local regressions alone do not authorize phase B, and the result must never be described as non-production acceptance.
+### 最高测试接缝
+
+首选接缝是 **Plugin -> `health-core` 的受控命令/效果协议**。测试通过结构化输入、受控候选和可替换的模型/投递/current-head 依赖观察外部业务行为；不得把内部表布局、函数名或模型提示词作为主要测试目标。宿主适配器、模型、Weixin、联系人和 current-head 通过该接缝注入受控 fake/contract fixture，只有少量宿主合同测试需要接触真实接口形状。
+
+### 测试层级
+
+- **静态 release/manifest**：验证七 Skill 名称、角色、版本指纹、Plugin/core/适配器版本、知识/安全/诊断 bundle、权限清单和迁移 manifest 的完整性与 hash 关系；验证旧 `medical` 和旧入口不会被当前 release 重新声明。
+- **core 合同与状态机**：验证初始化 prepare/commit/finalize、启用持续性、最小上下文、候选回收、单一写入者、画像/证据/任务/控制/诊断/安全/删除/迁移状态机以及唯一主人回复。
+- **幂等与重投**：验证同一 envelope、重复因果 ID、cursor 未知、批次重投和崩溃恢复最多形成一份业务效果；不能静默吞掉逐条来源，也不能重复外发。
+- **加密和副本边界**：验证密钥隔离、认证加密、普通 Session/Memory/log/cache/transcript 不成为权威、候选失败不残留健康正文以及删除清除枚举对象。
+- **current-head 故障**：验证条件冲突、超时、未知响应、transition 回查、digest 不一致、writer fence 过期、terminal deletion 和 old-snapshot canary；任何不一致都停止健康读写、模型和外发。
+- **Skill 使用证明**：验证实际使用、加载失败、版本不明、模型自述但无运行事实、未使用职责和系统生成披露；初始化和日常健康结果不能因虚假 Skill 标识而形成。
+- **模型合同**：使用合成输入验证首跳配置锁定、最终 wire payload 容量、严格结构、completed/incomplete/failed 终态、禁止 fallback、未知传播和不完整结果不提交。测试不上传真实健康资料或调用真实模型。
+- **知识与诊断门禁**：验证 release 权利/中文状态/审核/hash 未满足时保持 staged；验证模型前、模型后、提交前三段门禁和 BMI 确定性重算；验证安全不可用、可信危险、危险未明、范围外和范围内分支。
+- **任务和当地日**：验证时区切换、每天一次、无行动安静、恢复不重放旧日、任务重复判断、批准重判、未知投递冻结以及业务三态不由 heartbeat 冒充。
+- **联系人和投递**：验证单一联系人、批准撤回/更换、最小警报、纠正追加、接口接受不等于送达、未知不盲重试、永久删除清除联系人事实；不使用真实联系人或发送真实警报。
+- **删除与迁移**：验证冻结顺序、terminal generation、密钥销毁、全部受管对象枚举、manifest 完整性、目标离线、CAS 接管、旧 fence 失效和转移未知双端停止。
+- **宿主合同**：在获准的 Hermes/Weixin 测试环境验证唯一入口、原生路径前 envelope、无旁路、Plugin 生命周期、受限 Unix socket、适配器回交终态和升级重新验证。真实环境测试必须有单独批准和脱敏/合成数据。
+- **分层验收**：按照静态、合成 core、本机故障、宿主合同、模型、医学权利/中文版本/专业审核、current-head/删除/迁移 canary、获准合成渠道、真实模型/微信、主人和联系人验收的顺序推进。任一层未通过不得宣称 active、已送达、已读、已审核、已激活或已验收。
+
+### 历史测试的使用边界
+
+`ops/partner-health-steward/tests` 和 `ops/weixin-skill-disclosure` 只提供历史行为、负向案例和可复用测试思想。它们不能证明当前 Plugin、七 Skill、当前 Partner、真实 Weixin、医学审核、外部许可、删除、迁移或主人/联系人验收。新测试必须以本 Spec 和当前 Ticket 为准，不为迁移旧实现而放宽当前合同。
 
 ## Out of Scope
 
-- A custom deterministic danger-signal or medication gate outside normal Hermes behavior.
-- Medical diagnosis, prescribing, medication changes, emergency exclusion, or replacing professional care.
-- Sharing health content with anyone other than the owner, the single explicitly authorized viewer, and the separately accepted health-model provider for the minimum approved operation.
-- Automatically following the partner chat model/provider when it changes, or claiming the accepted third-party provider is an official/direct OpenAI service without separate evidence.
-- Supporting arbitrary additional viewers, administrator-initiated owner rebind, recovery without the old identity or recovery code, or viewer export.
-- Creating one native Cron Job per derived task or allowing a Cron execution to recursively manage Cron.
-- Modifying Hermes core, maintaining a private Hermes fork, or deploying the old v0.2 core patch.
-- Deploying the old fixed health guard or deterministic no-LLM dispatcher as production behavior.
-- Storing full chat history, full webpage archives without limits, or complete health content in ordinary Hermes memory.
-- Sending a full view/export through the ordinary chat LLM, writing it to ordinary Hermes session history, or automatically asking a model to analyze it.
-- A public or remote sidecar API, hosting the sidecar on the Windows development machine, or sharing one health sidecar across unrelated Hermes profiles.
-- Automatically inferring owner timezone, identity, consent, or health facts from server ownership, relationship status, silence, or arbitrary web content.
-- Continuing health conversation, LLM classification, daily review, or proactive dispatch while the Gateway or whole host is unavailable; independent monitoring detects and reports such failure but does not replace the Gateway.
-- An application-level RMB daily cost limit.
-- Production deployment, server migration, or live channel changes as part of this specification-writing stage.
+- 把七个 Skill 实现成七个独立插件、七个独立数据库、七个独立入口或七个独立回复者。
+- 恢复旧 Ticket 98、ADR 0021、替换前的旧 `spec.md`、旧 `medical` 入口、旧 sidecar 产品合同或 `ops/` 的历史路线作为当前权威。
+- 读取、上传或提交真实健康资料、聊天正文、联系人信息、密钥、Token、服务器配置、运行数据库、日志、缓存、备份或模型 transcript。
+- 在未获批准的情况下调用真实模型、真实微信、真实联系人、真实告警、真实删除、真实迁移、真实部署或真实主人/联系人验收。
+- 多画像主人、多个同时使用者、多个同时有效私聊入口、群聊、其他聊天接口以及现实身份核验、账号迁移或一次性恢复码流程。
+- 真人医生账号、自动转交医生材料、医生逐条复核、正式诊断回写，或独立建议开始/停止/调整处方药。
+- 把通用知识、模型推断、任务完成、接口接受、进程存活、安装成功或静态测试通过宣传为个人健康事实、诊断、已送达或稳定运行。
+- 在本 Spec 中自行修改 TO、风险接受、监管分类、整体法律合规或当前 HOW；发现路线存在性冲突时必须回到 CAN。
+- 通过普通 Hermes Memory、Session、日志、FTS、cache、通用备份或模型上下文建立第二份健康权威。
 
 ## Further Notes
 
-- Domain vocabulary is defined by the root health-steward glossary. The sidecar/fixed-Job, owner-grant, and current-snapshot ADRs are authoritative constraints for implementation.
-- The current repository contains historical v0.2 prototype code and tests. They are evidence and prior art, not the authority for current behavior. Conflicts must be resolved in favor of this spec and the ADRs.
-- Before implementation touches deployment assets, perform a read-only live audit of the partner server. Historical paths, service-account assumptions, Hermes version, channel state, and Cron state are not proof of current production state.
-- Ticket decomposition and deployment must preserve one authoritative chain from this spec. Existing Tickets 01–13 and the reviewed Ticket 14 deployment package are implementation evidence, but the recorded Phase A `no-go` means the new production-integration gaps require explicit tickets and cannot be closed by documentation alone.
-- Deployment parameters still to be supplied and snapshotted are the exact owner Weixin sender ID, the exact single viewer/operator Weixin sender ID, the actual accepted health provider/endpoint/model configuration, the external dead-man endpoint, the outage-alert email, and the Phase B maintenance window with fresh interruption/rollback authorization. They are deployment inputs, not unresolved architecture choices.
-- The `ready-for-agent` status means the feature is fully specified for ticket decomposition. It does not mean implemented, deployed, or accepted.
-
-## Comments
-
-- Spec synthesized from the user-confirmed `$grill-with-docs` design tree. The primary system seam and the thin Hermes integration seam were explicitly confirmed before publication.
-- 2026-08-09: updated from the user-confirmed Q1–Q22 production-integration decisions after the same-host Phase A `no-go`. The confirmed highest seams are the real-format partner Weixin runtime path and the LLM-independent operations-monitor path. Gateway failure is monitored and alerted; it is not treated as continued health-steward operation.
+1. 本 Spec 是从决策链到实现工作的承接，不是实现完成、部署完成、医学批准、外部许可取得、真实模型/微信可用或产品验收证明。
+2. 当前路线的产品载体、目标和领域术语以 `CONTEXT.md` 为准；完整 TO/CAN/HOW 决定分别以对应 Ticket 的 Answer、Evidence 和 ADR 0022 为准；Map 只作索引，不重复保存完整决定。
+3. 当前实现状态必须继续区分：固定平台/源码原语的有界证明；需要重新核验的 Partner 绑定和运行事实；已经失效的旧目标/旧路线；尚未实现或尚未证明的完整能力链和真实外部效果。
+4. 下一步使用 `$to-tickets` 将本 Spec 拆成带依赖的实现 Tickets。每次只认领一个未阻塞 Ticket，并把测试、审查和结果回写同一条 `.scratch/partner-health-steward/` 权威链。
+5. `$implement` 只能从已由 `$to-tickets` 生成、依赖闭合且 `ready-for-agent` 的实现 Ticket 开始；实现每个 Ticket 时使用 TDD，并在完成前运行 Standards/Spec 双轴代码审查。
+6. 若实现、宿主合同、外部资源或 canary 研究暴露了会改变路线存在性的精确未知，立即停止当前实现 Ticket，建立唯一的 CAN 前提 Ticket；不要在实现代码、Spec 或新 Map 中静默改写决定。
+7. 真实数据、密钥、Token、服务器配置和运行数据库不属于本 Spec、Git 或测试 fixture。所有本地验证默认使用合成、脱敏或无内容合同数据。
+8. 该 Spec 不建立竞争的 Map、计划、tracker 或状态字段；任何新决定必须回到现有 Map 和对应 Ticket。
