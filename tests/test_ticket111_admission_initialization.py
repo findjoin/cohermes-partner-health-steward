@@ -18,6 +18,7 @@ from partner_health_steward.initialization import (
     HealthInitAttestor,
     HealthInitRuntime,
     InitialPreferences,
+    OwnerConsentEvidence,
     OwnerInitialization,
     SupportContactBoundary,
 )
@@ -156,22 +157,34 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         values.update(changes)
         return OwnerInitialization(**values)
 
+    def consent_body(self, initialization=None):
+        request = initialization or self.initialization_request()
+        return CountingBody(
+            OwnerConsentEvidence.for_initialization(
+                request,
+                self.init_asset,
+            ).to_message_body()
+        )
+
     def admit_and_prepare(self):
+        initialization = self.initialization_request()
         self.assertEqual(
             self.plugin.receive_weixin(
-                self.message(CountingBody("start synthetic initialization")),
+                self.message(self.consent_body(initialization)),
                 peer_id="plugin",
             ).status,
             "accepted",
         )
         result = self.plugin.prepare_initialization(
-            self.initialization_request(),
+            initialization,
             peer_id="plugin",
         )
         self.assertEqual(result.status, "accepted")
         return result
 
-    def test_only_the_unique_private_health_init_source_may_materialize_body_and_create_a_receipt(self):
+    def test_only_the_unique_private_health_init_source_may_materialize_body_and_create_a_receipt(
+        self,
+    ):
         for owner_value in ("", ("owner-A", "owner-B"), None):
             with self.subTest(owner_value=owner_value):
                 with self.assertRaises(AuthorityValidationError):
@@ -195,7 +208,12 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
                 )
                 self.assertEqual(result.status, "rejected")
                 self.assertEqual(body.reads, 0)
-                self.assertIsNone(self.plugin.source_envelope(f"rejected-{index}", peer_id="plugin"))
+                self.assertIsNone(
+                    self.plugin.source_envelope(
+                        f"rejected-{index}",
+                        peer_id="plugin",
+                    )
+                )
 
         body = CountingBody("start synthetic initialization")
         result = self.plugin.receive_weixin(self.message(body), peer_id="plugin")
@@ -327,10 +345,28 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         self.assertEqual(replay_receipt.related_causal_id, "delivery-1")
         self.assertEqual(replay_receipt.envelope.body, "same synthetic text")
 
+    def test_missing_native_message_identifier_preserves_replay_ambiguity(self):
+        for index in (1, 2):
+            causal_id = f"unidentified-delivery-{index}"
+            response = self.plugin.receive_weixin(
+                self.message(
+                    CountingBody("same unidentified synthetic text"),
+                    causal_id=causal_id,
+                    message_id=None,
+                    native_cursor=f"unidentified-cursor-{index}",
+                ),
+                peer_id="plugin",
+            )
+            self.assertEqual(response.status, "accepted")
+            receipt = self.plugin.source_receipt(causal_id, peer_id="plugin")
+            self.assertEqual(receipt.relation, "replay-unknown")
+            self.assertIsNone(receipt.related_causal_id)
+
     def test_health_init_runtime_proof_and_complete_candidate_are_required_for_prepare(self):
+        initialization = self.initialization_request()
         self.assertEqual(
             self.plugin.receive_weixin(
-                self.message(CountingBody("start synthetic initialization")),
+                self.message(self.consent_body(initialization)),
                 peer_id="plugin",
             ).status,
             "accepted",
@@ -360,11 +396,11 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         )
 
         prepared = self.plugin.prepare_initialization(
-            self.initialization_request(),
+            initialization,
             peer_id="plugin",
         )
         prepared_replay = self.plugin.prepare_initialization(
-            self.initialization_request(),
+            initialization,
             peer_id="plugin",
         )
 
@@ -403,12 +439,72 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         self.assertEqual(conflict.reason_code, "health-init workflow conflict")
         self.assertEqual(self.store.count_records(), 1)
 
-    def test_wrong_asset_forged_proof_and_model_self_report_cannot_prepare(self):
+    def test_prepare_replay_after_runtime_restart_reuses_the_durable_exact_proof(self):
+        initialization = self.initialization_request()
         self.plugin.receive_weixin(
-            self.message(CountingBody("start synthetic initialization")),
+            self.message(self.consent_body(initialization)),
             peer_id="plugin",
         )
+        first = self.plugin.prepare_initialization(initialization, peer_id="plugin")
+        self.assertEqual(first.status, "accepted")
+
+        self.assertTrue(self.core.close().complete)
+        self.core = HealthCore(
+            self.store,
+            self.head,
+            writer_fence_vault=self.writer_vault,
+            admission_policy=self.policy,
+            health_init_verifier=self.init_attestor,
+            health_init_asset=self.init_asset,
+        )
+
+        def must_not_execute(asset, request):
+            del asset, request
+            raise AssertionError("durable replay reran health-init")
+
+        restarted_runtime = HealthInitRuntime(
+            self.init_asset,
+            self.init_attestor,
+            executor=must_not_execute,
+        )
+        self.plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=restarted_runtime,
+        )
+
+        replay = self.plugin.prepare_initialization(initialization, peer_id="plugin")
+        self.assertEqual(replay.to_wire(), first.to_wire())
+        conflict = self.plugin.prepare_initialization(
+            self.initialization_request(timezone="UTC"),
+            peer_id="plugin",
+        )
+        self.assertEqual(conflict.status, "rejected")
+        self.assertEqual(conflict.reason_code, "health-init workflow conflict")
+
+        self.assertEqual(
+            self.plugin.commit_initialization(peer_id="plugin").status,
+            "accepted",
+        )
+        self.assertEqual(
+            self.plugin.finalize_initialization(peer_id="plugin").status,
+            "accepted",
+        )
+        self.assertIsNone(
+            self.plugin.source_envelope("delivery-1", peer_id="plugin").body
+        )
+        replay_after_release = self.plugin.prepare_initialization(
+            initialization,
+            peer_id="plugin",
+        )
+        self.assertEqual(replay_after_release.to_wire(), first.to_wire())
+
+    def test_wrong_asset_forged_proof_and_model_self_report_cannot_prepare(self):
         initialization = self.initialization_request()
+        self.plugin.receive_weixin(
+            self.message(self.consent_body(initialization)),
+            peer_id="plugin",
+        )
         wrong_asset = HealthInitAsset(
             version="9.9.9",
             asset_digest="sha256:" + ("9" * 64),
@@ -462,8 +558,9 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         )
 
     def test_health_init_executor_failure_never_creates_use_fact_or_initialization(self):
+        initialization = self.initialization_request()
         self.plugin.receive_weixin(
-            self.message(CountingBody("start synthetic initialization")),
+            self.message(self.consent_body(initialization)),
             peer_id="plugin",
         )
         failed_runtime = HealthInitRuntime(
@@ -478,7 +575,7 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         )
 
         response = failed_plugin.prepare_initialization(
-            self.initialization_request(),
+            initialization,
             peer_id="plugin",
         )
 
@@ -489,6 +586,44 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
             self.plugin.initialization_status(peer_id="plugin").phase,
             "uninitialized",
         )
+
+    def test_caller_booleans_without_owner_message_consent_evidence_cannot_prepare(self):
+        initialization = self.initialization_request(
+            owner_consent=True,
+            first_hop_route_consent=True,
+        )
+        self.plugin.receive_weixin(
+            self.message(CountingBody("start synthetic initialization")),
+            peer_id="plugin",
+        )
+
+        response = self.plugin.prepare_initialization(
+            initialization,
+            peer_id="plugin",
+        )
+
+        self.assertEqual(response.status, "rejected")
+        self.assertEqual(response.reason_code, "owner-consent-evidence-required")
+        self.assertEqual(self.store.count_records(), 0)
+
+        direct = self.plugin.invoke(
+            CommandEnvelope(
+                peer="plugin",
+                action="initialization.prepare",
+                source="health_weixin",
+                causal_id="direct-prepare-without-owner-evidence",
+                generation=1,
+                scope=("initialization:prepare",),
+                payload=InitializationPreparePayload(
+                    initialization,
+                    self.init_runtime.run(initialization),
+                ),
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(direct.status, "rejected")
+        self.assertEqual(direct.reason_code, "owner-consent-evidence-required")
+        self.assertEqual(self.store.count_records(), 0)
 
     def test_initialization_protocol_rejects_wrong_types_extra_scope_and_generic_state_bypass(self):
         values = self.initialization_request().to_storage()
@@ -603,9 +738,31 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         )
         self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
 
+    def test_initialization_without_preconfigured_support_contact_is_allowed(self):
+        initialization = self.initialization_request(support_contact=None)
+        admitted = self.plugin.receive_weixin(
+            self.message(self.consent_body(initialization)),
+            peer_id="plugin",
+        )
+        self.assertEqual(admitted.status, "accepted")
+        self.assertEqual(
+            self.plugin.prepare_initialization(initialization, peer_id="plugin").status,
+            "accepted",
+        )
+        self.assertEqual(self.plugin.commit_initialization(peer_id="plugin").status, "accepted")
+        self.assertEqual(self.plugin.finalize_initialization(peer_id="plugin").status, "accepted")
+
+        status = self.plugin.initialization_status(peer_id="plugin")
+        self.assertTrue(status.enabled)
+        self.assertIsNone(status.support_contact)
+        self.assertEqual(status.support_contact_approval_state, "not-configured")
+        self.assertTrue(self.plugin.health_writes_allowed())
+        self.assertFalse(self.plugin.outbound_effects_allowed())
+
     def test_cursor_is_released_only_after_finalize_and_unknown_does_not_repeat_business(self):
+        initialization = self.initialization_request()
         self.plugin.receive_weixin(
-            self.message(CountingBody("start synthetic initialization")),
+            self.message(self.consent_body(initialization)),
             peer_id="plugin",
         )
         initial_receipt = self.plugin.source_receipt("delivery-1", peer_id="plugin")
@@ -613,7 +770,7 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         self.assertEqual(initial_receipt.native_cursor_state, "not-ready")
         self.assertIsNone(self.plugin.native_cursor_directive("delivery-1", peer_id="plugin"))
 
-        self.plugin.prepare_initialization(self.initialization_request(), peer_id="plugin")
+        self.plugin.prepare_initialization(initialization, peer_id="plugin")
         self.plugin.commit_initialization(peer_id="plugin")
         self.assertIsNone(self.plugin.native_cursor_directive("delivery-1", peer_id="plugin"))
 
@@ -643,6 +800,17 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         self.assertEqual(unknown.status, "unknown")
         self.assertEqual(unknown.reason_code, "native-cursor-unknown")
         self.assertEqual(replay.to_wire(), unknown.to_wire())
+        self.assertEqual(
+            self.plugin.source_receipt("delivery-1", peer_id="plugin").native_cursor_state,
+            "unknown",
+        )
+        contradictory = self.plugin.record_native_cursor_result(
+            directive,
+            status="advanced",
+            peer_id="plugin",
+        )
+        self.assertEqual(contradictory.status, "rejected")
+        self.assertEqual(contradictory.reason_code, "native-cursor-result-terminal")
         self.assertEqual(
             self.plugin.source_receipt("delivery-1", peer_id="plugin").native_cursor_state,
             "unknown",
@@ -678,6 +846,65 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
             self.plugin.finalize_initialization(peer_id="plugin").status,
             "accepted",
         )
+        self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
+
+    def test_ambiguous_remote_commit_can_close_read_only_during_config_drift(self):
+        self.admit_and_prepare()
+        self.head.set_failure(FailureMode.UNKNOWN_AFTER_ADVANCE, operation="advance")
+        self.assertEqual(
+            self.plugin.commit_initialization(peer_id="plugin").status,
+            "unknown",
+        )
+        self.head.clear_failure()
+
+        self.assertTrue(self.core.close().complete)
+        wrong_asset = HealthInitAsset(
+            version="2.0.0",
+            asset_digest="sha256:" + ("2" * 64),
+            disclosure_version="health-init-disclosure-v2",
+        )
+        self.core = HealthCore(
+            self.store,
+            self.head,
+            writer_fence_vault=self.writer_vault,
+            admission_policy=self.policy,
+            health_init_verifier=self.init_attestor,
+            health_init_asset=wrong_asset,
+        )
+        self.plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=self.init_runtime,
+        )
+
+        recovered = self.plugin.commit_initialization(peer_id="plugin")
+        self.assertEqual(recovered.status, "accepted")
+        self.assertEqual(
+            self.plugin.initialization_status(peer_id="plugin").phase,
+            "committed",
+        )
+        denied_finalize = self.plugin.finalize_initialization(peer_id="plugin")
+        self.assertEqual(denied_finalize.status, "unavailable")
+        self.assertEqual(
+            denied_finalize.reason_code,
+            "initialization-configuration-mismatch",
+        )
+
+        self.assertTrue(self.core.close().complete)
+        self.core = HealthCore(
+            self.store,
+            self.head,
+            writer_fence_vault=self.writer_vault,
+            admission_policy=self.policy,
+            health_init_verifier=self.init_attestor,
+            health_init_asset=self.init_asset,
+        )
+        self.plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=self.init_runtime,
+        )
+        self.assertEqual(self.plugin.finalize_initialization(peer_id="plugin").status, "accepted")
         self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
 
     def test_enabled_state_survives_restart_and_transient_head_failure_recovers_in_place(self):
@@ -795,6 +1022,89 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
             "ready",
         )
 
+    def test_commit_and_finalize_revalidate_current_admission_and_health_init_asset(self):
+        self.admit_and_prepare()
+        wrong_policy = AdmissionPolicy(
+            partner_id="partner-A",
+            owner_sender_id="different-owner",
+            conversation_id="private-A",
+        )
+        wrong_asset = HealthInitAsset(
+            version="2.0.0",
+            asset_digest="sha256:" + ("2" * 64),
+            disclosure_version="health-init-disclosure-v2",
+        )
+
+        def restart(*, policy, asset):
+            self.assertTrue(self.core.close().complete)
+            self.core = HealthCore(
+                self.store,
+                self.head,
+                writer_fence_vault=self.writer_vault,
+                admission_policy=policy,
+                health_init_verifier=self.init_attestor,
+                health_init_asset=asset,
+            )
+            self.plugin = HealthPlugin(
+                self.core,
+                admission_policy=policy,
+                health_init_runtime=self.init_runtime,
+            )
+
+        restart(policy=wrong_policy, asset=self.init_asset)
+        denied_policy_commit = self.plugin.commit_initialization(peer_id="plugin")
+        self.assertEqual(denied_policy_commit.status, "unavailable")
+        self.assertEqual(
+            denied_policy_commit.reason_code,
+            "initialization-configuration-mismatch",
+        )
+        self.assertEqual(self.head.read().head.generation, 1)
+
+        restart(policy=self.policy, asset=wrong_asset)
+        denied_asset_commit = self.plugin.commit_initialization(peer_id="plugin")
+        self.assertEqual(denied_asset_commit.status, "unavailable")
+        self.assertEqual(
+            denied_asset_commit.reason_code,
+            "initialization-configuration-mismatch",
+        )
+        self.assertEqual(self.head.read().head.generation, 1)
+
+        restart(policy=self.policy, asset=self.init_asset)
+        self.assertEqual(self.plugin.commit_initialization(peer_id="plugin").status, "accepted")
+        self.assertEqual(self.head.read().head.generation, 2)
+
+        restart(policy=wrong_policy, asset=self.init_asset)
+        denied_policy_finalize = self.plugin.finalize_initialization(peer_id="plugin")
+        self.assertEqual(denied_policy_finalize.status, "unavailable")
+        self.assertEqual(
+            denied_policy_finalize.reason_code,
+            "initialization-configuration-mismatch",
+        )
+        self.assertEqual(
+            self.plugin.initialization_status(peer_id="plugin").phase,
+            "committed",
+        )
+
+        restart(policy=self.policy, asset=wrong_asset)
+        denied_asset_finalize = self.plugin.finalize_initialization(peer_id="plugin")
+        self.assertEqual(denied_asset_finalize.status, "unavailable")
+        self.assertEqual(
+            denied_asset_finalize.reason_code,
+            "initialization-configuration-mismatch",
+        )
+
+        restart(policy=self.policy, asset=self.init_asset)
+        self.assertEqual(self.plugin.finalize_initialization(peer_id="plugin").status, "accepted")
+        self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
+
+        restart(policy=self.policy, asset=wrong_asset)
+        self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
+        self.assertFalse(self.plugin.health_writes_allowed())
+        self.assertFalse(self.plugin.model_effects_allowed())
+
+        restart(policy=self.policy, asset=self.init_asset)
+        self.assertTrue(self.plugin.health_writes_allowed())
+
     def test_cursor_result_response_loss_replays_close_without_reissuing_execution(self):
         self.assertTrue(self.core.close().complete)
         self.store.close()
@@ -871,25 +1181,25 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
         self.assertTrue(self.plugin.initialization_status(peer_id="plugin").enabled)
 
     def test_concurrent_initialization_candidates_create_only_one_owner_aggregate(self):
-        self.plugin.receive_weixin(
-            self.message(CountingBody("initialize one")),
-            peer_id="plugin",
-        )
-        self.plugin.receive_weixin(
-            self.message(
-                CountingBody("initialize two"),
-                causal_id="delivery-2",
-                message_id="wx-message-2",
-                native_cursor="cursor-2",
-            ),
-            peer_id="plugin",
-        )
         requests = (
             self.initialization_request(),
             self.initialization_request(
                 workflow_id="init-workflow-2",
                 admission_causal_id="delivery-2",
             ),
+        )
+        self.plugin.receive_weixin(
+            self.message(self.consent_body(requests[0])),
+            peer_id="plugin",
+        )
+        self.plugin.receive_weixin(
+            self.message(
+                self.consent_body(requests[1]),
+                causal_id="delivery-2",
+                message_id="wx-message-2",
+                native_cursor="cursor-2",
+            ),
+            peer_id="plugin",
         )
         barrier = threading.Barrier(2)
         responses = []
@@ -900,18 +1210,27 @@ class Ticket111AdmissionInitializationTests(unittest.TestCase):
                 self.plugin.prepare_initialization(request, peer_id="plugin")
             )
 
-        workers = [threading.Thread(target=prepare, args=(request,)) for request in requests]
+        workers = [
+            threading.Thread(target=prepare, args=(request,))
+            for request in requests
+        ]
         for worker in workers:
             worker.start()
         for worker in workers:
             worker.join(timeout=2)
             self.assertFalse(worker.is_alive())
 
-        self.assertEqual(sorted(response.status for response in responses), ["accepted", "rejected"])
+        self.assertEqual(
+            sorted(response.status for response in responses),
+            ["accepted", "rejected"],
+        )
         self.assertEqual(self.store.count_records(), 1)
         status = self.plugin.initialization_status(peer_id="plugin")
         self.assertEqual(status.phase, "prepared")
-        self.assertIn(status.skill_use.workflow_id, {"init-workflow-1", "init-workflow-2"})
+        self.assertIn(
+            status.skill_use.workflow_id,
+            {"init-workflow-1", "init-workflow-2"},
+        )
         winning_source = status.skill_use.admission_causal_id
         losing_source = "delivery-2" if winning_source == "delivery-1" else "delivery-1"
         self.plugin.commit_initialization(peer_id="plugin")

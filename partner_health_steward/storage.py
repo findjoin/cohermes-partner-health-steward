@@ -1207,7 +1207,13 @@ class EncryptedStateStore:
                         break
             receipt = SourceReceipt(
                 envelope=envelope,
-                relation="first-observation" if related_causal_id is None else "possible-replay",
+                relation=(
+                    "replay-unknown"
+                    if envelope.message_id is None
+                    else "first-observation"
+                    if related_causal_id is None
+                    else "possible-replay"
+                ),
                 related_causal_id=related_causal_id,
                 managed_cursor_state="held",
                 native_cursor_state="not-ready",

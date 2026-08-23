@@ -233,10 +233,24 @@ class SourceReceipt:
     def __post_init__(self) -> None:
         if type(self.envelope) is not SourceEnvelope:
             raise AuthorityValidationError("invalid source receipt")
-        if self.relation not in {"first-observation", "possible-replay"}:
+        if self.relation not in {
+            "first-observation",
+            "possible-replay",
+            "replay-unknown",
+        }:
             raise AuthorityValidationError("invalid source relation")
         _optional_opaque_text(self.related_causal_id, "related_causal_id")
-        if (self.relation == "first-observation") != (self.related_causal_id is None):
+        if self.relation == "first-observation" and (
+            self.envelope.message_id is None or self.related_causal_id is not None
+        ):
+            raise AuthorityValidationError("invalid source relation")
+        if self.relation == "possible-replay" and (
+            self.envelope.message_id is None or self.related_causal_id is None
+        ):
+            raise AuthorityValidationError("invalid source relation")
+        if self.relation == "replay-unknown" and (
+            self.envelope.message_id is not None or self.related_causal_id is not None
+        ):
             raise AuthorityValidationError("invalid source relation")
         if self.managed_cursor_state not in {"held", "committed"}:
             raise AuthorityValidationError("invalid source cursor state")

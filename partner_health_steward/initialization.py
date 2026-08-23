@@ -175,7 +175,10 @@ class HealthInitAsset:
         validate_opaque_text(self.version, "health-init version")
         _sha256_text(self.asset_digest, "health-init asset digest")
         validate_opaque_text(self.disclosure_version, "health-init disclosure version")
-        if type(self.canonical_name) is not str or self.canonical_name != HEALTH_INIT_CANONICAL_NAME:
+        if (
+            type(self.canonical_name) is not str
+            or self.canonical_name != HEALTH_INIT_CANONICAL_NAME
+        ):
             raise AuthorityValidationError("invalid health-init canonical name")
 
     def to_storage(self) -> dict[str, object]:
@@ -287,7 +290,7 @@ class OwnerInitialization:
     timezone: str
     preferences: InitialPreferences
     data_boundary: tuple[str, ...]
-    support_contact: SupportContactBoundary
+    support_contact: SupportContactBoundary | None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.workflow_id, "initialization workflow identifier")
@@ -303,7 +306,10 @@ class OwnerInitialization:
             "initial data boundary",
             expected=INITIAL_DATA_BOUNDARY,
         )
-        if type(self.support_contact) is not SupportContactBoundary:
+        if (
+            self.support_contact is not None
+            and type(self.support_contact) is not SupportContactBoundary
+        ):
             raise AuthorityValidationError("invalid support contact boundary")
 
     @property
@@ -329,7 +335,9 @@ class OwnerInitialization:
             "timezone": self.timezone,
             "preferences": self.preferences.to_storage(),
             "data_boundary": list(self.data_boundary),
-            "support_contact": self.support_contact.to_storage(),
+            "support_contact": (
+                None if self.support_contact is None else self.support_contact.to_storage()
+            ),
         }
 
     @classmethod
@@ -362,7 +370,11 @@ class OwnerInitialization:
             data_boundary=_required_storage_text_list(
                 stored["data_boundary"], "initial data boundary"
             ),
-            support_contact=SupportContactBoundary.from_storage(stored["support_contact"]),
+            support_contact=(
+                None
+                if stored["support_contact"] is None
+                else SupportContactBoundary.from_storage(stored["support_contact"])
+            ),
         )
 
     @property
@@ -378,6 +390,156 @@ class OwnerInitialization:
 
 
 @dataclass(frozen=True)
+class OwnerConsentEvidence:
+    """Owner-visible consent callback bound to one admitted initialization source.
+
+    The adapter may only construct this payload after presenting the approved
+    disclosure.  Core reparses the admitted message body and binds it to the
+    exact candidate, so caller-supplied booleans alone cannot prove consent.
+    """
+
+    workflow_id: str
+    admission_causal_id: str
+    initialization_digest: str
+    disclosure_version: str
+    disclosed_topics: tuple[str, ...]
+    owner_confirmed: bool
+    first_hop_route_confirmed: bool
+    schema: str = "health-init-owner-consent-v1"
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not str or self.schema != "health-init-owner-consent-v1":
+            raise AuthorityValidationError("invalid owner consent evidence")
+        validate_opaque_text(self.workflow_id, "initialization workflow identifier")
+        validate_opaque_text(self.admission_causal_id, "admission causal identifier")
+        _sha256_text(self.initialization_digest, "initialization digest")
+        validate_opaque_text(self.disclosure_version, "health-init disclosure version")
+        _required_text_tuple(
+            self.disclosed_topics,
+            "initialization disclosed topics",
+            expected=INITIALIZATION_DISCLOSED_TOPICS,
+        )
+        _required_bool(self.owner_confirmed, "owner consent confirmation")
+        _required_bool(
+            self.first_hop_route_confirmed,
+            "first-hop route confirmation",
+        )
+
+    @classmethod
+    def for_initialization(
+        cls,
+        initialization: OwnerInitialization,
+        asset: HealthInitAsset,
+    ) -> "OwnerConsentEvidence":
+        if type(initialization) is not OwnerInitialization or type(asset) is not HealthInitAsset:
+            raise AuthorityValidationError("invalid owner consent evidence")
+        initialization.require_complete()
+        return cls(
+            workflow_id=initialization.workflow_id,
+            admission_causal_id=initialization.admission_causal_id,
+            initialization_digest=initialization.digest,
+            disclosure_version=asset.disclosure_version,
+            disclosed_topics=INITIALIZATION_DISCLOSED_TOPICS,
+            owner_confirmed=True,
+            first_hop_route_confirmed=True,
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "workflow_id": self.workflow_id,
+            "admission_causal_id": self.admission_causal_id,
+            "initialization_digest": self.initialization_digest,
+            "disclosure_version": self.disclosure_version,
+            "disclosed_topics": list(self.disclosed_topics),
+            "owner_confirmed": self.owner_confirmed,
+            "first_hop_route_confirmed": self.first_hop_route_confirmed,
+        }
+
+    def to_message_body(self) -> str:
+        return _canonical_bytes(self.to_storage()).decode("utf-8")
+
+    @classmethod
+    def from_message_body(cls, value: object) -> "OwnerConsentEvidence":
+        if type(value) is not str or not value:
+            raise AuthorityValidationError("invalid owner consent evidence")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise AuthorityValidationError("invalid owner consent evidence") from exc
+        if len(encoded) > 16_384:
+            raise AuthorityValidationError("invalid owner consent evidence")
+
+        def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, item in pairs:
+                if type(key) is not str or key in result:
+                    raise AuthorityValidationError("invalid owner consent evidence")
+                result[key] = item
+            return result
+
+        try:
+            decoded = json.loads(value, object_pairs_hook=reject_duplicate_keys)
+        except (
+            json.JSONDecodeError,
+            UnicodeError,
+            RecursionError,
+            AuthorityValidationError,
+        ) as exc:
+            raise AuthorityValidationError("invalid owner consent evidence") from exc
+        return cls.from_storage(decoded)
+
+    @classmethod
+    def from_storage(cls, value: object) -> "OwnerConsentEvidence":
+        stored = _required_mapping(
+            value,
+            frozenset(
+                {
+                    "schema",
+                    "workflow_id",
+                    "admission_causal_id",
+                    "initialization_digest",
+                    "disclosure_version",
+                    "disclosed_topics",
+                    "owner_confirmed",
+                    "first_hop_route_confirmed",
+                }
+            ),
+            "owner consent evidence",
+        )
+        return cls(
+            schema=stored["schema"],  # type: ignore[arg-type]
+            workflow_id=stored["workflow_id"],  # type: ignore[arg-type]
+            admission_causal_id=stored["admission_causal_id"],  # type: ignore[arg-type]
+            initialization_digest=stored["initialization_digest"],  # type: ignore[arg-type]
+            disclosure_version=stored["disclosure_version"],  # type: ignore[arg-type]
+            disclosed_topics=_required_storage_text_list(
+                stored["disclosed_topics"],
+                "initialization disclosed topics",
+            ),
+            owner_confirmed=stored["owner_confirmed"],  # type: ignore[arg-type]
+            first_hop_route_confirmed=stored["first_hop_route_confirmed"],  # type: ignore[arg-type]
+        )
+
+    def matches(
+        self,
+        initialization: OwnerInitialization,
+        asset: HealthInitAsset,
+    ) -> bool:
+        return (
+            type(initialization) is OwnerInitialization
+            and type(asset) is HealthInitAsset
+            and self.workflow_id == initialization.workflow_id
+            and self.admission_causal_id == initialization.admission_causal_id
+            and self.initialization_digest == initialization.digest
+            and self.disclosure_version == asset.disclosure_version
+            and self.disclosed_topics == INITIALIZATION_DISCLOSED_TOPICS
+            and self.owner_confirmed is True
+            and self.first_hop_route_confirmed is True
+        )
+
+
+@dataclass(frozen=True)
 class SkillUseFact:
     """Minimal durable system fact for one actual ``health-init`` execution."""
 
@@ -390,7 +552,10 @@ class SkillUseFact:
     admission_causal_id: str
 
     def __post_init__(self) -> None:
-        if type(self.canonical_name) is not str or self.canonical_name != HEALTH_INIT_CANONICAL_NAME:
+        if (
+            type(self.canonical_name) is not str
+            or self.canonical_name != HEALTH_INIT_CANONICAL_NAME
+        ):
             raise AuthorityValidationError("invalid health-init canonical name")
         validate_opaque_text(self.version, "health-init version")
         _sha256_text(self.asset_digest, "health-init asset digest")
@@ -672,7 +837,8 @@ class InitializationDraft:
 
     owner: OwnerInitialization
     source_causal_id: str
-    skill_use: SkillUseFact
+    skill_proof: SkillUseProof
+    owner_consent_evidence: OwnerConsentEvidence
     key_id: str
     prepared_authority: AuthoritySnapshot
     record_id: str
@@ -688,15 +854,32 @@ class InitializationDraft:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
         if self.source_causal_id != self.owner.admission_causal_id:
             raise AuthorityValidationError("initialization source causal mismatch")
-        if type(self.skill_use) is not SkillUseFact:
-            raise AuthorityValidationError("invalid health-init use fact")
+        if type(self.skill_proof) is not SkillUseProof:
+            raise AuthorityValidationError("invalid health-init use proof")
         if (
-            self.skill_use.workflow_id != self.owner.workflow_id
-            or self.skill_use.admission_causal_id != self.source_causal_id
+            self.skill_proof.workflow_id != self.owner.workflow_id
+            or self.skill_proof.admission_causal_id != self.source_causal_id
+            or self.skill_proof.request_digest != self.owner.digest
         ):
             raise AuthorityValidationError("health-init use binding mismatch")
+        if (
+            type(self.owner_consent_evidence) is not OwnerConsentEvidence
+            or self.owner_consent_evidence.workflow_id != self.owner.workflow_id
+            or self.owner_consent_evidence.admission_causal_id != self.source_causal_id
+            or self.owner_consent_evidence.initialization_digest != self.owner.digest
+            or self.owner_consent_evidence.disclosure_version
+            != self.skill_proof.skill_use.disclosure_version
+            or self.owner_consent_evidence.disclosed_topics
+            != INITIALIZATION_DISCLOSED_TOPICS
+            or self.owner_consent_evidence.owner_confirmed is not True
+            or self.owner_consent_evidence.first_hop_route_confirmed is not True
+        ):
+            raise AuthorityValidationError("owner consent evidence binding mismatch")
         validate_opaque_text(self.key_id, "initialization key identifier")
-        if type(self.prepared_authority) is not AuthoritySnapshot or self.prepared_authority.terminal:
+        if (
+            type(self.prepared_authority) is not AuthoritySnapshot
+            or self.prepared_authority.terminal
+        ):
             raise AuthorityValidationError("invalid prepared authority")
         validate_opaque_text(self.record_id, "initialization record identifier")
         validate_opaque_text(self.revision_digest, "initialization revision digest")
@@ -713,11 +896,16 @@ class InitializationDraft:
     def owner_initialization(self) -> OwnerInitialization:
         return self.owner
 
+    @property
+    def skill_use(self) -> SkillUseFact:
+        return self.skill_proof.skill_use
+
     def to_storage(self) -> dict[str, object]:
         return {
             "owner": self.owner.to_storage(),
             "source_causal_id": self.source_causal_id,
-            "skill_use": self.skill_use.to_storage(),
+            "skill_proof": self.skill_proof.to_storage(),
+            "owner_consent_evidence": self.owner_consent_evidence.to_storage(),
             "key_id": self.key_id,
             "prepared_authority": self.prepared_authority.to_storage(),
             "record_id": self.record_id,
@@ -735,7 +923,8 @@ class InitializationDraft:
                 {
                     "owner",
                     "source_causal_id",
-                    "skill_use",
+                    "skill_proof",
+                    "owner_consent_evidence",
                     "key_id",
                     "prepared_authority",
                     "record_id",
@@ -750,7 +939,10 @@ class InitializationDraft:
         return cls(
             owner=OwnerInitialization.from_storage(stored["owner"]),
             source_causal_id=stored["source_causal_id"],  # type: ignore[arg-type]
-            skill_use=SkillUseFact.from_storage(stored["skill_use"]),
+            skill_proof=SkillUseProof.from_storage(stored["skill_proof"]),
+            owner_consent_evidence=OwnerConsentEvidence.from_storage(
+                stored["owner_consent_evidence"]
+            ),
             key_id=stored["key_id"],  # type: ignore[arg-type]
             prepared_authority=AuthoritySnapshot.from_storage(stored["prepared_authority"]),
             record_id=stored["record_id"],  # type: ignore[arg-type]
@@ -766,7 +958,12 @@ class InitializationDraft:
     def content_digest(self) -> str:
         return stable_digest(self.to_storage())
 
-    def projection(self, *, phase: str = "prepared", enabled: bool = False) -> "InitializationProjection":
+    def projection(
+        self,
+        *,
+        phase: str = "prepared",
+        enabled: bool = False,
+    ) -> "InitializationProjection":
         if phase not in {"prepared", "committed", "unknown", "enabled"}:
             raise AuthorityValidationError("invalid initialization phase")
         return InitializationProjection(
@@ -779,6 +976,7 @@ class InitializationDraft:
             prepared_authority=self.prepared_authority,
             initial_portrait=self.initial_portrait,
             disclosed_topics=self.disclosed_topics,
+            support_contact=self.owner.support_contact,
             record_id=self.record_id,
             revision_digest=self.revision_digest,
             transition_id=self.transition_id,
@@ -786,7 +984,11 @@ class InitializationDraft:
             disclosure_state="formed",
             owner_delivery_state="unknown" if phase == "enabled" else "not-attempted",
             support_contact_approval_state=(
-                "approved-boundary" if phase == "enabled" else "not-effective"
+                "not-configured"
+                if self.owner.support_contact is None
+                else "approved-boundary"
+                if phase == "enabled"
+                else "not-effective"
             ),
         )
 
@@ -804,6 +1006,7 @@ class InitializationProjection:
     prepared_authority: AuthoritySnapshot | None
     initial_portrait: InitialPortrait | None
     disclosed_topics: tuple[str, ...]
+    support_contact: SupportContactBoundary | None
     record_id: str | None
     revision_digest: str | None
     transition_id: str | None
@@ -838,6 +1041,7 @@ class InitializationProjection:
                     self.key_id,
                     self.prepared_authority,
                     self.initial_portrait,
+                    self.support_contact,
                     self.record_id,
                     self.revision_digest,
                     self.transition_id,
@@ -861,10 +1065,18 @@ class InitializationProjection:
         validate_opaque_text(self.first_hop_route, "first-hop route")
         _iana_timezone(self.timezone)
         validate_opaque_text(self.key_id, "initialization key identifier")
-        if type(self.prepared_authority) is not AuthoritySnapshot or self.prepared_authority.terminal:
+        if (
+            type(self.prepared_authority) is not AuthoritySnapshot
+            or self.prepared_authority.terminal
+        ):
             raise AuthorityValidationError("invalid prepared authority")
         if type(self.initial_portrait) is not InitialPortrait:
             raise AuthorityValidationError("invalid initial portrait")
+        if (
+            self.support_contact is not None
+            and type(self.support_contact) is not SupportContactBoundary
+        ):
+            raise AuthorityValidationError("invalid support contact boundary")
         validate_opaque_text(self.record_id, "initialization record identifier")
         validate_opaque_text(self.revision_digest, "initialization revision digest")
         validate_opaque_text(self.transition_id, "initialization transition identifier")
@@ -878,7 +1090,13 @@ class InitializationProjection:
         expected_delivery = "unknown" if self.phase == "enabled" else "not-attempted"
         if self.owner_delivery_state != expected_delivery:
             raise AuthorityValidationError("invalid initialization delivery state")
-        expected_contact = "approved-boundary" if self.phase == "enabled" else "not-effective"
+        expected_contact = (
+            "not-configured"
+            if self.support_contact is None
+            else "approved-boundary"
+            if self.phase == "enabled"
+            else "not-effective"
+        )
         if self.support_contact_approval_state != expected_contact:
             raise AuthorityValidationError("invalid support contact approval state")
 
@@ -894,6 +1112,7 @@ class InitializationProjection:
             prepared_authority=None,
             initial_portrait=None,
             disclosed_topics=(),
+            support_contact=None,
             record_id=None,
             revision_digest=None,
             transition_id=None,
@@ -915,6 +1134,7 @@ class InitializationProjection:
             prepared_authority=None,
             initial_portrait=None,
             disclosed_topics=(),
+            support_contact=None,
             record_id=None,
             revision_digest=None,
             transition_id=None,
@@ -939,6 +1159,9 @@ class InitializationProjection:
                 None if self.initial_portrait is None else self.initial_portrait.to_storage()
             ),
             "disclosed_topics": list(self.disclosed_topics),
+            "support_contact": (
+                None if self.support_contact is None else self.support_contact.to_storage()
+            ),
             "record_id": self.record_id,
             "revision_digest": self.revision_digest,
             "transition_id": self.transition_id,
@@ -963,6 +1186,7 @@ class InitializationProjection:
                     "prepared_authority",
                     "initial_portrait",
                     "disclosed_topics",
+                    "support_contact",
                     "record_id",
                     "revision_digest",
                     "transition_id",
@@ -1000,13 +1224,20 @@ class InitializationProjection:
                 else InitialPortrait.from_storage(stored["initial_portrait"])
             ),
             disclosed_topics=topics,  # validated by __post_init__
+            support_contact=(
+                None
+                if stored["support_contact"] is None
+                else SupportContactBoundary.from_storage(stored["support_contact"])
+            ),
             record_id=stored["record_id"],  # type: ignore[arg-type]
             revision_digest=stored["revision_digest"],  # type: ignore[arg-type]
             transition_id=stored["transition_id"],  # type: ignore[arg-type]
             business_state=stored["business_state"],  # type: ignore[arg-type]
             disclosure_state=stored["disclosure_state"],  # type: ignore[arg-type]
             owner_delivery_state=stored["owner_delivery_state"],  # type: ignore[arg-type]
-            support_contact_approval_state=stored["support_contact_approval_state"],  # type: ignore[arg-type]
+            support_contact_approval_state=stored[
+                "support_contact_approval_state"
+            ],  # type: ignore[arg-type]
         )
 
 
@@ -1022,6 +1253,7 @@ __all__ = [
     "InitialPortrait",
     "InitializationDraft",
     "InitializationProjection",
+    "OwnerConsentEvidence",
     "OwnerInitialization",
     "SkillUseFact",
     "SkillUseProof",

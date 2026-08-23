@@ -26,6 +26,7 @@ from .core import HealthCore
 from .initialization import (
     HealthInitRuntime,
     InitializationProjection,
+    OwnerConsentEvidence,
     OwnerInitialization,
 )
 from .probe import ProbeReport
@@ -112,39 +113,59 @@ class HealthPlugin:
     ) -> Response:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
-        runtime = self._health_init_runtime
-        if type(runtime) is not HealthInitRuntime:
-            return Response("unavailable", reason_code="health-init-runtime-unavailable")
         if type(initialization) is not OwnerInitialization:
             return Response("rejected", reason_code="invalid-owner-initialization")
         reason = initialization.incomplete_reason
         if reason is not None:
             return Response("rejected", reason_code=reason)
         try:
-            proof = runtime.run(initialization)
+            durable_replay = self._core.initialization_prepare_replay(initialization)
         except AuthorityValidationError as exc:
             reason_code = str(exc)
-            if reason_code == "health-init-execution-failed":
-                return Response("unavailable", reason_code=reason_code)
-            if reason_code not in {
-                "owner-consent-required",
-                "first-hop-route-consent-required",
+            if reason_code in {
                 "health-init workflow conflict",
+                "initialization already exists",
             }:
-                reason_code = "health-init-runtime-failed"
-            return Response("rejected", reason_code=reason_code)
-        source = self._core.source_envelope(initialization.admission_causal_id)
-        if source is None:
-            status = self._core.initialization_status()
-            if (
-                status.skill_use is None
-                or status.skill_use.workflow_id != initialization.workflow_id
-                or status.skill_use.admission_causal_id != initialization.admission_causal_id
-                or status.prepared_authority is None
-            ):
-                return Response("rejected", reason_code="initialization-source-required")
-            generation = status.prepared_authority.generation
+                return Response("rejected", reason_code=reason_code)
+            return Response(
+                "unavailable",
+                reason_code="initialization-state-unavailable",
+            )
+        if durable_replay is not None:
+            proof, generation = durable_replay
         else:
+            runtime = self._health_init_runtime
+            if type(runtime) is not HealthInitRuntime:
+                return Response("unavailable", reason_code="health-init-runtime-unavailable")
+            source = self._core.source_envelope(initialization.admission_causal_id)
+            if source is None:
+                return Response(
+                    "rejected",
+                    reason_code="initialization-source-required",
+                )
+            approved_asset = runtime.asset
+            try:
+                consent = OwnerConsentEvidence.from_message_body(source.body)
+            except AuthorityValidationError:
+                consent = None
+            if consent is None or not consent.matches(initialization, approved_asset):
+                return Response(
+                    "rejected",
+                    reason_code="owner-consent-evidence-required",
+                )
+            try:
+                proof = runtime.run(initialization)
+            except AuthorityValidationError as exc:
+                reason_code = str(exc)
+                if reason_code == "health-init-execution-failed":
+                    return Response("unavailable", reason_code=reason_code)
+                if reason_code not in {
+                    "owner-consent-required",
+                    "first-hop-route-consent-required",
+                    "health-init workflow conflict",
+                }:
+                    reason_code = "health-init-runtime-failed"
+                return Response("rejected", reason_code=reason_code)
             generation = source.generation
         command = CommandEnvelope(
             peer="plugin",
@@ -235,7 +256,10 @@ class HealthPlugin:
             return Response("rejected", reason_code="invalid-native-cursor-directive")
         initialization = self.initialization_status(peer_id=peer_id)
         authority = initialization.prepared_authority
-        if authority is None or initialization.transition_id != directive.initialization_transition_id:
+        if (
+            authority is None
+            or initialization.transition_id != directive.initialization_transition_id
+        ):
             return Response("rejected", reason_code="native-cursor-directive-stale")
         try:
             payload = NativeCursorResultPayload(

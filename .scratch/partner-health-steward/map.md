@@ -115,7 +115,7 @@ Type: wayfinder:map
 
 ## Not yet specified
 
-- 统一 HOW 已完成路线选择；当前实现承接已发布为[首发健康管家 Plugin 实现 Spec](spec.md)，覆盖实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚，不建立竞争计划。实现 Tickets 110—119 已按依赖顺序发布；[Ticket 110：建立 Plugin/core 受信边界与合成验证骨架](issues/110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)已完成，其 Answer 是当前基础边界的实现上下文指针。后继实现票继续按现有依赖顺序推进，本 Map 不直接承载代码实现。
+- 统一 HOW 已完成路线选择；当前实现承接已发布为[首发健康管家 Plugin 实现 Spec](spec.md)，覆盖实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚，不建立竞争计划。实现 Tickets 110—119 已按依赖顺序发布；[Ticket 110：建立 Plugin/core 受信边界与合成验证骨架](issues/110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)已完成基础受信边界，[Ticket 111：实现唯一准入与主人初始化](issues/111-implement-unique-admission-and-owner-initialization.md)已完成保真入站、真实 `health-init` 证明和 finalize 后启用／cursor 交接；初始化后路由与七 Skill 日常协调继续由 Ticket 112 承接。本 Map 不直接承载代码实现。
 
 ## Out of scope
 

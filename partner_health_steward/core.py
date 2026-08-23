@@ -49,6 +49,9 @@ from .initialization import (
     InitialPortrait,
     InitializationDraft,
     InitializationProjection,
+    OwnerConsentEvidence,
+    OwnerInitialization,
+    SkillUseProof,
     stable_digest,
 )
 from .current_head import (
@@ -2075,6 +2078,20 @@ class HealthCore:
         # handler, but only journal a CAS that is still safe to issue.
         if head != prepared.base:
             return None
+        if self._admission_policy is not None:
+            initialization = self._store.initialization()
+            if (
+                initialization is None
+                or initialization.draft.record_id != payload.record_id
+                or not self._initialization_configuration_matches(
+                    initialization.draft
+                )
+            ):
+                return Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-configuration-mismatch",
+                )
         # Owning a durable CAS-recovery lane is itself authority-sensitive.
         # A copied database plus the public fence text must not be able to
         # reserve/poison a real writer's causal ID before the later CAS check.
@@ -2346,6 +2363,23 @@ class HealthCore:
                 Response("rejected", command.causal_id, "initialization-source-required"),
                 True,
             )
+        try:
+            consent = OwnerConsentEvidence.from_message_body(source.body)
+        except AuthorityValidationError:
+            consent = None
+        if (
+            consent is None
+            or type(approved_asset) is not HealthInitAsset
+            or not consent.matches(initialization, approved_asset)
+        ):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "owner-consent-evidence-required",
+                ),
+                True,
+            )
         if self._store.initialization() is not None:
             raise ProtocolViolation("initialization already exists")
 
@@ -2353,10 +2387,12 @@ class HealthCore:
         content = {
             "owner": initialization.to_storage(),
             "source_causal_id": source.causal_id,
-            "skill_use": payload.skill_proof.skill_use.to_storage(),
+            "skill_proof": payload.skill_proof.to_storage(),
+            "owner_consent_evidence": consent.to_storage(),
             "key_id": self._store.key_id,
             "prepared_authority": head.to_storage(),
             "initial_portrait": portrait.to_storage(),
+            "disclosed_topics": list(consent.disclosed_topics),
         }
         revision_digest = stable_digest(content)
         transition_id = "initialization-transition:" + revision_digest.removeprefix("sha256:")
@@ -2364,7 +2400,8 @@ class HealthCore:
         draft = InitializationDraft(
             owner=initialization,
             source_causal_id=source.causal_id,
-            skill_use=payload.skill_proof.skill_use,
+            skill_proof=payload.skill_proof,
+            owner_consent_evidence=consent,
             key_id=self._store.key_id,
             prepared_authority=head,
             record_id=record_id,
@@ -2403,6 +2440,15 @@ class HealthCore:
         receipt = self._store.source_receipt(payload.source_causal_id)
         if receipt is None or receipt.envelope.native_cursor != payload.native_cursor:
             raise ProtocolViolation("native cursor mismatch")
+        if receipt.native_cursor_state != "executing":
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "native-cursor-result-terminal",
+                ),
+                True,
+            )
         self._store.mark_native_cursor_state(payload.source_causal_id, payload.status)
         if payload.status == "unknown":
             return _Handled(
@@ -2510,6 +2556,22 @@ class HealthCore:
                 transition_id=transition_id,
             ):
                 raise ProtocolViolation("record transition changed")
+            initialization = self._store.initialization()
+            if self._admission_policy is not None and (
+                initialization is None
+                or initialization.draft.record_id != record_id
+                or not self._initialization_configuration_matches(
+                    initialization.draft
+                )
+            ):
+                return _Handled(
+                    Response(
+                        "unavailable",
+                        command.causal_id,
+                        "initialization-configuration-mismatch",
+                    ),
+                    False,
+                )
             if self._current_writer_proof(head) is None:
                 return _Handled(
                     Response("unavailable", command.causal_id, "current-writer-holder-missing"),
@@ -2522,7 +2584,6 @@ class HealthCore:
                 committed,
                 committed.committed,
             )
-            initialization = self._store.initialization()
             if (
                 initialization is not None
                 and initialization.draft.record_id == record_id
@@ -2961,6 +3022,33 @@ class HealthCore:
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return InitializationProjection.cannot_confirm()
 
+    def initialization_prepare_replay(
+        self,
+        initialization: OwnerInitialization,
+    ) -> tuple[SkillUseProof, int] | None:
+        """Return the exact durable prepare proof without rerunning health-init."""
+
+        if type(initialization) is not OwnerInitialization:
+            raise AuthorityValidationError("invalid owner initialization")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("initialization-state-unavailable")
+            try:
+                self._store.verify_key()
+                stored = self._store.initialization()
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError(
+                    "initialization-state-unavailable"
+                ) from exc
+            if stored is None:
+                return None
+            draft = stored.draft
+            if draft.owner == initialization:
+                return draft.skill_proof, draft.prepared_authority.generation
+            if draft.owner.workflow_id == initialization.workflow_id:
+                raise AuthorityValidationError("health-init workflow conflict")
+            raise AuthorityValidationError("initialization already exists")
+
     def native_cursor_directive(self, causal_id: str) -> NativeCursorDirective | None:
         """Release one exact native cursor only after initialization finalizes."""
 
@@ -3114,14 +3202,42 @@ class HealthCore:
             if initialization is None or initialization.phase != "enabled":
                 return False
             draft = initialization.draft
-            source = self._store.source_envelope(draft.source_causal_id)
             return (
                 draft.key_id == self._store.key_id
-                and type(self._admission_policy) is AdmissionPolicy
-                and self._admission_policy.accepts(source)
+                and self._initialization_configuration_matches(draft)
             )
         except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
             return False
+
+    def _initialization_configuration_matches(
+        self,
+        draft: InitializationDraft,
+    ) -> bool:
+        """Revalidate every live authority input bound by initialization."""
+
+        policy = self._admission_policy
+        asset = self._health_init_asset
+        verifier = self._health_init_verifier
+        if (
+            type(draft) is not InitializationDraft
+            or type(policy) is not AdmissionPolicy
+            or type(asset) is not HealthInitAsset
+            or type(verifier) is not HealthInitAttestor
+            or draft.key_id != self._store.key_id
+        ):
+            return False
+        source = self._store.source_envelope(draft.source_causal_id)
+        fact = draft.skill_proof.skill_use
+        return (
+            source is not None
+            and policy.accepts(source)
+            and fact.canonical_name == asset.canonical_name
+            and fact.version == asset.version
+            and fact.asset_digest == asset.asset_digest
+            and fact.disclosure_version == asset.disclosure_version
+            and verifier.verify(draft.skill_proof, draft.owner)
+            and draft.owner_consent_evidence.matches(draft.owner, asset)
+        )
 
     def model_effects_allowed(self) -> bool:
         return self._execution_capability_vault is not None and self.health_writes_allowed()
