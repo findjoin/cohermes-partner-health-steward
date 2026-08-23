@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .answer_resolution import ModelEffectReport
 from .admission import (
     AdmissionPolicy,
     NativeCursorDirective,
@@ -759,3 +760,10 @@ class HealthPlugin:
         if not self._core.admission_policy_matches(self._admission_policy):
             return None
         return self._core.claim_effect_execution(intent)
+
+    def model_effect_report(self, effect_id: str) -> ModelEffectReport | None:
+        """Expose only the core-verified, content-free terminal model report."""
+
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return None
+        return self._core.model_effect_report(effect_id)

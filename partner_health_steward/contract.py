@@ -8,9 +8,11 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
 from .admission import AdmissionPolicy, SourceEnvelope
+from .answer_resolution import ModelEffectReport
 from .authority import EffectIntent, MAX_OPAQUE_TEXT_BYTES
 from .coordination import DailyTurnDraft, DailyTurnResult
 from .initialization import InitializationDisclosure, OwnerInitialization, SkillUseProof
+from .nondiagnostic import NonDiagnosticCandidate, NonDiagnosticContractViolation
 
 
 PROTOCOL_VERSION = 1
@@ -111,13 +113,19 @@ class InitializationPreparePayload(CommandPayload):
 @dataclass(frozen=True)
 class DailyTurnPreparePayload(CommandPayload):
     draft: DailyTurnDraft
+    candidate: NonDiagnosticCandidate | None = None
 
     def __post_init__(self) -> None:
         if type(self.draft) is not DailyTurnDraft:
             raise ProtocolViolation("invalid daily turn draft")
+        if self.candidate is not None and type(self.candidate) is not NonDiagnosticCandidate:
+            raise ProtocolViolation("invalid non-diagnostic candidate")
 
     def to_wire(self) -> dict[str, object]:
-        return {"draft": self.draft.to_storage()}
+        wire: dict[str, object] = {"draft": self.draft.to_storage()}
+        if self.candidate is not None:
+            wire["candidate"] = self.candidate.to_wire()
+        return wire
 
 
 @dataclass(frozen=True)
@@ -230,6 +238,7 @@ class EffectResultPayload(CommandPayload):
     status: str
     terminal: bool
     result_digest: str
+    model_report: ModelEffectReport | None = None
 
     def __post_init__(self) -> None:
         _bounded_text(self.effect_id, "effect_id")
@@ -244,9 +253,16 @@ class EffectResultPayload(CommandPayload):
             raise ProtocolViolation("effect terminal must be boolean")
         if self.status == "unknown" and not self.terminal:
             raise IncompleteResult("unknown effect must be terminal")
+        if self.model_report is not None:
+            if type(self.model_report) is not ModelEffectReport:
+                raise ProtocolViolation("invalid model effect report")
+            if self.result_digest != self.model_report.digest:
+                raise ProtocolViolation("model effect report digest mismatch")
+            if self.status != self.model_report.outer_effect_status:
+                raise ProtocolViolation("model effect outer status mismatch")
 
     def to_wire(self) -> dict[str, object]:
-        return {
+        wire: dict[str, object] = {
             "effect_id": self.effect_id,
             "intent_digest": self.intent_digest,
             "lease_id": self.lease_id,
@@ -255,6 +271,9 @@ class EffectResultPayload(CommandPayload):
             "terminal": self.terminal,
             "result_digest": self.result_digest,
         }
+        if self.model_report is not None:
+            wire["model_report"] = self.model_report.to_storage()
+        return wire
 
 
 _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
@@ -358,12 +377,22 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
             raise ProtocolViolation("invalid initialization payload") from exc
         return InitializationPreparePayload(initialization, proof)
     if payload_type is DailyTurnPreparePayload:
-        fields = _strict_mapping(value, frozenset({"draft"}), "payload")
+        if type(value) is not dict or set(value) not in (
+            {"draft"},
+            {"draft", "candidate"},
+        ):
+            raise ProtocolViolation("invalid payload fields")
+        fields = value
         try:
             draft = DailyTurnDraft.from_storage(fields["draft"])
-        except (TypeError, ValueError) as exc:
+            candidate = (
+                None
+                if "candidate" not in fields
+                else NonDiagnosticCandidate.from_wire(fields["candidate"])
+            )
+        except (TypeError, ValueError, NonDiagnosticContractViolation) as exc:
             raise ProtocolViolation("invalid daily turn payload") from exc
-        return DailyTurnPreparePayload(draft)
+        return DailyTurnPreparePayload(draft, candidate)
     if payload_type is NativeCursorResultPayload:
         fields = _strict_mapping(
             value,
@@ -405,13 +434,24 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
             _bounded_text(fields["effect_kind"], "effect_kind"),
             _bounded_text(fields["request_digest"], "request_digest"),
         )
-    fields = _strict_mapping(
-        value,
-        frozenset(
-            {"effect_id", "intent_digest", "lease_id", "completion_capability", "status", "terminal", "result_digest"}
-        ),
-        "payload",
-    )
+    legacy_fields = {
+        "effect_id", "intent_digest", "lease_id", "completion_capability",
+        "status", "terminal", "result_digest",
+    }
+    if type(value) is not dict or set(value) not in (
+        legacy_fields,
+        legacy_fields | {"model_report"},
+    ):
+        raise ProtocolViolation("invalid payload fields")
+    fields = value
+    try:
+        model_report = (
+            None
+            if "model_report" not in fields
+            else ModelEffectReport.from_storage(fields["model_report"])
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProtocolViolation("invalid model effect report") from exc
     return EffectResultPayload(
         _bounded_text(fields["effect_id"], "effect_id"),
         _bounded_text(fields["intent_digest"], "intent_digest"),
@@ -420,6 +460,7 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
         _bounded_text(fields["status"], "status"),
         fields["terminal"] if type(fields["terminal"]) is bool else _invalid_terminal(),
         _bounded_text(fields["result_digest"], "result_digest"),
+        model_report,
     )
 
 

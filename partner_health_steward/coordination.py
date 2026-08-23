@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from .admission import SourceEnvelope
+from .answer_resolution import ModelAnswerResolution, render_failed_closed
 from .authority import AuthorityValidationError, validate_opaque_text
 from .evidence_profile import (
     AuthoritativeKnowledgeProfile,
@@ -3929,6 +3930,8 @@ class DailyTurnResult:
     skill_disclosures: tuple[DailySkillDisclosure, ...]
     owner_reply: str
     evidence_change_ids: tuple[str, ...] = ()
+    answer_status: str | None = None
+    answer_resolution_digest: str | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
@@ -3941,20 +3944,36 @@ class DailyTurnResult:
             type(item) is not DailySkillDisclosure for item in self.skill_disclosures):
             raise AuthorityValidationError("invalid daily Skill disclosures")
         _owner_reply_text(self.owner_reply, "owner reply intent")
+        if (self.answer_status is None) != (self.answer_resolution_digest is None):
+            raise AuthorityValidationError("incomplete model answer result")
+        if self.answer_status is not None:
+            if self.answer_status not in {"failed-closed", "rendered"}:
+                raise AuthorityValidationError("invalid model answer status")
+            _sha(self.answer_resolution_digest, "model answer resolution")
 
     def to_storage(self) -> dict[str, object]:
-        return {"source_causal_id": self.source_causal_id, "record_id": self.record_id,
+        stored: dict[str, object] = {"source_causal_id": self.source_causal_id, "record_id": self.record_id,
             "transition_id": self.transition_id, "evidence_ids": list(self.evidence_ids),
             "portrait_topics": list(self.portrait_topics),
             "skill_disclosures": [d.to_storage() for d in self.skill_disclosures],
             "owner_reply": self.owner_reply,
             "evidence_change_ids": list(self.evidence_change_ids)}
+        if self.answer_status is not None:
+            stored["answer_status"] = self.answer_status
+            stored["answer_resolution_digest"] = self.answer_resolution_digest
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "DailyTurnResult":
-        f = _mapping(value, frozenset({"source_causal_id", "record_id", "transition_id",
+        legacy_fields = frozenset({"source_causal_id", "record_id", "transition_id",
             "evidence_ids", "portrait_topics", "skill_disclosures", "owner_reply",
-            "evidence_change_ids"}), "daily turn result")
+            "evidence_change_ids"})
+        if type(value) is not dict or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"answer_status", "answer_resolution_digest"},
+        ):
+            raise AuthorityValidationError("invalid daily turn result")
+        f = value
         disclosures = f["skill_disclosures"]
         if type(disclosures) is not list: raise AuthorityValidationError("invalid Skill disclosures")
         return cls(f["source_causal_id"], f["record_id"], f["transition_id"],
@@ -3965,7 +3984,10 @@ class DailyTurnResult:
                 f["evidence_change_ids"],
                 "evidence change identifiers",
                 empty=True,
-            ))  # type: ignore[arg-type]
+            ),
+            f.get("answer_status"),
+            f.get("answer_resolution_digest"),
+        )  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -3990,6 +4012,7 @@ class DailyTurnDraft:
     evidence_stage: "DailyTurnDraft | None" = None
     portrait_withdrawals: tuple[str, ...] = ()
     evidence_applicability_changes: tuple[EvidenceApplicabilityChange, ...] = ()
+    model_answer_resolution: ModelAnswerResolution | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
@@ -4018,6 +4041,10 @@ class DailyTurnDraft:
                 raise AuthorityValidationError(f"invalid {name}")
         if not self.skill_proofs or not self.skill_disclosures:
             raise AuthorityValidationError("daily Skill proof required")
+        if self.model_answer_resolution is not None and type(
+            self.model_answer_resolution
+        ) is not ModelAnswerResolution:
+            raise AuthorityValidationError("invalid model answer resolution")
         if len({c.evidence_id for c in self.evidence_cards}) != len(self.evidence_cards):
             raise AuthorityValidationError("duplicate evidence card")
         for topic_ref in _texts(
@@ -4042,6 +4069,7 @@ class DailyTurnDraft:
                 or self.owner_reply != ""
                 or any(name != "health-evidence" for name in proof_names[1:])
                 or any(name != "health-evidence" for name in result_names)
+                or self.model_answer_resolution is not None
             ):
                 raise AuthorityValidationError("evidence stage exceeded its authority")
         else:
@@ -4080,7 +4108,7 @@ class DailyTurnDraft:
     def payload_digest(self) -> str: return self.digest
 
     def to_storage(self) -> dict[str, object]:
-        return {"source_causal_id": self.source_causal_id, "source_digest": self.source_digest,
+        stored: dict[str, object] = {"source_causal_id": self.source_causal_id, "source_digest": self.source_digest,
             "base_state_digest": self.base_state_digest, "purpose": self.purpose,
             "created_at": self.created_at,
             "steward_plan": self.steward_plan.to_storage(),
@@ -4111,16 +4139,26 @@ class DailyTurnDraft:
                 change.to_storage()
                 for change in self.evidence_applicability_changes
             ]}
+        if self.model_answer_resolution is not None:
+            stored["model_answer_resolution"] = (
+                self.model_answer_resolution.to_storage()
+            )
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "DailyTurnDraft":
-        f = _mapping(value, frozenset({"source_causal_id", "source_digest", "base_state_digest",
+        legacy_fields = frozenset({"source_causal_id", "source_digest", "base_state_digest",
             "purpose", "created_at", "steward_plan", "responsibility_results",
             "reply_atoms", "steward_resolution", "evidence_cards", "portrait_topics",
             "evidence_relations", "evidence_compactions", "skill_proofs",
             "skill_disclosures", "owner_reply", "turn_kind", "evidence_stage",
-            "portrait_withdrawals", "evidence_applicability_changes"}),
-            "daily turn draft")
+            "portrait_withdrawals", "evidence_applicability_changes"})
+        if type(value) is not dict or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"model_answer_resolution"},
+        ):
+            raise AuthorityValidationError("invalid daily turn draft")
+        f = value
         for key in ("responsibility_results", "reply_atoms", "evidence_cards",
                     "portrait_topics", "evidence_relations", "evidence_compactions",
                     "skill_proofs",
@@ -4132,6 +4170,18 @@ class DailyTurnDraft:
         raw_resolution = f["steward_resolution"]
         if raw_resolution is not None and type(raw_resolution) is not dict:
             raise AuthorityValidationError("invalid steward resolution")
+        try:
+            model_resolution = (
+                None
+                if "model_answer_resolution" not in f
+                else ModelAnswerResolution.from_storage(
+                    f["model_answer_resolution"]
+                )
+            )
+        except ValueError as exc:
+            raise AuthorityValidationError(
+                "invalid model answer resolution"
+            ) from exc
         return cls(f["source_causal_id"], f["source_digest"], f["base_state_digest"], f["purpose"],
             f["created_at"], StewardPlan.from_storage(f["steward_plan"]),
             tuple(ResponsibilityResult.from_storage(x) for x in f["responsibility_results"]),
@@ -4153,7 +4203,9 @@ class DailyTurnDraft:
             tuple(
                 EvidenceApplicabilityChange.from_storage(item)
                 for item in f["evidence_applicability_changes"]
-            ))  # type: ignore[arg-type]
+            ),
+            model_resolution,
+        )  # type: ignore[arg-type]
 
     def verify(
         self,
@@ -5479,7 +5531,17 @@ class DailyHealthState:
         result = DailyTurnResult(draft.source_causal_id, draft.record_id, draft.transition_id,
             tuple(c.evidence_id for c in stage.evidence_cards), resolution.commit_portrait_topic_refs,
             draft.skill_disclosures, draft.owner_reply,
-            resolution.commit_evidence_change_ids)
+            resolution.commit_evidence_change_ids,
+            (
+                None
+                if draft.model_answer_resolution is None
+                else draft.model_answer_resolution.status
+            ),
+            (
+                None
+                if draft.model_answer_resolution is None
+                else draft.model_answer_resolution.digest
+            ))
         return state, result
 
 
@@ -6024,6 +6086,9 @@ class DailySkillRuntime:
         source: SourceEnvelope,
         post_stage_state: DailyHealthState,
         evidence_stage: DailyTurnDraft,
+        *,
+        model_answer_resolution: ModelAnswerResolution | None = None,
+        model_reply_atoms: tuple[OwnerReplyAtom, ...] = (),
     ) -> DailyTurnDraft:
         if (
             type(source) is not SourceEnvelope
@@ -6035,6 +6100,38 @@ class DailySkillRuntime:
             or evidence_stage.source_digest != stable_digest(source.to_storage())
         ):
             raise AuthorityValidationError("invalid evidence stage continuation")
+        if model_answer_resolution is not None and type(
+            model_answer_resolution
+        ) is not ModelAnswerResolution:
+            raise AuthorityValidationError("invalid model answer resolution")
+        if type(model_reply_atoms) is not tuple or any(
+            type(atom) is not OwnerReplyAtom for atom in model_reply_atoms
+        ):
+            raise AuthorityValidationError("invalid model reply atoms")
+        if model_answer_resolution is None:
+            if model_reply_atoms:
+                raise AuthorityValidationError(
+                    "model reply atoms require an answer resolution"
+                )
+        elif model_answer_resolution.status == "failed-closed":
+            if model_reply_atoms:
+                raise AuthorityValidationError(
+                    "failed-closed resolution cannot carry model reply atoms"
+                )
+        elif not model_reply_atoms:
+            raise AuthorityValidationError(
+                "rendered resolution requires deterministic reply atoms"
+            )
+        if any(
+            atom.source_skill != "health-steward"
+            or atom.required_evidence_ids
+            or atom.required_portrait_topic_refs
+            or atom.required_evidence_change_ids
+            for atom in model_reply_atoms
+        ):
+            raise AuthorityValidationError(
+                "model reply atoms exceeded the steward answer boundary"
+            )
         state_cards = {
             card.evidence_id: card for card in post_stage_state.evidence_cards
         }
@@ -6446,6 +6543,18 @@ class DailySkillRuntime:
                     f"unsupported daily Skill candidate: {skill_name}"
                 )
 
+        if model_answer_resolution is not None:
+            if model_answer_resolution.status == "failed-closed":
+                reply_atoms.append(
+                    OwnerReplyAtom.form(
+                        kind="limitation",
+                        text=render_failed_closed(model_answer_resolution),
+                        source_skill="health-steward",
+                        source_result_digest=model_answer_resolution.digest,
+                    )
+                )
+            else:
+                reply_atoms.extend(model_reply_atoms)
         if not reply_atoms:
             reply_atoms.append(
                 OwnerReplyAtom.form(
@@ -6554,4 +6663,5 @@ class DailySkillRuntime:
             "complete-turn",
             evidence_stage,
             tuple(portrait_withdrawals),
+            model_answer_resolution=model_answer_resolution,
         )

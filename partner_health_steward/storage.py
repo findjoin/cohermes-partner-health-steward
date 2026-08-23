@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .admission import SourceEnvelope, SourceReceipt
+from .answer_resolution import ModelEffectReport
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -420,6 +421,7 @@ class PendingEffectResult:
     status: str
     terminal: bool
     result_digest: str
+    model_report: ModelEffectReport | None
     remote_attempted: bool
 
     @classmethod
@@ -454,6 +456,7 @@ class PendingEffectResult:
             status=payload.status,
             terminal=payload.terminal,
             result_digest=payload.result_digest,
+            model_report=payload.model_report,
             remote_attempted=remote_attempted,
         )
 
@@ -476,12 +479,15 @@ class PendingEffectResult:
             "status": self.status,
             "terminal": self.terminal,
             "result_digest": self.result_digest,
+            "model_report": (
+                None if self.model_report is None else self.model_report.to_storage()
+            ),
             "remote_attempted": self.remote_attempted,
         }
 
     @classmethod
     def from_storage(cls, value: object) -> "PendingEffectResult":
-        required = {
+        legacy = {
             "effect_id",
             "causal_id",
             "protocol_version",
@@ -497,12 +503,21 @@ class PendingEffectResult:
             "result_digest",
             "remote_attempted",
         }
-        if not isinstance(value, Mapping) or set(value) != required:
+        if not isinstance(value, Mapping) or set(value) not in (
+            legacy,
+            legacy | {"model_report"},
+        ):
             raise KeyUnavailable("invalid pending effect result")
         scope_value = value["scope"]
         if not isinstance(scope_value, list):
             raise KeyUnavailable("invalid pending effect result")
         try:
+            raw_report = value.get("model_report")
+            model_report = (
+                None
+                if raw_report is None
+                else ModelEffectReport.from_storage(raw_report)
+            )
             payload = EffectResultPayload(
                 effect_id=value["effect_id"],
                 intent_digest=value["intent_digest"],
@@ -511,6 +526,7 @@ class PendingEffectResult:
                 status=value["status"],
                 terminal=value["terminal"],
                 result_digest=value["result_digest"],
+                model_report=model_report,
             )
             command = CommandEnvelope(
                 peer=value["peer"],
@@ -540,6 +556,7 @@ class PendingEffectResult:
             status=payload.status,
             terminal=payload.terminal,
             result_digest=payload.result_digest,
+            model_report=payload.model_report,
             remote_attempted=value["remote_attempted"],
         )
 
@@ -1637,10 +1654,25 @@ class EncryptedStateStore:
 
         if response.causal_id != command.causal_id:
             raise KeyUnavailable("receipt causal identifier mismatch")
-        receipt_command = self._receipt_command_wire(command)
+        content = (
+            {
+                "kind": "command-digest-v1",
+                "command_digest": self._receipt_command_digest(command),
+                "response": response.to_wire(),
+            }
+            if (
+                command.action == "turn.prepare"
+                and isinstance(command.payload, DailyTurnPreparePayload)
+                and command.payload.candidate is not None
+            )
+            else {
+                "command": self._receipt_command_wire(command),
+                "response": response.to_wire(),
+            }
+        )
         nonce, ciphertext = self._seal(
             f"receipt:v2:{command.causal_id}",
-            {"command": receipt_command, "response": response.to_wire()},
+            content,
         )
         with self.transaction() as connection:
             self._assert_integrity_manifest_before_mutation()
@@ -2621,6 +2653,16 @@ class EncryptedStateStore:
             draft.skill_disclosures,
             draft.owner_reply,
             draft.steward_resolution.commit_evidence_change_ids,
+            (
+                None
+                if draft.model_answer_resolution is None
+                else draft.model_answer_resolution.status
+            ),
+            (
+                None
+                if draft.model_answer_resolution is None
+                else draft.model_answer_resolution.digest
+            ),
         )
 
     def _validate_daily_turn_record_binding(

@@ -6,6 +6,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Mapping
 
+from .answer_resolution import ModelEffectReport
+
 
 class AuthorityValidationError(ValueError):
     """Raised when encrypted authority or transition state is malformed."""
@@ -556,6 +558,7 @@ class TerminalEffect:
     execution: ExecutingEffect
     status: str
     result_digest: str
+    model_report: ModelEffectReport | None = None
 
     def __post_init__(self) -> None:
         if type(self.execution) is not ExecutingEffect:
@@ -564,6 +567,15 @@ class TerminalEffect:
         if type(self.status) is not str or self.status not in {"accepted", "rejected", "unknown"}:
             raise AuthorityValidationError("invalid effect status")
         validate_opaque_text(self.result_digest, "result_digest")
+        if self.model_report is not None:
+            if type(self.model_report) is not ModelEffectReport:
+                raise AuthorityValidationError("invalid model effect report")
+            if self.execution.intent.effect_kind != "model-work":
+                raise AuthorityValidationError("model report requires a model effect")
+            if self.result_digest != self.model_report.digest:
+                raise AuthorityValidationError("model effect report digest mismatch")
+            if self.status != self.model_report.outer_effect_status:
+                raise AuthorityValidationError("model effect outer status mismatch")
 
     @property
     def intent(self) -> EffectIntent:
@@ -574,21 +586,36 @@ class TerminalEffect:
         return self.execution.lease
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored: dict[str, object] = {
             "execution": self.execution.to_storage(),
             "status": self.status,
             "result_digest": self.result_digest,
         }
+        if self.model_report is not None:
+            stored["model_report"] = self.model_report.to_storage()
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TerminalEffect":
-        stored = _required_mapping(
-            value,
-            frozenset({"execution", "status", "result_digest"}),
-            "terminal effect",
-        )
-        return cls(
-            execution=ExecutingEffect.from_storage(stored["execution"]),
-            status=stored["status"],  # type: ignore[arg-type]
-            result_digest=validate_opaque_text(stored["result_digest"], "result_digest"),
-        )
+        legacy_fields = frozenset({"execution", "status", "result_digest"})
+        if not isinstance(value, Mapping) or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"model_report"},
+        ):
+            raise AuthorityValidationError("invalid terminal effect")
+        stored = value
+        try:
+            return cls(
+                execution=ExecutingEffect.from_storage(stored["execution"]),
+                status=stored["status"],  # type: ignore[arg-type]
+                result_digest=validate_opaque_text(stored["result_digest"], "result_digest"),
+                model_report=(
+                    None
+                    if "model_report" not in stored
+                    else ModelEffectReport.from_storage(stored["model_report"])
+                ),
+            )
+        except ValueError as exc:
+            if isinstance(exc, AuthorityValidationError):
+                raise
+            raise AuthorityValidationError("invalid terminal effect") from exc

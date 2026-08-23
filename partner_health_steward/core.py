@@ -17,6 +17,11 @@ from .admission import (
     SourceEnvelope,
     SourceReceipt,
 )
+from .answer_resolution import (
+    ModelAnswerResolution,
+    ModelEffectReport,
+    render_failed_closed,
+)
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -62,6 +67,7 @@ from .coordination import (
     DailySkillBundle,
     DailyTurnDraft,
     DailyTurnResult,
+    OwnerReplyAtom,
 )
 from .initialization import (
     HealthInitAttestor,
@@ -76,6 +82,14 @@ from .initialization import (
     OwnerInitialization,
     SkillUseProof,
     stable_digest,
+)
+from .knowledge import KnowledgeRelease
+from .nondiagnostic import (
+    ApprovedClaimAtom,
+    ApprovedReplyTemplate,
+    NonDiagnosticCandidate,
+    NonDiagnosticContractViolation,
+    NonDiagnosticReplyPipeline,
 )
 from .current_head import (
     AdvanceRequest,
@@ -115,6 +129,21 @@ _PERSISTENT_CLOSE_REASONS = frozenset(
 )
 _MAX_HELD_INITIALIZATION_SOURCES = MAX_RESOLVED_SOURCE_CAUSAL_IDS + 1
 _MAX_UNRESOLVED_INITIALIZATION_SOURCES = _MAX_HELD_INITIALIZATION_SOURCES + 1
+_PRECALL_FAILED_CLOSED_REASONS = frozenset(
+    {
+        "route-id-drift",
+        "provider-drift",
+        "base-url-drift",
+        "api-mode-drift",
+        "requested-model-drift",
+        "configuration-generation-drift",
+        "owner-consent-drift",
+        "capability-profile-drift",
+        "output-reservation-drift",
+        "strict-schema-drift",
+        "capacity-unavailable",
+    }
+)
 _CurrentHeadValue = TypeVar("_CurrentHeadValue")
 
 
@@ -525,6 +554,10 @@ class HealthCore:
         health_init_asset: HealthInitAsset | None = None,
         daily_skill_verifier: DailySkillAttestor | None = None,
         daily_skill_bundle: DailySkillBundle | None = None,
+        model_authority_digest: str | None = None,
+        knowledge_releases: tuple[KnowledgeRelease, ...] = (),
+        approved_claims: tuple[ApprovedClaimAtom, ...] = (),
+        approved_templates: tuple[ApprovedReplyTemplate, ...] = (),
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -542,6 +575,28 @@ class HealthCore:
         self._health_init_asset = health_init_asset
         self._daily_skill_verifier = daily_skill_verifier
         self._daily_skill_bundle = daily_skill_bundle
+        if model_authority_digest is not None and (
+            type(model_authority_digest) is not str
+            or len(model_authority_digest) != 71
+            or not model_authority_digest.startswith("sha256:")
+        ):
+            raise AuthorityValidationError("invalid model authority digest")
+        try:
+            if model_authority_digest is not None:
+                int(model_authority_digest[7:], 16)
+        except ValueError as exc:
+            raise AuthorityValidationError("invalid model authority digest") from exc
+        self._model_authority_digest = model_authority_digest
+        self._non_diagnostic_pipeline = (
+            None
+            if not (knowledge_releases or approved_claims or approved_templates)
+            else NonDiagnosticReplyPipeline(
+                current_owner_cards=(),
+                current_knowledge_releases=knowledge_releases,
+                approved_claims=approved_claims,
+                approved_templates=approved_templates,
+            )
+        )
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
@@ -1490,6 +1545,11 @@ class HealthCore:
         if stored.state != "executing" or not isinstance(stored.payload, ExecutingEffect):
             raise ProtocolViolation("effect-execution-required")
         execution = stored.payload
+        if (
+            payload.model_report is not None
+            and execution.intent.effect_kind != "model-work"
+        ):
+            raise ProtocolViolation("model report requires a model effect")
         if payload.intent_digest != execution.intent.intent_digest:
             raise ProtocolViolation("effect-intent-required")
         if payload.terminal is not True:
@@ -1826,6 +1886,7 @@ class HealthCore:
             execution=execution,
             status=payload.status,
             result_digest=payload.result_digest,
+            model_report=payload.model_report,
         )
         response = Response(
             "unknown" if payload.status == "unknown" else ("accepted" if payload.status == "accepted" else "rejected"),
@@ -2035,6 +2096,11 @@ class HealthCore:
             self._closed_reason = "current-head-observation-incomplete"
             return Response("unavailable", command.causal_id, self._closed_reason)
         execution = stored.payload
+        if (
+            payload.model_report is not None
+            and execution.intent.effect_kind != "model-work"
+        ):
+            raise ProtocolViolation("model report requires a model effect")
         try:
             if not pending.matches(command, execution):
                 self._closed_reason = "current-head-observation-incomplete"
@@ -2260,6 +2326,11 @@ class HealthCore:
         if not isinstance(stored.payload, ExecutingEffect):
             raise KeyUnavailable("invalid executing effect")
         execution = stored.payload
+        if (
+            payload.model_report is not None
+            and execution.intent.effect_kind != "model-work"
+        ):
+            raise ProtocolViolation("model report requires a model effect")
         existing = self._store.pending_effect_result(payload.effect_id)
         if existing is None:
             if command.generation != execution.lease.authority.generation:
@@ -2562,6 +2633,16 @@ class HealthCore:
                 Response("rejected", command.causal_id, "daily-skill-proof-required"),
                 True,
             )
+        answer_rejection = self._daily_answer_resolution_rejection(
+            draft,
+            payload.candidate,
+            state if continuing_stage is None else post_stage_state,
+        )
+        if answer_rejection is not None:
+            return _Handled(
+                Response("rejected", command.causal_id, answer_rejection),
+                True,
+            )
         # The lease read and a possible prepared-row write occur inside the
         # caller's serialized store transaction.  A busy response deliberately
         # has no receipt, so the caller can retry after the current owner reaches
@@ -2597,6 +2678,120 @@ class HealthCore:
             Response("accepted", command.causal_id, "daily-turn-prepared"),
             True,
         )
+
+    def _daily_answer_resolution_rejection(
+        self,
+        draft: DailyTurnDraft,
+        candidate: NonDiagnosticCandidate | None,
+        state: DailyHealthState,
+    ) -> str | None:
+        """Revalidate a model candidate at the core-owned business-write seam."""
+
+        resolution = draft.model_answer_resolution
+        if resolution is None:
+            return None if candidate is None else "model-answer-resolution-required"
+        if type(resolution) is not ModelAnswerResolution:
+            return "model-answer-resolution-invalid"
+        if (
+            self._model_authority_digest is None
+            or resolution.model_authority_digest != self._model_authority_digest
+        ):
+            return "model-answer-authority-mismatch"
+
+        report: ModelEffectReport | None = None
+        effect_ref = resolution.effect_ref
+        if effect_ref is None:
+            if (
+                resolution.status != "failed-closed"
+                or resolution.reason_code not in _PRECALL_FAILED_CLOSED_REASONS
+            ):
+                return "model-effect-reference-required"
+        else:
+            stored = self._store.effect(effect_ref.effect_id)
+            if (
+                stored is None
+                or stored.state not in {"accepted", "rejected", "unknown"}
+                or type(stored.payload) is not TerminalEffect
+                or stored.payload.intent.effect_kind != "model-work"
+                or type(stored.payload.model_report) is not ModelEffectReport
+            ):
+                return "model-effect-terminal-required"
+            terminal_effect = stored.payload
+            report = terminal_effect.model_report
+            if (
+                terminal_effect.status == "unknown"
+                or report.outer_effect_status != terminal_effect.status
+                or report.digest != effect_ref.report_digest
+                or terminal_effect.result_digest != report.digest
+                or terminal_effect.intent.intent_digest
+                != resolution.strict_request_digest
+            ):
+                return "model-effect-terminal-mismatch"
+
+        if resolution.status == "failed-closed":
+            if candidate is not None:
+                return "failed-closed-candidate-forbidden"
+            if report is not None and (
+                report.reason_code != resolution.reason_code
+                or (
+                    report.model_status == "completed"
+                    and report.reason_code is None
+                    and not report.fallback_observed
+                    and not report.truncated
+                )
+            ):
+                return "model-failure-reason-mismatch"
+            expected_atom = OwnerReplyAtom.form(
+                kind="limitation",
+                text=render_failed_closed(resolution),
+                source_skill="health-steward",
+                source_result_digest=resolution.digest,
+            )
+            if (
+                expected_atom not in draft.reply_atoms
+                or draft.steward_resolution is None
+                or expected_atom.atom_id not in draft.steward_resolution.reply_atom_ids
+            ):
+                return "failed-closed-owner-prompt-required"
+            return None
+
+        if (
+            candidate is None
+            or report is None
+            or report.model_status != "completed"
+            or not report.terminal_proven
+            or report.reason_code is not None
+            or report.fallback_observed
+            or report.truncated
+        ):
+            return "completed-model-result-required"
+        if stable_digest(candidate.to_wire()) != resolution.candidate_digest:
+            return "model-candidate-digest-mismatch"
+        pipeline = self._non_diagnostic_pipeline
+        if type(pipeline) is not NonDiagnosticReplyPipeline:
+            return "model-answer-configuration-mismatch"
+        try:
+            template = pipeline.approved_template(candidate.template_id)
+            rendered = pipeline.with_current_owner_cards(
+                state.current_evidence_cards
+            ).render(candidate)
+        except NonDiagnosticContractViolation:
+            return "non-diagnostic-candidate-rejected"
+        if (
+            resolution.template_id != template.template_id
+            or resolution.template_version != template.version
+            or resolution.template_digest != stable_digest(template.to_wire())
+            or resolution.rendered_reply_digest
+            != stable_digest(rendered.to_commit_wire())
+            or draft.steward_resolution is None
+            or any(atom not in draft.reply_atoms for atom in rendered.reply_atoms)
+            or any(
+                atom.atom_id not in draft.steward_resolution.reply_atom_ids
+                for atom in rendered.reply_atoms
+            )
+        ):
+            return "deterministic-model-reply-mismatch"
+        return None
 
     def _handle_inbound_admit(self, command: CommandEnvelope) -> _Handled:
         payload = command.payload
@@ -4105,6 +4300,31 @@ class HealthCore:
                     prepared.base,
                     daily.terminal,
                 )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
+    def model_effect_report(self, effect_id: str) -> ModelEffectReport | None:
+        """Return only the content-free report for one terminal model effect."""
+
+        validate_opaque_text(effect_id, "effect identifier")
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    return None
+                stored = self._store.effect(effect_id)
+                if (
+                    stored is None
+                    or stored.state not in {"accepted", "rejected", "unknown"}
+                    or type(stored.payload) is not TerminalEffect
+                    or stored.payload.intent.effect_kind != "model-work"
+                    or type(stored.payload.model_report) is not ModelEffectReport
+                ):
+                    return None
+                return stored.payload.model_report
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
 
