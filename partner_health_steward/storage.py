@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import secrets
 import sqlite3
 import threading
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Protocol
+from typing import Protocol
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,8 +31,25 @@ from .authority import (
     validate_opaque_text,
     validate_ticket110_effect_kind,
 )
-from .contract import CommandEnvelope, EffectResultPayload, ProtocolViolation, Response, StateCommitPayload
-from .initialization import InitializationDisclosureChallenge, InitializationDraft
+from .contract import (
+    CommandEnvelope,
+    DailyTurnPreparePayload,
+    EffectResultPayload,
+    ProtocolViolation,
+    Response,
+    StateCommitPayload,
+)
+from .coordination import (
+    DailyHealthState,
+    DailySkillUseFact,
+    DailyTurnDraft,
+    DailyTurnResult,
+)
+from .initialization import (
+    InitializationDisclosureChallenge,
+    InitializationDraft,
+    stable_digest,
+)
 
 
 class KeyUnavailable(RuntimeError):
@@ -52,6 +70,309 @@ class StoredInitialization:
 
     phase: str
     draft: InitializationDraft
+
+
+@dataclass(frozen=True)
+class DailyTurnTerminalReceipt:
+    """Body-free authenticated link from one finalized turn to its aggregate.
+
+    The full draft is recovery authority only while a turn is unresolved.  At
+    finalization the store keeps this bounded identity/digest projection so
+    integrity verification can bind the ordered terminal chain to the current
+    aggregate without replaying historical owner content.
+    """
+
+    source_causal_id: str
+    record_id: str
+    revision_digest: str
+    transition_id: str
+    payload_digest: str
+    base_state_digest: str
+    completion_base_state_digest: str
+    evidence_stage_record_id: str
+    evidence_stage_revision_digest: str
+    evidence_stage_transition_id: str
+    evidence_stage_payload_digest: str
+    result_digest: str
+    state_digest: str
+    previous_terminal_digest: str | None
+    ordinal: int
+    skill_uses: tuple[DailySkillUseFact, ...]
+    skill_proof_digests: tuple[str, ...]
+    stage_kind: str = "complete-turn"
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.source_causal_id, "source causal identifier"),
+            (self.record_id, "daily turn record identifier"),
+            (self.transition_id, "daily turn transition identifier"),
+            (self.evidence_stage_record_id, "evidence stage record identifier"),
+            (self.evidence_stage_transition_id, "evidence stage transition identifier"),
+        ):
+            validate_opaque_text(value, name)
+        for value, name in (
+            (self.revision_digest, "daily turn revision digest"),
+            (self.payload_digest, "daily turn payload digest"),
+            (self.base_state_digest, "daily turn base state digest"),
+            (self.completion_base_state_digest, "daily completion base state digest"),
+            (self.evidence_stage_revision_digest, "evidence stage revision digest"),
+            (self.evidence_stage_payload_digest, "evidence stage payload digest"),
+            (self.result_digest, "daily turn result digest"),
+            (self.state_digest, "daily turn state digest"),
+        ):
+            self._validate_digest(value, name)
+        if self.previous_terminal_digest is not None:
+            self._validate_digest(
+                self.previous_terminal_digest,
+                "previous daily terminal digest",
+            )
+        if type(self.ordinal) is not int or self.ordinal < 1:
+            raise AuthorityValidationError("invalid daily terminal ordinal")
+        if (
+            type(self.skill_uses) is not tuple
+            or not self.skill_uses
+            or any(type(item) is not DailySkillUseFact for item in self.skill_uses)
+            or type(self.skill_proof_digests) is not tuple
+            or len(self.skill_proof_digests) != len(self.skill_uses)
+        ):
+            raise AuthorityValidationError("invalid daily terminal Skill uses")
+        for proof_digest in self.skill_proof_digests:
+            self._validate_digest(proof_digest, "daily Skill proof digest")
+        for index, skill_use in enumerate(self.skill_uses):
+            expected_parent = (
+                None if index == 0 else self.skill_proof_digests[index - 1]
+            )
+            if (
+                skill_use.source_causal_id != self.source_causal_id
+                or skill_use.sequence_index != index
+                or skill_use.parent_proof_digest != expected_parent
+            ):
+                raise AuthorityValidationError("invalid daily terminal Skill chain")
+        if (
+            self.skill_uses[0].canonical_name != "health-steward"
+            or self.skill_uses[0].action != "plan"
+            or self.skill_uses[-1].canonical_name != "health-steward"
+            or self.skill_uses[-1].action != "resolve"
+        ):
+            raise AuthorityValidationError("invalid daily terminal stewardship")
+        if self.stage_kind != "complete-turn":
+            raise AuthorityValidationError("invalid daily terminal stage")
+
+    @staticmethod
+    def _validate_digest(value: object, name: str) -> str:
+        if (
+            type(value) is not str
+            or not value.startswith("sha256:")
+            or len(value) != len("sha256:") + 64
+        ):
+            raise AuthorityValidationError(f"invalid {name}")
+        try:
+            int(value.removeprefix("sha256:"), 16)
+        except ValueError as exc:
+            raise AuthorityValidationError(f"invalid {name}") from exc
+        return value
+
+    @classmethod
+    def for_finalization(
+        cls,
+        draft: DailyTurnDraft,
+        result: DailyTurnResult,
+        state: DailyHealthState,
+        *,
+        previous_terminal_digest: str | None,
+    ) -> "DailyTurnTerminalReceipt":
+        if type(draft) is not DailyTurnDraft or type(result) is not DailyTurnResult:
+            raise AuthorityValidationError("invalid finalized daily turn")
+        if type(state) is not DailyHealthState:
+            raise AuthorityValidationError("invalid daily health state")
+        evidence_stage = draft.evidence_stage
+        if (
+            draft.turn_kind != "complete-turn"
+            or type(evidence_stage) is not DailyTurnDraft
+            or evidence_stage.turn_kind != "evidence-stage"
+        ):
+            raise AuthorityValidationError("complete daily turn required")
+        return cls(
+            source_causal_id=draft.source_causal_id,
+            record_id=draft.record_id,
+            revision_digest=draft.revision_digest,
+            transition_id=draft.transition_id,
+            payload_digest=draft.payload_digest,
+            base_state_digest=evidence_stage.base_state_digest,
+            completion_base_state_digest=draft.base_state_digest,
+            evidence_stage_record_id=evidence_stage.record_id,
+            evidence_stage_revision_digest=evidence_stage.revision_digest,
+            evidence_stage_transition_id=evidence_stage.transition_id,
+            evidence_stage_payload_digest=evidence_stage.payload_digest,
+            result_digest=stable_digest(result.to_storage()),
+            state_digest=state.digest,
+            previous_terminal_digest=previous_terminal_digest,
+            ordinal=len(state.processed_source_causal_ids),
+            skill_uses=tuple(proof.skill_use for proof in draft.skill_proofs),
+            skill_proof_digests=tuple(proof.digest for proof in draft.skill_proofs),
+        )
+
+    @property
+    def digest(self) -> str:
+        return stable_digest(self.to_storage())
+
+    def matches_draft(self, draft: DailyTurnDraft) -> bool:
+        evidence_stage = (
+            draft.evidence_stage if type(draft) is DailyTurnDraft else None
+        )
+        return type(evidence_stage) is DailyTurnDraft and (
+            self.source_causal_id == draft.source_causal_id
+            and self.record_id == draft.record_id
+            and self.revision_digest == draft.revision_digest
+            and self.transition_id == draft.transition_id
+            and self.payload_digest == draft.payload_digest
+            and self.base_state_digest == evidence_stage.base_state_digest
+            and self.completion_base_state_digest == draft.base_state_digest
+            and self.evidence_stage_record_id == evidence_stage.record_id
+            and self.evidence_stage_revision_digest == evidence_stage.revision_digest
+            and self.evidence_stage_transition_id == evidence_stage.transition_id
+            and self.evidence_stage_payload_digest == evidence_stage.payload_digest
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "source_causal_id": self.source_causal_id,
+            "record_id": self.record_id,
+            "revision_digest": self.revision_digest,
+            "transition_id": self.transition_id,
+            "payload_digest": self.payload_digest,
+            "base_state_digest": self.base_state_digest,
+            "completion_base_state_digest": self.completion_base_state_digest,
+            "evidence_stage_record_id": self.evidence_stage_record_id,
+            "evidence_stage_revision_digest": self.evidence_stage_revision_digest,
+            "evidence_stage_transition_id": self.evidence_stage_transition_id,
+            "evidence_stage_payload_digest": self.evidence_stage_payload_digest,
+            "result_digest": self.result_digest,
+            "state_digest": self.state_digest,
+            "previous_terminal_digest": self.previous_terminal_digest,
+            "ordinal": self.ordinal,
+            "skill_uses": [item.to_storage() for item in self.skill_uses],
+            "skill_proof_digests": list(self.skill_proof_digests),
+            "stage_kind": self.stage_kind,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "DailyTurnTerminalReceipt":
+        fields = {
+            "source_causal_id",
+            "record_id",
+            "revision_digest",
+            "transition_id",
+            "payload_digest",
+            "base_state_digest",
+            "completion_base_state_digest",
+            "evidence_stage_record_id",
+            "evidence_stage_revision_digest",
+            "evidence_stage_transition_id",
+            "evidence_stage_payload_digest",
+            "result_digest",
+            "state_digest",
+            "previous_terminal_digest",
+            "ordinal",
+            "skill_uses",
+            "skill_proof_digests",
+            "stage_kind",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise AuthorityValidationError("invalid daily terminal receipt")
+        skill_uses = value["skill_uses"]
+        skill_proof_digests = value["skill_proof_digests"]
+        if type(skill_uses) is not list or type(skill_proof_digests) is not list:
+            raise AuthorityValidationError("invalid daily terminal Skill uses")
+        return cls(
+            source_causal_id=value["source_causal_id"],  # type: ignore[arg-type]
+            record_id=value["record_id"],  # type: ignore[arg-type]
+            revision_digest=value["revision_digest"],  # type: ignore[arg-type]
+            transition_id=value["transition_id"],  # type: ignore[arg-type]
+            payload_digest=value["payload_digest"],  # type: ignore[arg-type]
+            base_state_digest=value["base_state_digest"],  # type: ignore[arg-type]
+            completion_base_state_digest=value["completion_base_state_digest"],  # type: ignore[arg-type]
+            evidence_stage_record_id=value["evidence_stage_record_id"],  # type: ignore[arg-type]
+            evidence_stage_revision_digest=value["evidence_stage_revision_digest"],  # type: ignore[arg-type]
+            evidence_stage_transition_id=value["evidence_stage_transition_id"],  # type: ignore[arg-type]
+            evidence_stage_payload_digest=value["evidence_stage_payload_digest"],  # type: ignore[arg-type]
+            result_digest=value["result_digest"],  # type: ignore[arg-type]
+            state_digest=value["state_digest"],  # type: ignore[arg-type]
+            previous_terminal_digest=value["previous_terminal_digest"],  # type: ignore[arg-type]
+            ordinal=value["ordinal"],  # type: ignore[arg-type]
+            skill_uses=tuple(
+                DailySkillUseFact.from_storage(item) for item in skill_uses
+            ),
+            skill_proof_digests=tuple(skill_proof_digests),  # type: ignore[arg-type]
+            stage_kind=value["stage_kind"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class StoredDailyTurn:
+    """One encrypted post-initialization turn and its durable phase.
+
+    Intermediate phases retain the immutable draft but never claim a business
+    result.  A finalized row contains only a body-free terminal receipt and,
+    while still useful for exact replay, the minimal result projection.  Later
+    evidence compaction may erase that projection without weakening the
+    immutable terminal digest chain.
+    """
+
+    phase: str
+    draft: DailyTurnDraft | None
+    result: DailyTurnResult | None
+    terminal: DailyTurnTerminalReceipt | None = None
+    evidence_state_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase == "finalized":
+            if (
+                self.draft is not None
+                or type(self.terminal) is not DailyTurnTerminalReceipt
+                or self.evidence_state_digest is not None
+            ):
+                raise AuthorityValidationError("invalid finalized daily turn")
+            if self.result is not None and type(self.result) is not DailyTurnResult:
+                raise AuthorityValidationError("invalid finalized daily result")
+        elif self.phase == "evidence-finalized":
+            if (
+                type(self.draft) is not DailyTurnDraft
+                or self.draft.turn_kind != "evidence-stage"
+                or self.result is not None
+                or self.terminal is not None
+                or self.evidence_state_digest is None
+            ):
+                raise AuthorityValidationError("invalid finalized evidence stage")
+            DailyTurnTerminalReceipt._validate_digest(
+                self.evidence_state_digest,
+                "evidence stage state digest",
+            )
+        elif (
+            self.phase not in {"prepared", "unknown", "committed"}
+            or type(self.draft) is not DailyTurnDraft
+            or self.result is not None
+            or self.terminal is not None
+            or self.evidence_state_digest is not None
+        ):
+            raise AuthorityValidationError("invalid unresolved daily turn")
+
+    @property
+    def source_causal_id(self) -> str:
+        return (
+            self.draft.source_causal_id
+            if self.draft is not None
+            else self._terminal().source_causal_id
+        )
+
+    @property
+    def record_id(self) -> str:
+        return self.draft.record_id if self.draft is not None else self._terminal().record_id
+
+    def _terminal(self) -> DailyTurnTerminalReceipt:
+        if self.terminal is None:
+            raise AuthorityValidationError("daily terminal receipt required")
+        return self.terminal
 
 
 @dataclass(frozen=True)
@@ -469,6 +790,26 @@ class EncryptedStateStore:
             )
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_turns_v1 (
+                source_causal_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_health_state_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
         self._commit("health state initialization unavailable")
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
@@ -584,15 +925,33 @@ class EncryptedStateStore:
                 "initialization_disclosure_challenges_v1",
                 "owner_initialization_v1",
             )
-            if (
-                not isinstance(fingerprint, str)
-                or fingerprint != self._integrity_fingerprint(include_ticket111=False)
-                or any(
-                    self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                    is not None
-                    for table in ticket111_tables
-                )
-            ):
+            ticket112_tables = ("daily_turns_v1", "daily_health_state_v1")
+            migration_tables: tuple[str, ...] | None = None
+            if isinstance(fingerprint, str):
+                if (
+                    fingerprint
+                    == self._integrity_fingerprint(include_ticket112=False)
+                    and all(
+                        self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        is None
+                        for table in ticket112_tables
+                    )
+                ):
+                    migration_tables = ticket112_tables
+                elif (
+                    fingerprint
+                    == self._integrity_fingerprint(
+                        include_ticket111=False,
+                        include_ticket112=False,
+                    )
+                    and all(
+                        self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        is None
+                        for table in (*ticket111_tables, *ticket112_tables)
+                    )
+                ):
+                    migration_tables = (*ticket111_tables, *ticket112_tables)
+            if migration_tables is None:
                 return
             with self.transaction() as connection:
                 current_row = connection.execute(
@@ -612,7 +971,7 @@ class EncryptedStateStore:
                             f"SELECT 1 FROM {table} LIMIT 1"
                         ).fetchone()
                         is not None
-                        for table in ticket111_tables
+                        for table in migration_tables
                     )
                 ):
                     return
@@ -631,14 +990,27 @@ class EncryptedStateStore:
             "source_envelopes_v1",
             "initialization_disclosure_challenges_v1",
             "owner_initialization_v1",
+            "daily_turns_v1",
+            "daily_health_state_v1",
         )
         if any(self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None for table in populated_tables):
             return
         with self.transaction() as connection:
             self._refresh_integrity_manifest(connection)
 
-    def _integrity_fingerprint(self, *, include_ticket111: bool = True) -> str:
+    def _integrity_fingerprint(
+        self,
+        *,
+        include_ticket111: bool = True,
+        include_ticket112: bool | None = None,
+    ) -> str:
         """Hash every mutable domain row except the manifest itself."""
+
+        if include_ticket112 is None:
+            # A caller asking for the pre-Ticket-111 shape is necessarily also
+            # asking for the pre-Ticket-112 shape.  Explicit values are used by
+            # the staged migration logic when only the newest tables are absent.
+            include_ticket112 = include_ticket111
 
         tables = {
             "records": self._execute(
@@ -689,6 +1061,19 @@ class EncryptedStateStore:
                     "owner_initialization": self._execute(
                         "SELECT slot, record_id, phase, nonce, ciphertext "
                         "FROM owner_initialization_v1 ORDER BY slot"
+                    ).fetchall(),
+                }
+            )
+        if include_ticket112:
+            tables.update(
+                {
+                    "daily_turns": self._execute(
+                        "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+                        "FROM daily_turns_v1 ORDER BY source_causal_id"
+                    ).fetchall(),
+                    "daily_health_state": self._execute(
+                        "SELECT slot, nonce, ciphertext "
+                        "FROM daily_health_state_v1 ORDER BY slot"
                     ).fetchall(),
                 }
             )
@@ -1554,6 +1939,20 @@ class EncryptedStateStore:
             )
             if cursor.rowcount != 1:
                 raise AuthorityValidationError("initialization source required")
+            if receipt.native_cursor_state == "advanced":
+                row = connection.execute(
+                    "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+                    "FROM daily_turns_v1 WHERE source_causal_id = ?",
+                    (causal_id,),
+                ).fetchone()
+                if row is not None:
+                    turn = self._decode_daily_turn(*row)
+                    if turn.phase == "finalized" and turn.result is not None:
+                        self._write_daily_turn_terminal_row(
+                            connection,
+                            turn._terminal(),
+                            None,
+                        )
             self._refresh_integrity_manifest(connection)
         return receipt
 
@@ -1637,6 +2036,669 @@ class EncryptedStateStore:
         if draft.record_id != record_id:
             raise KeyUnavailable("initialization record identifier mismatch")
         return StoredInitialization(phase=phase, draft=draft)
+
+    def write_daily_turn(
+        self,
+        phase: str,
+        draft: DailyTurnDraft,
+        result: DailyTurnResult | None = None,
+    ) -> None:
+        """Create or advance one encrypted post-initialization turn.
+
+        The generic transition record is the commit authority.  Every daily
+        row must therefore match its exact phase and target before the row can
+        be written.  Finalization is normally performed through
+        :meth:`finalize_daily_turn`, which updates the daily aggregate and the
+        turn result atomically; a direct finalized write is accepted only as
+        an idempotent replay of an already-finalized aggregate.
+        """
+
+        self._validate_daily_turn_value(phase, draft, result)
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            existing = self._daily_turn_row(draft.source_causal_id)
+            if phase == "finalized":
+                if (
+                    existing is None
+                    or existing.phase != "finalized"
+                    or existing.terminal is None
+                    or not existing.terminal.matches_draft(draft)
+                    or type(result) is not DailyTurnResult
+                    or stable_digest(result.to_storage())
+                    != existing.terminal.result_digest
+                ):
+                    raise AuthorityValidationError(
+                        "finalized daily turn must already exist"
+                    )
+                self._validate_daily_terminal_record_binding(existing.terminal)
+                return
+            self._validate_daily_turn_record_binding(draft, phase)
+            if existing is None:
+                if phase != "prepared":
+                    raise AuthorityValidationError("daily turn must begin prepared")
+                if draft.turn_kind != "evidence-stage":
+                    raise AuthorityValidationError(
+                        "daily turn must begin with evidence stage"
+                    )
+                if self.unresolved_daily_turn() is not None:
+                    raise AuthorityValidationError("daily turn lease already owned")
+            elif existing.phase == "evidence-finalized":
+                if (
+                    phase != "prepared"
+                    or draft.turn_kind != "complete-turn"
+                    or existing.draft is None
+                    or draft.evidence_stage != existing.draft
+                    or draft.base_state_digest != existing.evidence_state_digest
+                ):
+                    raise AuthorityValidationError(
+                        "complete turn must continue exact evidence stage"
+                    )
+            else:
+                if existing.draft is None or existing.draft != draft:
+                    raise AuthorityValidationError("daily source already has another turn")
+                allowed = {
+                    "prepared": {"prepared", "unknown", "committed"},
+                    "unknown": {"unknown", "prepared", "committed"},
+                    "committed": {"committed"},
+                }
+                if phase not in allowed[existing.phase]:
+                    raise AuthorityValidationError("invalid daily turn transition")
+            self._write_daily_turn_row(connection, phase, draft, result)
+            self._refresh_integrity_manifest(connection)
+
+    def daily_turn(self, source_causal_id: str) -> StoredDailyTurn | None:
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        turn = self._daily_turn_row(source_causal_id)
+        if turn is not None:
+            if turn.draft is not None:
+                self._validate_daily_turn_record_binding(turn.draft, turn.phase)
+            else:
+                self._validate_daily_terminal_record_binding(turn._terminal())
+        return turn
+
+    def daily_turn_for_record(self, record_id: str) -> StoredDailyTurn | None:
+        validate_opaque_text(record_id, "daily turn record identifier")
+        row = self._execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1 WHERE record_id = ?",
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        turn = self._decode_daily_turn(*row)
+        if turn.draft is not None:
+            self._validate_daily_turn_record_binding(turn.draft, turn.phase)
+        else:
+            self._validate_daily_terminal_record_binding(turn._terminal())
+        return turn
+
+    def unresolved_daily_turn(self) -> StoredDailyTurn | None:
+        """Return the single authoritative unfinished daily turn, if any.
+
+        Ticket 112 deliberately permits only one core-owned daily transition
+        lease at a time.  This is a read-only projection over the encrypted
+        turn journal: callers may use it while holding the store transaction
+        that will create a new prepared row.  Multiple unfinished rows, or a
+        draft based on any state other than the current committed aggregate,
+        are impossible under that contract and therefore fail closed instead
+        of selecting an arbitrary owner.
+        """
+
+        self._verify_integrity_manifest()
+        rows = self._execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1 "
+            "WHERE phase IN ('prepared', 'unknown', 'committed', 'evidence-finalized') "
+            "ORDER BY source_causal_id"
+        ).fetchall()
+        if len(rows) > 1:
+            raise KeyUnavailable("multiple unresolved daily turns")
+        if not rows:
+            return None
+        turn = self._decode_daily_turn(*rows[0])
+        if turn.draft is None:
+            raise KeyUnavailable("unresolved daily turn draft missing")
+        self._validate_daily_turn_record_binding(turn.draft, turn.phase)
+        current_state_digest = self.daily_state().digest
+        if turn.phase == "evidence-finalized":
+            if (
+                turn.draft.base_state_digest != current_state_digest
+                or turn.evidence_state_digest
+                != self.daily_state().apply_evidence_stage(turn.draft).digest
+            ):
+                raise KeyUnavailable("evidence stage state mismatch")
+        elif turn.draft.turn_kind == "complete-turn":
+            evidence_stage = turn.draft.evidence_stage
+            if (
+                type(evidence_stage) is not DailyTurnDraft
+                or evidence_stage.base_state_digest != current_state_digest
+                or turn.draft.base_state_digest
+                != self.daily_state().apply_evidence_stage(evidence_stage).digest
+            ):
+                raise KeyUnavailable("daily completion base state mismatch")
+        elif turn.draft.base_state_digest != current_state_digest:
+            raise KeyUnavailable("daily turn base state mismatch")
+        return turn
+
+    def daily_state(self) -> DailyHealthState:
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM daily_health_state_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return DailyHealthState.empty()
+        try:
+            return DailyHealthState.from_storage(
+                self._open("daily-health-state", row[0], row[1])
+            )
+        except AuthorityValidationError as exc:
+            raise KeyUnavailable("invalid daily health state") from exc
+
+    def finalize_daily_evidence_stage(
+        self,
+        draft: DailyTurnDraft,
+    ) -> DailyHealthState:
+        """Commit evidence only while retaining the source's overall lease."""
+
+        if type(draft) is not DailyTurnDraft or draft.turn_kind != "evidence-stage":
+            raise AuthorityValidationError("evidence stage draft required")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            existing = self._daily_turn_row(draft.source_causal_id)
+            if (
+                existing is None
+                or existing.phase != "committed"
+                or existing.draft != draft
+            ):
+                raise AuthorityValidationError("committed evidence stage required")
+            self._validate_daily_turn_record_binding(
+                draft,
+                "evidence-finalized",
+            )
+            current_state = self.daily_state()
+            # The stage is durable recovery authority, not a published health
+            # revision.  Materialize its digest only so the exact continuation
+            # can be bound; evidence, portrait and reply intent publish together
+            # when the complete turn finalizes.
+            next_state = current_state.apply_evidence_stage(draft)
+            self._write_daily_turn_row(
+                connection,
+                "evidence-finalized",
+                draft,
+                None,
+                evidence_state_digest=next_state.digest,
+            )
+            self._refresh_integrity_manifest(connection)
+            return next_state
+
+    def finalize_daily_turn(self, draft: DailyTurnDraft) -> DailyTurnResult:
+        """Apply one committed draft and persist its result atomically."""
+
+        if type(draft) is not DailyTurnDraft or draft.turn_kind != "complete-turn":
+            raise AuthorityValidationError("complete daily turn draft required")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            existing = self._daily_turn_row(draft.source_causal_id)
+            if existing is None:
+                raise AuthorityValidationError("committed daily turn required")
+            if existing.phase == "finalized":
+                terminal = existing.terminal
+                result = self._daily_result_for_draft(draft)
+                if (
+                    terminal is None
+                    or not terminal.matches_draft(draft)
+                    or stable_digest(result.to_storage()) != terminal.result_digest
+                ):
+                    raise AuthorityValidationError("finalized daily turn mismatch")
+                self._validate_daily_terminal_record_binding(terminal)
+                if draft.source_causal_id not in self.daily_state().processed_source_causal_ids:
+                    raise KeyUnavailable("daily turn aggregate mismatch")
+                return existing.result if existing.result is not None else result
+            if existing.draft is None or existing.draft != draft or existing.phase != "committed":
+                raise AuthorityValidationError("committed daily turn required")
+            self._validate_daily_turn_record_binding(draft, "finalized")
+            current_state = self.daily_state()
+            evidence_stage = draft.evidence_stage
+            if type(evidence_stage) is not DailyTurnDraft:
+                raise AuthorityValidationError("complete turn evidence stage required")
+            post_stage_state = current_state.apply_evidence_stage(evidence_stage)
+            if post_stage_state.digest != draft.base_state_digest:
+                raise AuthorityValidationError("daily completion base state changed")
+            next_state, result = post_stage_state.apply(draft)
+            previous_terminal_digest = None
+            if current_state.processed_source_causal_ids:
+                previous_source = current_state.processed_source_causal_ids[-1]
+                previous = self._daily_turn_row(previous_source)
+                if (
+                    previous is None
+                    or previous.phase != "finalized"
+                    or previous.terminal is None
+                ):
+                    raise KeyUnavailable("daily terminal chain is incomplete")
+                previous_terminal_digest = previous.terminal.digest
+            terminal = DailyTurnTerminalReceipt.for_finalization(
+                draft,
+                result,
+                next_state,
+                previous_terminal_digest=previous_terminal_digest,
+            )
+            state_nonce, state_ciphertext = self._seal(
+                "daily-health-state",
+                next_state.to_storage(),
+            )
+            connection.execute(
+                """
+                INSERT INTO daily_health_state_v1(slot, nonce, ciphertext)
+                VALUES (1, ?, ?)
+                ON CONFLICT(slot) DO UPDATE SET
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext
+                """,
+                (state_nonce, state_ciphertext),
+            )
+            self._write_daily_turn_terminal_row(
+                connection,
+                terminal,
+                result,
+            )
+            self._delete_daily_prepare_receipts(
+                connection,
+                draft.source_causal_id,
+            )
+            retired_evidence_ids = {
+                evidence_id
+                for compaction in draft.evidence_stage.evidence_compactions
+                for evidence_id in compaction.retire_evidence_ids
+            }
+            if retired_evidence_ids:
+                self._scrub_compacted_terminal_results(
+                    connection,
+                    retired_evidence_ids,
+                    exclude_source_causal_id=draft.source_causal_id,
+                )
+            self._refresh_integrity_manifest(connection)
+            return result
+
+    def _daily_turn_row(self, source_causal_id: str) -> StoredDailyTurn | None:
+        row = self._execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1 WHERE source_causal_id = ?",
+            (source_causal_id,),
+        ).fetchone()
+        return None if row is None else self._decode_daily_turn(*row)
+
+    def _decode_daily_turn(
+        self,
+        source_causal_id: object,
+        record_id: object,
+        phase: object,
+        nonce: object,
+        ciphertext: object,
+    ) -> StoredDailyTurn:
+        if type(source_causal_id) is not str or not source_causal_id:
+            raise KeyUnavailable("invalid daily turn source identifier")
+        if type(record_id) is not str or not record_id:
+            raise KeyUnavailable("invalid daily turn record identifier")
+        if type(phase) is not str or phase not in {
+            "prepared",
+            "unknown",
+            "committed",
+            "evidence-finalized",
+            "finalized",
+        }:
+            raise KeyUnavailable("invalid daily turn phase")
+        stored = self._open(
+            f"daily-turn:{source_causal_id}:{record_id}:{phase}",
+            nonce,  # type: ignore[arg-type]
+            ciphertext,  # type: ignore[arg-type]
+        )
+        try:
+            if phase == "finalized":
+                if not isinstance(stored, Mapping) or set(stored) != {
+                    "terminal",
+                    "result",
+                }:
+                    raise AuthorityValidationError("invalid finalized daily turn")
+                terminal = DailyTurnTerminalReceipt.from_storage(stored["terminal"])
+                result = (
+                    None
+                    if stored["result"] is None
+                    else DailyTurnResult.from_storage(stored["result"])
+                )
+                if (
+                    terminal.source_causal_id != source_causal_id
+                    or terminal.record_id != record_id
+                    or (
+                        result is not None
+                        and (
+                            result.source_causal_id != source_causal_id
+                            or result.record_id != record_id
+                            or result.transition_id != terminal.transition_id
+                            or stable_digest(result.to_storage())
+                            != terminal.result_digest
+                        )
+                    )
+                ):
+                    raise AuthorityValidationError("daily terminal identifier mismatch")
+                return StoredDailyTurn(
+                    phase=phase,
+                    draft=None,
+                    result=result,
+                    terminal=terminal,
+                )
+            if phase == "evidence-finalized":
+                if not isinstance(stored, Mapping) or set(stored) != {
+                    "draft",
+                    "evidence_state_digest",
+                }:
+                    raise AuthorityValidationError(
+                        "invalid finalized evidence stage"
+                    )
+                draft = DailyTurnDraft.from_storage(stored["draft"])
+                evidence_state_digest = stored["evidence_state_digest"]
+                if type(evidence_state_digest) is not str:
+                    raise AuthorityValidationError(
+                        "invalid evidence stage state digest"
+                    )
+                self._validate_daily_turn_value(phase, draft, None)
+                if (
+                    draft.source_causal_id != source_causal_id
+                    or draft.record_id != record_id
+                ):
+                    raise AuthorityValidationError(
+                        "evidence stage identifier mismatch"
+                    )
+                return StoredDailyTurn(
+                    phase=phase,
+                    draft=draft,
+                    result=None,
+                    terminal=None,
+                    evidence_state_digest=evidence_state_digest,
+                )
+            if not isinstance(stored, Mapping) or set(stored) != {"draft", "result"}:
+                raise AuthorityValidationError("invalid unresolved daily turn")
+            draft = DailyTurnDraft.from_storage(stored["draft"])
+            result = None
+            if stored["result"] is not None:
+                raise AuthorityValidationError("unresolved daily result forbidden")
+            self._validate_daily_turn_value(phase, draft, result)
+        except AuthorityValidationError as exc:
+            raise KeyUnavailable("invalid daily turn") from exc
+        if draft.source_causal_id != source_causal_id or draft.record_id != record_id:
+            raise KeyUnavailable("daily turn identifier mismatch")
+        return StoredDailyTurn(
+            phase=phase,
+            draft=draft,
+            result=result,
+            terminal=None,
+            evidence_state_digest=None,
+        )
+
+    @staticmethod
+    def _validate_daily_turn_value(
+        phase: object,
+        draft: object,
+        result: object,
+    ) -> None:
+        if type(phase) is not str or phase not in {
+            "prepared",
+            "unknown",
+            "committed",
+            "evidence-finalized",
+            "finalized",
+        }:
+            raise AuthorityValidationError("invalid daily turn phase")
+        if type(draft) is not DailyTurnDraft:
+            raise AuthorityValidationError("invalid daily turn draft")
+        if phase == "evidence-finalized":
+            if draft.turn_kind != "evidence-stage" or result is not None:
+                raise AuthorityValidationError("invalid finalized evidence stage")
+        elif phase == "finalized":
+            if type(result) is not DailyTurnResult:
+                raise AuthorityValidationError("finalized daily turn result required")
+            expected = EncryptedStateStore._daily_result_for_draft(draft)
+            if result != expected:
+                raise AuthorityValidationError("daily turn result mismatch")
+        elif result is not None:
+            raise AuthorityValidationError("intermediate daily turn has a result")
+
+    @staticmethod
+    def _daily_result_for_draft(draft: DailyTurnDraft) -> DailyTurnResult:
+        evidence_stage = draft.evidence_stage
+        if draft.turn_kind != "complete-turn" or type(evidence_stage) is not DailyTurnDraft:
+            raise AuthorityValidationError("complete daily turn required")
+        return DailyTurnResult(
+            draft.source_causal_id,
+            draft.record_id,
+            draft.transition_id,
+            tuple(card.evidence_id for card in evidence_stage.evidence_cards),
+            draft.steward_resolution.commit_portrait_topic_refs,
+            draft.skill_disclosures,
+            draft.owner_reply,
+            draft.steward_resolution.commit_evidence_change_ids,
+        )
+
+    def _validate_daily_turn_record_binding(
+        self,
+        draft: DailyTurnDraft,
+        phase: str,
+    ) -> None:
+        record = self.record(draft.record_id)
+        expected_record_phase = {
+            "prepared": "prepared",
+            "unknown": "unknown",
+            "committed": "committed",
+            "evidence-finalized": "final",
+            "finalized": "final",
+        }[phase]
+        if (
+            record is None
+            or record.state != expected_record_phase
+            or record.revision_digest != draft.revision_digest
+            or record.transition_id != draft.transition_id
+        ):
+            raise KeyUnavailable("daily turn transition mismatch")
+        payload = record.payload
+        if type(payload) is PreparedTransition:
+            target = payload.target
+        elif type(payload) is CommittedTransition:
+            target = payload.prepared.target
+        else:
+            raise KeyUnavailable("daily turn transition mismatch")
+        if (
+            target.record_id != draft.record_id
+            or target.revision_digest != draft.revision_digest
+            or target.transition_id != draft.transition_id
+            or target.payload_digest != draft.payload_digest
+        ):
+            raise KeyUnavailable("daily turn transition mismatch")
+
+    def _validate_daily_terminal_record_binding(
+        self,
+        terminal: DailyTurnTerminalReceipt,
+    ) -> None:
+        for record_id, revision_digest, transition_id, payload_digest in (
+            (
+                terminal.evidence_stage_record_id,
+                terminal.evidence_stage_revision_digest,
+                terminal.evidence_stage_transition_id,
+                terminal.evidence_stage_payload_digest,
+            ),
+            (
+                terminal.record_id,
+                terminal.revision_digest,
+                terminal.transition_id,
+                terminal.payload_digest,
+            ),
+        ):
+            record = self.record(record_id)
+            if (
+                record is None
+                or record.state != "final"
+                or record.revision_digest != revision_digest
+                or record.transition_id != transition_id
+                or type(record.payload) is not CommittedTransition
+            ):
+                raise KeyUnavailable("daily terminal transition mismatch")
+            target = record.payload.prepared.target
+            if (
+                target.record_id != record_id
+                or target.revision_digest != revision_digest
+                or target.transition_id != transition_id
+                or target.payload_digest != payload_digest
+            ):
+                raise KeyUnavailable("daily terminal transition mismatch")
+
+    def _write_daily_turn_row(
+        self,
+        connection: sqlite3.Connection,
+        phase: str,
+        draft: DailyTurnDraft,
+        result: DailyTurnResult | None,
+        *,
+        evidence_state_digest: str | None = None,
+    ) -> None:
+        if phase == "finalized":
+            raise AuthorityValidationError("finalized daily draft cannot be retained")
+        if phase == "evidence-finalized":
+            if evidence_state_digest is None:
+                raise AuthorityValidationError("evidence stage state digest required")
+            sealed_value = {
+                "draft": draft.to_storage(),
+                "evidence_state_digest": evidence_state_digest,
+            }
+        else:
+            if evidence_state_digest is not None:
+                raise AuthorityValidationError("unexpected evidence stage state digest")
+            sealed_value = {
+                "draft": draft.to_storage(),
+                "result": None if result is None else result.to_storage(),
+            }
+        nonce, ciphertext = self._seal(
+            f"daily-turn:{draft.source_causal_id}:{draft.record_id}:{phase}",
+            sealed_value,
+        )
+        connection.execute(
+            """
+            INSERT INTO daily_turns_v1(
+                source_causal_id, record_id, phase, nonce, ciphertext
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source_causal_id) DO UPDATE SET
+                record_id=excluded.record_id,
+                phase=excluded.phase,
+                nonce=excluded.nonce,
+                ciphertext=excluded.ciphertext
+            """,
+            (
+                draft.source_causal_id,
+                draft.record_id,
+                phase,
+                nonce,
+                ciphertext,
+            ),
+        )
+
+    def _write_daily_turn_terminal_row(
+        self,
+        connection: sqlite3.Connection,
+        terminal: DailyTurnTerminalReceipt,
+        result: DailyTurnResult | None,
+    ) -> None:
+        if (
+            result is not None
+            and (
+                result.source_causal_id != terminal.source_causal_id
+                or result.record_id != terminal.record_id
+                or result.transition_id != terminal.transition_id
+                or stable_digest(result.to_storage()) != terminal.result_digest
+            )
+        ):
+            raise AuthorityValidationError("daily terminal result mismatch")
+        nonce, ciphertext = self._seal(
+            (
+                f"daily-turn:{terminal.source_causal_id}:"
+                f"{terminal.record_id}:finalized"
+            ),
+            {
+                "terminal": terminal.to_storage(),
+                "result": None if result is None else result.to_storage(),
+            },
+        )
+        connection.execute(
+            """
+            INSERT INTO daily_turns_v1(
+                source_causal_id, record_id, phase, nonce, ciphertext
+            ) VALUES (?, ?, 'finalized', ?, ?)
+            ON CONFLICT(source_causal_id) DO UPDATE SET
+                record_id=excluded.record_id,
+                phase=excluded.phase,
+                nonce=excluded.nonce,
+                ciphertext=excluded.ciphertext
+            """,
+            (
+                terminal.source_causal_id,
+                terminal.record_id,
+                nonce,
+                ciphertext,
+            ),
+        )
+
+    def _delete_daily_prepare_receipts(
+        self,
+        connection: sqlite3.Connection,
+        source_causal_id: str,
+    ) -> None:
+        """Erase recovery-only full-draft receipts after atomic finalization."""
+
+        rows = connection.execute(
+            "SELECT causal_id, nonce, ciphertext FROM command_receipts_v2"
+        ).fetchall()
+        matched: list[str] = []
+        for causal_id, nonce, ciphertext in rows:
+            command, _ = self._decode_receipt(causal_id, nonce, ciphertext)
+            if (
+                command.action == "turn.prepare"
+                and isinstance(command.payload, DailyTurnPreparePayload)
+                and command.payload.draft.source_causal_id == source_causal_id
+            ):
+                matched.append(causal_id)
+        for causal_id in matched:
+            connection.execute(
+                "DELETE FROM command_receipts_v2 WHERE causal_id = ?",
+                (causal_id,),
+            )
+
+    def _scrub_compacted_terminal_results(
+        self,
+        connection: sqlite3.Connection,
+        retired_evidence_ids: set[str],
+        *,
+        exclude_source_causal_id: str,
+    ) -> None:
+        """Drop obsolete replay text once its committed evidence is summarized.
+
+        The immutable terminal receipt continues to bind the original result
+        digest and state-chain position.  Only the optional replay projection
+        is erased, so retired detail and predecessor-summary literals cannot
+        survive in finalized daily rows.
+        """
+
+        rows = connection.execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1 WHERE phase = 'finalized'"
+        ).fetchall()
+        for row in rows:
+            turn = self._decode_daily_turn(*row)
+            if (
+                turn.source_causal_id == exclude_source_causal_id
+                or turn.result is None
+                or not set(turn.result.evidence_ids) & retired_evidence_ids
+            ):
+                continue
+            self._write_daily_turn_terminal_row(
+                connection,
+                turn._terminal(),
+                None,
+            )
 
     def write_record(
         self,
@@ -1924,6 +2986,100 @@ class EncryptedStateStore:
             ):
                 raise KeyUnavailable("initialization transition mismatch")
 
+        daily_rows = self._execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1 ORDER BY source_causal_id"
+        ).fetchall()
+        daily_turns: dict[str, StoredDailyTurn] = {}
+        for row in daily_rows:
+            turn = self._decode_daily_turn(*row)
+            if turn.draft is not None:
+                self._validate_daily_turn_record_binding(turn.draft, turn.phase)
+            else:
+                self._validate_daily_terminal_record_binding(turn._terminal())
+            if turn.source_causal_id in daily_turns:
+                raise KeyUnavailable("duplicate daily turn source")
+            daily_turns[turn.source_causal_id] = turn
+
+        daily_state_rows = self._execute(
+            "SELECT nonce, ciphertext FROM daily_health_state_v1 ORDER BY slot"
+        ).fetchall()
+        if len(daily_state_rows) > 1:
+            raise KeyUnavailable("multiple daily health aggregates")
+        daily_state = self.daily_state()
+        processed_sources = set(daily_state.processed_source_causal_ids)
+        if len(processed_sources) != len(daily_state.processed_source_causal_ids):
+            raise KeyUnavailable("duplicate processed daily source")
+        previous_terminal_digest = None
+        expected_base_state_digest = DailyHealthState.empty().digest
+        last_terminal: DailyTurnTerminalReceipt | None = None
+        for ordinal, source_causal_id in enumerate(
+            daily_state.processed_source_causal_ids,
+            start=1,
+        ):
+            stored_turn = daily_turns.get(source_causal_id)
+            if (
+                stored_turn is None
+                or stored_turn.phase != "finalized"
+                or stored_turn.draft is not None
+                or stored_turn.terminal is None
+            ):
+                raise KeyUnavailable("daily health aggregate turn mismatch")
+            terminal = stored_turn.terminal
+            if (
+                terminal.ordinal != ordinal
+                or terminal.previous_terminal_digest != previous_terminal_digest
+                or terminal.base_state_digest != expected_base_state_digest
+            ):
+                raise KeyUnavailable("daily terminal chain mismatch")
+            previous_terminal_digest = terminal.digest
+            expected_base_state_digest = terminal.state_digest
+            last_terminal = terminal
+        if (
+            last_terminal is not None
+            and last_terminal.state_digest != daily_state.digest
+        ):
+            raise KeyUnavailable("daily health aggregate mismatch")
+        if last_terminal is None and daily_state != DailyHealthState.empty():
+            raise KeyUnavailable("daily health aggregate has no terminal chain")
+        for source_causal_id, turn in daily_turns.items():
+            if (turn.phase == "finalized") != (source_causal_id in processed_sources):
+                raise KeyUnavailable("daily turn phase and aggregate mismatch")
+            if turn.phase == "finalized":
+                continue
+            draft = turn.draft
+            if draft is None:
+                raise KeyUnavailable("unresolved daily turn draft missing")
+            if draft.turn_kind == "evidence-stage":
+                if draft.base_state_digest != daily_state.digest:
+                    raise KeyUnavailable("daily turn base state mismatch")
+                if turn.phase == "evidence-finalized":
+                    if (
+                        turn.evidence_state_digest
+                        != daily_state.apply_evidence_stage(draft).digest
+                    ):
+                        raise KeyUnavailable("evidence stage state mismatch")
+                elif turn.evidence_state_digest is not None:
+                    raise KeyUnavailable("unexpected evidence stage state digest")
+            else:
+                evidence_stage = draft.evidence_stage
+                if (
+                    type(evidence_stage) is not DailyTurnDraft
+                    or turn.phase == "evidence-finalized"
+                    or evidence_stage.base_state_digest != daily_state.digest
+                    or draft.base_state_digest
+                    != daily_state.apply_evidence_stage(evidence_stage).digest
+                ):
+                    raise KeyUnavailable("daily completion base state mismatch")
+                self._validate_daily_turn_record_binding(
+                    evidence_stage,
+                    "evidence-finalized",
+                )
+        if sum(turn.phase != "finalized" for turn in daily_turns.values()) > 1:
+            raise KeyUnavailable("multiple unresolved daily turns")
+        if processed_sources and not daily_state_rows:
+            raise KeyUnavailable("daily health aggregate missing")
+
         # A terminal latch must itself be authenticated; its row is also part
         # of the signed inventory above, so raw deletion cannot silently reopen
         # the state domain.
@@ -1965,6 +3121,13 @@ class EncryptedStateStore:
         initialization_rows = self._execute(
             "SELECT record_id, phase, nonce, ciphertext FROM owner_initialization_v1"
         ).fetchall()
+        daily_turn_rows = self._execute(
+            "SELECT source_causal_id, record_id, phase, nonce, ciphertext "
+            "FROM daily_turns_v1"
+        ).fetchall()
+        daily_state_rows = self._execute(
+            "SELECT slot, nonce, ciphertext FROM daily_health_state_v1"
+        ).fetchall()
         return repr(
             (
                 record_rows,
@@ -1977,6 +3140,8 @@ class EncryptedStateStore:
                 observation_guard_rows,
                 source_rows,
                 initialization_rows,
+                daily_turn_rows,
+                daily_state_rows,
             )
         ).encode("utf-8")
 

@@ -18,6 +18,8 @@ from .authority import (
 )
 from .contract import (
     CommandEnvelope,
+    DailyTurnMeta,
+    DailyTurnPreparePayload,
     InboundAdmitPayload,
     InitializationDisclosurePayload,
     InitializationPreparePayload,
@@ -28,7 +30,13 @@ from .contract import (
     decode_frame,
     encode_raw_response,
 )
-from .core import HealthCore
+from .coordination import (
+    CoarseMessageRouter,
+    DAILY_HEALTH_SKILL_NAMES,
+    DailyHealthState,
+    DailySkillRuntime,
+)
+from .core import DailyTurnStatus, HealthCore
 from .initialization import (
     HealthInitAsset,
     HealthInitRuntime,
@@ -48,10 +56,14 @@ class HealthPlugin:
         *,
         admission_policy: AdmissionPolicy | None = None,
         health_init_runtime: HealthInitRuntime | None = None,
+        coarse_router: CoarseMessageRouter | None = None,
+        daily_skill_runtime: DailySkillRuntime | None = None,
     ) -> None:
         self._core = core
         self._admission_policy = admission_policy
         self._health_init_runtime = health_init_runtime
+        self._coarse_router = coarse_router
+        self._daily_skill_runtime = daily_skill_runtime
 
     def invoke(self, command: CommandEnvelope, *, peer_id: str) -> Response:
         if type(peer_id) is not str or peer_id != "plugin":
@@ -81,7 +93,16 @@ class HealthPlugin:
         policy = self._admission_policy
         if type(policy) is not AdmissionPolicy:
             return Response("unavailable", reason_code="admission-policy-unavailable")
-        reason = policy.rejection_reason(message)
+        initialization = self._core.initialization_status()
+        allowed_capabilities = (
+            ("health-init",)
+            if initialization.phase == "uninitialized"
+            else ("health-init", *DAILY_HEALTH_SKILL_NAMES)
+        )
+        reason = policy.rejection_reason(
+            message,
+            allowed_capabilities=allowed_capabilities,
+        )
         causal_id = None
         if type(message) is RawWeixinMessage:
             try:
@@ -96,24 +117,59 @@ class HealthPlugin:
                 causal_id,
                 "admission-policy-mismatch",
             )
-        initialization = self._core.initialization_status()
         if initialization.phase == "cannot-confirm":
             return Response(
                 "unavailable",
                 causal_id,
                 "initialization-state-unavailable",
             )
-        if initialization.phase != "uninitialized":
+        if initialization.phase != "uninitialized" and (
+            type(message) is not RawWeixinMessage
+            or message.requested_capability == "health-init"
+        ):
             return Response(
                 "rejected",
                 causal_id,
                 "initialization already exists",
             )
-        report = self._core.probe()
-        if report.state is not ProbeState.HEALTHY:
-            return Response("unavailable", causal_id, report.reason_code)
+        if initialization.phase not in {"uninitialized", "enabled"}:
+            return Response(
+                "unavailable",
+                causal_id,
+                "initialization-state-unavailable",
+            )
+        if initialization.phase == "uninitialized":
+            report = self._core.probe()
+            if report.state is not ProbeState.HEALTHY:
+                return Response("unavailable", causal_id, report.reason_code)
         try:
             envelope = materialize_source(message)
+            if initialization.phase == "enabled":
+                router = self._coarse_router
+                if type(router) is not CoarseMessageRouter:
+                    return Response(
+                        "unavailable",
+                        envelope.causal_id,
+                        "daily-routing-unavailable",
+                    )
+                classification = router.classify(
+                    envelope.body,
+                    envelope.requested_capability,
+                )
+                if (
+                    classification == "ordinary"
+                    and envelope.requested_capability == "health-steward"
+                ):
+                    return Response(
+                        "accepted",
+                        envelope.causal_id,
+                        "ordinary-hermes-route",
+                    )
+                return self._run_daily_turn(
+                    envelope,
+                    generation=message.generation,
+                    peer_id=peer_id,
+                )
             command = CommandEnvelope(
                 peer="plugin",
                 action="inbound.admit",
@@ -126,6 +182,227 @@ class HealthPlugin:
         except (AuthorityValidationError, ProtocolViolation, TypeError, ValueError):
             return Response("rejected", causal_id, "invalid-weixin-source")
         return self.invoke(command, peer_id=peer_id)
+
+    def _run_daily_turn(
+        self,
+        envelope: SourceEnvelope,
+        *,
+        generation: int,
+        peer_id: str,
+    ) -> Response:
+        """Admit, prepare, commit, and finalize one resumable local health turn."""
+
+        policy = self._admission_policy
+        if type(policy) is not AdmissionPolicy:
+            return Response("unavailable", envelope.causal_id, "admission-policy-unavailable")
+        admitted = self.invoke(
+            CommandEnvelope(
+                peer="plugin",
+                action="inbound.admit",
+                source="health_weixin",
+                causal_id=envelope.causal_id,
+                generation=generation,
+                scope=("inbound:admit",),
+                payload=InboundAdmitPayload(envelope, policy),
+            ),
+            peer_id=peer_id,
+        )
+        if admitted.status not in {"accepted", "replayed"}:
+            return admitted
+
+        runtime = self._daily_skill_runtime
+        status = self._core.daily_turn_status(envelope.causal_id)
+        if status is None:
+            if type(runtime) is not DailySkillRuntime:
+                return Response(
+                    "unavailable",
+                    envelope.causal_id,
+                    "daily-turn-runtime-unavailable",
+                )
+            try:
+                with self._core.daily_turn_runtime_preparation(
+                    envelope.causal_id
+                ) as preparation:
+                    if preparation.reason_code == "daily-turn-busy":
+                        return Response(
+                            "unavailable",
+                            envelope.causal_id,
+                            preparation.reason_code,
+                        )
+                    if not preparation.ready:
+                        status = self._core.daily_turn_status(envelope.causal_id)
+                    else:
+                        draft = runtime.execute_evidence_stage(
+                            envelope,
+                            self._core.daily_state(),
+                        )
+                        prepared = self.invoke(
+                            CommandEnvelope(
+                                peer="plugin",
+                                action="turn.prepare",
+                                source="daily_skill_runtime",
+                                causal_id=self._daily_turn_causal_id(
+                                    "evidence-prepare",
+                                    envelope.causal_id,
+                                ),
+                                generation=preparation.generation,
+                                scope=("turn:prepare",),
+                                payload=DailyTurnPreparePayload(draft),
+                            ),
+                            peer_id=peer_id,
+                        )
+                        if prepared.status not in {"accepted", "replayed"}:
+                            return prepared
+                        status = self._core.daily_turn_status(envelope.causal_id)
+            except (AuthorityValidationError, ProtocolViolation, TypeError, ValueError):
+                return Response(
+                    "unavailable",
+                    envelope.causal_id,
+                    "daily-turn-candidate-invalid",
+                )
+
+        while status is not None and status.phase != "finalized":
+            if status.phase == "evidence-finalized":
+                if type(runtime) is not DailySkillRuntime or status.draft is None:
+                    return Response(
+                        "unavailable",
+                        envelope.causal_id,
+                        "daily-turn-runtime-unavailable",
+                    )
+                try:
+                    with self._core.daily_turn_runtime_preparation(
+                        envelope.causal_id,
+                        committed_evidence_stage=status.draft,
+                    ) as preparation:
+                        if preparation.reason_code == "daily-turn-busy":
+                            return Response(
+                                "unavailable",
+                                envelope.causal_id,
+                                preparation.reason_code,
+                            )
+                        if not preparation.ready:
+                            status = self._core.daily_turn_status(
+                                envelope.causal_id
+                            )
+                            continue
+                        complete_draft = runtime.complete(
+                            envelope,
+                            self._core.daily_turn_post_stage_state(
+                                envelope.causal_id
+                            ),
+                            status.draft,
+                        )
+                        prepared = self.invoke(
+                            CommandEnvelope(
+                                peer="plugin",
+                                action="turn.prepare",
+                                source="daily_skill_runtime",
+                                causal_id=self._daily_turn_causal_id(
+                                    "complete-prepare",
+                                    envelope.causal_id,
+                                ),
+                                generation=preparation.generation,
+                                scope=("turn:prepare",),
+                                payload=DailyTurnPreparePayload(complete_draft),
+                            ),
+                            peer_id=peer_id,
+                        )
+                        if prepared.status not in {"accepted", "replayed"}:
+                            return prepared
+                        status = self._core.daily_turn_status(
+                            envelope.causal_id
+                        )
+                except (
+                    AuthorityValidationError,
+                    ProtocolViolation,
+                    TypeError,
+                    ValueError,
+                ):
+                    return Response(
+                        "unavailable",
+                        envelope.causal_id,
+                        "daily-turn-candidate-invalid",
+                    )
+                continue
+            if status.phase in {"prepared", "unknown"}:
+                transitioned = self.invoke(
+                    self._daily_transition_command(status, "state.commit"),
+                    peer_id=peer_id,
+                )
+            elif status.phase == "committed":
+                transitioned = self.invoke(
+                    self._daily_transition_command(status, "state.finalize"),
+                    peer_id=peer_id,
+                )
+            else:
+                return Response(
+                    "unavailable",
+                    envelope.causal_id,
+                    "daily-turn-state-unavailable",
+                )
+            if transitioned.status not in {"accepted", "replayed"}:
+                return transitioned
+            status = self._core.daily_turn_status(envelope.causal_id)
+        if status is None or status.phase != "finalized":
+            return Response("unavailable", envelope.causal_id, "daily-turn-state-unavailable")
+        if status.result is None:
+            # A later bounded historical summary may intentionally remove the
+            # old reply/evidence projection.  Exact causal replay still proves
+            # that the turn finalized, but must not reconstruct deleted health
+            # detail from hashes or model output.
+            return Response(
+                "accepted",
+                envelope.causal_id,
+                "daily-turn-result-redacted",
+            )
+        return Response(
+            "accepted",
+            envelope.causal_id,
+            "daily-turn-finalized",
+            DailyTurnMeta(status.result),
+        )
+
+    @staticmethod
+    def _daily_turn_causal_id(stage: str, source_causal_id: str) -> str:
+        digest = stable_digest({"stage": stage, "source_causal_id": source_causal_id})
+        return f"daily-turn-{stage}:" + digest.removeprefix("sha256:")
+
+    @staticmethod
+    def _daily_transition_command(status: DailyTurnStatus, action: str) -> CommandEnvelope:
+        if action not in {"state.commit", "state.finalize"}:
+            raise ProtocolViolation("invalid daily transition action")
+        if status.draft is None or status.phase == "evidence-finalized":
+            raise ProtocolViolation("daily transition draft unavailable")
+        suffix = "commit" if action == "state.commit" else "finalize"
+        turn_stage = (
+            "evidence" if status.draft.turn_kind == "evidence-stage" else "complete"
+        )
+        authority = status.prepared_authority
+        generation = authority.generation if action == "state.commit" else authority.generation + 1
+        return CommandEnvelope(
+            peer="plugin",
+            action=action,
+            source="daily_skill_runtime",
+            causal_id=HealthPlugin._daily_turn_causal_id(
+                f"{turn_stage}-{suffix}",
+                status.draft.source_causal_id,
+            ),
+            generation=generation,
+            scope=(f"state:{suffix}",),
+            payload=StateCommitPayload(
+                status.draft.record_id,
+                status.draft.revision_digest,
+                status.draft.transition_id,
+                authority.writer_fence,
+            ),
+        )
+
+    def daily_state(self, *, peer_id: str) -> DailyHealthState:
+        if type(peer_id) is not str or peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            raise AuthorityValidationError("daily-state-unavailable")
+        return self._core.daily_state()
 
     def source_envelope(self, causal_id: str, *, peer_id: str) -> SourceEnvelope | None:
         if type(peer_id) is not str or peer_id != "plugin":
@@ -372,12 +649,7 @@ class HealthPlugin:
             return Response("unavailable", reason_code="admission-policy-mismatch")
         if type(directive) is not NativeCursorDirective:
             return Response("rejected", reason_code="invalid-native-cursor-directive")
-        initialization = self.initialization_status(peer_id=peer_id)
-        authority = initialization.prepared_authority
-        if (
-            authority is None
-            or initialization.transition_id != directive.initialization_transition_id
-        ):
+        if not self._core.native_cursor_directive_matches(directive):
             return Response("rejected", reason_code="native-cursor-directive-stale")
         try:
             payload = NativeCursorResultPayload(
@@ -393,7 +665,7 @@ class HealthPlugin:
                     directive.source_causal_id,
                     status,
                 ),
-                generation=authority.generation + 1,
+                generation=directive.authority_generation,
                 scope=("cursor:result",),
                 payload=payload,
             )

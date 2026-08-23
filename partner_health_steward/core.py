@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import secrets
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Callable, Protocol, TypeVar
+from typing import Callable, Iterator, Protocol, TypeVar
 
 from .admission import (
     MAX_MESSAGE_BODY_BYTES,
@@ -32,11 +33,13 @@ from .authority import (
     WriterHolderClaim,
     WriterFenceProof,
     holder_id_for,
+    validate_opaque_text,
     validate_ticket110_effect_kind,
 )
 from .contract import (
     CommandEnvelope,
     CommitMeta,
+    DailyTurnPreparePayload,
     EffectIntentMeta,
     EffectRequestPayload,
     EffectResultPayload,
@@ -50,6 +53,14 @@ from .contract import (
     StateCandidatePayload,
     StateCommitPayload,
     canonicalize_command,
+)
+from .coordination import (
+    DAILY_HEALTH_SKILL_NAMES,
+    DailyHealthState,
+    DailySkillAttestor,
+    DailySkillBundle,
+    DailyTurnDraft,
+    DailyTurnResult,
 )
 from .initialization import (
     HealthInitAttestor,
@@ -88,6 +99,7 @@ from .probe import ProbeReport, ProbeState
 from .storage import (
     CausalIdConflict,
     CurrentHeadRecoveryBinding,
+    DailyTurnTerminalReceipt,
     EncryptedStateStore,
     KeyUnavailable,
     StoreUnavailable,
@@ -113,6 +125,75 @@ class MalformedCurrentHeadResponse(CurrentHeadError):
 class _Handled:
     response: Response
     persist_receipt: bool
+
+
+@dataclass(frozen=True)
+class DailyTurnStatus:
+    """Core-owned recovery projection for one admitted daily source."""
+
+    phase: str
+    draft: DailyTurnDraft | None
+    result: DailyTurnResult | None
+    prepared_authority: AuthoritySnapshot
+    terminal: DailyTurnTerminalReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase not in {
+            "prepared",
+            "unknown",
+            "committed",
+            "evidence-finalized",
+            "finalized",
+        }:
+            raise AuthorityValidationError("invalid daily turn phase")
+        if self.phase == "finalized":
+            if self.draft is not None or type(self.terminal) is not DailyTurnTerminalReceipt:
+                raise AuthorityValidationError("invalid finalized daily turn status")
+        elif type(self.draft) is not DailyTurnDraft or self.terminal is not None:
+            raise AuthorityValidationError("invalid unresolved daily turn status")
+        if self.result is not None and type(self.result) is not DailyTurnResult:
+            raise AuthorityValidationError("invalid daily turn result")
+        if type(self.prepared_authority) is not AuthoritySnapshot:
+            raise AuthorityValidationError("invalid daily turn authority")
+
+    @property
+    def record_id(self) -> str:
+        if self.draft is not None:
+            return self.draft.record_id
+        if self.terminal is None:
+            raise AuthorityValidationError("daily terminal receipt required")
+        return self.terminal.record_id
+
+    @property
+    def transition_id(self) -> str:
+        if self.draft is not None:
+            return self.draft.transition_id
+        if self.terminal is None:
+            raise AuthorityValidationError("daily terminal receipt required")
+        return self.terminal.transition_id
+
+
+@dataclass(frozen=True)
+class DailyTurnRuntimePreparation:
+    """Core-owned permission to form one draft under the lifecycle lock."""
+
+    generation: int | None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        ready = type(self.generation) is int and self.generation >= 0
+        if ready != (self.reason_code is None):
+            raise AuthorityValidationError("invalid daily runtime preparation")
+        if self.reason_code not in {
+            None,
+            "daily-turn-busy",
+            "daily-turn-recovery-required",
+        }:
+            raise AuthorityValidationError("invalid daily runtime preparation")
+
+    @property
+    def ready(self) -> bool:
+        return self.generation is not None
 
 
 @dataclass(frozen=True)
@@ -441,6 +522,8 @@ class HealthCore:
         admission_policy: AdmissionPolicy | None = None,
         health_init_verifier: HealthInitAttestor | None = None,
         health_init_asset: HealthInitAsset | None = None,
+        daily_skill_verifier: DailySkillAttestor | None = None,
+        daily_skill_bundle: DailySkillBundle | None = None,
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -456,6 +539,8 @@ class HealthCore:
         self._admission_policy = admission_policy
         self._health_init_verifier = health_init_verifier
         self._health_init_asset = health_init_asset
+        self._daily_skill_verifier = daily_skill_verifier
+        self._daily_skill_bundle = daily_skill_bundle
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
@@ -1009,6 +1094,14 @@ class HealthCore:
                     self._closed_reason = "current-head-terminal"
                     return Response("unavailable", command.causal_id, self._closed_reason)
 
+                if command.action == "turn.prepare":
+                    with self._store.transaction():
+                        lease_handled = self._daily_turn_lease_response(command)
+                        if lease_handled is not None:
+                            if lease_handled.persist_receipt:
+                                self._store.save_receipt(command, lease_handled.response)
+                            return lease_handled.response
+
                 interrupted = self._store.current_head_observation_guard()
                 if interrupted is not None:
                     return self._recover_interrupted_current_head_observation(command, interrupted.binding)
@@ -1252,6 +1345,7 @@ class HealthCore:
             ):
                 raise StoreUnavailable("state commit recovery state changed")
             if current_state == "unknown":
+                daily = self._store.daily_turn_for_record(prepared.target.record_id)
                 self._store.write_record(
                     prepared.target.record_id,
                     "prepared",
@@ -1265,6 +1359,8 @@ class HealthCore:
                     and initialization.draft.record_id == prepared.target.record_id
                 ):
                     self._store.write_initialization("prepared", initialization.draft)
+                if daily is not None:
+                    self._store.write_daily_turn("prepared", daily.draft)
             self._store.clear_pending_command(command.causal_id)
 
     def _mark_state_commit_ambiguous(
@@ -1295,6 +1391,7 @@ class HealthCore:
             ):
                 raise StoreUnavailable("state commit ambiguity state changed")
             if stored.state != "unknown":
+                daily = self._store.daily_turn_for_record(prepared.target.record_id)
                 self._store.write_record(
                     prepared.target.record_id,
                     "unknown",
@@ -1308,6 +1405,8 @@ class HealthCore:
                     and initialization.draft.record_id == prepared.target.record_id
                 ):
                     self._store.write_initialization("unknown", initialization.draft)
+                if daily is not None:
+                    self._store.write_daily_turn("unknown", daily.draft)
 
     def _persist_state_commit_success(
         self,
@@ -1354,6 +1453,7 @@ class HealthCore:
                 or not pending.remote_attempted
             ):
                 raise StoreUnavailable("state commit persistence changed")
+            daily = self._store.daily_turn_for_record(prepared.target.record_id)
             self._store.write_record(
                 prepared.target.record_id,
                 "committed",
@@ -1367,6 +1467,8 @@ class HealthCore:
                 and initialization.draft.record_id == prepared.target.record_id
             ):
                 self._store.write_initialization("committed", initialization.draft)
+            if daily is not None:
+                self._store.write_daily_turn("committed", daily.draft)
             self._store.clear_pending_command(command.causal_id)
             self._store.save_receipt(command, response)
             self._store.clear_current_head_observation(binding)
@@ -2034,11 +2136,7 @@ class HealthCore:
         if not isinstance(payload, StateCommitPayload):
             raise ProtocolViolation("invalid commit payload")
         if self._admission_policy is not None:
-            initialization = self._store.initialization()
-            if (
-                initialization is None
-                or payload.record_id != initialization.draft.record_id
-            ):
+            if self._business_transition_record_kind(payload.record_id) is None:
                 return self._persist_rejection(
                     command,
                     "generic-initialization-action-denied",
@@ -2092,14 +2190,7 @@ class HealthCore:
         if head != prepared.base:
             return None
         if self._admission_policy is not None:
-            initialization = self._store.initialization()
-            if (
-                initialization is None
-                or initialization.draft.record_id != payload.record_id
-                or not self._initialization_configuration_matches(
-                    initialization.draft
-                )
-            ):
+            if self._business_transition_kind(payload.record_id) is None:
                 return Response(
                     "unavailable",
                     command.causal_id,
@@ -2297,12 +2388,10 @@ class HealthCore:
         if command.action in _STATE_ACTIONS:
             if self._admission_policy is not None:
                 payload = command.payload
-                initialization = self._store.initialization()
                 if (
                     command.action in {"state.candidate", "state.prepare"}
                     or not isinstance(payload, StateCommitPayload)
-                    or initialization is None
-                    or payload.record_id != initialization.draft.record_id
+                    or self._business_transition_record_kind(payload.record_id) is None
                 ):
                     return _Handled(
                         Response(
@@ -2319,6 +2408,8 @@ class HealthCore:
             return self._handle_initialization_disclose(command)
         if command.action == "initialization.prepare":
             return self._handle_initialization_prepare(command, head)
+        if command.action == "turn.prepare":
+            return self._handle_daily_turn_prepare(command, head)
         if command.action == "cursor.result":
             return self._handle_native_cursor_result(command)
         if command.action == "effect.request":
@@ -2326,6 +2417,155 @@ class HealthCore:
         if command.action == "effect.result":
             raise StoreUnavailable("effect result must use the remote handler")
         raise ProtocolViolation("unknown action")
+
+    def _daily_turn_lease_response(
+        self,
+        command: CommandEnvelope,
+    ) -> _Handled | None:
+        """Resolve an already-owned daily lease before any remote-head read.
+
+        An unknown or committed transition can legitimately make the generic
+        probe unavailable, but neither state should obscure the core-owned
+        daily lease.  The caller holds both the store's serialized writer lane
+        and its SQLite transaction, so this read is authoritative for the
+        response and cannot race a new prepared row in this core/store.
+        """
+
+        if command.action != "turn.prepare":
+            return None
+        payload = command.payload
+        if not isinstance(payload, DailyTurnPreparePayload):
+            raise ProtocolViolation("invalid daily turn payload")
+        unresolved = self._store.unresolved_daily_turn()
+        if unresolved is None:
+            return None
+        draft = payload.draft
+        if unresolved.draft.source_causal_id != draft.source_causal_id:
+            return _Handled(
+                Response("unavailable", command.causal_id, "daily-turn-busy"),
+                False,
+            )
+        if (
+            unresolved.phase == "evidence-finalized"
+            and draft.turn_kind == "complete-turn"
+        ):
+            if (
+                draft.evidence_stage != unresolved.draft
+                or draft.base_state_digest != unresolved.evidence_state_digest
+            ):
+                raise ProtocolViolation(
+                    "daily completion did not continue exact evidence stage"
+                )
+            return None
+        if unresolved.draft != draft:
+            raise ProtocolViolation("daily source already has another turn")
+        return _Handled(
+            Response("accepted", command.causal_id, "daily-turn-already-prepared"),
+            True,
+        )
+
+    def _handle_daily_turn_prepare(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> _Handled:
+        payload = command.payload
+        if not isinstance(payload, DailyTurnPreparePayload):
+            raise ProtocolViolation("invalid daily turn payload")
+        initialization = self._store.initialization()
+        verifier = self._daily_skill_verifier
+        bundle = self._daily_skill_bundle
+        if (
+            initialization is None
+            or initialization.phase != "enabled"
+            or not self._initialization_configuration_matches(initialization.draft)
+            or type(verifier) is not DailySkillAttestor
+            or type(bundle) is not DailySkillBundle
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "daily-skill-configuration-mismatch",
+                ),
+                False,
+            )
+        draft = payload.draft
+        source = self._store.source_envelope(draft.source_causal_id)
+        receipt = self._store.source_receipt(draft.source_causal_id)
+        state = self._store.daily_state()
+        if (
+            source is None
+            or receipt is None
+            or receipt.managed_cursor_state != "held"
+            or source.requested_capability not in DAILY_HEALTH_SKILL_NAMES
+        ):
+            return _Handled(
+                Response("rejected", command.causal_id, "daily-source-required"),
+                True,
+            )
+        unresolved = self._store.unresolved_daily_turn()
+        if draft.turn_kind == "evidence-stage":
+            verified = draft.verify(source, state, bundle, verifier)
+            continuing_stage = None
+        else:
+            continuing_stage = (
+                unresolved.draft
+                if unresolved is not None
+                and unresolved.phase == "evidence-finalized"
+                and unresolved.draft.source_causal_id == draft.source_causal_id
+                else None
+            )
+            if type(continuing_stage) is not DailyTurnDraft:
+                raise ProtocolViolation("daily completion evidence stage missing")
+            post_stage_state = state.apply_evidence_stage(continuing_stage)
+            verified = draft.verify(
+                source,
+                post_stage_state,
+                bundle,
+                verifier,
+                committed_evidence_stage=continuing_stage,
+            )
+        if not verified:
+            return _Handled(
+                Response("rejected", command.causal_id, "daily-skill-proof-required"),
+                True,
+            )
+        # The lease read and a possible prepared-row write occur inside the
+        # caller's serialized store transaction.  A busy response deliberately
+        # has no receipt, so the caller can retry after the current owner reaches
+        # its finalized phase.  Exact recovery for that owner remains idempotent.
+        existing = self._store.daily_turn(draft.source_causal_id)
+        if existing is not None and draft.turn_kind == "evidence-stage":
+            if existing.draft != draft:
+                raise ProtocolViolation("daily source already has another turn")
+            return _Handled(
+                Response("accepted", command.causal_id, "daily-turn-already-prepared"),
+                True,
+            )
+        if unresolved is not None and draft.turn_kind == "evidence-stage":
+            return _Handled(
+                Response("unavailable", command.causal_id, "daily-turn-busy"),
+                False,
+            )
+        target = RevisionTarget(
+            record_id=draft.record_id,
+            revision_digest=draft.revision_digest,
+            transition_id=draft.transition_id,
+            payload_digest=draft.payload_digest,
+        )
+        self._store.write_record(
+            draft.record_id,
+            "prepared",
+            draft.revision_digest,
+            draft.transition_id,
+            PreparedTransition(target=target, base=head),
+        )
+        self._store.write_daily_turn("prepared", draft)
+        return _Handled(
+            Response("accepted", command.causal_id, "daily-turn-prepared"),
+            True,
+        )
 
     def _handle_inbound_admit(self, command: CommandEnvelope) -> _Handled:
         payload = command.payload
@@ -2344,7 +2584,16 @@ class HealthCore:
                 ),
                 False,
             )
-        if not policy.accepts(payload.envelope):
+        initialization = self._store.initialization()
+        allowed_capabilities = (
+            ("health-init",)
+            if initialization is None
+            else DAILY_HEALTH_SKILL_NAMES
+        )
+        if not policy.accepts(
+            payload.envelope,
+            allowed_capabilities=allowed_capabilities,
+        ):
             return _Handled(
                 Response("rejected", command.causal_id, "unique-private-source-denied"),
                 False,
@@ -2353,9 +2602,22 @@ class HealthCore:
             raise ProtocolViolation("source body is required")
         if payload.envelope.causal_id != command.causal_id:
             raise ProtocolViolation("source causal identifier mismatch")
-        if self._store.initialization() is not None:
+        if initialization is not None:
+            if (
+                initialization.phase != "enabled"
+                or not self._initialization_configuration_matches(initialization.draft)
+            ):
+                return _Handled(
+                    Response(
+                        "unavailable",
+                        command.causal_id,
+                        "initialization-configuration-mismatch",
+                    ),
+                    False,
+                )
+            self._store.save_source_envelope(payload.envelope)
             return _Handled(
-                Response("rejected", command.causal_id, "initialization already exists"),
+                Response("accepted", command.causal_id, "daily-source-admitted"),
                 True,
             )
         unresolved_receipts = self._store.held_source_receipts()
@@ -2745,10 +3007,7 @@ class HealthCore:
         payload = command.payload
         if not isinstance(payload, NativeCursorResultPayload):
             raise ProtocolViolation("invalid native cursor result")
-        initialization = self._store.initialization()
-        if initialization is None or initialization.phase != "enabled":
-            raise ProtocolViolation("initialization-finalize-required")
-        if payload.source_causal_id not in initialization.draft.source_causal_ids:
+        if self._business_transition_id_for_source(payload.source_causal_id) is None:
             raise ProtocolViolation("native cursor source mismatch")
         receipt = self._store.source_receipt(payload.source_causal_id)
         if receipt is None or receipt.envelope.native_cursor != payload.native_cursor:
@@ -3075,13 +3334,8 @@ class HealthCore:
             ):
                 raise ProtocolViolation("record transition changed")
             initialization = self._store.initialization()
-            if self._admission_policy is not None and (
-                initialization is None
-                or initialization.draft.record_id != record_id
-                or not self._initialization_configuration_matches(
-                    initialization.draft
-                )
-            ):
+            transition_kind = self._business_transition_kind(record_id)
+            if self._admission_policy is not None and transition_kind is None:
                 return _Handled(
                     Response(
                         "unavailable",
@@ -3095,6 +3349,11 @@ class HealthCore:
                     Response("unavailable", command.causal_id, "current-writer-holder-missing"),
                     False,
                 )
+            daily = (
+                self._store.daily_turn_for_record(record_id)
+                if transition_kind == "daily"
+                else None
+            )
             self._store.write_finalized_record(
                 record_id,
                 revision_digest,
@@ -3110,6 +3369,16 @@ class HealthCore:
                 self._store.mark_source_business_committed_many(
                     initialization.draft.source_causal_ids
                 )
+            elif transition_kind == "daily":
+                if daily is None:
+                    raise KeyUnavailable("daily turn aggregate missing")
+                if daily.draft.turn_kind == "evidence-stage":
+                    self._store.finalize_daily_evidence_stage(daily.draft)
+                else:
+                    self._store.finalize_daily_turn(daily.draft)
+                    self._store.mark_source_business_committed(
+                        daily.draft.source_causal_id
+                    )
             self._closed_reason = None
             return _Handled(Response("accepted", command.causal_id, "revision-finalized"), True)
 
@@ -3532,6 +3801,223 @@ class HealthCore:
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
 
+    def daily_state(self) -> DailyHealthState:
+        """Return managed daily evidence/portrait state after full integrity proof."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("daily-state-unavailable")
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                initialization = self._store.initialization()
+                if (
+                    authority is None
+                    or not self._store.verify_integrity(authority)
+                    or initialization is None
+                    or initialization.phase != "enabled"
+                    or not self._initialization_configuration_matches(initialization.draft)
+                    or type(self._daily_skill_verifier) is not DailySkillAttestor
+                    or type(self._daily_skill_bundle) is not DailySkillBundle
+                ):
+                    raise AuthorityValidationError("daily-state-unavailable")
+                return self._store.daily_state()
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError("daily-state-unavailable") from exc
+
+    @contextmanager
+    def daily_turn_runtime_preparation(
+        self,
+        source_causal_id: str,
+        *,
+        committed_evidence_stage: DailyTurnDraft | None = None,
+    ) -> Iterator[DailyTurnRuntimePreparation]:
+        """Serialize Skill formation with its strict ``turn.prepare`` command.
+
+        The lifecycle lock remains held across the caller's runtime work and
+        re-entrant command invocation, but no SQLite transaction or store lock
+        crosses the yield.  A different source's durable lease is reported
+        before any model-backed Skill may run.
+        """
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        if committed_evidence_stage is not None and (
+            type(committed_evidence_stage) is not DailyTurnDraft
+            or committed_evidence_stage.turn_kind != "evidence-stage"
+            or committed_evidence_stage.source_causal_id != source_causal_id
+        ):
+            raise AuthorityValidationError("invalid daily evidence continuation")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("daily-authority-unavailable")
+            try:
+                self._store.verify_key()
+                unresolved = self._store.unresolved_daily_turn()
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError(
+                    "daily-authority-unavailable"
+                ) from exc
+            if (
+                unresolved is not None
+                and unresolved.source_causal_id != source_causal_id
+            ):
+                yield DailyTurnRuntimePreparation(None, "daily-turn-busy")
+                return
+            if committed_evidence_stage is None:
+                if unresolved is not None:
+                    yield DailyTurnRuntimePreparation(
+                        None,
+                        "daily-turn-recovery-required",
+                    )
+                    return
+            elif (
+                unresolved is None
+                or unresolved.phase != "evidence-finalized"
+                or unresolved.draft != committed_evidence_stage
+            ):
+                yield DailyTurnRuntimePreparation(
+                    None,
+                    "daily-turn-recovery-required",
+                )
+                return
+            # This re-enters the same lifecycle lock only for the bounded head,
+            # writer and configuration proof.  Its store locks are released
+            # before control is yielded to DailySkillRuntime.
+            generation = self.daily_prepare_generation()
+            yield DailyTurnRuntimePreparation(generation)
+
+    def daily_prepare_generation(self) -> int:
+        """Return the currently verified writer generation for a new daily prepare."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("daily-authority-unavailable")
+            with self._store.serialized():
+                try:
+                    self._store.verify_key()
+                    authority = self._store.finalized_authority()
+                    initialization = self._store.initialization()
+                    if (
+                        authority is None
+                        or not self._store.verify_integrity(authority)
+                        or initialization is None
+                        or initialization.phase != "enabled"
+                        or not self._initialization_configuration_matches(
+                            initialization.draft
+                        )
+                        or self._store.current_head_observation_guard() is not None
+                        or self._terminal_closed()
+                        or self._writer_entry_preflight() is not None
+                    ):
+                        raise AuthorityValidationError(
+                            "daily-authority-unavailable"
+                        )
+                    self._enter_current_head_guard()
+                    try:
+                        head = self._read_head()
+                        if (
+                            self._probe_for_head(head).state is not ProbeState.HEALTHY
+                            or self._current_writer_proof(head) is None
+                        ):
+                            raise AuthorityValidationError(
+                                "daily-authority-unavailable"
+                            )
+                        return head.generation
+                    finally:
+                        self._exit_current_head_guard()
+                except HeadTerminal as exc:
+                    self._latch_terminal()
+                    raise AuthorityValidationError(
+                        "daily-authority-unavailable"
+                    ) from exc
+                except (KeyUnavailable, StoreUnavailable, CurrentHeadError) as exc:
+                    raise AuthorityValidationError(
+                        "daily-authority-unavailable"
+                    ) from exc
+
+    def daily_turn_post_stage_state(
+        self,
+        source_causal_id: str,
+    ) -> DailyHealthState:
+        """Materialize one durable evidence stage without publishing it."""
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("daily-stage-state-unavailable")
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    raise AuthorityValidationError("daily-stage-state-unavailable")
+                daily = self._store.daily_turn(source_causal_id)
+                if (
+                    daily is None
+                    or daily.phase != "evidence-finalized"
+                    or type(daily.draft) is not DailyTurnDraft
+                    or daily.evidence_state_digest is None
+                ):
+                    raise AuthorityValidationError("daily-stage-state-unavailable")
+                state = self._store.daily_state().apply_evidence_stage(daily.draft)
+                if state.digest != daily.evidence_state_digest:
+                    raise KeyUnavailable("evidence stage state mismatch")
+                return state
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError(
+                    "daily-stage-state-unavailable"
+                ) from exc
+
+    def daily_turn_status(self, source_causal_id: str) -> DailyTurnStatus | None:
+        """Project one exact durable turn so Plugin can resume without rerunning Skills."""
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    return None
+                daily = self._store.daily_turn(source_causal_id)
+                if daily is None:
+                    return None
+                record = self._store.record(daily.record_id)
+                if record is None:
+                    raise KeyUnavailable("daily turn transition missing")
+                expected = {
+                    "prepared": "prepared",
+                    "unknown": "unknown",
+                    "committed": "committed",
+                    "evidence-finalized": "final",
+                    "finalized": "final",
+                }[daily.phase]
+                identity = daily.draft if daily.draft is not None else daily.terminal
+                if identity is None:
+                    raise KeyUnavailable("daily turn identity missing")
+                if (
+                    record.state != expected
+                    or record.revision_digest != identity.revision_digest
+                    or record.transition_id != identity.transition_id
+                ):
+                    raise KeyUnavailable("daily turn transition mismatch")
+                payload = record.payload
+                if isinstance(payload, PreparedTransition):
+                    prepared = payload
+                elif isinstance(payload, CommittedTransition):
+                    prepared = payload.prepared
+                else:
+                    raise KeyUnavailable("daily turn authority missing")
+                return DailyTurnStatus(
+                    daily.phase,
+                    daily.draft,
+                    daily.result,
+                    prepared.base,
+                    daily.terminal,
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
     def initialization_status(self) -> InitializationProjection:
         """Return the durable product phase without treating probe liveness as enablement."""
 
@@ -3660,18 +4146,18 @@ class HealthCore:
             raise AuthorityValidationError("initialization already exists")
 
     def native_cursor_directive(self, causal_id: str) -> NativeCursorDirective | None:
-        """Release one exact native cursor only after initialization finalizes."""
+        """Release one exact native cursor only after its business transition finalizes."""
 
         with self._lifecycle_lock:
             if self._closed or not self.health_writes_allowed():
                 return None
             try:
-                initialization = self._store.initialization()
                 receipt = self._store.source_receipt(causal_id)
+                transition_id = self._business_transition_id_for_source(causal_id)
+                authority = self._store.finalized_authority()
                 if (
-                    initialization is None
-                    or initialization.phase != "enabled"
-                    or causal_id not in initialization.draft.source_causal_ids
+                    transition_id is None
+                    or authority is None
                     or receipt is None
                     or receipt.managed_cursor_state != "committed"
                     or receipt.native_cursor_state not in {"ready", "executing"}
@@ -3680,13 +4166,50 @@ class HealthCore:
                 directive = NativeCursorDirective(
                     source_causal_id=causal_id,
                     native_cursor=receipt.envelope.native_cursor,
-                    initialization_transition_id=initialization.draft.transition_id,
+                    business_transition_id=transition_id,
+                    authority_generation=authority.generation,
                 )
                 if receipt.native_cursor_state == "ready":
                     self._store.mark_native_cursor_state(causal_id, "executing")
                 return directive
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
+
+    def native_cursor_directive_matches(self, directive: object) -> bool:
+        """Validate a previously issued directive, including terminal result replay."""
+
+        if type(directive) is not NativeCursorDirective:
+            return False
+        with self._lifecycle_lock:
+            try:
+                receipt = self._store.source_receipt(directive.source_causal_id)
+                authority = self._store.finalized_authority()
+                return (
+                    receipt is not None
+                    and authority is not None
+                    and receipt.envelope.native_cursor == directive.native_cursor
+                    and self._business_transition_id_for_source(
+                        directive.source_causal_id
+                    ) == directive.business_transition_id
+                    and authority.generation == directive.authority_generation
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return False
+
+    def _business_transition_id_for_source(self, causal_id: str) -> str | None:
+        initialization = self._store.initialization()
+        if (
+            initialization is not None
+            and initialization.phase == "enabled"
+            and causal_id in initialization.draft.source_causal_ids
+        ):
+            return initialization.draft.transition_id
+        daily = self._store.daily_turn(causal_id)
+        if daily is not None and daily.phase == "finalized":
+            if daily.terminal is None:
+                raise KeyUnavailable("daily terminal receipt missing")
+            return daily.terminal.transition_id
+        return None
 
     def probe(self) -> ProbeReport:
         with self._lifecycle_lock:
@@ -3848,6 +4371,88 @@ class HealthCore:
             and fact.disclosure_version == asset.disclosure_version
             and verifier.verify(draft.skill_proof, draft.owner)
             and draft.owner_consent_evidence.matches(draft.owner, asset)
+        )
+
+    def _business_transition_kind(self, record_id: str) -> str | None:
+        """Authorize only an exact initialization or attested daily record."""
+
+        record_kind = self._business_transition_record_kind(record_id)
+        initialization = self._store.initialization()
+        if (
+            record_kind == "initialization"
+            and initialization is not None
+            and self._initialization_configuration_matches(initialization.draft)
+        ):
+            return "initialization"
+        daily = (
+            self._store.daily_turn_for_record(record_id)
+            if record_kind == "daily"
+            else None
+        )
+        verifier = self._daily_skill_verifier
+        bundle = self._daily_skill_bundle
+        if (
+            daily is None
+            or type(verifier) is not DailySkillAttestor
+            or type(bundle) is not DailySkillBundle
+        ):
+            return None
+        if daily.phase == "finalized":
+            return "daily" if daily.terminal is not None else None
+        if daily.draft is None:
+            return None
+        source = self._store.source_envelope(daily.draft.source_causal_id)
+        if source is None:
+            return None
+        return (
+            "daily" if self._daily_draft_is_authorized(
+                daily.draft,
+                source,
+                bundle,
+                verifier,
+            ) else None
+        )
+
+    def _daily_draft_is_authorized(
+        self,
+        draft: DailyTurnDraft,
+        source: SourceEnvelope,
+        bundle: DailySkillBundle,
+        verifier: DailySkillAttestor,
+    ) -> bool:
+        """Verify one stage against public state or its exact provisional view."""
+
+        state = self._store.daily_state()
+        if draft.turn_kind == "evidence-stage":
+            return draft.verify(source, state, bundle, verifier)
+        evidence_stage = draft.evidence_stage
+        if type(evidence_stage) is not DailyTurnDraft:
+            return False
+        try:
+            post_stage_state = state.apply_evidence_stage(evidence_stage)
+        except AuthorityValidationError:
+            return False
+        return draft.verify(
+            source,
+            post_stage_state,
+            bundle,
+            verifier,
+            committed_evidence_stage=evidence_stage,
+        )
+
+    def _business_transition_record_kind(self, record_id: str) -> str | None:
+        """Identify the purpose-specific owner without accepting config drift."""
+
+        initialization = self._store.initialization()
+        if (
+            initialization is not None
+            and initialization.draft.record_id == record_id
+        ):
+            return "initialization"
+        return (
+            "daily"
+            if self._store.daily_turn_for_record(record_id) is not None
+            else None
         )
 
     def model_effects_allowed(self) -> bool:

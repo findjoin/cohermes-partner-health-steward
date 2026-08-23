@@ -68,7 +68,12 @@ class AdmissionPolicy:
         if self.channel != "weixin" or self.entrypoint != "health_weixin":
             raise AuthorityValidationError("invalid admission policy")
 
-    def rejection_reason(self, message: object) -> str | None:
+    def rejection_reason(
+        self,
+        message: object,
+        *,
+        allowed_capabilities: tuple[str, ...] = ("health-init",),
+    ) -> str | None:
         """Classify headers without materializing a possibly sensitive body."""
 
         if type(message) is not RawWeixinMessage:
@@ -85,12 +90,29 @@ class AdmissionPolicy:
         )
         if any(type(actual) is not str or actual != expected for actual, expected in values):
             return "unique-private-source-denied"
-        if message.requested_capability != "health-init":
+        if (
+            type(allowed_capabilities) is not tuple
+            or not allowed_capabilities
+            or any(type(item) is not str or not item for item in allowed_capabilities)
+            or type(message.requested_capability) is not str
+            or message.requested_capability not in allowed_capabilities
+        ):
             return "initialization-required"
         return None
 
-    def accepts(self, envelope: object) -> bool:
+    def accepts(
+        self,
+        envelope: object,
+        *,
+        allowed_capabilities: tuple[str, ...] = ("health-init",),
+    ) -> bool:
         if type(envelope) is not SourceEnvelope:
+            return False
+        if (
+            type(allowed_capabilities) is not tuple
+            or not allowed_capabilities
+            or any(type(item) is not str or not item for item in allowed_capabilities)
+        ):
             return False
         return (
             envelope.channel == self.channel
@@ -99,7 +121,7 @@ class AdmissionPolicy:
             and envelope.conversation_id == self.conversation_id
             and envelope.chat_type == "private"
             and envelope.entrypoint == self.entrypoint
-            and envelope.requested_capability == "health-init"
+            and envelope.requested_capability in allowed_capabilities
         )
 
     def to_storage(self) -> dict[str, object]:
@@ -316,6 +338,12 @@ class SourceReceipt:
             "native_cursor_state": self.native_cursor_state,
         }
 
+    @property
+    def business_committed(self) -> bool:
+        """Whether core finalized the business effect and released body data."""
+
+        return self.managed_cursor_state == "committed"
+
     @classmethod
     def from_storage(cls, value: object) -> "SourceReceipt":
         fields = {
@@ -371,15 +399,24 @@ class NativeCursorDirective:
 
     source_causal_id: str
     native_cursor: str
-    initialization_transition_id: str
+    business_transition_id: str
+    authority_generation: int
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
         validate_opaque_text(self.native_cursor, "native cursor")
         validate_opaque_text(
-            self.initialization_transition_id,
-            "initialization transition identifier",
+            self.business_transition_id,
+            "business transition identifier",
         )
+        if type(self.authority_generation) is not int or self.authority_generation < 1:
+            raise AuthorityValidationError("invalid cursor authority generation")
+
+    @property
+    def initialization_transition_id(self) -> str:
+        """Compatibility name for Ticket 111 callers; now business-generic."""
+
+        return self.business_transition_id
 
 
 def materialize_source(message: RawWeixinMessage) -> SourceEnvelope:

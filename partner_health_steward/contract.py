@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from .admission import AdmissionPolicy, SourceEnvelope
 from .authority import EffectIntent, MAX_OPAQUE_TEXT_BYTES
+from .coordination import DailyTurnDraft, DailyTurnResult
 from .initialization import InitializationDisclosure, OwnerInitialization, SkillUseProof
 
 
@@ -105,6 +106,18 @@ class InitializationPreparePayload(CommandPayload):
             "initialization": self.initialization.to_storage(),
             "skill_proof": self.skill_proof.to_storage(),
         }
+
+
+@dataclass(frozen=True)
+class DailyTurnPreparePayload(CommandPayload):
+    draft: DailyTurnDraft
+
+    def __post_init__(self) -> None:
+        if type(self.draft) is not DailyTurnDraft:
+            raise ProtocolViolation("invalid daily turn draft")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"draft": self.draft.to_storage()}
 
 
 @dataclass(frozen=True)
@@ -249,6 +262,7 @@ _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
     "inbound.admit": InboundAdmitPayload,
     "initialization.disclose": InitializationDisclosurePayload,
     "initialization.prepare": InitializationPreparePayload,
+    "turn.prepare": DailyTurnPreparePayload,
     "cursor.result": NativeCursorResultPayload,
     "state.candidate": StateCandidatePayload,
     "state.prepare": StateCandidatePayload,
@@ -263,6 +277,7 @@ _ACTION_SCOPES = {
     "inbound.admit": "inbound:admit",
     "initialization.disclose": "initialization:disclose",
     "initialization.prepare": "initialization:prepare",
+    "turn.prepare": "turn:prepare",
     "cursor.result": "cursor:result",
     "state.candidate": "state:candidate",
     "state.prepare": "state:prepare",
@@ -342,6 +357,13 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
         except (TypeError, ValueError) as exc:
             raise ProtocolViolation("invalid initialization payload") from exc
         return InitializationPreparePayload(initialization, proof)
+    if payload_type is DailyTurnPreparePayload:
+        fields = _strict_mapping(value, frozenset({"draft"}), "payload")
+        try:
+            draft = DailyTurnDraft.from_storage(fields["draft"])
+        except (TypeError, ValueError) as exc:
+            raise ProtocolViolation("invalid daily turn payload") from exc
+        return DailyTurnPreparePayload(draft)
     if payload_type is NativeCursorResultPayload:
         fields = _strict_mapping(
             value,
@@ -456,8 +478,26 @@ class EffectIntentMeta(ResponseMeta):
         return self.intent.to_wire_metadata()
 
 
+@dataclass(frozen=True)
+class DailyTurnMeta(ResponseMeta):
+    turn_result: DailyTurnResult
+
+    def __post_init__(self) -> None:
+        if type(self.turn_result) is not DailyTurnResult:
+            raise ProtocolViolation("invalid daily turn metadata")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"turn_result": self.turn_result.to_storage()}
+
+
 def _parse_response_meta(value: object) -> ResponseMeta:
-    if type(value) in {EmptyMeta, ProbeMeta, CommitMeta, EffectIntentMeta}:
+    if type(value) in {
+        EmptyMeta,
+        ProbeMeta,
+        CommitMeta,
+        EffectIntentMeta,
+        DailyTurnMeta,
+    }:
         return value
     if isinstance(value, ResponseMeta) or type(value) is not dict:
         raise ProtocolViolation("invalid response metadata")
@@ -468,6 +508,12 @@ def _parse_response_meta(value: object) -> ResponseMeta:
         return ProbeMeta(_bounded_text(value["probe_state"], "probe_state"))
     if keys == {"generation", "writer_fence"}:
         return CommitMeta(value["generation"], _bounded_text(value["writer_fence"], "writer_fence"))
+    if keys == {"turn_result"}:
+        try:
+            turn_result = DailyTurnResult.from_storage(value["turn_result"])
+        except (TypeError, ValueError) as exc:
+            raise ProtocolViolation("invalid daily turn metadata") from exc
+        return DailyTurnMeta(turn_result)
     effect_fields = {"effect_id", "effect_kind", "intent_digest", "authority"}
     if keys == effect_fields:
         try:
