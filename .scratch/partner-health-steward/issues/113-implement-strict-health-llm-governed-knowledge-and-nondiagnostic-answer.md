@@ -1,7 +1,7 @@
 # 113 - 实现 StrictHealthLLM 治理知识与非诊断回答
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [112 - 实现七 Skill 协调与日常证据画像处理](112-implement-seven-skill-coordination-and-daily-evidence-portrait-turn.md)
 
@@ -9,12 +9,25 @@ Blocked by: [112 - 实现七 Skill 协调与日常证据画像处理](112-implem
 
 **Blocked by:** 112 - 实现七 Skill 协调与日常证据画像处理
 
-- [ ] `StrictHealthLLM` 在最终 wire payload 上锁定 provider、canonical base URL、API mode、model、配置代际、主人同意指纹、容量 profile 和结构；路线变化先暂停并重新取得主人同意。
-- [ ] 禁止跨首跳 fallback、路线外 Web Search/MCP/普通 Tool/任意 HTTP 和主人派生医学查询；`completed`、`incomplete`、`failed` 及原因必须可观察。
-- [ ] `KnowledgePublisher` 只读取无主人数据并生成不可变 staged release，绑定来源、版本、许可、中文状态、适用范围、专业审核状态和 hash；过期/缺失返回知识缺口。
-- [ ] 非诊断候选区分主人事实、通用知识、支持、反对、未知、限制和下一步；只允许引用当前有效证据/知识卡和批准 claim/template。
-- [ ] 疾病排序、诊断标签、排除结论和个体化处方调整没有非诊断输出原子；模型失败、结构错误、容量不足或终态未知不写入、不发送。
-- [ ] 合成测试覆盖 provider drift、fallback、工具旁路、截断、未知终态、旧卡引用和确定性渲染，不调用真实模型或上传真实健康资料。
+- [x] `StrictHealthLLM` 在最终 wire payload 上锁定 provider、canonical base URL、API mode、model、配置代际、主人同意指纹、容量 profile 和结构；路线变化先暂停并重新取得主人同意。
+- [x] 禁止跨首跳 fallback、路线外 Web Search/MCP/普通 Tool/任意 HTTP 和主人派生医学查询；`completed`、`incomplete`、`failed` 及原因必须可观察。
+- [x] `KnowledgePublisher` 只读取无主人数据并生成不可变 staged release，绑定来源、版本、许可、中文状态、适用范围、专业审核状态和 hash；过期/缺失返回知识缺口。
+- [x] 非诊断候选区分主人事实、通用知识、支持、反对、未知、限制和下一步；只允许引用当前有效证据/知识卡和批准 claim/template。
+- [x] 疾病排序、诊断标签、排除结论和个体化处方调整没有非诊断输出原子；模型失败、结构错误、容量不足或终态未知不写入、不发送。
+- [x] 合成测试覆盖 provider drift、fallback、工具旁路、截断、未知终态、旧卡引用和确定性渲染，不调用真实模型或上传真实健康资料。
+
+## Answer
+
+独立 reviewer 复核结论：Ticket 113 通过当前实现 Spec 与本票验收矩阵，可标记为 `resolved`。
+
+- **A1—A2 严格模型端口：**最终请求把 provider、canonical base URL、API mode、requested model、配置代际、主人同意指纹、capability profile、输入摘要、输出预留与严格 schema 绑定到同一受控模型效果；route/consent/profile/capacity 漂移在调用前失败关闭。只有终态可证明的 `completed`、严格结构通过且 actual model 被当前 profile 精确允许时才接受候选；fallback、截断、`incomplete`、`failed`、`unknown`、结构错误与实际模型漂移均不能形成候选或业务正文，路线外 Web/MCP/Tool/HTTP 旁路由 deny harness 捕获。
+- **A3 受治理知识：**`KnowledgePublisher` 只消费无主人数据的固定治理输入，形成内容寻址、不可变的 staged release；来源、版本、权利、中文状态、适用范围、专业审核、内容 hash、发布时间、过期与撤回状态均受严格合同约束，缺失或失效只返回知识缺口，不触发按主人问题临时回源。
+- **A4—A5 非诊断裁决与渲染：**core 只接受引用当前主人证据卡、当前知识卡及已批准 claim/template 的完整候选，并强制支持、反对、未知、限制和下一步字段；确定性 renderer 对相同验证输入生成同一唯一回复并保留主人事实与通用知识边界。疾病排序、诊断标签、排除结论和个体化处方调整没有可构造或可解析的批准原子，模型候选也不作为第二权威持久化。
+- **A6 权威闭合：**已知未形成模型效果的拒绝与明确模型失败可原子提交无模型正文的 failed-closed 结果并按上游协议释放 cursor；模型效果、current-head 或 finalize 结果未知时保留 unknown、冻结重试与 cursor，只允许沿原 transition/readback 或主人决定恢复。重放不会创建第二个模型效果、第二份候选或第二条主人回复。
+
+验收证据为：Ticket 113 focused `99/99`、全量 `363/363`、Ticket 110 回归 `135/135`、Ticket 112 回归 `83/83` 均通过；`compileall` 退出码为 `0`，`git diff --check` 无 whitespace error。正式实现链由 `294d56f`（主体实现）、`83a8b2d`（权威闭合加固）和 `e4f1f74`（逐 Case 实施证据）组成。
+
+本结论严格限定为本地合成数据及 fake/deny harness 验收：未调用真实模型、网络、Web Search、MCP、普通 Tool 或任意 HTTP，未读取或上传真实主人健康资料，也不代表真实 Partner profile、Hermes/Weixin 宿主或生产环境已经验收。
 
 ## Implementation contract
 
