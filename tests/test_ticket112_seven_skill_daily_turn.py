@@ -107,6 +107,19 @@ class CountingBody:
         return self._text
 
 
+def _portrait_evidence_period(
+    context: PortraitContext,
+    evidence_id: str,
+) -> str:
+    for card in (
+        *context.committed_related_cards,
+        *context.in_turn_evidence_candidates,
+    ):
+        if card.evidence_id == evidence_id:
+            return card.applicable_period
+    raise AssertionError(f"portrait evidence missing: {evidence_id}")
+
+
 class SyntheticSleepTurnExecutor:
     def __init__(self) -> None:
         self.contexts: dict[str, object] = {}
@@ -187,6 +200,10 @@ class SyntheticSleepTurnExecutor:
                             topic_ref="physical-function-and-experience/sleep",
                             item_kind="current-understanding",
                             item_text=understanding,
+                            applicable_period=_portrait_evidence_period(
+                                context,
+                                evidence_id,
+                            ),
                         )
                         for evidence_id in context.evidence_ids
                     ),
@@ -778,6 +795,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                 topic_ref=topic_ref,
                 item_kind="current-understanding",
                 item_text=seed_claim.content,
+                applicable_period=old_card.applicable_period,
             ),
             PortraitProofLink.form(
                 evidence_id=old_card.evidence_id,
@@ -890,6 +908,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                                     topic_ref=topic_ref,
                                     item_kind="current-understanding",
                                     item_text=corrected_text,
+                                    applicable_period=successor.applicable_period,
                                 ),
                                 PortraitProofLink.form(
                                     evidence_id=successor.evidence_id,
@@ -1151,6 +1170,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                             topic_ref=topic_ref,
                             item_kind="current-understanding",
                             item_text=understanding,
+                            applicable_period=seeded_card.applicable_period,
                         ),
                         PortraitProofLink.form(
                             evidence_id=seeded_card.evidence_id,
@@ -1269,6 +1289,9 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
             topic_ref=topic.topic_ref,
             item_kind="current-understanding",
             item_text=forged_understanding,
+            applicable_period=(
+                topic.current_understanding_applicable_periods[0]
+            ),
         )
         forged_topic = replace(
             topic,
@@ -1895,12 +1918,22 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                 prepare_stage,
                 source_causal_id,
             )
-            self.assertIsNone(
-                self.store._execute(
-                    "SELECT 1 FROM command_receipts_v2 WHERE causal_id = ?",
-                    (prepare_causal_id,),
-                ).fetchone()
+            receipt_row = self.store._execute(
+                "SELECT nonce, ciphertext FROM command_receipts_v2 "
+                "WHERE causal_id = ?",
+                (prepare_causal_id,),
+            ).fetchone()
+            self.assertIsNotNone(receipt_row)
+            receipt_plaintext = self.store._open(
+                f"receipt:v2:{prepare_causal_id}",
+                receipt_row[0],
+                receipt_row[1],
             )
+            self.assertEqual(
+                set(receipt_plaintext),
+                {"kind", "command_digest", "response"},
+            )
+            self.assertNotIn("draft", repr(receipt_plaintext))
         self.assertTrue(self.store.verify_integrity(self.store.finalized_authority()))
         reopened = EncryptedStateStore(
             "file:ticket112?mode=memory&cache=shared",
@@ -2580,7 +2613,8 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
         status = self.core.daily_turn_status("ticket112-atomic-source")
         self.assertIsNotNone(status)
         self.assertEqual(status.phase, "committed")
-        self.assertEqual(self.plugin.daily_state(peer_id="plugin").evidence_cards, ())
+        with self.assertRaises(AuthorityValidationError):
+            self.plugin.daily_state(peer_id="plugin")
         self.assertIsNone(
             self.plugin.source_receipt("ticket112-atomic-source", peer_id="plugin")
         )
@@ -2921,6 +2955,9 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
             "topic_ref": "physical-function-and-experience/sleep",
             "current_status": "known",
             "current_understandings": ("过去一周有多次睡眠观察",),
+            "current_understanding_applicable_periods": (
+                "2026-08-18/2026-08-24",
+            ),
             "open_judgments": (),
             "key_unknowns": (),
             "related_task_preview_ids": (),
@@ -3155,6 +3192,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                         topic_ref="physical-function-and-experience/sleep",
                         item_kind="current-understanding",
                         item_text="一次近期观察",
+                        applicable_period="2026-08-23",
                     ),
                     PortraitProofLink.form(
                         evidence_id=evidence_id,
@@ -3301,6 +3339,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                 topic_ref=topic_ref,
                 item_kind="current-understanding",
                 item_text=first,
+                applicable_period="2026-08-23-night",
             ),
             PortraitProofLink.form(
                 evidence_id="evidence:second",
@@ -3308,6 +3347,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                 topic_ref=topic_ref,
                 item_kind="current-understanding",
                 item_text=second,
+                applicable_period="2026-08-24-day",
             ),
         )
         decision = PortraitDecision.update(
@@ -3363,6 +3403,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                     topic_ref=topic_ref,
                     item_kind="current-understanding",
                     item_text=first,
+                    applicable_period="2026-08-23-night",
                 ),
             ),
             reason="当前依据只能维持较弱结论",
@@ -3838,26 +3879,31 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
             if skill_name == "health-evidence":
                 return EvidenceDecision.admit(context.atomic_claim)
             if skill_name == "health-portrait":
-                understanding = (
-                    "主人本轮报告了与该主题相关的两项独立观察"
-                    if len(context.evidence_ids) == 2
-                    else "主人本轮报告了与该主题相关的一项观察"
+                related_cards = tuple(
+                    card
+                    for card in (
+                        *context.committed_related_cards,
+                        *context.in_turn_evidence_candidates,
+                    )
+                    if card.evidence_id in context.evidence_ids
                 )
+                understandings = tuple(card.content for card in related_cards)
                 return PortraitDecision.update(
                     topic_ref=context.topic_refs[0],
-                    current_understandings=(understanding,),
+                    current_understandings=understandings,
                     open_judgments=(),
                     key_unknowns=("原因未知",),
                     proof_links=(
                         *(
                             PortraitProofLink.form(
-                                evidence_id=evidence_id,
+                                evidence_id=card.evidence_id,
                                 relation_kind="supports",
                                 topic_ref=context.topic_refs[0],
                                 item_kind="current-understanding",
-                                item_text=understanding,
+                                item_text=card.content,
+                                applicable_period=card.applicable_period,
                             )
-                            for evidence_id in context.evidence_ids
+                            for card in related_cards
                         ),
                         PortraitProofLink.form(
                             evidence_id=context.evidence_ids[0],
@@ -4196,6 +4242,7 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                         topic_ref=topic_ref,
                         item_kind="current-understanding",
                         item_text=understanding,
+                        applicable_period=cards[0].applicable_period,
                     ),
                 ),
             )
@@ -4292,6 +4339,10 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                             topic_ref=topic_ref,
                             item_kind="current-understanding",
                             item_text=partial_text,
+                            applicable_period=_portrait_evidence_period(
+                                context,
+                                evidence_id,
+                            ),
                         ),
                     ),
                 )
@@ -4682,6 +4733,663 @@ class Ticket112SevenSkillDailyTurnTests(unittest.TestCase):
                 "same-gap-state-unavailable",
             },
         )
+
+    def test_terminal_current_head_blocks_daily_result_replay_and_state_reads(self) -> None:
+        self.route_classification = "health"
+        message_changes = {
+            "causal_id": "ticket112-terminal-strong-read",
+            "generation": self.head.read().head.generation,
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-terminal-strong-read",
+            "protocol_timestamp": "2026-08-24T12:14:00+08:00",
+            "received_at": "2026-08-24T12:14:01+08:00",
+            "native_cursor": "cursor-ticket112-terminal-strong-read",
+        }
+        first = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **message_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        calls_before_replay = tuple(self.turn_executor.calls)
+
+        self.head.mark_terminal()
+        replayed = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **message_changes),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(replayed.status, "unavailable", replayed)
+        self.assertEqual(replayed.reason_code, "current-head-terminal")
+        self.assertEqual(replayed.meta.to_wire(), {})
+        self.assertEqual(tuple(self.turn_executor.calls), calls_before_replay)
+        status = self.core.daily_turn_status(message_changes["causal_id"])
+        self.assertTrue(status is None or status.result is None)
+        with self.assertRaises(AuthorityValidationError):
+            self.plugin.daily_state(peer_id="plugin")
+
+    def test_finalized_prepare_replay_uses_body_free_digest_receipts(self) -> None:
+        self.route_classification = "health"
+        source_causal_id = "ticket112-redacted-prepare-replay"
+        first = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id=source_causal_id,
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-redacted-prepare-replay",
+                protocol_timestamp="2026-08-24T12:15:00+08:00",
+                received_at="2026-08-24T12:15:01+08:00",
+                native_cursor="cursor-ticket112-redacted-prepare-replay",
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        complete_draft = self.store.last_daily_finalize_draft
+        self.assertIs(type(complete_draft), DailyTurnDraft)
+        evidence_draft = complete_draft.evidence_stage
+        self.assertIs(type(evidence_draft), DailyTurnDraft)
+
+        def prepare_command(stage: str, draft: DailyTurnDraft) -> CommandEnvelope:
+            record = self.store.record(draft.record_id)
+            self.assertIsNotNone(record)
+            return CommandEnvelope(
+                peer="plugin",
+                action="turn.prepare",
+                source="daily_skill_runtime",
+                causal_id=self.plugin._daily_turn_causal_id(stage, source_causal_id),
+                generation=record.payload.prepared.base.generation,
+                scope=("turn:prepare",),
+                payload=DailyTurnPreparePayload(draft),
+            )
+
+        commands = (
+            prepare_command("evidence-prepare", evidence_draft),
+            prepare_command("complete-prepare", complete_draft),
+        )
+        directive = self.plugin.native_cursor_directive(
+            source_causal_id,
+            peer_id="plugin",
+        )
+        self.assertIsNotNone(directive)
+        self.assertEqual(
+            self.plugin.record_native_cursor_result(
+                directive,
+                status="advanced",
+                peer_id="plugin",
+            ).status,
+            "accepted",
+        )
+        before_digest = self.store.daily_state().digest
+        before_generation = self.head.read().head.generation
+
+        for command in commands:
+            replayed = self.plugin.invoke(command, peer_id="plugin")
+            self.assertEqual(replayed.status, "accepted", replayed)
+            self.assertEqual(replayed.reason_code, "daily-turn-prepared")
+            self.assertEqual(replayed.meta.to_wire(), {})
+            self.assertEqual(self.store.receipt(command), replayed)
+            row = self.store._execute(
+                "SELECT nonce, ciphertext FROM command_receipts_v2 WHERE causal_id = ?",
+                (command.causal_id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            stored = self.store._open(
+                f"receipt:v2:{command.causal_id}",
+                row[0],
+                row[1],
+            )
+            self.assertEqual(
+                set(stored),
+                {"kind", "command_digest", "response"},
+            )
+            self.assertNotIn("owner_reply", repr(stored))
+            self.assertNotIn("主人自述昨晚主观睡眠体验不佳", repr(stored))
+
+            forged = replace(command, generation=command.generation + 1)
+            conflict = self.plugin.invoke(forged, peer_id="plugin")
+            self.assertEqual(conflict.status, "rejected", conflict)
+            self.assertEqual(conflict.reason_code, "causal-id-conflict")
+
+        self.assertEqual(self.store.daily_state().digest, before_digest)
+        self.assertEqual(self.head.read().head.generation, before_generation)
+
+    def test_confirmed_native_redelivery_reuses_one_business_turn_and_two_cursors(self) -> None:
+        self.route_classification = "health"
+        root_causal_id = "ticket112-native-root"
+        shared = {
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-native-same",
+            "protocol_timestamp": "2026-08-24T12:16:00+08:00",
+        }
+        first = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id=root_causal_id,
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:16:01+08:00",
+                native_cursor="cursor-ticket112-native-root",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        calls_after_first = tuple(self.turn_executor.calls)
+
+        alias_causal_id = "ticket112-native-alias"
+        second = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id=alias_causal_id,
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:16:05+08:00",
+                native_cursor="cursor-ticket112-native-alias",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(second.status, "replayed", second)
+        self.assertEqual(second.reason_code, "daily-source-native-replay")
+        self.assertEqual(tuple(self.turn_executor.calls), calls_after_first)
+        state = self.plugin.daily_state(peer_id="plugin")
+        self.assertEqual(len(state.evidence_cards), 1)
+        self.assertEqual(state.processed_source_causal_ids, (root_causal_id,))
+        alias_receipt = self.plugin.source_receipt(alias_causal_id, peer_id="plugin")
+        self.assertEqual(alias_receipt.relation, "possible-replay")
+        self.assertEqual(alias_receipt.business_source_causal_id, root_causal_id)
+        self.assertTrue(
+            alias_receipt.native_event_digest.startswith("hmac-sha256:")
+        )
+        self.assertTrue(alias_receipt.business_committed)
+        self.assertIsNone(alias_receipt.envelope.body)
+
+        directives = tuple(
+            self.plugin.native_cursor_directive(causal_id, peer_id="plugin")
+            for causal_id in (root_causal_id, alias_causal_id)
+        )
+        self.assertTrue(all(item is not None for item in directives))
+        self.assertEqual(
+            tuple(item.native_cursor for item in directives),
+            ("cursor-ticket112-native-root", "cursor-ticket112-native-alias"),
+        )
+        self.assertEqual(
+            directives[0].business_transition_id,
+            directives[1].business_transition_id,
+        )
+        for directive in directives:
+            advanced = self.plugin.record_native_cursor_result(
+                directive,
+                status="advanced",
+                peer_id="plugin",
+            )
+            self.assertEqual(advanced.status, "accepted", advanced)
+
+    def test_native_redelivery_after_restart_uses_persisted_fingerprint(self) -> None:
+        self.route_classification = "health"
+        root_causal_id = "ticket112-native-restart-root"
+        shared = {
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-native-restart",
+            "protocol_timestamp": "2026-08-24T12:16:10+08:00",
+        }
+        first = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id=root_causal_id,
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:16:11+08:00",
+                native_cursor="cursor-ticket112-native-restart-root",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        calls_after_first = tuple(self.turn_executor.calls)
+
+        self.assertTrue(self.core.close().complete)
+        self.core = HealthCore(
+            self.store,
+            self.head,
+            writer_fence_vault=self.writer_vault,
+            admission_policy=self.policy,
+            health_init_verifier=self.init_attestor,
+            health_init_asset=self.init_asset,
+            daily_skill_verifier=self.daily_attestor,
+            daily_skill_bundle=self.daily_bundle,
+        )
+        self.plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=self.init_runtime,
+            coarse_router=self.router,
+            daily_skill_runtime=self.daily_runtime,
+        )
+
+        alias_causal_id = "ticket112-native-restart-alias"
+        replayed = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id=alias_causal_id,
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:16:15+08:00",
+                native_cursor="cursor-ticket112-native-restart-alias",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(replayed.status, "replayed", replayed)
+        self.assertEqual(replayed.reason_code, "daily-source-native-replay")
+        self.assertEqual(tuple(self.turn_executor.calls), calls_after_first)
+        self.assertEqual(len(self.plugin.daily_state(peer_id="plugin").evidence_cards), 1)
+        alias_receipt = self.store.source_receipt(alias_causal_id)
+        self.assertEqual(alias_receipt.business_source_causal_id, root_causal_id)
+        self.assertTrue(alias_receipt.business_committed)
+
+    def test_different_native_message_ids_with_same_body_are_independent_turns(self) -> None:
+        self.route_classification = "health"
+        first = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-native-distinct-first",
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-native-distinct-first",
+                protocol_timestamp="2026-08-24T12:16:20+08:00",
+                received_at="2026-08-24T12:16:21+08:00",
+                native_cursor="cursor-ticket112-native-distinct-first",
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        calls_after_first = len(self.turn_executor.calls)
+
+        second = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-native-distinct-second",
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-native-distinct-second",
+                protocol_timestamp="2026-08-24T12:16:20+08:00",
+                received_at="2026-08-24T12:16:25+08:00",
+                native_cursor="cursor-ticket112-native-distinct-second",
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(second.status, "accepted", second)
+        self.assertGreater(len(self.turn_executor.calls), calls_after_first)
+        state = self.plugin.daily_state(peer_id="plugin")
+        self.assertEqual(len(state.evidence_cards), 2)
+        self.assertEqual(
+            state.processed_source_causal_ids,
+            (
+                "ticket112-native-distinct-first",
+                "ticket112-native-distinct-second",
+            ),
+        )
+
+    def test_native_redelivery_during_evidence_stage_waits_for_root_recovery(self) -> None:
+        self.route_classification = "health"
+        self.turn_executor.fail_next_portrait = True
+        root_causal_id = "ticket112-native-pending-root"
+        root_changes = {
+            "causal_id": root_causal_id,
+            "generation": self.head.read().head.generation,
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-native-pending",
+            "protocol_timestamp": "2026-08-24T12:16:30+08:00",
+            "received_at": "2026-08-24T12:16:31+08:00",
+            "native_cursor": "cursor-ticket112-native-pending-root",
+        }
+        interrupted = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **root_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(interrupted.status, "unavailable", interrupted)
+        self.assertEqual(
+            self.core.daily_turn_status(root_causal_id).phase,
+            "evidence-finalized",
+        )
+        calls_after_interruption = tuple(self.turn_executor.calls)
+
+        alias_causal_id = "ticket112-native-pending-alias"
+        alias_changes = {
+            "causal_id": alias_causal_id,
+            "generation": self.head.read().head.generation,
+            "requested_capability": "health-steward",
+            "message_id": root_changes["message_id"],
+            "protocol_timestamp": root_changes["protocol_timestamp"],
+            "received_at": "2026-08-24T12:16:35+08:00",
+            "native_cursor": "cursor-ticket112-native-pending-alias",
+        }
+        alias = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                **alias_changes,
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(alias.status, "unavailable", alias)
+        self.assertEqual(alias.reason_code, "daily-source-native-replay-pending")
+        self.assertEqual(tuple(self.turn_executor.calls), calls_after_interruption)
+        self.assertIsNone(self.store.daily_turn(alias_causal_id))
+        alias_receipt = self.store.source_receipt(alias_causal_id)
+        self.assertEqual(
+            alias_receipt.business_source_causal_id,
+            root_causal_id,
+        )
+        self.assertFalse(alias_receipt.business_committed)
+
+        recovered = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **root_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(recovered.status, "accepted", recovered)
+        self.assertEqual(
+            self.core.daily_turn_status(root_causal_id).phase,
+            "finalized",
+        )
+        self.assertEqual(len(self.plugin.daily_state(peer_id="plugin").evidence_cards), 1)
+        self.assertTrue(self.store.source_receipt(alias_causal_id).business_committed)
+        calls_after_recovery = tuple(self.turn_executor.calls)
+        converged_alias = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **alias_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(converged_alias.status, "replayed", converged_alias)
+        self.assertEqual(
+            converged_alias.reason_code,
+            "daily-source-native-replay",
+        )
+        self.assertEqual(tuple(self.turn_executor.calls), calls_after_recovery)
+        alias_directive = self.plugin.native_cursor_directive(
+            alias_causal_id,
+            peer_id="plugin",
+        )
+        self.assertIsNotNone(alias_directive)
+        self.assertEqual(
+            alias_directive.business_transition_id,
+            self.plugin.native_cursor_directive(
+                root_causal_id,
+                peer_id="plugin",
+            ).business_transition_id,
+        )
+
+    def test_native_alias_family_commit_rolls_back_and_recovers_atomically(self) -> None:
+        self.route_classification = "health"
+        self.turn_executor.fail_next_portrait = True
+        root_changes = {
+            "causal_id": "ticket112-native-family-root",
+            "generation": self.head.read().head.generation,
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-native-family",
+            "protocol_timestamp": "2026-08-24T12:16:40+08:00",
+            "received_at": "2026-08-24T12:16:41+08:00",
+            "native_cursor": "cursor-ticket112-native-family-root",
+        }
+        interrupted = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **root_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(interrupted.status, "unavailable", interrupted)
+
+        alias_changes = {
+            **root_changes,
+            "causal_id": "ticket112-native-family-alias",
+            "generation": self.head.read().head.generation,
+            "received_at": "2026-08-24T12:16:45+08:00",
+            "native_cursor": "cursor-ticket112-native-family-alias",
+        }
+        pending = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **alias_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(pending.reason_code, "daily-source-native-replay-pending")
+
+        self.store.fail_next_daily_finalize = True
+        failed = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **root_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(failed.reason_code, "health-state-unavailable")
+        for causal_id in (
+            root_changes["causal_id"],
+            alias_changes["causal_id"],
+        ):
+            receipt = self.store.source_receipt(causal_id)
+            self.assertFalse(receipt.business_committed)
+            self.assertIsNotNone(receipt.envelope.body)
+
+        recovered = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **root_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(recovered.status, "accepted", recovered)
+        for causal_id in (
+            root_changes["causal_id"],
+            alias_changes["causal_id"],
+        ):
+            receipt = self.store.source_receipt(causal_id)
+            self.assertTrue(receipt.business_committed)
+            self.assertIsNone(receipt.envelope.body)
+
+    def test_legacy_root_without_fingerprint_rejects_alias_without_retaining_body(self) -> None:
+        self.route_classification = "health"
+        root = materialize_source(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-native-legacy-root",
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-native-legacy",
+                protocol_timestamp="2026-08-24T12:16:50+08:00",
+                received_at="2026-08-24T12:16:51+08:00",
+                native_cursor="cursor-ticket112-native-legacy-root",
+            )
+        )
+        self.store.save_source_envelope(root)
+        committed = self.store.mark_source_business_committed(root.causal_id)
+        legacy = committed.to_storage()
+        legacy.pop("native_event_digest")
+        legacy.pop("business_source_causal_id")
+        nonce, ciphertext = self.store._seal(
+            f"source-envelope:{root.causal_id}",
+            legacy,
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE source_envelopes_v1 SET nonce = ?, ciphertext = ? "
+                "WHERE causal_id = ?",
+                (nonce, ciphertext, root.causal_id),
+            )
+            self.store._refresh_integrity_manifest(connection)
+
+        alias_causal_id = "ticket112-native-legacy-alias"
+        alias_changes = {
+            "causal_id": alias_causal_id,
+            "generation": self.head.read().head.generation,
+            "requested_capability": "health-steward",
+            "message_id": root.message_id,
+            "protocol_timestamp": root.protocol_timestamp,
+            "received_at": "2026-08-24T12:16:55+08:00",
+            "native_cursor": "cursor-ticket112-native-legacy-alias",
+        }
+        unavailable = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **alias_changes),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(unavailable.status, "unavailable", unavailable)
+        self.assertEqual(
+            unavailable.reason_code,
+            "native-replay-proof-unavailable",
+        )
+        rejected = self.store.source_receipt(alias_causal_id)
+        self.assertEqual(rejected.managed_cursor_state, "rejected")
+        self.assertIsNone(rejected.envelope.body)
+        self.assertIsNone(
+            self.plugin.native_cursor_directive(alias_causal_id, peer_id="plugin")
+        )
+        replayed = self.plugin.receive_weixin(
+            self.message(CountingBody("我昨晚没睡好"), **alias_changes),
+            peer_id="plugin",
+        )
+        self.assertEqual(replayed, unavailable)
+
+    def test_native_message_id_conflict_fails_closed_without_second_turn(self) -> None:
+        self.route_classification = "health"
+        shared = {
+            "requested_capability": "health-steward",
+            "message_id": "wx-ticket112-native-conflict",
+            "protocol_timestamp": "2026-08-24T12:17:00+08:00",
+        }
+        first = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-native-conflict-root",
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:17:01+08:00",
+                native_cursor="cursor-ticket112-native-conflict-root",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+        self.assertEqual(first.status, "accepted", first)
+        calls_after_first = tuple(self.turn_executor.calls)
+
+        conflict_causal_id = "ticket112-native-conflict-second"
+        conflict = self.plugin.receive_weixin(
+            self.message(
+                CountingBody("我今天睡得很好"),
+                causal_id=conflict_causal_id,
+                generation=self.head.read().head.generation,
+                received_at="2026-08-24T12:17:05+08:00",
+                native_cursor="cursor-ticket112-native-conflict-second",
+                **shared,
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(conflict.status, "rejected", conflict)
+        self.assertEqual(conflict.reason_code, "native-message-id-conflict")
+        self.assertEqual(tuple(self.turn_executor.calls), calls_after_first)
+        self.assertEqual(len(self.plugin.daily_state(peer_id="plugin").evidence_cards), 1)
+        conflict_receipt = self.store.source_receipt(conflict_causal_id)
+        self.assertEqual(conflict_receipt.managed_cursor_state, "rejected")
+        self.assertIsNone(conflict_receipt.envelope.body)
+        self.assertIsNone(
+            self.plugin.native_cursor_directive(
+                conflict_causal_id,
+                peer_id="plugin",
+            )
+        )
+
+    def test_steward_cannot_hide_committed_evidence_from_owner_reply(self) -> None:
+        self.route_classification = "health"
+        delegate = SyntheticSleepTurnExecutor()
+
+        def executor(skill_name, context):
+            if skill_name == "health-steward" and type(context) is StewardResolutionContext:
+                selected = tuple(
+                    atom.atom_id
+                    for atom in context.reply_atoms
+                    if atom.required_portrait_topic_refs
+                )
+                return StewardResolution(
+                    context.candidate_evidence_ids,
+                    context.candidate_portrait_topic_refs,
+                    selected,
+                    context.candidate_evidence_change_ids,
+                )
+            return delegate(skill_name, context)
+
+        plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=self.init_runtime,
+            coarse_router=self.router,
+            daily_skill_runtime=DailySkillRuntime(
+                self.daily_bundle,
+                self.daily_attestor,
+                executor=executor,
+                clock=lambda: datetime(2026, 8, 24, 4, 18, tzinfo=timezone.utc),
+            ),
+        )
+        before = plugin.daily_state(peer_id="plugin").digest
+        response = plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-hidden-commit",
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-hidden-commit",
+                protocol_timestamp="2026-08-24T12:18:00+08:00",
+                received_at="2026-08-24T12:18:01+08:00",
+                native_cursor="cursor-ticket112-hidden-commit",
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(response.status, "unavailable", response)
+        self.assertEqual(response.reason_code, "daily-turn-candidate-invalid")
+        self.assertEqual(plugin.daily_state(peer_id="plugin").digest, before)
+
+    def test_portrait_time_in_display_text_cannot_replace_structured_period(self) -> None:
+        self.route_classification = "health"
+        delegate = SyntheticSleepTurnExecutor()
+
+        def executor(skill_name, context):
+            if skill_name != "health-portrait":
+                return delegate(skill_name, context)
+            understanding = "主人自述昨晚睡眠体验不佳（仅昨晚）"
+            return PortraitDecision.update(
+                topic_ref="physical-function-and-experience/sleep",
+                current_understandings=(understanding,),
+                open_judgments=(),
+                key_unknowns=(),
+                proof_links=(
+                    PortraitProofLink.form(
+                        evidence_id=context.evidence_ids[0],
+                        relation_kind="supports",
+                        topic_ref="physical-function-and-experience/sleep",
+                        item_kind="current-understanding",
+                        item_text=understanding,
+                    ),
+                ),
+            )
+
+        plugin = HealthPlugin(
+            self.core,
+            admission_policy=self.policy,
+            health_init_runtime=self.init_runtime,
+            coarse_router=self.router,
+            daily_skill_runtime=DailySkillRuntime(
+                self.daily_bundle,
+                self.daily_attestor,
+                executor=executor,
+                clock=lambda: datetime(2026, 8, 24, 4, 19, tzinfo=timezone.utc),
+            ),
+        )
+        before = plugin.daily_state(peer_id="plugin").digest
+        response = plugin.receive_weixin(
+            self.message(
+                CountingBody("我昨晚没睡好"),
+                causal_id="ticket112-portrait-time-required",
+                generation=self.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx-ticket112-portrait-time-required",
+                protocol_timestamp="2026-08-24T12:19:00+08:00",
+                received_at="2026-08-24T12:19:01+08:00",
+                native_cursor="cursor-ticket112-portrait-time-required",
+            ),
+            peer_id="plugin",
+        )
+
+        self.assertEqual(response.status, "unavailable", response)
+        self.assertEqual(response.reason_code, "daily-turn-candidate-invalid")
+        self.assertEqual(plugin.daily_state(peer_id="plugin").digest, before)
 
     def test_summary_coverage_order_uses_real_instants_not_raw_strings(self) -> None:
         common = {

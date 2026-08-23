@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -249,6 +250,31 @@ class SourceEnvelope:
             body=None,
         )
 
+    @property
+    def native_event_fingerprint_material(self) -> dict[str, object]:
+        """Return fields the encrypted store binds with a keyed digest.
+
+        Delivery-local identifiers, receipt time and cursor are deliberately
+        excluded: those may change when the same native event is delivered
+        again.  Protocol time, routing/security scope and exact body remain in
+        the digest so a reused message ID cannot silently inherit old effects.
+        """
+
+        if self.message_id is None or type(self.body) is not str:
+            raise AuthorityValidationError("native event fingerprint unavailable")
+        return {
+            "channel": self.channel,
+            "partner_id": self.partner_id,
+            "sender_id": self.sender_id,
+            "conversation_id": self.conversation_id,
+            "chat_type": self.chat_type,
+            "entrypoint": self.entrypoint,
+            "requested_capability": self.requested_capability,
+            "message_id": self.message_id,
+            "protocol_timestamp": self.protocol_timestamp,
+            "body": self.body,
+        }
+
     @classmethod
     def from_storage(cls, value: object) -> "SourceEnvelope":
         fields = {
@@ -281,6 +307,8 @@ class SourceReceipt:
     related_causal_id: str | None
     managed_cursor_state: str
     native_cursor_state: str
+    native_event_digest: str | None = None
+    business_source_causal_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.envelope) is not SourceEnvelope:
@@ -292,6 +320,10 @@ class SourceReceipt:
         }:
             raise AuthorityValidationError("invalid source relation")
         _optional_opaque_text(self.related_causal_id, "related_causal_id")
+        _optional_opaque_text(
+            self.business_source_causal_id,
+            "business_source_causal_id",
+        )
         if self.relation == "first-observation" and (
             self.envelope.message_id is None or self.related_causal_id is not None
         ):
@@ -304,7 +336,36 @@ class SourceReceipt:
             self.envelope.message_id is not None or self.related_causal_id is not None
         ):
             raise AuthorityValidationError("invalid source relation")
-        if self.managed_cursor_state not in {"held", "superseded", "committed"}:
+        if self.native_event_digest is not None and (
+            type(self.native_event_digest) is not str
+            or not self.native_event_digest.startswith("hmac-sha256:")
+            or len(self.native_event_digest) != len("hmac-sha256:") + 64
+        ):
+            raise AuthorityValidationError("invalid native event digest")
+        if self.native_event_digest is not None:
+            try:
+                int(self.native_event_digest.removeprefix("hmac-sha256:"), 16)
+            except ValueError as exc:
+                raise AuthorityValidationError(
+                    "invalid native event digest"
+                ) from exc
+        if self.envelope.message_id is None and (
+            self.native_event_digest is not None
+            or self.business_source_causal_id is not None
+        ):
+            raise AuthorityValidationError("invalid source replay proof")
+        if self.business_source_causal_id is not None and (
+            self.relation != "possible-replay"
+            or self.business_source_causal_id == self.envelope.causal_id
+            or self.native_event_digest is None
+        ):
+            raise AuthorityValidationError("invalid business replay source")
+        if self.managed_cursor_state not in {
+            "held",
+            "superseded",
+            "rejected",
+            "committed",
+        }:
             raise AuthorityValidationError("invalid source cursor state")
         if self.native_cursor_state not in {
             "not-ready",
@@ -315,7 +376,7 @@ class SourceReceipt:
         }:
             raise AuthorityValidationError("invalid source cursor state")
         if (
-            self.managed_cursor_state in {"held", "superseded"}
+            self.managed_cursor_state in {"held", "superseded", "rejected"}
             and self.native_cursor_state != "not-ready"
         ):
             raise AuthorityValidationError("invalid source cursor state")
@@ -326,6 +387,11 @@ class SourceReceipt:
             and self.envelope.body is None
         ):
             raise AuthorityValidationError("held source body is missing")
+        if (
+            self.managed_cursor_state == "rejected"
+            and self.envelope.body is not None
+        ):
+            raise AuthorityValidationError("rejected source body was retained")
         if self.managed_cursor_state == "committed" and self.envelope.body is not None:
             raise AuthorityValidationError("committed source body was not released")
 
@@ -336,6 +402,8 @@ class SourceReceipt:
             "related_causal_id": self.related_causal_id,
             "managed_cursor_state": self.managed_cursor_state,
             "native_cursor_state": self.native_cursor_state,
+            "native_event_digest": self.native_event_digest,
+            "business_source_causal_id": self.business_source_causal_id,
         }
 
     @property
@@ -344,16 +412,51 @@ class SourceReceipt:
 
         return self.managed_cursor_state == "committed"
 
+    @property
+    def business_causal_id(self) -> str:
+        return self.business_source_causal_id or self.envelope.causal_id
+
+    def matches_exact_delivery(
+        self,
+        envelope: SourceEnvelope,
+        native_event_digest: str | None,
+    ) -> bool:
+        """Match one original delivery after its sensitive body was cleared."""
+
+        if type(envelope) is not SourceEnvelope:
+            return False
+        if self.envelope == envelope:
+            return True
+        if (
+            self.envelope != envelope.without_body()
+            or self.native_event_digest is None
+            or native_event_digest is None
+            or envelope.message_id is None
+            or type(envelope.body) is not str
+        ):
+            return False
+        return hmac.compare_digest(
+            self.native_event_digest,
+            native_event_digest,
+        )
+
     @classmethod
     def from_storage(cls, value: object) -> "SourceReceipt":
-        fields = {
+        legacy_fields = {
             "envelope",
             "relation",
             "related_causal_id",
             "managed_cursor_state",
             "native_cursor_state",
         }
-        if type(value) is not dict or set(value) != fields:
+        current_fields = legacy_fields | {
+            "native_event_digest",
+            "business_source_causal_id",
+        }
+        if type(value) is not dict or frozenset(value) not in {
+            frozenset(legacy_fields),
+            frozenset(current_fields),
+        }:
             raise AuthorityValidationError("invalid source receipt")
         return cls(
             envelope=SourceEnvelope.from_storage(value["envelope"]),
@@ -361,6 +464,8 @@ class SourceReceipt:
             related_causal_id=value["related_causal_id"],
             managed_cursor_state=value["managed_cursor_state"],
             native_cursor_state=value["native_cursor_state"],
+            native_event_digest=value.get("native_event_digest"),
+            business_source_causal_id=value.get("business_source_causal_id"),
         )
 
     def with_business_committed(self) -> "SourceReceipt":
@@ -370,6 +475,22 @@ class SourceReceipt:
             related_causal_id=self.related_causal_id,
             managed_cursor_state="committed",
             native_cursor_state="ready",
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=self.business_source_causal_id,
+        )
+
+    def with_business_source(self, causal_id: str) -> "SourceReceipt":
+        if self.relation != "possible-replay" or self.native_event_digest is None:
+            raise AuthorityValidationError("native replay proof required")
+        validate_opaque_text(causal_id, "business_source_causal_id")
+        return SourceReceipt(
+            envelope=self.envelope,
+            relation=self.relation,
+            related_causal_id=self.related_causal_id,
+            managed_cursor_state=self.managed_cursor_state,
+            native_cursor_state=self.native_cursor_state,
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=causal_id,
         )
 
     def with_resolution_superseded(self) -> "SourceReceipt":
@@ -381,6 +502,26 @@ class SourceReceipt:
             related_causal_id=self.related_causal_id,
             managed_cursor_state="superseded",
             native_cursor_state="not-ready",
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=self.business_source_causal_id,
+        )
+
+    def with_native_replay_rejected(self) -> "SourceReceipt":
+        if (
+            self.managed_cursor_state != "held"
+            or self.relation != "possible-replay"
+            or self.business_source_causal_id is not None
+            or self.native_event_digest is None
+        ):
+            raise AuthorityValidationError("unresolved native replay required")
+        return SourceReceipt(
+            envelope=self.envelope.without_body(),
+            relation=self.relation,
+            related_causal_id=self.related_causal_id,
+            managed_cursor_state="rejected",
+            native_cursor_state="not-ready",
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=None,
         )
 
     def with_native_cursor_state(self, state: str) -> "SourceReceipt":
@@ -390,6 +531,8 @@ class SourceReceipt:
             related_causal_id=self.related_causal_id,
             managed_cursor_state="committed",
             native_cursor_state=state,
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=self.business_source_causal_id,
         )
 
 

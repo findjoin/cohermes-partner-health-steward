@@ -18,6 +18,7 @@ from .authority import (
 )
 from .contract import (
     CommandEnvelope,
+    DailySourceMeta,
     DailyTurnMeta,
     DailyTurnPreparePayload,
     InboundAdmitPayload,
@@ -209,6 +210,38 @@ class HealthPlugin:
         )
         if admitted.status not in {"accepted", "replayed"}:
             return admitted
+        if (
+            type(admitted.meta) is DailySourceMeta
+            and admitted.meta.business_source_causal_id != envelope.causal_id
+        ):
+            root_causal_id = admitted.meta.business_source_causal_id
+            root_status = self._core.daily_turn_status(root_causal_id)
+            if root_status is None or root_status.phase != "finalized":
+                return Response(
+                    "unavailable",
+                    envelope.causal_id,
+                    "daily-source-native-replay-pending",
+                )
+            try:
+                root_result = self._core.daily_turn_result(root_causal_id)
+            except AuthorityValidationError as exc:
+                return Response(
+                    "unavailable",
+                    envelope.causal_id,
+                    str(exc) or "daily-turn-result-unavailable",
+                )
+            if root_result is None:
+                return Response(
+                    "replayed",
+                    envelope.causal_id,
+                    "daily-turn-result-redacted",
+                )
+            return Response(
+                "replayed",
+                envelope.causal_id,
+                "daily-source-native-replay",
+                DailyTurnMeta(root_result),
+            )
 
         runtime = self._daily_skill_runtime
         status = self._core.daily_turn_status(envelope.causal_id)
@@ -345,7 +378,15 @@ class HealthPlugin:
             status = self._core.daily_turn_status(envelope.causal_id)
         if status is None or status.phase != "finalized":
             return Response("unavailable", envelope.causal_id, "daily-turn-state-unavailable")
-        if status.result is None:
+        try:
+            result = self._core.daily_turn_result(envelope.causal_id)
+        except AuthorityValidationError as exc:
+            return Response(
+                "unavailable",
+                envelope.causal_id,
+                str(exc) or "daily-turn-result-unavailable",
+            )
+        if result is None:
             # A later bounded historical summary may intentionally remove the
             # old reply/evidence projection.  Exact causal replay still proves
             # that the turn finalized, but must not reconstruct deleted health
@@ -359,7 +400,7 @@ class HealthPlugin:
             "accepted",
             envelope.causal_id,
             "daily-turn-finalized",
-            DailyTurnMeta(status.result),
+            DailyTurnMeta(result),
         )
 
     @staticmethod

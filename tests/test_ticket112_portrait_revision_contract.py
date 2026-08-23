@@ -126,6 +126,7 @@ def _seeded_state() -> tuple[DailyHealthState, EvidenceCard, PortraitTopic]:
         topic_ref=TOPIC_REF,
         item_kind="current-understanding",
         item_text=claim.content,
+        applicable_period=card.applicable_period,
     )
     topic = PortraitTopic.from_decision(
         PortraitDecision.update(
@@ -155,7 +156,10 @@ def _proof_link(
     item_kind: str,
     item_text: str,
     trend_period: str | None = None,
+    applicable_period: str | None = None,
 ) -> PortraitProofLink:
+    if item_kind == "current-understanding" and applicable_period is None:
+        applicable_period = "2026-08-23-night"
     return PortraitProofLink.form(
         evidence_id=evidence_id,
         relation_kind=relation_kind,
@@ -163,6 +167,7 @@ def _proof_link(
         item_kind=item_kind,
         item_text=item_text,
         trend_period=trend_period,
+        applicable_period=applicable_period,
     )
 
 

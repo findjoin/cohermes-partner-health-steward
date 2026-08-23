@@ -162,6 +162,38 @@ def _display_texts(value: object, name: str) -> tuple[str, ...]:
     return result
 
 
+def _aligned_periods(
+    value: object,
+    expected_count: int,
+    name: str,
+) -> tuple[str, ...]:
+    """Validate one structured period per displayed conclusion.
+
+    Unlike ``_texts``, duplicate periods are valid: several distinct current
+    understandings may apply to the same period.
+    """
+
+    if type(value) is not tuple or len(value) != expected_count:
+        raise AuthorityValidationError(f"invalid {name}")
+    result = tuple(validate_opaque_text(item, name) for item in value)
+    if result != value:
+        raise AuthorityValidationError(f"invalid {name}")
+    return result
+
+
+def _stored_aligned_periods(
+    value: object,
+    expected_count: int,
+    name: str,
+) -> tuple[str, ...]:
+    if type(value) is not list or len(value) != expected_count:
+        raise AuthorityValidationError(f"invalid {name}")
+    result = tuple(validate_opaque_text(item, name) for item in value)
+    if list(result) != value:
+        raise AuthorityValidationError(f"invalid {name}")
+    return result
+
+
 class CoarseMessageRouter:
     """Use only the current body; failures conservatively stay in health."""
 
@@ -1386,6 +1418,122 @@ class StewardResolution:
         )
 
 
+def _validated_selected_reply_atoms(
+    context: StewardResolutionContext,
+    resolution: StewardResolution,
+) -> tuple[OwnerReplyAtom, ...]:
+    """Return only a complete, ordered, responsibility-bound reply selection."""
+
+    if (
+        type(context) is not StewardResolutionContext
+        or type(resolution) is not StewardResolution
+    ):
+        raise AuthorityValidationError("invalid steward reply selection")
+    atoms_by_id = {atom.atom_id: atom for atom in context.reply_atoms}
+    if len(atoms_by_id) != len(context.reply_atoms):
+        raise AuthorityValidationError("duplicate owner reply atom")
+    try:
+        selected_atoms = tuple(
+            atoms_by_id[atom_id] for atom_id in resolution.reply_atom_ids
+        )
+    except KeyError as exc:
+        raise AuthorityValidationError("unknown owner reply atom") from exc
+    if (
+        len({atom.atom_id for atom in selected_atoms}) != len(selected_atoms)
+        or [REPLY_ATOM_KINDS.index(atom.kind) for atom in selected_atoms]
+        != sorted(REPLY_ATOM_KINDS.index(atom.kind) for atom in selected_atoms)
+    ):
+        raise AuthorityValidationError("invalid final owner reply selection")
+
+    committed_evidence_ids = set(resolution.commit_evidence_ids)
+    committed_topic_refs = set(resolution.commit_portrait_topic_refs)
+    committed_change_ids = set(resolution.commit_evidence_change_ids)
+    if (
+        {
+            evidence_id
+            for atom in selected_atoms
+            if atom.kind == "record-result"
+            for evidence_id in atom.required_evidence_ids
+        }
+        != committed_evidence_ids
+        or {
+            topic_ref
+            for atom in selected_atoms
+            if atom.kind == "record-result"
+            for topic_ref in atom.required_portrait_topic_refs
+        }
+        != committed_topic_refs
+        or {
+            change_id
+            for atom in selected_atoms
+            if atom.kind == "record-result"
+            for change_id in atom.required_evidence_change_ids
+        }
+        != committed_change_ids
+    ):
+        raise AuthorityValidationError(
+            "owner reply did not cover every committed business change"
+        )
+
+    results_by_source: dict[
+        tuple[str, str], list[ResponsibilityResult]
+    ] = {}
+    for result in context.responsibility_results:
+        results_by_source.setdefault(
+            (result.canonical_name, result.result_digest), []
+        ).append(result)
+    for atom in selected_atoms:
+        carries_reference = bool(
+            atom.required_evidence_ids
+            or atom.required_portrait_topic_refs
+            or atom.required_evidence_change_ids
+        )
+        if atom.source_skill == "health-steward":
+            if carries_reference:
+                raise AuthorityValidationError(
+                    "steward reply reference lacks a responsibility result"
+                )
+            continue
+        matching_results = results_by_source.get(
+            (atom.source_skill, atom.source_result_digest), []
+        )
+        if len(matching_results) != 1:
+            raise AuthorityValidationError(
+                "owner reply source did not bind one responsibility result"
+            )
+        result = matching_results[0]
+        if (
+            (
+                atom.required_evidence_ids
+                and (
+                    result.canonical_name != "health-evidence"
+                    or not set(atom.required_evidence_ids)
+                    <= set(result.candidate_refs)
+                )
+            )
+            or (
+                atom.required_portrait_topic_refs
+                and (
+                    result.canonical_name != "health-portrait"
+                    or not set(atom.required_portrait_topic_refs)
+                    <= set(result.candidate_refs)
+                )
+            )
+            or (
+                atom.required_evidence_change_ids
+                and (
+                    result.canonical_name != "health-evidence"
+                    or not set(atom.required_evidence_change_ids)
+                    <= set(result.candidate_change_ids)
+                )
+            )
+        ):
+            raise AuthorityValidationError(
+                "owner reply reference exceeded its responsibility result"
+            )
+    return selected_atoms
+
+
 @dataclass(frozen=True)
 class EvidenceContext:
     source_causal_id: str
@@ -1677,6 +1825,31 @@ class PortraitContext:
                 "related_task_refs": list(self.related_task_refs)}
 
 
+def _portrait_item_target_ref(
+    *,
+    topic_ref: str,
+    item_kind: str,
+    item_text: str,
+    trend_period: str | None,
+    applicable_period: str | None,
+) -> str:
+    prefix = {
+        "current-understanding": "portrait-understanding:",
+        "trend": "portrait-trend:",
+        "open-judgment": "portrait-open-judgment:",
+        "key-unknown": "portrait-key-unknown:",
+    }[item_kind]
+    target: dict[str, object] = {
+        "topic_ref": topic_ref,
+        "item_kind": item_kind,
+        "item_text": item_text,
+        "trend_period": trend_period,
+    }
+    if item_kind == "current-understanding":
+        target["applicable_period"] = applicable_period
+    return prefix + stable_digest(target).removeprefix("sha256:")
+
+
 @dataclass(frozen=True)
 class PortraitProofLink:
     """One explicit evidence-to-portrait-item proof candidate.
@@ -1694,6 +1867,7 @@ class PortraitProofLink:
     item_kind: str
     item_text: str
     trend_period: str | None = None
+    applicable_period: str | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.evidence_id, "portrait proof evidence identifier")
@@ -1714,6 +1888,19 @@ class PortraitProofLink:
             validate_opaque_text(self.trend_period, "portrait trend proof period")
         elif self.trend_period is not None:
             raise AuthorityValidationError("unexpected portrait proof period")
+        if self.item_kind == "current-understanding":
+            if self.applicable_period is None:
+                raise AuthorityValidationError(
+                    "portrait current understanding applicable period required"
+                )
+            validate_opaque_text(
+                self.applicable_period,
+                "portrait current understanding applicable period",
+            )
+        elif self.applicable_period is not None:
+            raise AuthorityValidationError(
+                "unexpected portrait current understanding applicable period"
+            )
 
     @classmethod
     def form(
@@ -1725,6 +1912,7 @@ class PortraitProofLink:
         item_kind: str,
         item_text: str,
         trend_period: str | None = None,
+        applicable_period: str | None = None,
     ) -> "PortraitProofLink":
         return cls(
             evidence_id,
@@ -1733,24 +1921,18 @@ class PortraitProofLink:
             item_kind,
             item_text,
             trend_period,
+            applicable_period,
         )
 
     @property
     def target_ref(self) -> str:
-        prefix = {
-            "current-understanding": "portrait-understanding:",
-            "trend": "portrait-trend:",
-            "open-judgment": "portrait-open-judgment:",
-            "key-unknown": "portrait-key-unknown:",
-        }[self.item_kind]
-        return prefix + stable_digest(
-            {
-                "topic_ref": self.topic_ref,
-                "item_kind": self.item_kind,
-                "item_text": self.item_text,
-                "trend_period": self.trend_period,
-            }
-        ).removeprefix("sha256:")
+        return _portrait_item_target_ref(
+            topic_ref=self.topic_ref,
+            item_kind=self.item_kind,
+            item_text=self.item_text,
+            trend_period=self.trend_period,
+            applicable_period=self.applicable_period,
+        )
 
     def to_relation(self) -> "EvidenceRelation":
         return EvidenceRelation(
@@ -1769,6 +1951,7 @@ class PortraitProofLink:
             "item_kind": self.item_kind,
             "item_text": self.item_text,
             "trend_period": self.trend_period,
+            "applicable_period": self.applicable_period,
         }
 
     @classmethod
@@ -1782,10 +1965,36 @@ class PortraitProofLink:
                 "item_kind",
                 "item_text",
                 "trend_period",
+                "applicable_period",
             }),
             "portrait proof link",
         )
         return cls(**fields)  # type: ignore[arg-type]
+
+
+def _current_understanding_applicable_periods(
+    current_understandings: tuple[str, ...],
+    proof_links: tuple[PortraitProofLink, ...],
+) -> tuple[str, ...]:
+    periods: list[str] = []
+    for understanding in current_understandings:
+        linked_periods = {
+            link.applicable_period
+            for link in proof_links
+            if link.item_kind == "current-understanding"
+            and link.item_text == understanding
+        }
+        if len(linked_periods) != 1 or None in linked_periods:
+            raise AuthorityValidationError(
+                "one applicable period required per current understanding"
+            )
+        period = next(iter(linked_periods))
+        if type(period) is not str:
+            raise AuthorityValidationError(
+                "invalid current understanding applicable period"
+            )
+        periods.append(period)
+    return tuple(periods)
 
 
 @dataclass(frozen=True)
@@ -1854,9 +2063,25 @@ class PortraitDecision:
             validate_opaque_text(self.trend_period, "portrait trend period")
         elif self.trend_period is not None:
             raise AuthorityValidationError("portrait trend period without trend")
-        expected_targets = set()
+        understanding_periods = _current_understanding_applicable_periods(
+            self.current_understandings,
+            self.proof_links,
+        )
+        expected_targets = {
+            PortraitProofLink.form(
+                evidence_id="evidence:target-check",
+                relation_kind="supports",
+                topic_ref=self.topic_ref,
+                item_kind="current-understanding",
+                item_text=item,
+                applicable_period=period,
+            ).target_ref
+            for item, period in zip(
+                self.current_understandings,
+                understanding_periods,
+            )
+        }
         for item_kind, items in (
-            ("current-understanding", self.current_understandings),
             ("open-judgment", self.open_judgments),
             ("key-unknown", self.key_unknowns),
         ):
@@ -1894,6 +2119,13 @@ class PortraitDecision:
             validate_opaque_text(self.reason, "portrait decision reason")
         elif self.reason is not None:
             raise AuthorityValidationError("unexpected portrait decision reason")
+
+    @property
+    def current_understanding_applicable_periods(self) -> tuple[str, ...]:
+        return _current_understanding_applicable_periods(
+            self.current_understandings,
+            self.proof_links,
+        )
 
     @classmethod
     def update(cls, *, topic_ref: str, current_understandings: tuple[str, ...],
@@ -1995,6 +2227,22 @@ class PortraitDecision:
             fields["trend_period"],
             fields["reason"],
         )  # type: ignore[arg-type]
+
+
+def _validate_portrait_decision_applicable_periods(
+    decision: PortraitDecision,
+    cards: Mapping[str, EvidenceCard],
+) -> None:
+    if decision.status not in {"update", "degrade"}:
+        return
+    for link in decision.proof_links:
+        if link.item_kind != "current-understanding":
+            continue
+        card = cards.get(link.evidence_id)
+        if card is None or link.applicable_period != card.applicable_period:
+            raise AuthorityValidationError(
+                "portrait applicable period did not match its evidence card"
+            )
 
 
 @dataclass(frozen=True)
@@ -3079,6 +3327,7 @@ def _expected_stage_evidence_artifacts(
 class PortraitTopic:
     topic_ref: str
     current_understandings: tuple[str, ...]
+    current_understanding_applicable_periods: tuple[str, ...]
     open_judgments: tuple[str, ...]
     key_unknowns: tuple[str, ...]
     evidence_ids: tuple[str, ...]
@@ -3090,6 +3339,11 @@ class PortraitTopic:
     def __post_init__(self) -> None:
         _topic(self.topic_ref)
         _display_texts(self.current_understandings, "current understandings")
+        _aligned_periods(
+            self.current_understanding_applicable_periods,
+            len(self.current_understandings),
+            "current understanding applicable periods",
+        )
         _display_texts(self.open_judgments, "open judgments")
         _display_texts(self.key_unknowns, "key unknowns")
         _texts(self.evidence_ids, "evidence identifiers")
@@ -3136,13 +3390,23 @@ class PortraitTopic:
             ),
             *(link.to_relation() for link in decision.proof_links),
         )))
-        return cls(decision.topic_ref, decision.current_understandings, decision.open_judgments,
-                   decision.key_unknowns, evidence_ids,
-                   trend=decision.trend, trend_period=decision.trend_period,
-                   evidence_relations=relations)
+        return cls(
+            decision.topic_ref,
+            decision.current_understandings,
+            decision.current_understanding_applicable_periods,
+            decision.open_judgments,
+            decision.key_unknowns,
+            evidence_ids,
+            trend=decision.trend,
+            trend_period=decision.trend_period,
+            evidence_relations=relations,
+        )
 
     def to_storage(self) -> dict[str, object]:
         return {"topic_ref": self.topic_ref, "current_understandings": list(self.current_understandings),
+            "current_understanding_applicable_periods": list(
+                self.current_understanding_applicable_periods
+            ),
             "open_judgments": list(self.open_judgments), "key_unknowns": list(self.key_unknowns),
             "evidence_ids": list(self.evidence_ids), "trend": self.trend,
             "trend_period": self.trend_period,
@@ -3151,19 +3415,62 @@ class PortraitTopic:
 
     @classmethod
     def from_storage(cls, value: object) -> "PortraitTopic":
-        f = _mapping(value, frozenset({"topic_ref", "current_understandings", "open_judgments",
+        f = _mapping(value, frozenset({"topic_ref", "current_understandings",
+            "current_understanding_applicable_periods", "open_judgments",
             "key_unknowns", "evidence_ids", "trend", "related_task_ids",
             "trend_period", "evidence_relations"}), "portrait topic")
         relations = f["evidence_relations"]
         if type(relations) is not list:
             raise AuthorityValidationError("invalid portrait evidence relations")
-        return cls(f["topic_ref"], _stored_texts(f["current_understandings"], "current understandings", empty=True),
+        current_understandings = _stored_texts(
+            f["current_understandings"],
+            "current understandings",
+            empty=True,
+        )
+        return cls(f["topic_ref"], current_understandings,
+            _stored_aligned_periods(
+                f["current_understanding_applicable_periods"],
+                len(current_understandings),
+                "current understanding applicable periods",
+            ),
             _stored_texts(f["open_judgments"], "open judgments", empty=True),
             _stored_texts(f["key_unknowns"], "key unknowns", empty=True),
             _stored_texts(f["evidence_ids"], "evidence identifiers"), f["trend"],
             f["trend_period"],
             _stored_texts(f["related_task_ids"], "related task identifiers", empty=True),
             tuple(EvidenceRelation.from_storage(item) for item in relations))  # type: ignore[arg-type]
+
+
+def _validate_portrait_topic_applicable_periods(
+    topic: PortraitTopic,
+    cards: Mapping[str, EvidenceCard],
+) -> None:
+    for understanding, applicable_period in zip(
+        topic.current_understandings,
+        topic.current_understanding_applicable_periods,
+    ):
+        target_ref = _portrait_item_target_ref(
+            topic_ref=topic.topic_ref,
+            item_kind="current-understanding",
+            item_text=understanding,
+            trend_period=None,
+            applicable_period=applicable_period,
+        )
+        proof_relations = tuple(
+            relation
+            for relation in topic.evidence_relations
+            if relation.relation_class == "proof"
+            and relation.target_kind == "portrait-item"
+            and relation.target_ref == target_ref
+        )
+        if not proof_relations or any(
+            cards.get(relation.evidence_id) is None
+            or cards[relation.evidence_id].applicable_period != applicable_period
+            for relation in proof_relations
+        ):
+            raise AuthorityValidationError(
+                "portrait applicable period did not match its evidence card"
+            )
 
 
 @dataclass(frozen=True)
@@ -3383,6 +3690,7 @@ class PortraitTopicProjection:
     topic_ref: str
     current_status: str
     current_understandings: tuple[str, ...]
+    current_understanding_applicable_periods: tuple[str, ...]
     open_judgments: tuple[str, ...]
     key_unknowns: tuple[str, ...]
     trend: str | None
@@ -3396,6 +3704,11 @@ class PortraitTopicProjection:
         if self.current_status not in {"known", "unknown"}:
             raise AuthorityValidationError("invalid portrait topic status")
         _display_texts(self.current_understandings, "current understandings")
+        _aligned_periods(
+            self.current_understanding_applicable_periods,
+            len(self.current_understandings),
+            "current understanding applicable periods",
+        )
         _display_texts(self.open_judgments, "open judgments")
         _display_texts(self.key_unknowns, "key unknowns")
         if self.trend is not None:
@@ -3430,6 +3743,9 @@ class PortraitTopicProjection:
             "topic_ref": self.topic_ref,
             "current_status": self.current_status,
             "current_understandings": list(self.current_understandings),
+            "current_understanding_applicable_periods": list(
+                self.current_understanding_applicable_periods
+            ),
             "open_judgments": list(self.open_judgments),
             "key_unknowns": list(self.key_unknowns),
             "trend": self.trend,
@@ -3448,6 +3764,7 @@ class PortraitTopicProjection:
                     "topic_ref",
                     "current_status",
                     "current_understandings",
+                    "current_understanding_applicable_periods",
                     "open_judgments",
                     "key_unknowns",
                     "trend",
@@ -3462,10 +3779,20 @@ class PortraitTopicProjection:
         previews = fields["evidence_previews"]
         if type(previews) is not list:
             raise AuthorityValidationError("invalid evidence previews")
+        current_understandings = _stored_texts(
+            fields["current_understandings"],
+            "current understandings",
+            empty=True,
+        )
         return cls(
             fields["topic_ref"],
             fields["current_status"],
-            _stored_texts(fields["current_understandings"], "current understandings", empty=True),
+            current_understandings,
+            _stored_aligned_periods(
+                fields["current_understanding_applicable_periods"],
+                len(current_understandings),
+                "current understanding applicable periods",
+            ),
             _stored_texts(fields["open_judgments"], "open judgments", empty=True),
             _stored_texts(fields["key_unknowns"], "key unknowns", empty=True),
             fields["trend"],
@@ -4173,6 +4500,16 @@ class DailyTurnDraft:
                 )
             ):
                 return False
+            try:
+                _validate_portrait_decision_applicable_periods(
+                    decision,
+                    {
+                        card.evidence_id: card
+                        for card in context.committed_related_cards
+                    },
+                )
+            except AuthorityValidationError:
+                return False
             if decision.status in {"update", "degrade"}:
                 if (
                     decision.topic_ref != topic_ref
@@ -4247,30 +4584,19 @@ class DailyTurnDraft:
             or self.evidence_relations != expected_portrait_relations
         ):
             return False
-        atoms_by_id = {atom.atom_id: atom for atom in self.reply_atoms}
         try:
-            selected_atoms = tuple(
-                atoms_by_id[atom_id] for atom_id in resolution.reply_atom_ids
+            selected_atoms = _validated_selected_reply_atoms(
+                resolution_context,
+                resolution,
             )
-        except KeyError:
+        except AuthorityValidationError:
             return False
-        committed_topic_refs = set(resolution.commit_portrait_topic_refs)
         if (
-            len(atoms_by_id) != len(self.reply_atoms)
-            or len({atom.atom_id for atom in selected_atoms}) != len(selected_atoms)
-            or (
+            (
                 "".join(atom.text for atom in selected_atoms)
                 + _render_daily_skill_disclosure(self.skill_disclosures)
             )
             != self.owner_reply
-            or any(
-                not set(atom.required_evidence_ids) <= set(candidate_evidence_ids)
-                or not set(atom.required_portrait_topic_refs)
-                <= committed_topic_refs
-                or not set(atom.required_evidence_change_ids)
-                <= set(candidate_evidence_change_ids)
-                for atom in selected_atoms
-            )
         ):
             return False
         try:
@@ -4341,6 +4667,8 @@ class DailyHealthState:
         ):
             raise AuthorityValidationError("portrait relation missing from evidence ledger")
         cards = {card.evidence_id: card for card in self.evidence_cards}
+        for topic in self.portrait_topics:
+            _validate_portrait_topic_applicable_periods(topic, cards)
         changes_by_target = {
             change.target_evidence_id: change
             for change in self.evidence_applicability_changes
@@ -4638,6 +4966,11 @@ class DailyHealthState:
                     topic_ref,
                     "unknown" if topic is None else "known",
                     () if topic is None else topic.current_understandings,
+                    (
+                        ()
+                        if topic is None
+                        else topic.current_understanding_applicable_periods
+                    ),
                     () if topic is None else topic.open_judgments,
                     () if topic is None else topic.key_unknowns,
                     None if topic is None else topic.trend,
@@ -5329,6 +5662,7 @@ def _portrait_context_for(
             (),
             (),
             (),
+            (),
             None,
             None,
             (),
@@ -5857,6 +6191,13 @@ class DailySkillRuntime:
                         raise AuthorityValidationError(
                             "portrait preview is incomplete; typed gap required"
                         )
+                    _validate_portrait_decision_applicable_periods(
+                        decision,
+                        {
+                            card.evidence_id: card
+                            for card in context.committed_related_cards
+                        },
+                    )
                     candidate_refs = (
                         (topic_ref,)
                         if decision.status in {
@@ -6144,7 +6485,6 @@ class DailySkillRuntime:
         candidate_topics = {
             topic.topic_ref: topic for topic in portrait_topics
         }
-        atoms_by_id = {atom.atom_id: atom for atom in reply_atoms}
         affected_portrait_refs = (
             resolution_context.candidate_portrait_topic_refs
         )
@@ -6153,7 +6493,6 @@ class DailySkillRuntime:
             or resolution.commit_portrait_topic_refs != affected_portrait_refs
             or resolution.commit_evidence_change_ids
             != stage_evidence_change_ids
-            or not set(resolution.reply_atom_ids) <= set(atoms_by_id)
         ):
             raise AuthorityValidationError(
                 "steward resolution did not preserve committed evidence"
@@ -6163,27 +6502,10 @@ class DailySkillRuntime:
             for topic_ref in resolution.commit_portrait_topic_refs
             if topic_ref in candidate_topics
         )
-        selected_atoms = tuple(
-            atoms_by_id[atom_id] for atom_id in resolution.reply_atom_ids
+        selected_atoms = _validated_selected_reply_atoms(
+            resolution_context,
+            resolution,
         )
-        if (
-            len({atom.atom_id for atom in selected_atoms})
-            != len(selected_atoms)
-            or [REPLY_ATOM_KINDS.index(atom.kind) for atom in selected_atoms]
-            != sorted(
-                REPLY_ATOM_KINDS.index(atom.kind)
-                for atom in selected_atoms
-            )
-            or any(
-                not set(atom.required_evidence_ids) <= set(stage_evidence_ids)
-                or not set(atom.required_portrait_topic_refs)
-                <= set(resolution.commit_portrait_topic_refs)
-                or not set(atom.required_evidence_change_ids)
-                <= set(stage_evidence_change_ids)
-                for atom in selected_atoms
-            )
-        ):
-            raise AuthorityValidationError("invalid final owner reply selection")
         proofs.append(
             self._proof(
                 self._bundle.asset("health-steward"),

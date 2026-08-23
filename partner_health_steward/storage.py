@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -62,6 +63,18 @@ class StoreUnavailable(RuntimeError):
 
 class CausalIdConflict(RuntimeError):
     """A causal ID was reused with a different command envelope."""
+
+
+@dataclass(frozen=True)
+class _ExactCommandReceipt:
+    command: CommandEnvelope
+    response: Response
+
+
+@dataclass(frozen=True)
+class _DigestCommandReceipt:
+    command_digest: str
+    response: Response
 
 
 @dataclass(frozen=True)
@@ -1324,10 +1337,16 @@ class EncryptedStateStore:
             if legacy is not None:
                 raise CausalIdConflict("legacy-receipt-unreplayable")
             return None
-        stored_command, stored_response = self._decode_receipt(command.causal_id, row[0], row[1])
-        if stored_command.to_wire() != self._receipt_command_wire(command):
+        stored = self._decode_receipt(command.causal_id, row[0], row[1])
+        if isinstance(stored, _ExactCommandReceipt):
+            if stored.command.to_wire() != self._receipt_command_wire(command):
+                raise CausalIdConflict("causal-id-conflict")
+        elif not hmac.compare_digest(
+            stored.command_digest,
+            self._receipt_command_digest(command),
+        ):
             raise CausalIdConflict("causal-id-conflict")
-        return stored_response
+        return stored.response
 
     def pending_command(self, command: CommandEnvelope) -> PendingCommand | None:
         row = self._execute(
@@ -1758,26 +1777,48 @@ class EncryptedStateStore:
             if cursor.rowcount:
                 self._refresh_integrity_manifest(connection)
 
-    def save_source_envelope(self, envelope: SourceEnvelope) -> None:
+    def save_source_envelope(
+        self,
+        envelope: SourceEnvelope,
+        *,
+        confirm_native_replay: bool = False,
+    ) -> SourceReceipt:
         """Persist one admitted source observation inside the caller transaction."""
 
         if type(envelope) is not SourceEnvelope:
             raise AuthorityValidationError("invalid source envelope")
+        if type(confirm_native_replay) is not bool:
+            raise AuthorityValidationError("invalid native replay policy")
+        native_event_digest = (
+            None
+            if envelope.message_id is None
+            else self._native_event_digest(envelope)
+        )
         with self.transaction() as connection:
             self._assert_integrity_manifest_before_mutation()
+            same_causal = self.source_receipt(envelope.causal_id)
+            if same_causal is not None:
+                if not same_causal.matches_exact_delivery(
+                    envelope,
+                    native_event_digest,
+                ):
+                    raise CausalIdConflict("causal-id-conflict")
+                return same_causal
             related_causal_id = None
+            related_receipt = None
             if envelope.message_id is not None:
                 rows = connection.execute(
                     "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY rowid"
                 ).fetchall()
                 for causal_id, existing_nonce, existing_ciphertext in rows:
-                    existing = SourceReceipt.from_storage(
+                    existing_receipt = SourceReceipt.from_storage(
                         self._open(
                             f"source-envelope:{causal_id}",
                             existing_nonce,
                             existing_ciphertext,
                         )
-                    ).envelope
+                    )
+                    existing = existing_receipt.envelope
                     if (
                         existing.channel == envelope.channel
                         and existing.partner_id == envelope.partner_id
@@ -1786,7 +1827,20 @@ class EncryptedStateStore:
                         and existing.message_id == envelope.message_id
                     ):
                         related_causal_id = causal_id
+                        related_receipt = existing_receipt
                         break
+            business_source_causal_id = None
+            if (
+                confirm_native_replay
+                and related_receipt is not None
+                and related_receipt.native_event_digest is not None
+                and native_event_digest is not None
+                and hmac.compare_digest(
+                    related_receipt.native_event_digest,
+                    native_event_digest,
+                )
+            ):
+                business_source_causal_id = related_receipt.business_causal_id
             receipt = SourceReceipt(
                 envelope=envelope,
                 relation=(
@@ -1799,21 +1853,69 @@ class EncryptedStateStore:
                 related_causal_id=related_causal_id,
                 managed_cursor_state="held",
                 native_cursor_state="not-ready",
+                native_event_digest=native_event_digest,
+                business_source_causal_id=business_source_causal_id,
             )
             nonce, ciphertext = self._seal(
                 f"source-envelope:{envelope.causal_id}",
                 receipt.to_storage(),
             )
-            try:
-                connection.execute(
-                    "INSERT INTO source_envelopes_v1(causal_id, nonce, ciphertext) VALUES (?, ?, ?)",
-                    (envelope.causal_id, nonce, ciphertext),
-                )
-            except sqlite3.IntegrityError as exc:
-                existing = self.source_envelope(envelope.causal_id)
-                if existing != envelope:
-                    raise CausalIdConflict("causal-id-conflict") from exc
+            connection.execute(
+                "INSERT INTO source_envelopes_v1(causal_id, nonce, ciphertext) VALUES (?, ?, ?)",
+                (envelope.causal_id, nonce, ciphertext),
+            )
             self._refresh_integrity_manifest(connection)
+            return receipt
+
+    def source_receipt_matches_exact_delivery(
+        self,
+        receipt: SourceReceipt,
+        envelope: SourceEnvelope,
+    ) -> bool:
+        if type(receipt) is not SourceReceipt or type(envelope) is not SourceEnvelope:
+            return False
+        digest = (
+            None
+            if envelope.message_id is None or type(envelope.body) is not str
+            else self._native_event_digest(envelope)
+        )
+        return receipt.matches_exact_delivery(envelope, digest)
+
+    def _native_event_digest(self, envelope: SourceEnvelope) -> str:
+        """Produce the long-lived, domain-separated keyed native fingerprint."""
+
+        if type(envelope) is not SourceEnvelope:
+            raise AuthorityValidationError("invalid source envelope")
+        try:
+            canonical = json.dumps(
+                envelope.native_event_fingerprint_material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            master_key = self._key_provider.get_key()
+        except (
+            TypeError,
+            ValueError,
+            UnicodeEncodeError,
+            RecursionError,
+        ) as exc:
+            raise KeyUnavailable("native event fingerprint unavailable") from exc
+        except Exception as exc:
+            raise KeyUnavailable("health key unavailable") from exc
+        if not isinstance(master_key, bytes) or len(master_key) not in {16, 24, 32}:
+            raise KeyUnavailable("health key invalid")
+        digest_key = hmac.new(
+            master_key,
+            b"partner-health-steward/native-event-digest-key/v1",
+            hashlib.sha256,
+        ).digest()
+        digest = hmac.new(
+            digest_key,
+            b"partner-health-steward/native-event/v1\x00" + canonical,
+            hashlib.sha256,
+        ).hexdigest()
+        return "hmac-sha256:" + digest
 
     def source_envelope(self, causal_id: str) -> SourceEnvelope | None:
         receipt = self.source_receipt(causal_id)
@@ -1870,8 +1972,52 @@ class EncryptedStateStore:
             receipt.with_resolution_superseded()
         )
 
+    def reject_source_native_replay(self, causal_id: str) -> SourceReceipt:
+        """Clear an unprovable/conflicting native body without releasing cursor."""
+
+        receipt = self.source_receipt(causal_id)
+        if receipt is None:
+            raise AuthorityValidationError("unresolved native replay required")
+        if receipt.managed_cursor_state == "rejected":
+            return receipt
+        return self._replace_source_receipt(
+            receipt.with_native_replay_rejected()
+        )
+
     def mark_source_business_committed(self, causal_id: str) -> SourceReceipt:
         return self.mark_source_business_committed_many((causal_id,))[0]
+
+    def mark_daily_source_family_business_committed(
+        self,
+        business_source_causal_id: str,
+    ) -> tuple[SourceReceipt, ...]:
+        """Release one canonical daily source and every proven native alias."""
+
+        validate_opaque_text(
+            business_source_causal_id,
+            "business_source_causal_id",
+        )
+        rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 "
+            "ORDER BY rowid"
+        ).fetchall()
+        causal_ids: list[str] = []
+        for causal_id, nonce, ciphertext in rows:
+            try:
+                receipt = SourceReceipt.from_storage(
+                    self._open(f"source-envelope:{causal_id}", nonce, ciphertext)
+                )
+            except AuthorityValidationError as exc:
+                raise KeyUnavailable("invalid source receipt") from exc
+            if (
+                causal_id == business_source_causal_id
+                or receipt.business_source_causal_id
+                == business_source_causal_id
+            ):
+                causal_ids.append(causal_id)
+        if business_source_causal_id not in causal_ids:
+            raise AuthorityValidationError("daily source required")
+        return self.mark_source_business_committed_many(tuple(causal_ids))
 
     def mark_source_business_committed_many(
         self,
@@ -2300,7 +2446,7 @@ class EncryptedStateStore:
                 terminal,
                 result,
             )
-            self._delete_daily_prepare_receipts(
+            self._redact_daily_prepare_receipts(
                 connection,
                 draft.source_causal_id,
             )
@@ -2642,29 +2788,47 @@ class EncryptedStateStore:
             ),
         )
 
-    def _delete_daily_prepare_receipts(
+    def _redact_daily_prepare_receipts(
         self,
         connection: sqlite3.Connection,
         source_causal_id: str,
     ) -> None:
-        """Erase recovery-only full-draft receipts after atomic finalization."""
+        """Replace recovery-only full drafts with exact body-free replay tombstones."""
 
         rows = connection.execute(
             "SELECT causal_id, nonce, ciphertext FROM command_receipts_v2"
         ).fetchall()
-        matched: list[str] = []
+        replacements: list[tuple[bytes, bytes, str]] = []
         for causal_id, nonce, ciphertext in rows:
-            command, _ = self._decode_receipt(causal_id, nonce, ciphertext)
+            stored = self._decode_receipt(causal_id, nonce, ciphertext)
+            if not isinstance(stored, _ExactCommandReceipt):
+                continue
+            command = stored.command
             if (
                 command.action == "turn.prepare"
                 and isinstance(command.payload, DailyTurnPreparePayload)
                 and command.payload.draft.source_causal_id == source_causal_id
             ):
-                matched.append(causal_id)
-        for causal_id in matched:
+                # A prepare response is deliberately content-free.  Refuse to
+                # preserve an unexpected projection while scrubbing its draft.
+                if stored.response.meta.to_wire() != {}:
+                    raise KeyUnavailable("daily prepare receipt response is not body-free")
+                redacted_nonce, redacted_ciphertext = self._seal(
+                    f"receipt:v2:{causal_id}",
+                    {
+                        "kind": "command-digest-v1",
+                        "command_digest": self._receipt_command_digest(command),
+                        "response": stored.response.to_wire(),
+                    },
+                )
+                replacements.append(
+                    (redacted_nonce, redacted_ciphertext, causal_id)
+                )
+        for redacted_nonce, redacted_ciphertext, causal_id in replacements:
             connection.execute(
-                "DELETE FROM command_receipts_v2 WHERE causal_id = ?",
-                (causal_id,),
+                "UPDATE command_receipts_v2 SET nonce = ?, ciphertext = ? "
+                "WHERE causal_id = ?",
+                (redacted_nonce, redacted_ciphertext, causal_id),
             )
 
     def _scrub_compacted_terminal_results(
@@ -3225,29 +3389,66 @@ class EncryptedStateStore:
             raise KeyUnavailable("invalid effect result receipt") from exc
         return wire
 
+    @classmethod
+    def _receipt_command_digest(cls, command: CommandEnvelope) -> str:
+        """Bind the complete redacted receipt identity without retaining its body."""
+
+        wire = cls._receipt_command_wire(command)
+        try:
+            canonical = json.dumps(
+                wire,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+            raise KeyUnavailable("invalid receipt command") from exc
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
     def _decode_receipt(
         self,
         causal_id: str,
         nonce: bytes,
         ciphertext: bytes,
-    ) -> tuple[CommandEnvelope, Response]:
+    ) -> _ExactCommandReceipt | _DigestCommandReceipt:
         stored = self._open(f"receipt:v2:{causal_id}", nonce, ciphertext)
-        if not isinstance(stored, Mapping) or set(stored) != {"command", "response"}:
+        if not isinstance(stored, Mapping):
             raise KeyUnavailable("invalid command receipt")
-        stored_command = stored["command"]
-        stored_response = stored["response"]
-        if not isinstance(stored_command, Mapping) or not isinstance(stored_response, Mapping):
+        stored_response = stored.get("response")
+        if not isinstance(stored_response, Mapping):
             raise KeyUnavailable("invalid command receipt")
         try:
-            command = CommandEnvelope.from_wire(stored_command)
             response = Response.from_wire(stored_response)
         except ProtocolViolation as exc:
             raise KeyUnavailable("invalid command receipt") from exc
-        if command.causal_id != causal_id:
-            raise KeyUnavailable("invalid command receipt")
         if response.causal_id != causal_id:
             raise KeyUnavailable("invalid command receipt")
-        return command, response
+        if set(stored) == {"command", "response"}:
+            stored_command = stored["command"]
+            if not isinstance(stored_command, Mapping):
+                raise KeyUnavailable("invalid command receipt")
+            try:
+                command = CommandEnvelope.from_wire(stored_command)
+            except ProtocolViolation as exc:
+                raise KeyUnavailable("invalid command receipt") from exc
+            if command.causal_id != causal_id:
+                raise KeyUnavailable("invalid command receipt")
+            return _ExactCommandReceipt(command, response)
+        if set(stored) != {"kind", "command_digest", "response"}:
+            raise KeyUnavailable("invalid command receipt")
+        command_digest = stored["command_digest"]
+        if (
+            stored["kind"] != "command-digest-v1"
+            or type(command_digest) is not str
+            or not command_digest.startswith("sha256:")
+            or len(command_digest) != len("sha256:") + 64
+        ):
+            raise KeyUnavailable("invalid command receipt")
+        try:
+            int(command_digest.removeprefix("sha256:"), 16)
+        except ValueError as exc:
+            raise KeyUnavailable("invalid command receipt") from exc
+        return _DigestCommandReceipt(command_digest, response)
 
     def _seal_finalized_authority(
         self,

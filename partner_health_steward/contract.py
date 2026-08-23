@@ -490,6 +490,22 @@ class DailyTurnMeta(ResponseMeta):
         return {"turn_result": self.turn_result.to_storage()}
 
 
+@dataclass(frozen=True)
+class DailySourceMeta(ResponseMeta):
+    """Canonical business source selected for one admitted native delivery."""
+
+    business_source_causal_id: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(
+            self.business_source_causal_id,
+            "business_source_causal_id",
+        )
+
+    def to_wire(self) -> dict[str, object]:
+        return {"business_source_causal_id": self.business_source_causal_id}
+
+
 def _parse_response_meta(value: object) -> ResponseMeta:
     if type(value) in {
         EmptyMeta,
@@ -497,6 +513,7 @@ def _parse_response_meta(value: object) -> ResponseMeta:
         CommitMeta,
         EffectIntentMeta,
         DailyTurnMeta,
+        DailySourceMeta,
     }:
         return value
     if isinstance(value, ResponseMeta) or type(value) is not dict:
@@ -514,6 +531,13 @@ def _parse_response_meta(value: object) -> ResponseMeta:
         except (TypeError, ValueError) as exc:
             raise ProtocolViolation("invalid daily turn metadata") from exc
         return DailyTurnMeta(turn_result)
+    if keys == {"business_source_causal_id"}:
+        return DailySourceMeta(
+            _bounded_text(
+                value["business_source_causal_id"],
+                "business_source_causal_id",
+            )
+        )
     effect_fields = {"effect_id", "effect_kind", "intent_digest", "authority"}
     if keys == effect_fields:
         try:

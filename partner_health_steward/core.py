@@ -39,6 +39,7 @@ from .authority import (
 from .contract import (
     CommandEnvelope,
     CommitMeta,
+    DailySourceMeta,
     DailyTurnPreparePayload,
     EffectIntentMeta,
     EffectRequestPayload,
@@ -2329,7 +2330,14 @@ class HealthCore:
         # A response-lost commit retries with the original prepared generation;
         # its state-specific branch below can only reconcile an existing
         # encrypted ``unknown`` operation by transition lookup.
-        if command.generation != head.generation and command.action not in {"state.commit", "effect.result"}:
+        confirmed_alias_replay = self._is_confirmed_daily_source_alias_replay(
+            command
+        )
+        if (
+            command.generation != head.generation
+            and command.action not in {"state.commit", "effect.result"}
+            and not confirmed_alias_replay
+        ):
             raise ProtocolViolation("generation mismatch")
         if command.action == "effect.result" and command.generation != head.generation:
             payload = command.payload
@@ -2417,6 +2425,29 @@ class HealthCore:
         if command.action == "effect.result":
             raise StoreUnavailable("effect result must use the remote handler")
         raise ProtocolViolation("unknown action")
+
+    def _is_confirmed_daily_source_alias_replay(
+        self,
+        command: CommandEnvelope,
+    ) -> bool:
+        """Permit an exact confirmed alias to converge after its root advanced head."""
+
+        payload = command.payload
+        if (
+            command.action != "inbound.admit"
+            or not isinstance(payload, InboundAdmitPayload)
+            or payload.envelope.causal_id != command.causal_id
+        ):
+            return False
+        receipt = self._store.source_receipt(command.causal_id)
+        return (
+            receipt is not None
+            and receipt.business_source_causal_id is not None
+            and self._store.source_receipt_matches_exact_delivery(
+                receipt,
+                payload.envelope,
+            )
+        )
 
     def _daily_turn_lease_response(
         self,
@@ -2615,7 +2646,62 @@ class HealthCore:
                     ),
                     False,
                 )
-            self._store.save_source_envelope(payload.envelope)
+            receipt = self._store.save_source_envelope(
+                payload.envelope,
+                confirm_native_replay=True,
+            )
+            if receipt.relation == "possible-replay":
+                business_source = receipt.business_source_causal_id
+                if business_source is None:
+                    related = (
+                        None
+                        if receipt.related_causal_id is None
+                        else self._store.source_receipt(receipt.related_causal_id)
+                    )
+                    if related is None or related.native_event_digest is None:
+                        self._store.reject_source_native_replay(
+                            command.causal_id
+                        )
+                        return _Handled(
+                            Response(
+                                "unavailable",
+                                command.causal_id,
+                                "native-replay-proof-unavailable",
+                            ),
+                            True,
+                        )
+                    self._store.reject_source_native_replay(
+                        command.causal_id
+                    )
+                    return _Handled(
+                        Response(
+                            "rejected",
+                            command.causal_id,
+                            "native-message-id-conflict",
+                        ),
+                        True,
+                    )
+                root_turn = self._store.daily_turn(business_source)
+                if root_turn is None or root_turn.phase != "finalized":
+                    return _Handled(
+                        Response(
+                            "unavailable",
+                            command.causal_id,
+                            "daily-source-native-replay-pending",
+                            DailySourceMeta(business_source),
+                        ),
+                        False,
+                    )
+                self._store.mark_source_business_committed(command.causal_id)
+                return _Handled(
+                    Response(
+                        "replayed",
+                        command.causal_id,
+                        "daily-source-native-replay",
+                        DailySourceMeta(business_source),
+                    ),
+                    True,
+                )
             return _Handled(
                 Response("accepted", command.causal_id, "daily-source-admitted"),
                 True,
@@ -3376,7 +3462,7 @@ class HealthCore:
                     self._store.finalize_daily_evidence_stage(daily.draft)
                 else:
                     self._store.finalize_daily_turn(daily.draft)
-                    self._store.mark_source_business_committed(
+                    self._store.mark_daily_source_family_business_committed(
                         daily.draft.source_causal_id
                     )
             self._closed_reason = None
@@ -3808,6 +3894,8 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("daily-state-unavailable")
             try:
+                if self._probe_open().state is not ProbeState.HEALTHY:
+                    raise AuthorityValidationError("daily-state-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
                 initialization = self._store.initialization()
@@ -3946,6 +4034,8 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("daily-stage-state-unavailable")
             try:
+                if self._probe_open().state is not ProbeState.HEALTHY:
+                    raise AuthorityValidationError("daily-stage-state-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
                 if authority is None or not self._store.verify_integrity(authority):
@@ -4011,12 +4101,41 @@ class HealthCore:
                 return DailyTurnStatus(
                     daily.phase,
                     daily.draft,
-                    daily.result,
+                    None if daily.phase == "finalized" else daily.result,
                     prepared.base,
                     daily.terminal,
                 )
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
+
+    def daily_turn_result(self, source_causal_id: str) -> DailyTurnResult | None:
+        """Release one finalized owner result only after a fresh strong read."""
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("daily-turn-result-unavailable")
+            report = self._probe_open()
+            if report.state is not ProbeState.HEALTHY:
+                raise AuthorityValidationError(
+                    report.reason_code or "daily-turn-result-unavailable"
+                )
+            try:
+                daily = self._store.daily_turn(source_causal_id)
+                if (
+                    daily is None
+                    or daily.phase != "finalized"
+                    or daily.draft is not None
+                    or daily.terminal is None
+                ):
+                    raise AuthorityValidationError(
+                        "daily-turn-result-unavailable"
+                    )
+                return daily.result
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError(
+                    "daily-turn-result-unavailable"
+                ) from exc
 
     def initialization_status(self) -> InitializationProjection:
         """Return the durable product phase without treating probe liveness as enablement."""
@@ -4197,6 +4316,14 @@ class HealthCore:
                 return False
 
     def _business_transition_id_for_source(self, causal_id: str) -> str | None:
+        receipt = self._store.source_receipt(causal_id)
+        if (
+            receipt is not None
+            and receipt.business_source_causal_id is not None
+        ):
+            return self._business_transition_id_for_source(
+                receipt.business_source_causal_id
+            )
         initialization = self._store.initialization()
         if (
             initialization is not None
