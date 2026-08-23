@@ -102,6 +102,36 @@ class AdmissionPolicy:
             and envelope.requested_capability == "health-init"
         )
 
+    def to_storage(self) -> dict[str, object]:
+        """Serialize the exact technical entrypoint that issued authority."""
+
+        return {
+            "partner_id": self.partner_id,
+            "owner_sender_id": self.owner_sender_id,
+            "conversation_id": self.conversation_id,
+            "channel": self.channel,
+            "entrypoint": self.entrypoint,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "AdmissionPolicy":
+        fields = {
+            "partner_id",
+            "owner_sender_id",
+            "conversation_id",
+            "channel",
+            "entrypoint",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise AuthorityValidationError("invalid admission policy")
+        return cls(
+            partner_id=value["partner_id"],  # type: ignore[arg-type]
+            owner_sender_id=value["owner_sender_id"],  # type: ignore[arg-type]
+            conversation_id=value["conversation_id"],  # type: ignore[arg-type]
+            channel=value["channel"],  # type: ignore[arg-type]
+            entrypoint=value["entrypoint"],  # type: ignore[arg-type]
+        )
+
 
 @dataclass(frozen=True)
 class RawWeixinMessage:
@@ -252,7 +282,7 @@ class SourceReceipt:
             self.envelope.message_id is not None or self.related_causal_id is not None
         ):
             raise AuthorityValidationError("invalid source relation")
-        if self.managed_cursor_state not in {"held", "committed"}:
+        if self.managed_cursor_state not in {"held", "superseded", "committed"}:
             raise AuthorityValidationError("invalid source cursor state")
         if self.native_cursor_state not in {
             "not-ready",
@@ -262,11 +292,17 @@ class SourceReceipt:
             "unknown",
         }:
             raise AuthorityValidationError("invalid source cursor state")
-        if self.managed_cursor_state == "held" and self.native_cursor_state != "not-ready":
+        if (
+            self.managed_cursor_state in {"held", "superseded"}
+            and self.native_cursor_state != "not-ready"
+        ):
             raise AuthorityValidationError("invalid source cursor state")
         if self.managed_cursor_state == "committed" and self.native_cursor_state == "not-ready":
             raise AuthorityValidationError("invalid source cursor state")
-        if self.managed_cursor_state == "held" and self.envelope.body is None:
+        if (
+            self.managed_cursor_state in {"held", "superseded"}
+            and self.envelope.body is None
+        ):
             raise AuthorityValidationError("held source body is missing")
         if self.managed_cursor_state == "committed" and self.envelope.body is not None:
             raise AuthorityValidationError("committed source body was not released")
@@ -306,6 +342,17 @@ class SourceReceipt:
             related_causal_id=self.related_causal_id,
             managed_cursor_state="committed",
             native_cursor_state="ready",
+        )
+
+    def with_resolution_superseded(self) -> "SourceReceipt":
+        if self.managed_cursor_state != "held":
+            raise AuthorityValidationError("initialization source is not active")
+        return SourceReceipt(
+            envelope=self.envelope,
+            relation=self.relation,
+            related_causal_id=self.related_causal_id,
+            managed_cursor_state="superseded",
+            native_cursor_state="not-ready",
         )
 
     def with_native_cursor_state(self, state: str) -> "SourceReceipt":

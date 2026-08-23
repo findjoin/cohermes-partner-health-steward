@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .admission import AdmissionPolicy
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -31,6 +32,7 @@ from .authority import (
 
 
 HEALTH_INIT_CANONICAL_NAME = "health-init"
+HEALTH_INIT_FRIENDLY_NAME = "健康管家初始化"
 INITIAL_DATA_BOUNDARY = (
     "health-portrait",
     "health-evidence",
@@ -54,6 +56,12 @@ INITIAL_PORTRAIT_DOMAINS = (
     "health-behaviour-and-exposure",
     "owner-goals-values-and-care-preferences",
 )
+# Six prior source identifiers plus one later resolution source fit the
+# 16,384-byte inbound body contract even when both workflow/source identifiers
+# use their full 256-byte bounds and every prior identifier needs maximal JSON
+# escaping.  Core reserves that seventh source for an immediately resolvable
+# owner decision instead of allowing an unbounded conflict queue.
+MAX_RESOLVED_SOURCE_CAUSAL_IDS = 6
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HMAC_SHA256_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
@@ -103,6 +111,46 @@ def _required_storage_text_list(
     if list(validated) != value:
         raise AuthorityValidationError(f"invalid {name}")
     return validated
+
+
+def _opaque_text_tuple(
+    value: object,
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if type(value) is not tuple or (not value and not allow_empty):
+        raise AuthorityValidationError(f"invalid {name}")
+    validated = tuple(validate_opaque_text(item, name) for item in value)
+    if validated != value or len(set(validated)) != len(validated):
+        raise AuthorityValidationError(f"invalid {name}")
+    return validated
+
+
+def _storage_opaque_text_list(
+    value: object,
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if type(value) is not list or (not value and not allow_empty):
+        raise AuthorityValidationError(f"invalid {name}")
+    validated = tuple(validate_opaque_text(item, name) for item in value)
+    if list(validated) != value or len(set(validated)) != len(validated):
+        raise AuthorityValidationError(f"invalid {name}")
+    return validated
+
+
+def _disclosure_text(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise AuthorityValidationError(f"invalid {name}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthorityValidationError(f"invalid {name}") from exc
+    if len(encoded) > 2_048:
+        raise AuthorityValidationError(f"invalid {name}")
+    return value
 
 
 def _sha256_text(value: object, name: str) -> str:
@@ -279,6 +327,255 @@ class SupportContactBoundary:
 
 
 @dataclass(frozen=True)
+class InitializationDisclosureNotice:
+    """One versioned, owner-visible meaning in the initialization bundle."""
+
+    topic: str
+    text: str
+
+    def __post_init__(self) -> None:
+        if self.topic not in INITIALIZATION_DISCLOSED_TOPICS:
+            raise AuthorityValidationError("invalid initialization disclosure topic")
+        _disclosure_text(self.text, "initialization disclosure text")
+
+    def to_storage(self) -> dict[str, object]:
+        return {"topic": self.topic, "text": self.text}
+
+    @classmethod
+    def from_storage(cls, value: object) -> "InitializationDisclosureNotice":
+        stored = _required_mapping(
+            value,
+            frozenset({"topic", "text"}),
+            "initialization disclosure notice",
+        )
+        return cls(
+            topic=stored["topic"],  # type: ignore[arg-type]
+            text=stored["text"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class InitializationDisclosureContent:
+    """The exact structured disclosure presented before owner confirmation."""
+
+    canonical_name: str
+    version: str
+    asset_digest: str
+    disclosure_version: str
+    disclosed_topics: tuple[str, ...]
+    first_hop_route: str
+    data_boundary: tuple[str, ...]
+    support_contact: SupportContactBoundary | None
+    owner_visible_notices: tuple[InitializationDisclosureNotice, ...]
+    friendly_name: str = HEALTH_INIT_FRIENDLY_NAME
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.friendly_name) is not str
+            or self.friendly_name != HEALTH_INIT_FRIENDLY_NAME
+        ):
+            raise AuthorityValidationError("invalid health-init friendly name")
+        if (
+            type(self.canonical_name) is not str
+            or self.canonical_name != HEALTH_INIT_CANONICAL_NAME
+        ):
+            raise AuthorityValidationError("invalid health-init canonical name")
+        validate_opaque_text(self.version, "health-init version")
+        _sha256_text(self.asset_digest, "health-init asset digest")
+        validate_opaque_text(self.disclosure_version, "health-init disclosure version")
+        _required_text_tuple(
+            self.disclosed_topics,
+            "initialization disclosed topics",
+            expected=INITIALIZATION_DISCLOSED_TOPICS,
+        )
+        validate_opaque_text(self.first_hop_route, "first-hop route")
+        _required_text_tuple(
+            self.data_boundary,
+            "initial data boundary",
+            expected=INITIAL_DATA_BOUNDARY,
+        )
+        if (
+            self.support_contact is not None
+            and type(self.support_contact) is not SupportContactBoundary
+        ):
+            raise AuthorityValidationError("invalid support contact boundary")
+        if type(self.owner_visible_notices) is not tuple or any(
+            type(notice) is not InitializationDisclosureNotice
+            for notice in self.owner_visible_notices
+        ):
+            raise AuthorityValidationError("invalid owner-visible disclosure bundle")
+        if (
+            tuple(notice.topic for notice in self.owner_visible_notices)
+            != self.disclosed_topics
+        ):
+            raise AuthorityValidationError("invalid owner-visible disclosure bundle")
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "friendly_name": self.friendly_name,
+            "canonical_name": self.canonical_name,
+            "version": self.version,
+            "asset_digest": self.asset_digest,
+            "disclosure_version": self.disclosure_version,
+            "disclosed_topics": list(self.disclosed_topics),
+            "first_hop_route": self.first_hop_route,
+            "data_boundary": list(self.data_boundary),
+            "support_contact": (
+                None if self.support_contact is None else self.support_contact.to_storage()
+            ),
+            "owner_visible_notices": [
+                notice.to_storage() for notice in self.owner_visible_notices
+            ],
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "InitializationDisclosureContent":
+        stored = _required_mapping(
+            value,
+            frozenset(
+                {
+                    "friendly_name",
+                    "canonical_name",
+                    "version",
+                    "asset_digest",
+                    "disclosure_version",
+                    "disclosed_topics",
+                    "first_hop_route",
+                    "data_boundary",
+                    "support_contact",
+                    "owner_visible_notices",
+                }
+            ),
+            "initialization disclosure content",
+        )
+        return cls(
+            friendly_name=stored["friendly_name"],  # type: ignore[arg-type]
+            canonical_name=stored["canonical_name"],  # type: ignore[arg-type]
+            version=stored["version"],  # type: ignore[arg-type]
+            asset_digest=stored["asset_digest"],  # type: ignore[arg-type]
+            disclosure_version=stored["disclosure_version"],  # type: ignore[arg-type]
+            disclosed_topics=_required_storage_text_list(
+                stored["disclosed_topics"],
+                "initialization disclosed topics",
+            ),
+            first_hop_route=stored["first_hop_route"],  # type: ignore[arg-type]
+            data_boundary=_required_storage_text_list(
+                stored["data_boundary"],
+                "initial data boundary",
+            ),
+            support_contact=(
+                None
+                if stored["support_contact"] is None
+                else SupportContactBoundary.from_storage(stored["support_contact"])
+            ),
+            owner_visible_notices=cls._notices_from_storage(
+                stored["owner_visible_notices"]
+            ),
+        )
+
+    @staticmethod
+    def _notices_from_storage(
+        value: object,
+    ) -> tuple[InitializationDisclosureNotice, ...]:
+        if type(value) is not list:
+            raise AuthorityValidationError("invalid owner-visible disclosure bundle")
+        return tuple(
+            InitializationDisclosureNotice.from_storage(item) for item in value
+        )
+
+    @classmethod
+    def for_initialization(
+        cls,
+        asset: HealthInitAsset,
+        initialization: "OwnerInitialization",
+    ) -> "InitializationDisclosureContent":
+        if (
+            type(asset) is not HealthInitAsset
+            or type(initialization) is not OwnerInitialization
+        ):
+            raise AuthorityValidationError("invalid initialization disclosure content")
+        boundaries = "、".join(initialization.data_boundary)
+        contact = initialization.support_contact
+        contact_text = (
+            "当前未配置危险支持联系人；健康管家不会向联系人发送危险警报。"
+            if contact is None
+            else (
+                f"危险支持联系人为“{contact.contact_ref}”，联系方法为“{contact.method}”，"
+                f"用途为“{contact.purpose}”。预置配置本身不构成授权；主人明确启用整个"
+                "健康管家后，才批准这一内置最小警报能力。只有当前可信危险、安全规则和"
+                "批准同时成立时，才发送不含诊断、原消息、症状、位置、画像或证据的最小"
+                "求助警报。"
+            )
+        )
+        notice_texts = {
+            "health-data-scope": (
+                "健康管家只把健康画像、证据、任务、设置、批准、运行和交付事实保存到"
+                f"加密受管状态；资料范围为 {boundaries}。普通聊天、完整提示词、模型草稿"
+                "和未准入候选不作为健康权威记录。"
+            ),
+            "daily-review": (
+                "健康管家会按主人当地日期自动复盘当前健康状态；失败或结果无法确认时"
+                "不会宣称自动复盘已经完成。"
+            ),
+            "health-task-automation": (
+                "健康任务会根据健康画像和聊天自动建立、合并、重新判断并跟踪；可能采用"
+                "主人补问、关心提醒、已准入证据、资料查找或另行批准的受控能力。主人可"
+                "查看任务目的、所用资料、承担者或接收方、外部影响和状态，并控制普通任务"
+                "及普通通知。"
+            ),
+            "proactive-support": (
+                "主动支持只在当前控制与批准边界内进行；主人可以暂停主动支持，暂停不会"
+                "把健康管家改回未初始化。"
+            ),
+            "first-hop-model-route": (
+                f"个人健康资料的首跳模型服务路线是“{initialization.first_hop_route}”及其"
+                "正常内部路由与故障切换；首跳路线变化时健康处理暂停并重新取得同意。"
+                "主人资料派生的医学查询不会发送到该路线之外的搜索服务。"
+            ),
+            "support-contact": contact_text,
+            "owner-data-rights": (
+                "主人可以查看、纠正、导出和永久删除受管健康资料；永久删除后旧画像、"
+                "证据、任务、批准和启用事实不得恢复或复活。"
+            ),
+            "unknown-effects-not-retried": (
+                "外部发送或其他效果结果无法确认时不会自动重试，也不会把接口接受、"
+                "发送尝试或进程存活冒充真实送达。"
+            ),
+        }
+        return cls(
+            friendly_name=HEALTH_INIT_FRIENDLY_NAME,
+            canonical_name=asset.canonical_name,
+            version=asset.version,
+            asset_digest=asset.asset_digest,
+            disclosure_version=asset.disclosure_version,
+            disclosed_topics=INITIALIZATION_DISCLOSED_TOPICS,
+            first_hop_route=initialization.first_hop_route,
+            data_boundary=initialization.data_boundary,
+            support_contact=initialization.support_contact,
+            owner_visible_notices=tuple(
+                InitializationDisclosureNotice(topic, notice_texts[topic])
+                for topic in INITIALIZATION_DISCLOSED_TOPICS
+            ),
+        )
+
+    @property
+    def digest(self) -> str:
+        return stable_digest(self.to_storage())
+
+    def matches(
+        self,
+        initialization: "OwnerInitialization",
+        asset: HealthInitAsset,
+    ) -> bool:
+        if (
+            type(initialization) is not OwnerInitialization
+            or type(asset) is not HealthInitAsset
+        ):
+            return False
+        return self == self.for_initialization(asset, initialization)
+
+
+@dataclass(frozen=True)
 class OwnerInitialization:
     """One complete owner candidate, still distinct from an enabled result."""
 
@@ -382,6 +679,22 @@ class OwnerInitialization:
         return stable_digest(self.to_storage())
 
     @property
+    def disclosure_request_digest(self) -> str:
+        request = self.to_storage()
+        del request["owner_consent"]
+        del request["first_hop_route_consent"]
+        return stable_digest(request)
+
+    @property
+    def configuration_digest(self) -> str:
+        """Digest the owner-selected configuration, excluding transport identity."""
+
+        configuration = self.to_storage()
+        del configuration["workflow_id"]
+        del configuration["admission_causal_id"]
+        return stable_digest(configuration)
+
+    @property
     def request_digest(self) -> str:
         return self.digest
 
@@ -401,47 +714,95 @@ class OwnerConsentEvidence:
     workflow_id: str
     admission_causal_id: str
     initialization_digest: str
+    initialization: OwnerInitialization
     disclosure_version: str
     disclosed_topics: tuple[str, ...]
+    disclosure: "InitializationDisclosure"
     owner_confirmed: bool
     first_hop_route_confirmed: bool
-    schema: str = "health-init-owner-consent-v1"
+    resolved_source_causal_ids: tuple[str, ...] = ()
+    schema: str = "health-init-owner-consent-v2"
 
     def __post_init__(self) -> None:
-        if type(self.schema) is not str or self.schema != "health-init-owner-consent-v1":
+        if type(self.schema) is not str or self.schema != "health-init-owner-consent-v2":
             raise AuthorityValidationError("invalid owner consent evidence")
         validate_opaque_text(self.workflow_id, "initialization workflow identifier")
         validate_opaque_text(self.admission_causal_id, "admission causal identifier")
         _sha256_text(self.initialization_digest, "initialization digest")
+        if type(self.initialization) is not OwnerInitialization:
+            raise AuthorityValidationError("invalid owner initialization")
+        self.initialization.require_complete()
+        if (
+            self.initialization.workflow_id != self.workflow_id
+            or self.initialization.admission_causal_id != self.admission_causal_id
+            or self.initialization.digest != self.initialization_digest
+        ):
+            raise AuthorityValidationError("owner consent evidence binding mismatch")
         validate_opaque_text(self.disclosure_version, "health-init disclosure version")
         _required_text_tuple(
             self.disclosed_topics,
             "initialization disclosed topics",
             expected=INITIALIZATION_DISCLOSED_TOPICS,
         )
+        if type(self.disclosure) is not InitializationDisclosure:
+            raise AuthorityValidationError("invalid initialization disclosure")
+        if (
+            self.disclosure.skill_proof.workflow_id != self.workflow_id
+            or self.disclosure.skill_proof.admission_causal_id
+            != self.admission_causal_id
+            or self.disclosure.content.disclosure_version
+            != self.disclosure_version
+            or self.disclosure.content.disclosed_topics != self.disclosed_topics
+        ):
+            raise AuthorityValidationError("owner consent evidence binding mismatch")
         _required_bool(self.owner_confirmed, "owner consent confirmation")
         _required_bool(
             self.first_hop_route_confirmed,
             "first-hop route confirmation",
         )
+        _opaque_text_tuple(
+            self.resolved_source_causal_ids,
+            "resolved source causal identifiers",
+            allow_empty=True,
+        )
+        if len(self.resolved_source_causal_ids) > MAX_RESOLVED_SOURCE_CAUSAL_IDS:
+            raise AuthorityValidationError(
+                "too many resolved source causal identifiers"
+            )
 
     @classmethod
     def for_initialization(
         cls,
         initialization: OwnerInitialization,
         asset: HealthInitAsset,
+        disclosure: "InitializationDisclosure",
+        *,
+        owner_confirmed: bool,
+        first_hop_route_confirmed: bool,
+        resolved_source_causal_ids: tuple[str, ...] = (),
     ) -> "OwnerConsentEvidence":
-        if type(initialization) is not OwnerInitialization or type(asset) is not HealthInitAsset:
+        if (
+            type(initialization) is not OwnerInitialization
+            or type(asset) is not HealthInitAsset
+            or type(disclosure) is not InitializationDisclosure
+        ):
             raise AuthorityValidationError("invalid owner consent evidence")
         initialization.require_complete()
+        if not disclosure.matches(initialization, asset):
+            raise AuthorityValidationError("invalid owner consent evidence")
+        if owner_confirmed is not True or first_hop_route_confirmed is not True:
+            raise AuthorityValidationError("owner consent evidence required")
         return cls(
             workflow_id=initialization.workflow_id,
             admission_causal_id=initialization.admission_causal_id,
             initialization_digest=initialization.digest,
-            disclosure_version=asset.disclosure_version,
-            disclosed_topics=INITIALIZATION_DISCLOSED_TOPICS,
-            owner_confirmed=True,
-            first_hop_route_confirmed=True,
+            initialization=initialization,
+            disclosure_version=disclosure.content.disclosure_version,
+            disclosed_topics=disclosure.content.disclosed_topics,
+            disclosure=disclosure,
+            owner_confirmed=owner_confirmed,
+            first_hop_route_confirmed=first_hop_route_confirmed,
+            resolved_source_causal_ids=resolved_source_causal_ids,
         )
 
     def to_storage(self) -> dict[str, object]:
@@ -450,10 +811,13 @@ class OwnerConsentEvidence:
             "workflow_id": self.workflow_id,
             "admission_causal_id": self.admission_causal_id,
             "initialization_digest": self.initialization_digest,
+            "initialization": self.initialization.to_storage(),
             "disclosure_version": self.disclosure_version,
             "disclosed_topics": list(self.disclosed_topics),
+            "disclosure": self.disclosure.to_storage(),
             "owner_confirmed": self.owner_confirmed,
             "first_hop_route_confirmed": self.first_hop_route_confirmed,
+            "resolved_source_causal_ids": list(self.resolved_source_causal_ids),
         }
 
     def to_message_body(self) -> str:
@@ -499,10 +863,13 @@ class OwnerConsentEvidence:
                     "workflow_id",
                     "admission_causal_id",
                     "initialization_digest",
+                    "initialization",
                     "disclosure_version",
                     "disclosed_topics",
+                    "disclosure",
                     "owner_confirmed",
                     "first_hop_route_confirmed",
+                    "resolved_source_causal_ids",
                 }
             ),
             "owner consent evidence",
@@ -512,13 +879,20 @@ class OwnerConsentEvidence:
             workflow_id=stored["workflow_id"],  # type: ignore[arg-type]
             admission_causal_id=stored["admission_causal_id"],  # type: ignore[arg-type]
             initialization_digest=stored["initialization_digest"],  # type: ignore[arg-type]
+            initialization=OwnerInitialization.from_storage(stored["initialization"]),
             disclosure_version=stored["disclosure_version"],  # type: ignore[arg-type]
             disclosed_topics=_required_storage_text_list(
                 stored["disclosed_topics"],
                 "initialization disclosed topics",
             ),
+            disclosure=InitializationDisclosure.from_storage(stored["disclosure"]),
             owner_confirmed=stored["owner_confirmed"],  # type: ignore[arg-type]
             first_hop_route_confirmed=stored["first_hop_route_confirmed"],  # type: ignore[arg-type]
+            resolved_source_causal_ids=_storage_opaque_text_list(
+                stored["resolved_source_causal_ids"],
+                "resolved source causal identifiers",
+                allow_empty=True,
+            ),
         )
 
     def matches(
@@ -532,8 +906,12 @@ class OwnerConsentEvidence:
             and self.workflow_id == initialization.workflow_id
             and self.admission_causal_id == initialization.admission_causal_id
             and self.initialization_digest == initialization.digest
+            and self.initialization == initialization
             and self.disclosure_version == asset.disclosure_version
             and self.disclosed_topics == INITIALIZATION_DISCLOSED_TOPICS
+            and self.disclosure.matches(initialization, asset)
+            and self.disclosure_version == self.disclosure.content.disclosure_version
+            and self.disclosed_topics == self.disclosure.content.disclosed_topics
             and self.owner_confirmed is True
             and self.first_hop_route_confirmed is True
         )
@@ -601,6 +979,7 @@ class SkillUseProof:
 
     skill_use: SkillUseFact
     request_digest: str
+    disclosure_digest: str
     key_id: str
     signature: str
 
@@ -608,6 +987,7 @@ class SkillUseProof:
         if type(self.skill_use) is not SkillUseFact:
             raise AuthorityValidationError("invalid health-init use fact")
         _sha256_text(self.request_digest, "health-init request digest")
+        _sha256_text(self.disclosure_digest, "health-init disclosure digest")
         validate_opaque_text(self.key_id, "health-init attestor key identifier")
         signature = validate_opaque_text(self.signature, "health-init signature")
         if _HMAC_SHA256_RE.fullmatch(signature) is None:
@@ -629,6 +1009,7 @@ class SkillUseProof:
         return {
             "skill_use": self.skill_use.to_storage(),
             "request_digest": self.request_digest,
+            "disclosure_digest": self.disclosure_digest,
             "key_id": self.key_id,
         }
 
@@ -639,14 +1020,216 @@ class SkillUseProof:
     def from_storage(cls, value: object) -> "SkillUseProof":
         stored = _required_mapping(
             value,
-            frozenset({"skill_use", "request_digest", "key_id", "signature"}),
+            frozenset(
+                {
+                    "skill_use",
+                    "request_digest",
+                    "disclosure_digest",
+                    "key_id",
+                    "signature",
+                }
+            ),
             "health-init use proof",
         )
         return cls(
             skill_use=SkillUseFact.from_storage(stored["skill_use"]),
             request_digest=stored["request_digest"],  # type: ignore[arg-type]
+            disclosure_digest=stored["disclosure_digest"],  # type: ignore[arg-type]
             key_id=stored["key_id"],  # type: ignore[arg-type]
             signature=stored["signature"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class InitializationDisclosure:
+    """One proof-bound disclosure formed before owner confirmation."""
+
+    content: InitializationDisclosureContent
+    skill_proof: SkillUseProof
+    disclosure_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not InitializationDisclosureContent:
+            raise AuthorityValidationError("invalid initialization disclosure content")
+        if type(self.skill_proof) is not SkillUseProof:
+            raise AuthorityValidationError("invalid health-init use proof")
+        validate_opaque_text(self.disclosure_id, "initialization disclosure identifier")
+        fact = self.skill_proof.skill_use
+        if (
+            self.content.digest != self.skill_proof.disclosure_digest
+            or self.content.canonical_name != fact.canonical_name
+            or self.content.version != fact.version
+            or self.content.asset_digest != fact.asset_digest
+            or self.content.disclosure_version != fact.disclosure_version
+            or self.disclosure_id != self.deterministic_id(self.skill_proof)
+        ):
+            raise AuthorityValidationError("initialization disclosure binding mismatch")
+
+    @staticmethod
+    def deterministic_id(skill_proof: SkillUseProof) -> str:
+        if type(skill_proof) is not SkillUseProof:
+            raise AuthorityValidationError("invalid health-init use proof")
+        identity_digest = stable_digest(
+            {
+                "workflow_id": skill_proof.workflow_id,
+                "admission_causal_id": skill_proof.admission_causal_id,
+                "request_digest": skill_proof.request_digest,
+                "disclosure_digest": skill_proof.disclosure_digest,
+                "asset_digest": skill_proof.skill_use.asset_digest,
+            }
+        )
+        return "health-init-disclosure:" + identity_digest.removeprefix("sha256:")
+
+    @classmethod
+    def form(
+        cls,
+        content: InitializationDisclosureContent,
+        skill_proof: SkillUseProof,
+    ) -> "InitializationDisclosure":
+        if (
+            type(content) is not InitializationDisclosureContent
+            or type(skill_proof) is not SkillUseProof
+        ):
+            raise AuthorityValidationError("invalid initialization disclosure")
+        return cls(
+            content=content,
+            skill_proof=skill_proof,
+            disclosure_id=cls.deterministic_id(skill_proof),
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "content": self.content.to_storage(),
+            "skill_proof": self.skill_proof.to_storage(),
+            "disclosure_id": self.disclosure_id,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "InitializationDisclosure":
+        stored = _required_mapping(
+            value,
+            frozenset({"content", "skill_proof", "disclosure_id"}),
+            "initialization disclosure",
+        )
+        return cls(
+            content=InitializationDisclosureContent.from_storage(stored["content"]),
+            skill_proof=SkillUseProof.from_storage(stored["skill_proof"]),
+            disclosure_id=stored["disclosure_id"],  # type: ignore[arg-type]
+        )
+
+    def matches(
+        self,
+        initialization: OwnerInitialization,
+        asset: HealthInitAsset,
+    ) -> bool:
+        if (
+            type(initialization) is not OwnerInitialization
+            or type(asset) is not HealthInitAsset
+        ):
+            return False
+        fact = self.skill_proof.skill_use
+        return (
+            self.content.matches(initialization, asset)
+            and fact.canonical_name == asset.canonical_name
+            and fact.version == asset.version
+            and fact.asset_digest == asset.asset_digest
+            and fact.disclosure_version == asset.disclosure_version
+            and fact.workflow_id == initialization.workflow_id
+            and fact.admission_causal_id == initialization.admission_causal_id
+            and self.skill_proof.request_digest
+            == initialization.disclosure_request_digest
+            and self.skill_proof.disclosure_digest == self.content.digest
+            and self.disclosure_id == self.deterministic_id(self.skill_proof)
+        )
+
+
+@dataclass(frozen=True)
+class InitializationDisclosureChallenge:
+    """A durable pre-consent disclosure issuance accepted by health-core."""
+
+    initialization: OwnerInitialization
+    disclosure: InitializationDisclosure
+    admission_policy: AdmissionPolicy | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.initialization) is not OwnerInitialization:
+            raise AuthorityValidationError("invalid owner initialization")
+        if (
+            self.initialization.owner_consent is not False
+            or self.initialization.first_hop_route_consent is not False
+        ):
+            raise AuthorityValidationError(
+                "initialization-disclosure-before-consent-required"
+            )
+        if type(self.disclosure) is not InitializationDisclosure:
+            raise AuthorityValidationError("invalid initialization disclosure")
+        if (
+            self.admission_policy is not None
+            and type(self.admission_policy) is not AdmissionPolicy
+        ):
+            raise AuthorityValidationError("invalid admission policy")
+        fact = self.disclosure.skill_proof.skill_use
+        asset = HealthInitAsset(
+            canonical_name=fact.canonical_name,
+            version=fact.version,
+            asset_digest=fact.asset_digest,
+            disclosure_version=fact.disclosure_version,
+        )
+        if not self.disclosure.matches(self.initialization, asset):
+            raise AuthorityValidationError("initialization disclosure binding mismatch")
+
+    @property
+    def disclosure_id(self) -> str:
+        return self.disclosure.disclosure_id
+
+    @property
+    def workflow_id(self) -> str:
+        return self.initialization.workflow_id
+
+    @property
+    def admission_causal_id(self) -> str:
+        return self.initialization.admission_causal_id
+
+    def to_storage(self) -> dict[str, object]:
+        stored: dict[str, object] = {
+            "initialization": self.initialization.to_storage(),
+            "disclosure": self.disclosure.to_storage(),
+        }
+        if self.admission_policy is not None:
+            stored["admission_policy"] = self.admission_policy.to_storage()
+        return stored
+
+    @classmethod
+    def from_storage(cls, value: object) -> "InitializationDisclosureChallenge":
+        legacy_fields = frozenset({"initialization", "disclosure"})
+        current_fields = legacy_fields | {"admission_policy"}
+        if type(value) is not dict or frozenset(value) not in {
+            legacy_fields,
+            current_fields,
+        }:
+            raise AuthorityValidationError("invalid initialization disclosure challenge")
+        stored = value
+        return cls(
+            initialization=OwnerInitialization.from_storage(stored["initialization"]),
+            disclosure=InitializationDisclosure.from_storage(stored["disclosure"]),
+            admission_policy=(
+                None
+                if "admission_policy" not in stored
+                else AdmissionPolicy.from_storage(stored["admission_policy"])
+            ),
+        )
+
+    def issued_under(self, policy: object) -> bool:
+        return type(policy) is AdmissionPolicy and self.admission_policy == policy
+
+    def matches_confirmation(self, evidence: OwnerConsentEvidence) -> bool:
+        return (
+            type(evidence) is OwnerConsentEvidence
+            and evidence.disclosure == self.disclosure
+            and evidence.workflow_id == self.workflow_id
+            and evidence.admission_causal_id == self.admission_causal_id
+            and evidence.initialization.disclosure_request_digest
+            == self.initialization.disclosure_request_digest
         )
 
 
@@ -677,18 +1260,25 @@ class HealthInitAttestor:
         skill_use: SkillUseFact,
         *,
         request_digest: str,
+        disclosure_digest: str,
     ) -> SkillUseProof:
         if type(skill_use) is not SkillUseFact:
             raise AuthorityValidationError("invalid health-init use fact")
         request_digest = _sha256_text(request_digest, "health-init request digest")
+        disclosure_digest = _sha256_text(
+            disclosure_digest,
+            "health-init disclosure digest",
+        )
         unsigned = {
             "skill_use": skill_use.to_storage(),
             "request_digest": request_digest,
+            "disclosure_digest": disclosure_digest,
             "key_id": self.key_id,
         }
         return SkillUseProof(
             skill_use=skill_use,
             request_digest=request_digest,
+            disclosure_digest=disclosure_digest,
             key_id=self.key_id,
             signature=self._signature(unsigned),
         )
@@ -704,7 +1294,7 @@ class HealthInitAttestor:
             if type(initialization) is not OwnerInitialization:
                 return False
             if (
-                proof.request_digest != initialization.digest
+                proof.request_digest != initialization.disclosure_request_digest
                 or proof.workflow_id != initialization.workflow_id
                 or proof.admission_causal_id != initialization.admission_causal_id
             ):
@@ -714,7 +1304,7 @@ class HealthInitAttestor:
 
 
 class HealthInitRuntime:
-    """Executes one approved asset and caches exact workflow replay proofs."""
+    """Forms one approved disclosure and caches exact workflow replay."""
 
     def __init__(
         self,
@@ -722,7 +1312,11 @@ class HealthInitRuntime:
         attestor: HealthInitAttestor,
         *,
         clock: Callable[[], datetime] | None = None,
-        executor: Callable[[HealthInitAsset, OwnerInitialization], bool] | None = None,
+        executor: Callable[
+            [HealthInitAsset, OwnerInitialization],
+            InitializationDisclosureContent,
+        ]
+        | None = None,
     ) -> None:
         if type(asset) is not HealthInitAsset or type(attestor) is not HealthInitAttestor:
             raise AuthorityValidationError("invalid health-init runtime")
@@ -735,29 +1329,44 @@ class HealthInitRuntime:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._executor = executor or self._execute_builtin_asset
         self._lock = threading.Lock()
-        self._workflow_proofs: dict[str, tuple[str, SkillUseProof]] = {}
+        self._workflow_disclosures: dict[
+            str,
+            tuple[str, InitializationDisclosure],
+        ] = {}
 
     @property
     def asset(self) -> HealthInitAsset:
         return self._asset
 
-    def run(self, initialization: OwnerInitialization) -> SkillUseProof:
+    def form_disclosure(
+        self,
+        initialization: OwnerInitialization,
+    ) -> InitializationDisclosure:
         if type(initialization) is not OwnerInitialization:
             raise AuthorityValidationError("invalid owner initialization")
-        initialization.require_complete()
-        request_digest = initialization.digest
+        if (
+            initialization.owner_consent is not False
+            or initialization.first_hop_route_consent is not False
+        ):
+            raise AuthorityValidationError(
+                "initialization-disclosure-before-consent-required"
+            )
+        request_digest = initialization.disclosure_request_digest
         with self._lock:
-            existing = self._workflow_proofs.get(initialization.workflow_id)
+            existing = self._workflow_disclosures.get(initialization.workflow_id)
             if existing is not None:
-                existing_digest, proof = existing
+                existing_digest, disclosure = existing
                 if existing_digest != request_digest:
                     raise AuthorityValidationError("health-init workflow conflict")
-                return proof
+                return disclosure
             try:
-                executed = self._executor(self._asset, initialization)
+                content = self._executor(self._asset, initialization)
             except Exception as exc:
                 raise AuthorityValidationError("health-init-execution-failed") from exc
-            if executed is not True:
+            if (
+                type(content) is not InitializationDisclosureContent
+                or not content.matches(initialization, self._asset)
+            ):
                 raise AuthorityValidationError("health-init-execution-failed")
             used_at_value = self._clock()
             if type(used_at_value) is not datetime:
@@ -774,29 +1383,39 @@ class HealthInitRuntime:
                 workflow_id=initialization.workflow_id,
                 admission_causal_id=initialization.admission_causal_id,
             )
-            proof = self._attestor.sign(skill_use, request_digest=request_digest)
-            self._workflow_proofs[initialization.workflow_id] = (request_digest, proof)
-            return proof
+            proof = self._attestor.sign(
+                skill_use,
+                request_digest=request_digest,
+                disclosure_digest=content.digest,
+            )
+            disclosure = InitializationDisclosure.form(content, proof)
+            if (
+                not self._attestor.verify(proof, initialization)
+                or not disclosure.matches(initialization, self._asset)
+            ):
+                raise AuthorityValidationError("health-init-execution-failed")
+            self._workflow_disclosures[initialization.workflow_id] = (
+                request_digest,
+                disclosure,
+            )
+            return disclosure
 
     @staticmethod
     def _execute_builtin_asset(
         asset: HealthInitAsset,
         initialization: OwnerInitialization,
-    ) -> bool:
+    ) -> InitializationDisclosureContent:
         """Run the deterministic built-in initialization disclosure contract."""
 
-        return (
-            type(asset) is HealthInitAsset
-            and type(initialization) is OwnerInitialization
-            and initialization.incomplete_reason is None
-            and asset.canonical_name == HEALTH_INIT_CANONICAL_NAME
-            and bool(INITIALIZATION_DISCLOSED_TOPICS)
+        if (
+            type(asset) is not HealthInitAsset
+            or type(initialization) is not OwnerInitialization
+        ):
+            raise AuthorityValidationError("health-init-execution-failed")
+        return InitializationDisclosureContent.for_initialization(
+            asset,
+            initialization,
         )
-
-    # Narrow aliases keep the Plugin seam descriptive without providing a
-    # second path that could issue a different proof.
-    execute = run
-    use = run
 
 
 @dataclass(frozen=True)
@@ -833,7 +1452,7 @@ class InitialPortrait:
 
 @dataclass(frozen=True)
 class InitializationDraft:
-    """Complete local content bound to one Ticket 110 prepare transition."""
+    """Complete local content bound to one Ticket 111 prepare transition."""
 
     owner: OwnerInitialization
     source_causal_id: str
@@ -844,6 +1463,7 @@ class InitializationDraft:
     record_id: str
     revision_digest: str
     transition_id: str
+    resolved_source_causal_ids: tuple[str, ...] = ()
     initial_portrait: InitialPortrait = field(default_factory=InitialPortrait)
     disclosed_topics: tuple[str, ...] = INITIALIZATION_DISCLOSED_TOPICS
 
@@ -854,14 +1474,28 @@ class InitializationDraft:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
         if self.source_causal_id != self.owner.admission_causal_id:
             raise AuthorityValidationError("initialization source causal mismatch")
+        _opaque_text_tuple(
+            self.resolved_source_causal_ids,
+            "resolved source causal identifiers",
+            allow_empty=True,
+        )
+        if self.source_causal_id in self.resolved_source_causal_ids:
+            raise AuthorityValidationError("initialization source causal mismatch")
         if type(self.skill_proof) is not SkillUseProof:
             raise AuthorityValidationError("invalid health-init use proof")
         if (
             self.skill_proof.workflow_id != self.owner.workflow_id
             or self.skill_proof.admission_causal_id != self.source_causal_id
-            or self.skill_proof.request_digest != self.owner.digest
+            or self.skill_proof.request_digest
+            != self.owner.disclosure_request_digest
         ):
             raise AuthorityValidationError("health-init use binding mismatch")
+        proof_asset = HealthInitAsset(
+            canonical_name=self.skill_proof.skill_use.canonical_name,
+            version=self.skill_proof.skill_use.version,
+            asset_digest=self.skill_proof.skill_use.asset_digest,
+            disclosure_version=self.skill_proof.skill_use.disclosure_version,
+        )
         if (
             type(self.owner_consent_evidence) is not OwnerConsentEvidence
             or self.owner_consent_evidence.workflow_id != self.owner.workflow_id
@@ -871,6 +1505,12 @@ class InitializationDraft:
             != self.skill_proof.skill_use.disclosure_version
             or self.owner_consent_evidence.disclosed_topics
             != INITIALIZATION_DISCLOSED_TOPICS
+            or self.owner_consent_evidence.disclosure.skill_proof
+            != self.skill_proof
+            or not self.owner_consent_evidence.disclosure.matches(
+                self.owner,
+                proof_asset,
+            )
             or self.owner_consent_evidence.owner_confirmed is not True
             or self.owner_consent_evidence.first_hop_route_confirmed is not True
         ):
@@ -900,6 +1540,10 @@ class InitializationDraft:
     def skill_use(self) -> SkillUseFact:
         return self.skill_proof.skill_use
 
+    @property
+    def source_causal_ids(self) -> tuple[str, ...]:
+        return (self.source_causal_id, *self.resolved_source_causal_ids)
+
     def to_storage(self) -> dict[str, object]:
         return {
             "owner": self.owner.to_storage(),
@@ -911,6 +1555,7 @@ class InitializationDraft:
             "record_id": self.record_id,
             "revision_digest": self.revision_digest,
             "transition_id": self.transition_id,
+            "resolved_source_causal_ids": list(self.resolved_source_causal_ids),
             "initial_portrait": self.initial_portrait.to_storage(),
             "disclosed_topics": list(self.disclosed_topics),
         }
@@ -930,6 +1575,7 @@ class InitializationDraft:
                     "record_id",
                     "revision_digest",
                     "transition_id",
+                    "resolved_source_causal_ids",
                     "initial_portrait",
                     "disclosed_topics",
                 }
@@ -948,6 +1594,11 @@ class InitializationDraft:
             record_id=stored["record_id"],  # type: ignore[arg-type]
             revision_digest=stored["revision_digest"],  # type: ignore[arg-type]
             transition_id=stored["transition_id"],  # type: ignore[arg-type]
+            resolved_source_causal_ids=_storage_opaque_text_list(
+                stored["resolved_source_causal_ids"],
+                "resolved source causal identifiers",
+                allow_empty=True,
+            ),
             initial_portrait=InitialPortrait.from_storage(stored["initial_portrait"]),
             disclosed_topics=_required_storage_text_list(
                 stored["disclosed_topics"], "initialization disclosed topics"
@@ -1243,14 +1894,20 @@ class InitializationProjection:
 
 __all__ = [
     "HEALTH_INIT_CANONICAL_NAME",
+    "HEALTH_INIT_FRIENDLY_NAME",
     "INITIAL_DATA_BOUNDARY",
     "INITIALIZATION_DISCLOSED_TOPICS",
     "INITIAL_PORTRAIT_DOMAINS",
+    "MAX_RESOLVED_SOURCE_CAUSAL_IDS",
     "HealthInitAsset",
     "HealthInitAttestor",
     "HealthInitRuntime",
     "InitialPreferences",
     "InitialPortrait",
+    "InitializationDisclosure",
+    "InitializationDisclosureChallenge",
+    "InitializationDisclosureContent",
+    "InitializationDisclosureNotice",
     "InitializationDraft",
     "InitializationProjection",
     "OwnerConsentEvidence",

@@ -5,10 +5,17 @@ from __future__ import annotations
 import hashlib
 import secrets
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Callable, Protocol, TypeVar
 
-from .admission import AdmissionPolicy, NativeCursorDirective, SourceEnvelope, SourceReceipt
+from .admission import (
+    MAX_MESSAGE_BODY_BYTES,
+    AdmissionPolicy,
+    NativeCursorDirective,
+    SourceEnvelope,
+    SourceReceipt,
+)
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -34,6 +41,7 @@ from .contract import (
     EffectRequestPayload,
     EffectResultPayload,
     InboundAdmitPayload,
+    InitializationDisclosurePayload,
     InitializationPreparePayload,
     NativeCursorResultPayload,
     ProbeMeta,
@@ -47,8 +55,11 @@ from .initialization import (
     HealthInitAttestor,
     HealthInitAsset,
     InitialPortrait,
+    InitializationDisclosure,
+    InitializationDisclosureChallenge,
     InitializationDraft,
     InitializationProjection,
+    MAX_RESOLVED_SOURCE_CAUSAL_IDS,
     OwnerConsentEvidence,
     OwnerInitialization,
     SkillUseProof,
@@ -89,6 +100,8 @@ _PROBE_BYPASS_ACTIONS = _TRANSITION_RECOVERY_ACTIONS | frozenset({"effect.result
 _PERSISTENT_CLOSE_REASONS = frozenset(
     {"effect-result-unknown", "health-key-unavailable", "current-head-terminal"}
 )
+_MAX_HELD_INITIALIZATION_SOURCES = MAX_RESOLVED_SOURCE_CAUSAL_IDS + 1
+_MAX_UNRESOLVED_INITIALIZATION_SOURCES = _MAX_HELD_INITIALIZATION_SOURCES + 1
 _CurrentHeadValue = TypeVar("_CurrentHeadValue")
 
 
@@ -2246,7 +2259,10 @@ class HealthCore:
             self._latch_terminal()
             return _Handled(Response("unavailable", command.causal_id, self._closed_reason), False)
 
-        if command.action == "initialization.prepare" and self._store.initialization() is not None:
+        if command.action in {
+            "initialization.disclose",
+            "initialization.prepare",
+        } and self._store.initialization() is not None:
             return _Handled(
                 Response("rejected", command.causal_id, "initialization already exists"),
                 True,
@@ -2257,6 +2273,15 @@ class HealthCore:
                 return _Handled(
                     Response("rejected", command.causal_id, "initialization-required"),
                     True,
+                )
+            if not self._initialization_configuration_matches(initialization.draft):
+                return _Handled(
+                    Response(
+                        "unavailable",
+                        command.causal_id,
+                        "initialization-configuration-mismatch",
+                    ),
+                    False,
                 )
 
         if command.action not in _PROBE_BYPASS_ACTIONS:
@@ -2290,6 +2315,8 @@ class HealthCore:
             return self._handle_state(command, head)
         if command.action == "inbound.admit":
             return self._handle_inbound_admit(command)
+        if command.action == "initialization.disclose":
+            return self._handle_initialization_disclose(command)
         if command.action == "initialization.prepare":
             return self._handle_initialization_prepare(command, head)
         if command.action == "cursor.result":
@@ -2305,7 +2332,19 @@ class HealthCore:
         policy = self._admission_policy
         if not isinstance(payload, InboundAdmitPayload):
             raise ProtocolViolation("invalid inbound payload")
-        if type(policy) is not AdmissionPolicy or not policy.accepts(payload.envelope):
+        if (
+            type(policy) is not AdmissionPolicy
+            or payload.admission_policy != policy
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "admission-policy-mismatch",
+                ),
+                False,
+            )
+        if not policy.accepts(payload.envelope):
             return _Handled(
                 Response("rejected", command.causal_id, "unique-private-source-denied"),
                 False,
@@ -2314,9 +2353,180 @@ class HealthCore:
             raise ProtocolViolation("source body is required")
         if payload.envelope.causal_id != command.causal_id:
             raise ProtocolViolation("source causal identifier mismatch")
+        if self._store.initialization() is not None:
+            return _Handled(
+                Response("rejected", command.causal_id, "initialization already exists"),
+                True,
+            )
+        unresolved_receipts = self._store.held_source_receipts()
+        if len(unresolved_receipts) >= _MAX_UNRESOLVED_INITIALIZATION_SOURCES:
+            # One stale resolution source may remain frozen while its exact
+            # same-configuration successor occupies the active slot.  A
+            # second rotation must restore/finish that successor rather than
+            # accumulating sensitive bodies and cursor obligations forever.
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-source-capacity-reached",
+                ),
+                False,
+            )
+        active_receipts = tuple(
+            receipt
+            for receipt in unresolved_receipts
+            if receipt.managed_cursor_state == "held"
+        )
+        if len(active_receipts) > _MAX_HELD_INITIALIZATION_SOURCES:
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "initialization-source-capacity-reached",
+                ),
+                True,
+            )
+        if len(active_receipts) == _MAX_HELD_INITIALIZATION_SOURCES:
+            stale_resolution = self._stale_initialization_resolution_slot(
+                active_receipts
+            )
+            if stale_resolution is None:
+                return _Handled(
+                    Response(
+                        "rejected",
+                        command.causal_id,
+                        "initialization-source-capacity-reached",
+                    ),
+                    True,
+                )
+            stale_slot, stale_candidate = stale_resolution
+            remaining = tuple(
+                receipt for receipt in active_receipts if receipt != stale_slot
+            )
+            resolution_status = self._initialization_resolution_slot_status(
+                payload.envelope,
+                remaining,
+                required_configuration_digest=(
+                    stale_candidate.initialization.configuration_digest
+                ),
+            )
+            if resolution_status == "initialization-configuration-mismatch":
+                return _Handled(
+                    Response("unavailable", command.causal_id, resolution_status),
+                    False,
+                )
+            if resolution_status != "ready":
+                return _Handled(
+                    Response(
+                        "rejected",
+                        command.causal_id,
+                        "owner-resolution-required",
+                    ),
+                    True,
+                )
+            self._store.supersede_initialization_resolution_source(
+                stale_slot.envelope.causal_id
+            )
+        elif len(active_receipts) == MAX_RESOLVED_SOURCE_CAUSAL_IDS:
+            resolution_status = self._initialization_resolution_slot_status(
+                payload.envelope,
+                active_receipts,
+            )
+            if resolution_status == "initialization-configuration-mismatch":
+                return _Handled(
+                    Response("unavailable", command.causal_id, resolution_status),
+                    False,
+                )
+            if resolution_status != "ready":
+                return _Handled(
+                    Response(
+                        "rejected",
+                        command.causal_id,
+                        "owner-resolution-required",
+                    ),
+                    True,
+                )
         self._store.save_source_envelope(payload.envelope)
         return _Handled(
             Response("accepted", command.causal_id, "initialization-source-admitted"),
+            True,
+        )
+
+    def _handle_initialization_disclose(self, command: CommandEnvelope) -> _Handled:
+        payload = command.payload
+        verifier = self._health_init_verifier
+        approved_asset = self._health_init_asset
+        policy = self._admission_policy
+        if not isinstance(payload, InitializationDisclosurePayload):
+            raise ProtocolViolation("invalid initialization disclosure payload")
+        if (
+            type(verifier) is not HealthInitAttestor
+            or type(approved_asset) is not HealthInitAsset
+            or type(policy) is not AdmissionPolicy
+            or payload.admission_policy != policy
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-configuration-mismatch",
+                ),
+                False,
+            )
+        try:
+            challenge = InitializationDisclosureChallenge(
+                initialization=payload.initialization,
+                disclosure=payload.disclosure,
+                admission_policy=payload.admission_policy,
+            )
+        except AuthorityValidationError as exc:
+            return _Handled(
+                Response("rejected", command.causal_id, str(exc)),
+                True,
+            )
+        if (
+            not challenge.disclosure.matches(
+                challenge.initialization,
+                approved_asset,
+            )
+            or not verifier.verify(
+                challenge.disclosure.skill_proof,
+                challenge.initialization,
+            )
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-configuration-mismatch",
+                ),
+                False,
+            )
+        if not self._resolution_evidence_fits_transport(
+            challenge,
+            approved_asset,
+        ):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "initialization-resolution-capacity-exceeded",
+                ),
+                True,
+            )
+        try:
+            self._store.save_initialization_disclosure_challenge(challenge)
+        except AuthorityValidationError as exc:
+            return _Handled(
+                Response("rejected", command.causal_id, str(exc)),
+                True,
+            )
+        return _Handled(
+            Response(
+                "accepted",
+                command.causal_id,
+                "initialization-disclosure-formed",
+            ),
             True,
         )
 
@@ -2334,43 +2544,31 @@ class HealthCore:
         reason = initialization.incomplete_reason
         if reason is not None:
             return _Handled(Response("rejected", command.causal_id, reason), True)
-        fact = payload.skill_proof.skill_use
-        asset_matches = (
-            type(approved_asset) is HealthInitAsset
-            and fact.canonical_name == approved_asset.canonical_name
-            and fact.version == approved_asset.version
-            and fact.asset_digest == approved_asset.asset_digest
-            and fact.disclosure_version == approved_asset.disclosure_version
-        )
-        if (
-            type(verifier) is not HealthInitAttestor
-            or not asset_matches
-            or not verifier.verify(payload.skill_proof, initialization)
-        ):
-            return _Handled(
-                Response("rejected", command.causal_id, "health-init-proof-required"),
-                True,
-            )
         source = self._store.source_envelope(initialization.admission_causal_id)
-        policy = self._admission_policy
-        if (
-            source is None
-            or type(policy) is not AdmissionPolicy
-            or not policy.accepts(source)
-            or source.causal_id != initialization.admission_causal_id
-        ):
+        if source is None:
             return _Handled(
-                Response("rejected", command.causal_id, "initialization-source-required"),
-                True,
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-source-required",
+                ),
+                False,
             )
         try:
             consent = OwnerConsentEvidence.from_message_body(source.body)
+            consent_fact = consent.disclosure.skill_proof.skill_use
+            historical_asset = HealthInitAsset(
+                canonical_name=consent_fact.canonical_name,
+                version=consent_fact.version,
+                asset_digest=consent_fact.asset_digest,
+                disclosure_version=consent_fact.disclosure_version,
+            )
         except AuthorityValidationError:
             consent = None
         if (
             consent is None
-            or type(approved_asset) is not HealthInitAsset
-            or not consent.matches(initialization, approved_asset)
+            or source.causal_id != initialization.admission_causal_id
+            or not consent.matches(initialization, historical_asset)
         ):
             return _Handled(
                 Response(
@@ -2380,8 +2578,120 @@ class HealthCore:
                 ),
                 True,
             )
+        if consent.disclosure.skill_proof != payload.skill_proof:
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "health-init-proof-required",
+                ),
+                True,
+            )
+        challenge = self._store.initialization_disclosure_challenge(
+            consent.disclosure.disclosure_id
+        )
+        if challenge is None or not challenge.matches_confirmation(consent):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "health-init-disclosure-challenge-required",
+                ),
+                True,
+            )
+        fact = payload.skill_proof.skill_use
+        asset_matches = (
+            type(approved_asset) is HealthInitAsset
+            and fact.canonical_name == approved_asset.canonical_name
+            and fact.version == approved_asset.version
+            and fact.asset_digest == approved_asset.asset_digest
+            and fact.disclosure_version == approved_asset.disclosure_version
+        )
+        policy = self._admission_policy
+        if (
+            type(verifier) is not HealthInitAttestor
+            or not asset_matches
+            or not verifier.verify(payload.skill_proof, initialization)
+            or type(policy) is not AdmissionPolicy
+            or not challenge.issued_under(policy)
+            or not policy.accepts(source)
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "initialization-configuration-mismatch",
+                ),
+                False,
+            )
+        if not self._disclosure_precedes_source(consent.disclosure, source):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "health-init-disclosure-order-invalid",
+                ),
+                True,
+            )
+        held_receipts = self._store.held_source_receipts()
+        candidates: dict[str, OwnerConsentEvidence] = {}
+        for receipt in held_receipts:
+            if receipt.managed_cursor_state != "held":
+                continue
+            candidate_source = receipt.envelope
+            candidate = self._historically_accepted_initialization_candidate(
+                candidate_source
+            )
+            if candidate is not None:
+                candidates[candidate_source.causal_id] = candidate
+        if candidates.get(source.causal_id) != consent:
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "owner-consent-evidence-required",
+                ),
+                True,
+            )
+        other_candidate_ids = set(candidates) - {source.causal_id}
+        declared_resolutions = set(consent.resolved_source_causal_ids)
+        arrival_index = {
+            receipt.envelope.causal_id: index
+            for index, receipt in enumerate(held_receipts)
+        }
+        current_arrival_index = arrival_index[source.causal_id]
+        conflicting_candidate_ids = {
+            causal_id
+            for causal_id, candidate in candidates.items()
+            if causal_id != source.causal_id
+            and candidate.initialization.configuration_digest
+            != initialization.configuration_digest
+        }
+        if (
+            source.causal_id in declared_resolutions
+            or not declared_resolutions <= other_candidate_ids
+            or not conflicting_candidate_ids <= declared_resolutions
+            or any(
+                arrival_index[causal_id] >= current_arrival_index
+                for causal_id in declared_resolutions
+            )
+        ):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "owner-resolution-required",
+                ),
+                True,
+            )
         if self._store.initialization() is not None:
             raise ProtocolViolation("initialization already exists")
+
+        resolved_source_causal_ids = tuple(
+            receipt.envelope.causal_id
+            for receipt in held_receipts
+            if receipt.envelope.causal_id != source.causal_id
+        )
 
         portrait = InitialPortrait()
         content = {
@@ -2393,6 +2703,7 @@ class HealthCore:
             "prepared_authority": head.to_storage(),
             "initial_portrait": portrait.to_storage(),
             "disclosed_topics": list(consent.disclosed_topics),
+            "resolved_source_causal_ids": list(resolved_source_causal_ids),
         }
         revision_digest = stable_digest(content)
         transition_id = "initialization-transition:" + revision_digest.removeprefix("sha256:")
@@ -2407,6 +2718,7 @@ class HealthCore:
             record_id=record_id,
             revision_digest=revision_digest,
             transition_id=transition_id,
+            resolved_source_causal_ids=resolved_source_causal_ids,
             initial_portrait=portrait,
         )
         target = RevisionTarget(
@@ -2423,6 +2735,7 @@ class HealthCore:
             PreparedTransition(target=target, base=head),
         )
         self._store.write_initialization("prepared", draft)
+        self._store.clear_initialization_disclosure_challenges()
         return _Handled(
             Response("accepted", command.causal_id, "initialization-prepared"),
             True,
@@ -2435,7 +2748,7 @@ class HealthCore:
         initialization = self._store.initialization()
         if initialization is None or initialization.phase != "enabled":
             raise ProtocolViolation("initialization-finalize-required")
-        if payload.source_causal_id != initialization.draft.source_causal_id:
+        if payload.source_causal_id not in initialization.draft.source_causal_ids:
             raise ProtocolViolation("native cursor source mismatch")
         receipt = self._store.source_receipt(payload.source_causal_id)
         if receipt is None or receipt.envelope.native_cursor != payload.native_cursor:
@@ -2459,6 +2772,211 @@ class HealthCore:
             Response("accepted", command.causal_id, "native-cursor-advanced"),
             True,
         )
+
+    @staticmethod
+    def _resolution_evidence_fits_transport(
+        challenge: InitializationDisclosureChallenge,
+        approved_asset: HealthInitAsset,
+    ) -> bool:
+        """Prove one later decision can enumerate the bounded prior-source set."""
+
+        try:
+            confirmed = replace(
+                challenge.initialization,
+                owner_consent=True,
+                first_hop_route_consent=True,
+            )
+            # A JSON-escaped ASCII control byte occupies six transport bytes.
+            # These unique 256-byte identifiers therefore bound every legal
+            # causal identifier's contribution to the canonical message body.
+            worst_case_source_ids = tuple(
+                ("\x00" * 255) + chr(index + 1)
+                for index in range(MAX_RESOLVED_SOURCE_CAUSAL_IDS)
+            )
+            evidence = OwnerConsentEvidence.for_initialization(
+                confirmed,
+                approved_asset,
+                challenge.disclosure,
+                owner_confirmed=True,
+                first_hop_route_confirmed=True,
+                resolved_source_causal_ids=worst_case_source_ids,
+            )
+            return (
+                len(evidence.to_message_body().encode("utf-8"))
+                <= MAX_MESSAGE_BODY_BYTES
+            )
+        except (AuthorityValidationError, UnicodeEncodeError):
+            return False
+
+    def _historically_accepted_initialization_candidate(
+        self,
+        source: SourceEnvelope,
+    ) -> OwnerConsentEvidence | None:
+        """Validate a source against its integrity-protected accepted challenge.
+
+        Historical candidates continue to count during asset or attestor
+        rotation.  Their challenge was verified by core when persisted; the
+        authenticated store, exact challenge binding, and original asset
+        metadata preserve that fact without asking the new verifier to bless
+        the old proof again.
+        """
+
+        try:
+            candidate = OwnerConsentEvidence.from_message_body(source.body)
+            fact = candidate.disclosure.skill_proof.skill_use
+            historical_asset = HealthInitAsset(
+                canonical_name=fact.canonical_name,
+                version=fact.version,
+                asset_digest=fact.asset_digest,
+                disclosure_version=fact.disclosure_version,
+            )
+            challenge = self._store.initialization_disclosure_challenge(
+                candidate.disclosure.disclosure_id
+            )
+        except AuthorityValidationError:
+            return None
+        if (
+            candidate.admission_causal_id != source.causal_id
+            or challenge is None
+            or (
+                challenge.admission_policy is not None
+                and not challenge.admission_policy.accepts(source)
+            )
+            or not challenge.matches_confirmation(candidate)
+            or not candidate.matches(candidate.initialization, historical_asset)
+            or not self._disclosure_precedes_source(candidate.disclosure, source)
+        ):
+            return None
+        return candidate
+
+    def _currently_approved_initialization_candidate(
+        self,
+        source: SourceEnvelope,
+    ) -> OwnerConsentEvidence | None:
+        candidate = self._historically_accepted_initialization_candidate(source)
+        approved_asset = self._health_init_asset
+        verifier = self._health_init_verifier
+        policy = self._admission_policy
+        challenge = (
+            None
+            if candidate is None
+            else self._store.initialization_disclosure_challenge(
+                candidate.disclosure.disclosure_id
+            )
+        )
+        if (
+            candidate is None
+            or type(approved_asset) is not HealthInitAsset
+            or type(verifier) is not HealthInitAttestor
+            or type(policy) is not AdmissionPolicy
+            or challenge is None
+            or not challenge.issued_under(policy)
+            or not policy.accepts(source)
+            or not candidate.matches(candidate.initialization, approved_asset)
+            or not verifier.verify(
+                candidate.disclosure.skill_proof,
+                candidate.initialization,
+            )
+        ):
+            return None
+        return candidate
+
+    def _initialization_resolution_slot_status(
+        self,
+        source: SourceEnvelope,
+        prior_receipts: tuple[SourceReceipt, ...],
+        *,
+        required_configuration_digest: str | None = None,
+    ) -> str:
+        historical = self._historically_accepted_initialization_candidate(source)
+        if historical is None:
+            return "owner-resolution-required"
+        candidate = self._currently_approved_initialization_candidate(source)
+        if candidate is None:
+            # A challenge accepted under another live asset/key/policy may
+            # become valid again after an operator restores that configuration.
+            # Do not persist a replay result for this transient condition.
+            return "initialization-configuration-mismatch"
+        if (
+            required_configuration_digest is not None
+            and candidate.initialization.configuration_digest
+            != required_configuration_digest
+        ):
+            return "owner-resolution-required"
+        if not self._candidate_resolves_prior_sources(
+            candidate,
+            source.causal_id,
+            prior_receipts,
+        ):
+            return "owner-resolution-required"
+        return "ready"
+
+    def _candidate_resolves_prior_sources(
+        self,
+        candidate: OwnerConsentEvidence,
+        source_causal_id: str,
+        prior_receipts: tuple[SourceReceipt, ...],
+    ) -> bool:
+        prior_candidates: dict[str, OwnerConsentEvidence] = {}
+        for receipt in prior_receipts:
+            if receipt.managed_cursor_state != "held":
+                continue
+            prior = self._historically_accepted_initialization_candidate(
+                receipt.envelope
+            )
+            if prior is not None:
+                prior_candidates[receipt.envelope.causal_id] = prior
+        declared = set(candidate.resolved_source_causal_ids)
+        prior_ids = set(prior_candidates)
+        conflicting = {
+            causal_id
+            for causal_id, prior in prior_candidates.items()
+            if prior.initialization.configuration_digest
+            != candidate.initialization.configuration_digest
+        }
+        return (
+            source_causal_id not in declared
+            and declared <= prior_ids
+            and conflicting <= declared
+        )
+
+    def _stale_initialization_resolution_slot(
+        self,
+        active_receipts: tuple[SourceReceipt, ...],
+    ) -> tuple[SourceReceipt, OwnerConsentEvidence] | None:
+        if len(active_receipts) != _MAX_HELD_INITIALIZATION_SOURCES:
+            return None
+        slot = active_receipts[-1]
+        historical = self._historically_accepted_initialization_candidate(
+            slot.envelope
+        )
+        if (
+            historical is None
+            or self._currently_approved_initialization_candidate(slot.envelope)
+            is not None
+            or not self._candidate_resolves_prior_sources(
+                historical,
+                slot.envelope.causal_id,
+                active_receipts[:-1],
+            )
+        ):
+            return None
+        return slot, historical
+
+    @staticmethod
+    def _disclosure_precedes_source(
+        disclosure: InitializationDisclosure,
+        source: SourceEnvelope,
+    ) -> bool:
+        if source.protocol_timestamp is None:
+            return False
+        try:
+            used_at = datetime.fromisoformat(disclosure.skill_proof.skill_use.used_at)
+            protocol_timestamp = datetime.fromisoformat(source.protocol_timestamp)
+            received_at = datetime.fromisoformat(source.received_at)
+        except (TypeError, ValueError):
+            return False
+        return used_at < protocol_timestamp and used_at < received_at
 
     def _handle_state(self, command: CommandEnvelope, head: AuthoritySnapshot) -> _Handled:
         payload = command.payload
@@ -2589,8 +3107,8 @@ class HealthCore:
                 and initialization.draft.record_id == record_id
             ):
                 self._store.write_initialization("enabled", initialization.draft)
-                self._store.mark_source_business_committed(
-                    initialization.draft.source_causal_id
+                self._store.mark_source_business_committed_many(
+                    initialization.draft.source_causal_ids
                 )
             self._closed_reason = None
             return _Handled(Response("accepted", command.causal_id, "revision-finalized"), True)
@@ -2820,6 +3338,16 @@ class HealthCore:
                 self._store.verify_key()
                 if self._terminal_closed():
                     return None
+                if self._admission_policy is not None:
+                    initialization = self._store.initialization()
+                    if (
+                        initialization is None
+                        or initialization.phase != "enabled"
+                        or not self._initialization_configuration_matches(
+                            initialization.draft
+                        )
+                    ):
+                        return None
                 if self._writer_entry_preflight() is not None:
                     return None
                 # Claim performs remote reads/acquire after local claim state is
@@ -3012,6 +3540,9 @@ class HealthCore:
                 return InitializationProjection.cannot_confirm()
             try:
                 self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    return InitializationProjection.cannot_confirm()
                 stored = self._store.initialization()
                 if stored is None:
                     return InitializationProjection.uninitialized()
@@ -3021,6 +3552,85 @@ class HealthCore:
                 )
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return InitializationProjection.cannot_confirm()
+
+    def initialization_disclosure_replay(
+        self,
+        initialization: OwnerInitialization,
+        admission_policy: AdmissionPolicy,
+    ) -> tuple[InitializationDisclosure | None, int]:
+        """Return an exact durable pre-consent challenge and local generation."""
+
+        if type(initialization) is not OwnerInitialization:
+            raise AuthorityValidationError("invalid owner initialization")
+        if type(admission_policy) is not AdmissionPolicy:
+            raise AuthorityValidationError("initialization-configuration-mismatch")
+        if (
+            initialization.owner_consent is not False
+            or initialization.first_hop_route_consent is not False
+        ):
+            raise AuthorityValidationError(
+                "initialization-disclosure-before-consent-required"
+            )
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("initialization-state-unavailable")
+            if self._admission_policy != admission_policy:
+                raise AuthorityValidationError("initialization-configuration-mismatch")
+            report = self._probe_open()
+            if report.state is not ProbeState.HEALTHY:
+                raise AuthorityValidationError(report.reason_code)
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    raise AuthorityValidationError("initialization-state-unavailable")
+                if self._store.initialization() is not None:
+                    raise AuthorityValidationError("initialization already exists")
+                challenge = self._store.initialization_disclosure_for_workflow(
+                    initialization.workflow_id
+                )
+            except (KeyUnavailable, StoreUnavailable) as exc:
+                raise AuthorityValidationError(
+                    "initialization-state-unavailable"
+                ) from exc
+            if challenge is None:
+                return None, authority.generation
+            if challenge.initialization == initialization:
+                approved_asset = self._health_init_asset
+                verifier = self._health_init_verifier
+                policy = admission_policy
+                if (
+                    type(approved_asset) is not HealthInitAsset
+                    or type(verifier) is not HealthInitAttestor
+                    or type(policy) is not AdmissionPolicy
+                    or not challenge.issued_under(policy)
+                    or not challenge.disclosure.matches(
+                        initialization,
+                        approved_asset,
+                    )
+                    or not verifier.verify(
+                        challenge.disclosure.skill_proof,
+                        initialization,
+                    )
+                ):
+                    raise AuthorityValidationError(
+                        "initialization-configuration-mismatch"
+                    )
+                return challenge.disclosure, authority.generation
+            raise AuthorityValidationError("health-init workflow conflict")
+
+    def admission_policy_matches(self, policy: object) -> bool:
+        """Compare the Plugin's immutable entrypoint contract without data access."""
+
+        with self._lifecycle_lock:
+            configured = self._admission_policy
+            if configured is None or policy is None:
+                return configured is None and policy is None
+            return (
+                type(configured) is AdmissionPolicy
+                and type(policy) is AdmissionPolicy
+                and configured == policy
+            )
 
     def initialization_prepare_replay(
         self,
@@ -3061,10 +3671,10 @@ class HealthCore:
                 if (
                     initialization is None
                     or initialization.phase != "enabled"
-                    or initialization.draft.source_causal_id != causal_id
+                    or causal_id not in initialization.draft.source_causal_ids
                     or receipt is None
                     or receipt.managed_cursor_state != "committed"
-                    or receipt.native_cursor_state != "ready"
+                    or receipt.native_cursor_state not in {"ready", "executing"}
                 ):
                     return None
                 directive = NativeCursorDirective(
@@ -3072,7 +3682,8 @@ class HealthCore:
                     native_cursor=receipt.envelope.native_cursor,
                     initialization_transition_id=initialization.draft.transition_id,
                 )
-                self._store.mark_native_cursor_state(causal_id, "executing")
+                if receipt.native_cursor_state == "ready":
+                    self._store.mark_native_cursor_state(causal_id, "executing")
                 return directive
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None

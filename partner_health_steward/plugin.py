@@ -10,10 +10,16 @@ from .admission import (
     SourceReceipt,
     materialize_source,
 )
-from .authority import AuthorityValidationError, EffectExecutionGrant, EffectIntent
+from .authority import (
+    AuthorityValidationError,
+    EffectExecutionGrant,
+    EffectIntent,
+    validate_opaque_text,
+)
 from .contract import (
     CommandEnvelope,
     InboundAdmitPayload,
+    InitializationDisclosurePayload,
     InitializationPreparePayload,
     NativeCursorResultPayload,
     ProtocolViolation,
@@ -24,12 +30,15 @@ from .contract import (
 )
 from .core import HealthCore
 from .initialization import (
+    HealthInitAsset,
     HealthInitRuntime,
+    InitializationDisclosure,
     InitializationProjection,
     OwnerConsentEvidence,
     OwnerInitialization,
+    stable_digest,
 )
-from .probe import ProbeReport
+from .probe import ProbeReport, ProbeState
 
 
 class HealthPlugin:
@@ -47,6 +56,8 @@ class HealthPlugin:
     def invoke(self, command: CommandEnvelope, *, peer_id: str) -> Response:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return Response("unavailable", reason_code="admission-policy-mismatch")
         # Do not read fields from a caller-provided Python object here.  Core
         # canonicalizes it through the strict wire parser before any command
         # field can reach state or authority handling.
@@ -71,15 +82,36 @@ class HealthPlugin:
         if type(policy) is not AdmissionPolicy:
             return Response("unavailable", reason_code="admission-policy-unavailable")
         reason = policy.rejection_reason(message)
-        causal_id = (
-            message.causal_id
-            if type(message) is RawWeixinMessage
-            and type(message.causal_id) is str
-            and message.causal_id
-            else None
-        )
+        causal_id = None
+        if type(message) is RawWeixinMessage:
+            try:
+                causal_id = validate_opaque_text(message.causal_id, "causal_id")
+            except AuthorityValidationError:
+                pass
         if reason is not None:
             return Response("rejected", causal_id, reason)
+        if not self._core.admission_policy_matches(policy):
+            return Response(
+                "unavailable",
+                causal_id,
+                "admission-policy-mismatch",
+            )
+        initialization = self._core.initialization_status()
+        if initialization.phase == "cannot-confirm":
+            return Response(
+                "unavailable",
+                causal_id,
+                "initialization-state-unavailable",
+            )
+        if initialization.phase != "uninitialized":
+            return Response(
+                "rejected",
+                causal_id,
+                "initialization already exists",
+            )
+        report = self._core.probe()
+        if report.state is not ProbeState.HEALTHY:
+            return Response("unavailable", causal_id, report.reason_code)
         try:
             envelope = materialize_source(message)
             command = CommandEnvelope(
@@ -89,7 +121,7 @@ class HealthPlugin:
                 causal_id=envelope.causal_id,
                 generation=message.generation,
                 scope=("inbound:admit",),
-                payload=InboundAdmitPayload(envelope),
+                payload=InboundAdmitPayload(envelope, policy),
             )
         except (AuthorityValidationError, ProtocolViolation, TypeError, ValueError):
             return Response("rejected", causal_id, "invalid-weixin-source")
@@ -98,12 +130,69 @@ class HealthPlugin:
     def source_envelope(self, causal_id: str, *, peer_id: str) -> SourceEnvelope | None:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return None
         return self._core.source_envelope(causal_id)
 
     def source_receipt(self, causal_id: str, *, peer_id: str) -> SourceReceipt | None:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return None
         return self._core.source_receipt(causal_id)
+
+    def form_initialization_disclosure(
+        self,
+        initialization: OwnerInitialization,
+        *,
+        peer_id: str,
+    ) -> InitializationDisclosure:
+        """Run the approved health-init disclosure before owner confirmation."""
+
+        if type(peer_id) is not str or peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        if type(initialization) is not OwnerInitialization:
+            raise AuthorityValidationError("invalid owner initialization")
+        policy = self._admission_policy
+        if (
+            type(policy) is not AdmissionPolicy
+            or not self._core.admission_policy_matches(policy)
+        ):
+            raise AuthorityValidationError("initialization-configuration-mismatch")
+        replay, generation = self._core.initialization_disclosure_replay(
+            initialization,
+            policy,
+        )
+        if replay is not None:
+            return replay
+        runtime = self._health_init_runtime
+        if type(runtime) is not HealthInitRuntime:
+            raise AuthorityValidationError("health-init-runtime-unavailable")
+        disclosure = runtime.form_disclosure(initialization)
+        response = self.invoke(
+            CommandEnvelope(
+                peer="plugin",
+                action="initialization.disclose",
+                source="health_init_runtime",
+                causal_id=self._initialization_causal_id(
+                    "disclose",
+                    initialization.workflow_id,
+                ),
+                generation=generation,
+                scope=("initialization:disclose",),
+                payload=InitializationDisclosurePayload(
+                    initialization,
+                    disclosure,
+                    policy,
+                ),
+            ),
+            peer_id=peer_id,
+        )
+        if response.status != "accepted":
+            raise AuthorityValidationError(
+                response.reason_code or "initialization-disclosure-unavailable"
+            )
+        return disclosure
 
     def prepare_initialization(
         self,
@@ -115,6 +204,11 @@ class HealthPlugin:
             raise ProtocolViolation("untrusted peer")
         if type(initialization) is not OwnerInitialization:
             return Response("rejected", reason_code="invalid-owner-initialization")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return Response(
+                "unavailable",
+                reason_code="admission-policy-mismatch",
+            )
         reason = initialization.incomplete_reason
         if reason is not None:
             return Response("rejected", reason_code=reason)
@@ -134,44 +228,50 @@ class HealthPlugin:
         if durable_replay is not None:
             proof, generation = durable_replay
         else:
-            runtime = self._health_init_runtime
-            if type(runtime) is not HealthInitRuntime:
-                return Response("unavailable", reason_code="health-init-runtime-unavailable")
             source = self._core.source_envelope(initialization.admission_causal_id)
             if source is None:
                 return Response(
                     "rejected",
                     reason_code="initialization-source-required",
                 )
-            approved_asset = runtime.asset
             try:
                 consent = OwnerConsentEvidence.from_message_body(source.body)
             except AuthorityValidationError:
                 consent = None
-            if consent is None or not consent.matches(initialization, approved_asset):
+            try:
+                evidence_asset = (
+                    None
+                    if consent is None
+                    else HealthInitAsset(
+                        canonical_name=consent.disclosure.skill_proof.skill_use.canonical_name,
+                        version=consent.disclosure.skill_proof.skill_use.version,
+                        asset_digest=consent.disclosure.skill_proof.skill_use.asset_digest,
+                        disclosure_version=(
+                            consent.disclosure.skill_proof.skill_use.disclosure_version
+                        ),
+                    )
+                )
+            except AuthorityValidationError:
+                evidence_asset = None
+            if (
+                consent is None
+                or evidence_asset is None
+                or not consent.matches(initialization, evidence_asset)
+            ):
                 return Response(
                     "rejected",
                     reason_code="owner-consent-evidence-required",
                 )
-            try:
-                proof = runtime.run(initialization)
-            except AuthorityValidationError as exc:
-                reason_code = str(exc)
-                if reason_code == "health-init-execution-failed":
-                    return Response("unavailable", reason_code=reason_code)
-                if reason_code not in {
-                    "owner-consent-required",
-                    "first-hop-route-consent-required",
-                    "health-init workflow conflict",
-                }:
-                    reason_code = "health-init-runtime-failed"
-                return Response("rejected", reason_code=reason_code)
+            proof = consent.disclosure.skill_proof
             generation = source.generation
         command = CommandEnvelope(
             peer="plugin",
             action="initialization.prepare",
             source="health_weixin",
-            causal_id="initialization-prepare:" + initialization.workflow_id,
+            causal_id=self._initialization_causal_id(
+                "prepare",
+                initialization.workflow_id,
+            ),
             generation=generation,
             scope=("initialization:prepare",),
             payload=InitializationPreparePayload(initialization, proof),
@@ -181,9 +281,13 @@ class HealthPlugin:
     def initialization_status(self, *, peer_id: str) -> InitializationProjection:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return InitializationProjection.cannot_confirm()
         return self._core.initialization_status()
 
     def commit_initialization(self, *, peer_id: str) -> Response:
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return Response("unavailable", reason_code="admission-policy-mismatch")
         status = self.initialization_status(peer_id=peer_id)
         if status.phase not in {"prepared", "unknown", "committed", "enabled"}:
             return Response("rejected", reason_code="initialization-not-prepared")
@@ -193,6 +297,8 @@ class HealthPlugin:
         )
 
     def finalize_initialization(self, *, peer_id: str) -> Response:
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return Response("unavailable", reason_code="admission-policy-mismatch")
         status = self.initialization_status(peer_id=peer_id)
         if status.phase not in {"committed", "enabled"}:
             return Response("rejected", reason_code="initialization-not-committed")
@@ -222,7 +328,10 @@ class HealthPlugin:
             peer="plugin",
             action=action,
             source="health_weixin",
-            causal_id=f"initialization-{suffix}:{skill_use.workflow_id}",
+            causal_id=HealthPlugin._initialization_causal_id(
+                suffix,
+                skill_use.workflow_id,
+            ),
             generation=generation,
             scope=(f"state:{suffix}",),
             payload=StateCommitPayload(
@@ -233,6 +342,11 @@ class HealthPlugin:
             ),
         )
 
+    @staticmethod
+    def _initialization_causal_id(stage: str, workflow_id: str) -> str:
+        digest = stable_digest({"stage": stage, "workflow_id": workflow_id})
+        return f"initialization-{stage}:" + digest.removeprefix("sha256:")
+
     def native_cursor_directive(
         self,
         source_causal_id: str,
@@ -241,6 +355,8 @@ class HealthPlugin:
     ) -> NativeCursorDirective | None:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return None
         return self._core.native_cursor_directive(source_causal_id)
 
     def record_native_cursor_result(
@@ -252,6 +368,8 @@ class HealthPlugin:
     ) -> Response:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return Response("unavailable", reason_code="admission-policy-mismatch")
         if type(directive) is not NativeCursorDirective:
             return Response("rejected", reason_code="invalid-native-cursor-directive")
         initialization = self.initialization_status(peer_id=peer_id)
@@ -271,7 +389,10 @@ class HealthPlugin:
                 peer="plugin",
                 action="cursor.result",
                 source="health_weixin",
-                causal_id=f"native-cursor:{directive.source_causal_id}:{status}",
+                causal_id=self._native_cursor_result_causal_id(
+                    directive.source_causal_id,
+                    status,
+                ),
                 generation=authority.generation + 1,
                 scope=("cursor:result",),
                 payload=payload,
@@ -280,21 +401,48 @@ class HealthPlugin:
             return Response("rejected", reason_code=str(exc))
         return self.invoke(command, peer_id=peer_id)
 
+    @staticmethod
+    def _native_cursor_result_causal_id(source_causal_id: str, status: str) -> str:
+        digest = stable_digest(
+            {
+                "source_causal_id": source_causal_id,
+                "status": status,
+            }
+        )
+        return "native-cursor-result:" + digest.removeprefix("sha256:")
+
     def probe(self, *, ordinary_hermes_status: str | None = None) -> ProbeReport:
         # The ordinary Hermes status is intentionally ignored: it is not health proof.
         del ordinary_hermes_status
-        return self._core.probe()
+        report = self._core.probe()
+        if (
+            report.state is ProbeState.HEALTHY
+            and not self._core.admission_policy_matches(self._admission_policy)
+        ):
+            return ProbeReport(ProbeState.UNAVAILABLE, "admission-policy-mismatch")
+        return report
 
     def health_writes_allowed(self) -> bool:
-        return self._core.health_writes_allowed()
+        return (
+            self._core.admission_policy_matches(self._admission_policy)
+            and self._core.health_writes_allowed()
+        )
 
     def model_effects_allowed(self) -> bool:
-        return self._core.model_effects_allowed()
+        return (
+            self._core.admission_policy_matches(self._admission_policy)
+            and self._core.model_effects_allowed()
+        )
 
     def outbound_effects_allowed(self) -> bool:
-        return self._core.outbound_effects_allowed()
+        return (
+            self._core.admission_policy_matches(self._admission_policy)
+            and self._core.outbound_effects_allowed()
+        )
 
     def claim_effect_execution(self, intent: EffectIntent) -> EffectExecutionGrant | None:
         """Return the non-durable completion grant before an adapter may act."""
 
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return None
         return self._core.claim_effect_execution(intent)

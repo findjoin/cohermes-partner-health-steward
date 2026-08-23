@@ -31,7 +31,7 @@ from .authority import (
     validate_ticket110_effect_kind,
 )
 from .contract import CommandEnvelope, EffectResultPayload, ProtocolViolation, Response, StateCommitPayload
-from .initialization import InitializationDraft
+from .initialization import InitializationDisclosureChallenge, InitializationDraft
 
 
 class KeyUnavailable(RuntimeError):
@@ -449,6 +449,17 @@ class EncryptedStateStore:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS initialization_disclosure_challenges_v1 (
+                disclosure_id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                admission_causal_id TEXT NOT NULL UNIQUE,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS owner_initialization_v1 (
                 slot INTEGER PRIMARY KEY CHECK(slot = 1),
                 record_id TEXT NOT NULL UNIQUE,
@@ -555,7 +566,57 @@ class EncryptedStateStore:
         rows into trusted current health state.
         """
 
-        if self._execute("SELECT 1 FROM integrity_manifest_v1 WHERE slot = 1").fetchone() is not None:
+        manifest_row = self._execute(
+            "SELECT nonce, ciphertext FROM integrity_manifest_v1 WHERE slot = 1"
+        ).fetchone()
+        if manifest_row is not None:
+            try:
+                stored = self._open("integrity-manifest", manifest_row[0], manifest_row[1])
+            except KeyUnavailable:
+                return
+            if not isinstance(stored, Mapping) or set(stored) != {"fingerprint"}:
+                return
+            fingerprint = stored["fingerprint"]
+            if fingerprint == self._integrity_fingerprint():
+                return
+            ticket111_tables = (
+                "source_envelopes_v1",
+                "initialization_disclosure_challenges_v1",
+                "owner_initialization_v1",
+            )
+            if (
+                not isinstance(fingerprint, str)
+                or fingerprint != self._integrity_fingerprint(include_ticket111=False)
+                or any(
+                    self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                    is not None
+                    for table in ticket111_tables
+                )
+            ):
+                return
+            with self.transaction() as connection:
+                current_row = connection.execute(
+                    "SELECT nonce, ciphertext FROM integrity_manifest_v1 WHERE slot = 1"
+                ).fetchone()
+                if current_row is None:
+                    return
+                current_stored = self._open(
+                    "integrity-manifest",
+                    current_row[0],
+                    current_row[1],
+                )
+                if (
+                    current_stored != stored
+                    or any(
+                        connection.execute(
+                            f"SELECT 1 FROM {table} LIMIT 1"
+                        ).fetchone()
+                        is not None
+                        for table in ticket111_tables
+                    )
+                ):
+                    return
+                self._refresh_integrity_manifest(connection)
             return
         populated_tables = (
             "health_records",
@@ -568,6 +629,7 @@ class EncryptedStateStore:
             "terminal_observation_v1",
             "current_head_observation_guard_v1",
             "source_envelopes_v1",
+            "initialization_disclosure_challenges_v1",
             "owner_initialization_v1",
         )
         if any(self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None for table in populated_tables):
@@ -575,7 +637,7 @@ class EncryptedStateStore:
         with self.transaction() as connection:
             self._refresh_integrity_manifest(connection)
 
-    def _integrity_fingerprint(self) -> str:
+    def _integrity_fingerprint(self, *, include_ticket111: bool = True) -> str:
         """Hash every mutable domain row except the manifest itself."""
 
         tables = {
@@ -607,14 +669,29 @@ class EncryptedStateStore:
             "current_head_observation_guard": self._execute(
                 "SELECT slot, nonce, ciphertext FROM current_head_observation_guard_v1 ORDER BY slot"
             ).fetchall(),
-            "source_envelopes": self._execute(
-                "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY causal_id"
-            ).fetchall(),
-            "owner_initialization": self._execute(
-                "SELECT slot, record_id, phase, nonce, ciphertext "
-                "FROM owner_initialization_v1 ORDER BY slot"
-            ).fetchall(),
         }
+        if include_ticket111:
+            tables.update(
+                {
+                    # Conflict resolution treats SQLite insertion order as an
+                    # authority fact.  Authenticate rowid itself so a raw row
+                    # reorder cannot turn a predeclared future source into a
+                    # later owner decision without invalidating the manifest.
+                    "source_envelopes": self._execute(
+                        "SELECT rowid, causal_id, nonce, ciphertext "
+                        "FROM source_envelopes_v1 ORDER BY rowid"
+                    ).fetchall(),
+                    "initialization_disclosure_challenges": self._execute(
+                        "SELECT disclosure_id, workflow_id, admission_causal_id, "
+                        "nonce, ciphertext FROM initialization_disclosure_challenges_v1 "
+                        "ORDER BY disclosure_id"
+                    ).fetchall(),
+                    "owner_initialization": self._execute(
+                        "SELECT slot, record_id, phase, nonce, ciphertext "
+                        "FROM owner_initialization_v1 ORDER BY slot"
+                    ).fetchall(),
+                }
+            )
 
         def wire_value(value: object) -> object:
             if isinstance(value, bytes):
@@ -1176,6 +1253,126 @@ class EncryptedStateStore:
                     raise CausalIdConflict("causal-id-conflict") from exc
             self._refresh_integrity_manifest(connection)
 
+    def save_initialization_disclosure_challenge(
+        self,
+        challenge: InitializationDisclosureChallenge,
+    ) -> None:
+        """Persist a pre-consent challenge before its owner source may exist."""
+
+        if type(challenge) is not InitializationDisclosureChallenge:
+            raise AuthorityValidationError("invalid initialization disclosure challenge")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            if self.source_receipt(challenge.admission_causal_id) is not None:
+                raise AuthorityValidationError(
+                    "initialization-disclosure-before-consent-required"
+                )
+            rows = connection.execute(
+                "SELECT disclosure_id, workflow_id, admission_causal_id, nonce, ciphertext "
+                "FROM initialization_disclosure_challenges_v1 "
+                "WHERE disclosure_id = ? OR workflow_id = ? OR admission_causal_id = ?",
+                (
+                    challenge.disclosure_id,
+                    challenge.workflow_id,
+                    challenge.admission_causal_id,
+                ),
+            ).fetchall()
+            if rows:
+                if len(rows) == 1 and self._decode_initialization_disclosure_challenge(
+                    *rows[0]
+                ) == challenge:
+                    return
+                raise AuthorityValidationError("health-init workflow conflict")
+            nonce, ciphertext = self._seal(
+                f"initialization-disclosure:{challenge.disclosure_id}",
+                challenge.to_storage(),
+            )
+            connection.execute(
+                "INSERT INTO initialization_disclosure_challenges_v1("
+                "disclosure_id, workflow_id, admission_causal_id, nonce, ciphertext"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    challenge.disclosure_id,
+                    challenge.workflow_id,
+                    challenge.admission_causal_id,
+                    nonce,
+                    ciphertext,
+                ),
+            )
+            self._refresh_integrity_manifest(connection)
+
+    def initialization_disclosure_challenge(
+        self,
+        disclosure_id: str,
+    ) -> InitializationDisclosureChallenge | None:
+        validate_opaque_text(disclosure_id, "initialization disclosure identifier")
+        row = self._execute(
+            "SELECT disclosure_id, workflow_id, admission_causal_id, nonce, ciphertext "
+            "FROM initialization_disclosure_challenges_v1 WHERE disclosure_id = ?",
+            (disclosure_id,),
+        ).fetchone()
+        return (
+            None
+            if row is None
+            else self._decode_initialization_disclosure_challenge(*row)
+        )
+
+    def initialization_disclosure_for_workflow(
+        self,
+        workflow_id: str,
+    ) -> InitializationDisclosureChallenge | None:
+        validate_opaque_text(workflow_id, "initialization workflow identifier")
+        row = self._execute(
+            "SELECT disclosure_id, workflow_id, admission_causal_id, nonce, ciphertext "
+            "FROM initialization_disclosure_challenges_v1 WHERE workflow_id = ?",
+            (workflow_id,),
+        ).fetchone()
+        return (
+            None
+            if row is None
+            else self._decode_initialization_disclosure_challenge(*row)
+        )
+
+    def _decode_initialization_disclosure_challenge(
+        self,
+        disclosure_id: object,
+        workflow_id: object,
+        admission_causal_id: object,
+        nonce: object,
+        ciphertext: object,
+    ) -> InitializationDisclosureChallenge:
+        if not all(
+            type(value) is str and value
+            for value in (disclosure_id, workflow_id, admission_causal_id)
+        ):
+            raise KeyUnavailable("invalid initialization disclosure challenge")
+        try:
+            challenge = InitializationDisclosureChallenge.from_storage(
+                self._open(
+                    f"initialization-disclosure:{disclosure_id}",
+                    nonce,  # type: ignore[arg-type]
+                    ciphertext,  # type: ignore[arg-type]
+                )
+            )
+        except AuthorityValidationError as exc:
+            raise KeyUnavailable("invalid initialization disclosure challenge") from exc
+        if (
+            challenge.disclosure_id != disclosure_id
+            or challenge.workflow_id != workflow_id
+            or challenge.admission_causal_id != admission_causal_id
+        ):
+            raise KeyUnavailable("initialization disclosure challenge mismatch")
+        return challenge
+
+    def clear_initialization_disclosure_challenges(self) -> None:
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            cursor = connection.execute(
+                "DELETE FROM initialization_disclosure_challenges_v1"
+            )
+            if cursor.rowcount:
+                self._refresh_integrity_manifest(connection)
+
     def save_source_envelope(self, envelope: SourceEnvelope) -> None:
         """Persist one admitted source observation inside the caller transaction."""
 
@@ -1255,13 +1452,80 @@ class EncryptedStateStore:
             raise KeyUnavailable("source envelope causal identifier mismatch")
         return receipt
 
-    def mark_source_business_committed(self, causal_id: str) -> SourceReceipt:
+    def held_source_receipts(self) -> tuple[SourceReceipt, ...]:
+        """Return every unresolved admitted source in stable arrival order."""
+
+        rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY rowid"
+        ).fetchall()
+        held: list[SourceReceipt] = []
+        for causal_id, nonce, ciphertext in rows:
+            try:
+                receipt = SourceReceipt.from_storage(
+                    self._open(f"source-envelope:{causal_id}", nonce, ciphertext)
+                )
+            except AuthorityValidationError as exc:
+                raise KeyUnavailable("invalid source receipt") from exc
+            if receipt.envelope.causal_id != causal_id:
+                raise KeyUnavailable("source envelope causal identifier mismatch")
+            if receipt.managed_cursor_state in {"held", "superseded"}:
+                held.append(receipt)
+        return tuple(held)
+
+    def supersede_initialization_resolution_source(
+        self,
+        causal_id: str,
+    ) -> SourceReceipt:
+        """Retire one stale resolution slot without advancing either cursor."""
+
         receipt = self.source_receipt(causal_id)
         if receipt is None:
             raise AuthorityValidationError("initialization source required")
-        if receipt.managed_cursor_state == "committed":
-            return receipt
-        return self._replace_source_receipt(receipt.with_business_committed())
+        return self._replace_source_receipt(
+            receipt.with_resolution_superseded()
+        )
+
+    def mark_source_business_committed(self, causal_id: str) -> SourceReceipt:
+        return self.mark_source_business_committed_many((causal_id,))[0]
+
+    def mark_source_business_committed_many(
+        self,
+        causal_ids: tuple[str, ...],
+    ) -> tuple[SourceReceipt, ...]:
+        """Clear and release one frozen initialization source set atomically."""
+
+        if type(causal_ids) is not tuple or not causal_ids:
+            raise AuthorityValidationError("initialization source required")
+        validated = tuple(validate_opaque_text(item, "causal_id") for item in causal_ids)
+        if validated != causal_ids or len(set(validated)) != len(validated):
+            raise AuthorityValidationError("invalid initialization source set")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            committed: list[SourceReceipt] = []
+            for causal_id in validated:
+                receipt = self.source_receipt(causal_id)
+                if receipt is None:
+                    raise AuthorityValidationError("initialization source required")
+                replacement = (
+                    receipt
+                    if receipt.managed_cursor_state == "committed"
+                    else receipt.with_business_committed()
+                )
+                if replacement != receipt:
+                    nonce, ciphertext = self._seal(
+                        f"source-envelope:{causal_id}",
+                        replacement.to_storage(),
+                    )
+                    cursor = connection.execute(
+                        "UPDATE source_envelopes_v1 SET nonce = ?, ciphertext = ? "
+                        "WHERE causal_id = ?",
+                        (nonce, ciphertext, causal_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise AuthorityValidationError("initialization source required")
+                committed.append(replacement)
+            self._refresh_integrity_manifest(connection)
+        return tuple(committed)
 
     def mark_native_cursor_state(self, causal_id: str, state: str) -> SourceReceipt:
         receipt = self.source_receipt(causal_id)
@@ -1629,6 +1893,13 @@ class EncryptedStateStore:
                 raise KeyUnavailable("invalid source envelope") from exc
             if receipt.envelope.causal_id != causal_id:
                 raise KeyUnavailable("source envelope causal identifier mismatch")
+
+        disclosure_rows = self._execute(
+            "SELECT disclosure_id, workflow_id, admission_causal_id, nonce, ciphertext "
+            "FROM initialization_disclosure_challenges_v1 ORDER BY disclosure_id"
+        ).fetchall()
+        for row in disclosure_rows:
+            self._decode_initialization_disclosure_challenge(*row)
 
         initialization_rows = self._execute(
             "SELECT record_id, phase, nonce, ciphertext "

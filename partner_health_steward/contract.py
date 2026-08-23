@@ -7,9 +7,9 @@ import struct
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
-from .admission import SourceEnvelope
+from .admission import AdmissionPolicy, SourceEnvelope
 from .authority import EffectIntent, MAX_OPAQUE_TEXT_BYTES
-from .initialization import OwnerInitialization, SkillUseProof
+from .initialization import InitializationDisclosure, OwnerInitialization, SkillUseProof
 
 
 PROTOCOL_VERSION = 1
@@ -74,13 +74,19 @@ class ProbePayload(CommandPayload):
 @dataclass(frozen=True)
 class InboundAdmitPayload(CommandPayload):
     envelope: SourceEnvelope
+    admission_policy: AdmissionPolicy
 
     def __post_init__(self) -> None:
         if type(self.envelope) is not SourceEnvelope:
             raise ProtocolViolation("invalid source envelope")
+        if type(self.admission_policy) is not AdmissionPolicy:
+            raise ProtocolViolation("invalid admission policy")
 
     def to_wire(self) -> dict[str, object]:
-        return {"envelope": self.envelope.to_storage()}
+        return {
+            "envelope": self.envelope.to_storage(),
+            "admission_policy": self.admission_policy.to_storage(),
+        }
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,28 @@ class InitializationPreparePayload(CommandPayload):
         return {
             "initialization": self.initialization.to_storage(),
             "skill_proof": self.skill_proof.to_storage(),
+        }
+
+
+@dataclass(frozen=True)
+class InitializationDisclosurePayload(CommandPayload):
+    initialization: OwnerInitialization
+    disclosure: InitializationDisclosure
+    admission_policy: AdmissionPolicy
+
+    def __post_init__(self) -> None:
+        if type(self.initialization) is not OwnerInitialization:
+            raise ProtocolViolation("invalid owner initialization")
+        if type(self.disclosure) is not InitializationDisclosure:
+            raise ProtocolViolation("invalid initialization disclosure")
+        if type(self.admission_policy) is not AdmissionPolicy:
+            raise ProtocolViolation("invalid admission policy")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "initialization": self.initialization.to_storage(),
+            "disclosure": self.disclosure.to_storage(),
+            "admission_policy": self.admission_policy.to_storage(),
         }
 
 
@@ -219,6 +247,7 @@ class EffectResultPayload(CommandPayload):
 _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
     "probe": ProbePayload,
     "inbound.admit": InboundAdmitPayload,
+    "initialization.disclose": InitializationDisclosurePayload,
     "initialization.prepare": InitializationPreparePayload,
     "cursor.result": NativeCursorResultPayload,
     "state.candidate": StateCandidatePayload,
@@ -232,6 +261,7 @@ _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
 _ACTION_SCOPES = {
     "probe": "probe",
     "inbound.admit": "inbound:admit",
+    "initialization.disclose": "initialization:disclose",
     "initialization.prepare": "initialization:prepare",
     "cursor.result": "cursor:result",
     "state.candidate": "state:candidate",
@@ -268,12 +298,38 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
         _strict_mapping(value, frozenset(), "payload")
         return ProbePayload()
     if payload_type is InboundAdmitPayload:
-        fields = _strict_mapping(value, frozenset({"envelope"}), "payload")
+        fields = _strict_mapping(
+            value,
+            frozenset({"envelope", "admission_policy"}),
+            "payload",
+        )
         try:
             envelope = SourceEnvelope.from_storage(fields["envelope"])
+            admission_policy = AdmissionPolicy.from_storage(
+                fields["admission_policy"]
+            )
         except (TypeError, ValueError) as exc:
             raise ProtocolViolation("invalid source envelope") from exc
-        return InboundAdmitPayload(envelope)
+        return InboundAdmitPayload(envelope, admission_policy)
+    if payload_type is InitializationDisclosurePayload:
+        fields = _strict_mapping(
+            value,
+            frozenset({"initialization", "disclosure", "admission_policy"}),
+            "payload",
+        )
+        try:
+            initialization = OwnerInitialization.from_storage(fields["initialization"])
+            disclosure = InitializationDisclosure.from_storage(fields["disclosure"])
+            admission_policy = AdmissionPolicy.from_storage(
+                fields["admission_policy"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProtocolViolation("invalid initialization disclosure payload") from exc
+        return InitializationDisclosurePayload(
+            initialization,
+            disclosure,
+            admission_policy,
+        )
     if payload_type is InitializationPreparePayload:
         fields = _strict_mapping(
             value,
