@@ -218,15 +218,27 @@ class StateCommitPayload(CommandPayload):
 class EffectRequestPayload(CommandPayload):
     effect_kind: str
     request_digest: str
+    business_source_causal_id: str | None = None
 
     def __post_init__(self) -> None:
         _bounded_text(self.effect_kind, "effect_kind")
         _bounded_text(self.request_digest, "request_digest")
         if self.effect_kind not in {"model-work", "owner-delivery", "contact-delivery"}:
             raise ProtocolViolation("invalid effect kind")
+        if self.business_source_causal_id is not None:
+            _bounded_text(
+                self.business_source_causal_id,
+                "business_source_causal_id",
+            )
 
     def to_wire(self) -> dict[str, object]:
-        return {"effect_kind": self.effect_kind, "request_digest": self.request_digest}
+        wire: dict[str, object] = {
+            "effect_kind": self.effect_kind,
+            "request_digest": self.request_digest,
+        }
+        if self.business_source_causal_id is not None:
+            wire["business_source_causal_id"] = self.business_source_causal_id
+        return wire
 
 
 @dataclass(frozen=True)
@@ -429,10 +441,24 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
             _bounded_text(fields["writer_fence"], "writer_fence"),
         )
     if payload_type is EffectRequestPayload:
-        fields = _strict_mapping(value, frozenset({"effect_kind", "request_digest"}), "payload")
+        legacy_fields = frozenset({"effect_kind", "request_digest"})
+        if type(value) is not dict or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"business_source_causal_id"},
+        ):
+            raise ProtocolViolation("invalid payload fields")
+        fields = value
         return EffectRequestPayload(
             _bounded_text(fields["effect_kind"], "effect_kind"),
             _bounded_text(fields["request_digest"], "request_digest"),
+            (
+                None
+                if "business_source_causal_id" not in fields
+                else _bounded_text(
+                    fields["business_source_causal_id"],
+                    "business_source_causal_id",
+                )
+            ),
         )
     legacy_fields = {
         "effect_id", "intent_digest", "lease_id", "completion_capability",
@@ -580,7 +606,7 @@ def _parse_response_meta(value: object) -> ResponseMeta:
             )
         )
     effect_fields = {"effect_id", "effect_kind", "intent_digest", "authority"}
-    if keys == effect_fields:
+    if keys in (effect_fields, effect_fields | {"business_source_causal_id"}):
         try:
             intent = EffectIntent.from_wire_metadata(value)
         except ValueError as exc:

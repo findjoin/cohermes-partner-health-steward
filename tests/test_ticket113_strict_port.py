@@ -11,6 +11,7 @@ from partner_health_steward.model_contract import (
     StrictHealthLLM,
     StrictModelRequest,
 )
+from partner_health_steward.initialization import stable_digest
 from tests.ticket113_deny_network import BypassDenied, DenyBypassHarness
 
 
@@ -38,7 +39,7 @@ def _profile() -> CapabilityProfile:
         requested_model="synthetic-health-model",
         allowed_actual_models=("synthetic-health-model", "synthetic-health-model-alias"),
         configuration_generation=7,
-        input_measurement_method="synthetic-conservative-upper-bound-v1",
+        input_measurement_method="synthetic-utf8-byte-upper-bound-v1",
         fixed_wrapper_tokens=96,
         output_reservation_tokens=512,
         common_context_lower_bound_tokens=4096,
@@ -48,19 +49,42 @@ def _profile() -> CapabilityProfile:
 
 
 def _request() -> StrictModelRequest:
+    messages = (
+        ModelMessage("system", "synthetic policy"),
+        ModelMessage("user", "synthetic health question"),
+    )
     return StrictModelRequest(
         route=_route(),
         capability_profile=_profile(),
-        messages=(
-            ModelMessage("system", "synthetic policy"),
-            ModelMessage("user", "synthetic health question"),
+        messages=messages,
+        final_input_digest=stable_digest(
+            {"messages": [message.to_wire() for message in messages]}
         ),
-        final_input_digest="sha256:" + "d" * 64,
         final_input_upper_bound_tokens=3000,
         output_reservation_tokens=512,
         strict_schema_name="nondiagnostic-candidate-v1",
         strict_schema_digest="sha256:" + "b" * 64,
     )
+
+
+def _execute(
+    request: StrictModelRequest,
+    adapter: object,
+    *,
+    route: FirstHopRoute | None = None,
+    profile: CapabilityProfile | None = None,
+):
+    llm = StrictHealthLLM(route or _route(), profile or _profile())
+    preflight = llm.preflight(request)
+    if preflight is not None:
+        return preflight
+    try:
+        result = adapter.execute(request.to_wire())  # type: ignore[attr-defined]
+    except Exception:
+        return llm.transport_unknown_outcome(request)
+    if type(result) is not ModelTransportResult:
+        return llm.transport_unknown_outcome(request)
+    return llm.resolve_transport_result(request, result)
 
 
 def _candidate_wire() -> dict[str, object]:
@@ -159,6 +183,130 @@ class ProxySignalAdapter:
 
 
 class Ticket113StrictPortTests(unittest.TestCase):
+    def test_transport_result_direct_constructor_rejects_non_mapping_output(self) -> None:
+        with self.assertRaises(ModelContractViolation):
+            ModelTransportResult(
+                response_id="synthetic-response",
+                requested_model="synthetic-health-model",
+                actual_model="synthetic-health-model",
+                status="completed",
+                incomplete_reason=None,
+                failure_reason=None,
+                usage_input_tokens=1,
+                usage_output_tokens=1,
+                fallback_observed=False,
+                truncated=False,
+                terminal_proven=True,
+                structured_output=[],  # type: ignore[arg-type]
+            )
+
+    def test_transport_terminal_reasons_are_mutually_exclusive(self) -> None:
+        invalid = (
+            {
+                "status": "incomplete",
+                "incomplete_reason": "max-output-tokens",
+                "failure_reason": "must-not-coexist",
+            },
+            {
+                "status": "failed",
+                "incomplete_reason": "must-not-coexist",
+                "failure_reason": "provider-rejected",
+            },
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                with self.assertRaises(ModelContractViolation):
+                    _completed_result(
+                        terminal_proven=True,
+                        structured_output=None,
+                        **changes,
+                    )
+
+    def test_strict_model_validator_has_no_public_transport_executor(self) -> None:
+        self.assertFalse(hasattr(StrictHealthLLM, "execute"))
+
+    def test_final_input_digest_must_match_the_exact_messages(self) -> None:
+        with self.assertRaises(ModelContractViolation):
+            replace(_request(), final_input_digest="sha256:" + "d" * 64)
+
+    def test_synthetic_input_measurement_cannot_understate_the_wire(self) -> None:
+        request = replace(_request(), final_input_upper_bound_tokens=1)
+        adapter = RecordingModelAdapter(_completed_result())
+
+        outcome = _execute(request, adapter)
+
+        self.assertEqual(outcome.reason_code, "capacity-unavailable")
+        self.assertEqual(outcome.model_effect, "not-started")
+        self.assertEqual(adapter.calls, 0)
+
+    def test_unapproved_real_or_unknown_measurement_profile_cannot_call(self) -> None:
+        for profile in (
+            replace(_profile(), synthetic=False),
+            replace(_profile(), input_measurement_method="unknown-method"),
+        ):
+            with self.subTest(profile=profile):
+                request = replace(_request(), capability_profile=profile)
+                adapter = RecordingModelAdapter(_completed_result())
+                outcome = _execute(request, adapter, profile=profile)
+                self.assertEqual(outcome.reason_code, "capacity-unavailable")
+                self.assertEqual(outcome.model_effect, "not-started")
+                self.assertEqual(adapter.calls, 0)
+
+    def test_incomplete_and_failed_results_must_prove_terminality(self) -> None:
+        for status, changes in (
+            (
+                "incomplete",
+                {
+                    "incomplete_reason": "max-output-tokens",
+                    "failure_reason": None,
+                },
+            ),
+            (
+                "failed",
+                {
+                    "incomplete_reason": None,
+                    "failure_reason": "provider-rejected",
+                },
+            ),
+        ):
+            with self.subTest(status=status):
+                with self.assertRaises(ModelContractViolation):
+                    _completed_result(
+                        status=status,
+                        terminal_proven=False,
+                        structured_output=None,
+                        **changes,
+                    )
+
+    def test_unknown_terminality_dominates_completed_only_drift_signals(self) -> None:
+        cases = (
+            {"requested_model": "other-model"},
+            {"actual_model": "unapproved-model"},
+            {"fallback_observed": True},
+            {"truncated": True},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = _completed_result(
+                    status="unknown",
+                    terminal_proven=False,
+                    structured_output=None,
+                    **changes,
+                )
+                outcome = _execute(_request(), RecordingModelAdapter(result))
+                self.assertEqual(outcome.disposition, "unknown")
+                self.assertEqual(outcome.model_effect, "unknown")
+                self.assertEqual(outcome.reason_code, "model-effect-unknown")
+                self.assertEqual(outcome.model_report.outer_effect_status, "unknown")
+
+    def test_preflight_never_receives_or_calls_a_transport_adapter(self) -> None:
+        adapter = RecordingModelAdapter(_completed_result())
+
+        outcome = StrictHealthLLM(_route(), _profile()).preflight(_request())
+
+        self.assertIsNone(outcome)
+        self.assertEqual(adapter.calls, 0)
+
     def test_current_profile_must_bind_the_current_route(self) -> None:
         with self.assertRaises(ModelContractViolation):
             StrictHealthLLM(_route(), replace(_profile(), route_id="other-route"))
@@ -168,7 +316,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         drifted = replace(request, route=replace(request.route, route_id="other-route"))
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "route-id-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -182,7 +330,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "capability-profile-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -192,7 +340,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         drifted = replace(_request(), output_reservation_tokens=513)
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "output-reservation-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -202,7 +350,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         drifted = replace(_request(), strict_schema_digest="sha256:" + "e" * 64)
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "strict-schema-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -216,7 +364,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -232,7 +380,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -245,7 +393,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         drifted = replace(request, route=replace(request.route, api_mode="chat-completions"))
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "api-mode-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -256,7 +404,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         drifted = replace(request, route=replace(request.route, requested_model="other-model"))
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "requested-model-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -270,7 +418,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "configuration-generation-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -284,7 +432,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(drifted, adapter)
+        outcome = _execute(drifted, adapter)
 
         self.assertEqual(outcome.reason_code, "owner-consent-drift")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -293,7 +441,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
     def test_113_a1_c07_fallback_fact_rejects_candidate(self) -> None:
         adapter = RecordingModelAdapter(_completed_result(fallback_observed=True))
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "completed")
@@ -303,10 +451,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
 
     def test_113_a1_c09_forbidden_bypass_is_observed_and_denied(self) -> None:
         with DenyBypassHarness() as harness:
-            outcome = StrictHealthLLM(_route(), _profile()).execute(
-                _request(),
-                BypassAttemptAdapter(harness),
-            )
+            outcome = _execute(_request(), BypassAttemptAdapter(harness))
 
         self.assertEqual(outcome.disposition, "candidate")
         self.assertEqual(
@@ -318,7 +463,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         request = _request()
         adapter = RecordingModelAdapter(_completed_result())
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(request, adapter)
+        outcome = _execute(request, adapter)
 
         self.assertEqual(outcome.disposition, "candidate")
         self.assertEqual(outcome.model_effect, "completed")
@@ -336,7 +481,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter(result)
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "incomplete")
@@ -353,7 +498,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter(result)
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "failed")
@@ -369,7 +514,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         )
         adapter = RecordingModelAdapter(result)
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "unknown")
         self.assertEqual(outcome.model_effect, "unknown")
@@ -379,7 +524,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
     def test_113_a2_c05_truncated_result_produces_no_candidate(self) -> None:
         adapter = RecordingModelAdapter(_completed_result(truncated=True))
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "completed")
@@ -391,7 +536,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         malformed.pop("limitations")
         adapter = RecordingModelAdapter(_completed_result(structured_output=malformed))
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "completed")
@@ -402,7 +547,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
         request = replace(_request(), final_input_upper_bound_tokens=3600)
         adapter = RecordingModelAdapter()
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(request, adapter)
+        outcome = _execute(request, adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "not-started")
@@ -413,7 +558,7 @@ class Ticket113StrictPortTests(unittest.TestCase):
     def test_113_a2_c08_actual_model_drift_rejects_candidate(self) -> None:
         adapter = RecordingModelAdapter(_completed_result(actual_model="unapproved-model"))
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.model_effect, "completed")
@@ -423,17 +568,14 @@ class Ticket113StrictPortTests(unittest.TestCase):
     def test_transport_requested_model_must_match_final_wire(self) -> None:
         adapter = RecordingModelAdapter(_completed_result(requested_model="other-model"))
 
-        outcome = StrictHealthLLM(_route(), _profile()).execute(_request(), adapter)
+        outcome = _execute(_request(), adapter)
 
         self.assertEqual(outcome.disposition, "failed-closed")
         self.assertEqual(outcome.reason_code, "transport-requested-model-drift")
         self.assertIsNone(outcome.candidate)
 
     def test_113_a2_c10_proxy_signals_do_not_infer_completion(self) -> None:
-        outcome = StrictHealthLLM(_route(), _profile()).execute(
-            _request(),
-            ProxySignalAdapter(),  # type: ignore[arg-type]
-        )
+        outcome = _execute(_request(), ProxySignalAdapter())
 
         self.assertEqual(outcome.disposition, "unknown")
         self.assertEqual(outcome.model_effect, "unknown")

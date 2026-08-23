@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Mapping
 
 from .coordination import EvidenceCard, OwnerReplyAtom
@@ -227,11 +228,42 @@ class RenderedNonDiagnosticReply:
 class NonDiagnosticReplyPipeline:
     """Validate current authorities and render without retaining model candidates."""
 
+    @staticmethod
+    def _validate_current_knowledge(
+        releases: tuple[KnowledgeRelease, ...],
+        knowledge_valid_at: str,
+    ) -> None:
+        try:
+            valid_at = datetime.fromisoformat(
+                _text(knowledge_valid_at, "knowledge valid-at")
+            )
+        except ValueError as exc:
+            raise NonDiagnosticContractViolation("invalid knowledge valid-at") from exc
+        if valid_at.tzinfo is None or valid_at.utcoffset() is None:
+            raise NonDiagnosticContractViolation(
+                "knowledge valid-at must be timezone-aware"
+            )
+        for release in releases:
+            if (
+                release.withdrawn
+                or release.rights_status != "approved"
+                or release.chinese_status != "reviewed-chinese"
+                or release.professional_review_status != "approved"
+                or release.release_id
+                != "knowledge-release:" + release.content_hash[7:]
+                or datetime.fromisoformat(release.published_at) > valid_at
+                or valid_at >= datetime.fromisoformat(release.expires_at)
+            ):
+                raise NonDiagnosticContractViolation(
+                    "knowledge release is not current at the bound instant"
+                )
+
     def __init__(
         self,
         *,
         current_owner_cards: tuple[EvidenceCard, ...],
         current_knowledge_releases: tuple[KnowledgeRelease, ...],
+        knowledge_valid_at: str,
         approved_claims: tuple[ApprovedClaimAtom, ...],
         approved_templates: tuple[ApprovedReplyTemplate, ...],
     ) -> None:
@@ -243,6 +275,10 @@ class NonDiagnosticReplyPipeline:
             raise NonDiagnosticContractViolation("invalid approved claims")
         if any(type(template) is not ApprovedReplyTemplate for template in approved_templates):
             raise NonDiagnosticContractViolation("invalid approved templates")
+        self._validate_current_knowledge(
+            current_knowledge_releases,
+            knowledge_valid_at,
+        )
         self._owner_cards = {card.evidence_id: card for card in current_owner_cards}
         self._knowledge_releases = {
             release.release_id: release for release in current_knowledge_releases
@@ -254,16 +290,24 @@ class NonDiagnosticReplyPipeline:
         self._knowledge_release_values = current_knowledge_releases
         self._approved_claim_values = approved_claims
         self._approved_template_values = approved_templates
+        self._knowledge_valid_at = knowledge_valid_at
 
     def with_current_owner_cards(
         self,
         current_owner_cards: tuple[EvidenceCard, ...],
+        *,
+        knowledge_valid_at: str | None = None,
     ) -> "NonDiagnosticReplyPipeline":
         """Rebind only owner facts while retaining the immutable governed policy."""
 
         return NonDiagnosticReplyPipeline(
             current_owner_cards=current_owner_cards,
             current_knowledge_releases=self._knowledge_release_values,
+            knowledge_valid_at=(
+                self._knowledge_valid_at
+                if knowledge_valid_at is None
+                else knowledge_valid_at
+            ),
             approved_claims=self._approved_claim_values,
             approved_templates=self._approved_template_values,
         )
@@ -276,7 +320,18 @@ class NonDiagnosticReplyPipeline:
                 "candidate template is not approved"
             ) from exc
 
-    def render(self, candidate: NonDiagnosticCandidate) -> RenderedNonDiagnosticReply:
+    def render(
+        self,
+        candidate: NonDiagnosticCandidate,
+        *,
+        knowledge_valid_at: str | None = None,
+    ) -> RenderedNonDiagnosticReply:
+        self._validate_current_knowledge(
+            self._knowledge_release_values,
+            self._knowledge_valid_at
+            if knowledge_valid_at is None
+            else knowledge_valid_at,
+        )
         if type(candidate) is not NonDiagnosticCandidate:
             raise NonDiagnosticContractViolation("invalid non-diagnostic candidate")
         if not candidate.support:

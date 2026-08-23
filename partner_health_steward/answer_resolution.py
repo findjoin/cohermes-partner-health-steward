@@ -127,6 +127,7 @@ class ModelEffectReport:
     truncated: bool
     reason_code: str | None
     result_digest: str
+    candidate_digest: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.model_status) is not str or self.model_status not in MODEL_EFFECT_STATUSES:
@@ -142,6 +143,8 @@ class ModelEffectReport:
         _optional_text(self.actual_model, "actual model")
         _optional_text(self.reason_code, "model effect reason code")
         _sha(self.result_digest, "model result digest")
+        if self.candidate_digest is not None:
+            _sha(self.candidate_digest, "model candidate digest")
 
         if not self.transport_attempted:
             if (
@@ -151,6 +154,7 @@ class ModelEffectReport:
                 or self.fallback_observed
                 or self.truncated
                 or self.reason_code is None
+                or self.candidate_digest is not None
             ):
                 raise AnswerResolutionViolation("invalid not-started model effect")
             return
@@ -158,7 +162,11 @@ class ModelEffectReport:
         if self.model_status == "not-started":
             raise AnswerResolutionViolation("attempted transport cannot be not-started")
         if self.model_status == "unknown":
-            if self.terminal_proven or self.reason_code is None:
+            if (
+                self.terminal_proven
+                or self.reason_code is None
+                or self.candidate_digest is not None
+            ):
                 raise AnswerResolutionViolation("invalid unknown model effect")
             return
         if not self.terminal_proven:
@@ -172,8 +180,19 @@ class ModelEffectReport:
                 raise AnswerResolutionViolation(
                     "unsafe completed model result requires a rejection reason"
                 )
-        elif self.reason_code is None:
-            raise AnswerResolutionViolation("non-completed model result requires a reason")
+            if (self.reason_code is None) != (self.candidate_digest is not None):
+                raise AnswerResolutionViolation(
+                    "accepted completed model result requires one candidate digest"
+                )
+        else:
+            if self.reason_code is None:
+                raise AnswerResolutionViolation(
+                    "non-completed model result requires a reason"
+                )
+            if self.candidate_digest is not None:
+                raise AnswerResolutionViolation(
+                    "non-completed model result cannot carry a candidate digest"
+                )
 
     @property
     def outer_effect_status(self) -> str:
@@ -202,6 +221,7 @@ class ModelEffectReport:
             "truncated": self.truncated,
             "reason_code": self.reason_code,
             "result_digest": self.result_digest,
+            "candidate_digest": self.candidate_digest,
         }
 
     @classmethod
@@ -219,6 +239,7 @@ class ModelEffectReport:
                     "truncated",
                     "reason_code",
                     "result_digest",
+                    "candidate_digest",
                 }
             ),
             "model effect report",
@@ -241,6 +262,11 @@ class ModelEffectReport:
                 fields["reason_code"], "model effect reason code"
             ),
             result_digest=_sha(fields["result_digest"], "model result digest"),
+            candidate_digest=(
+                None
+                if fields["candidate_digest"] is None
+                else _sha(fields["candidate_digest"], "model candidate digest")
+            ),
         )
 
 

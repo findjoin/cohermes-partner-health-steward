@@ -6122,6 +6122,14 @@ class DailySkillRuntime:
             raise AuthorityValidationError(
                 "rendered resolution requires deterministic reply atoms"
             )
+        elif any(
+            atom.source_result_digest
+            != model_answer_resolution.candidate_digest
+            for atom in model_reply_atoms
+        ):
+            raise AuthorityValidationError(
+                "model reply atoms do not bind the validated candidate"
+            )
         if any(
             atom.source_skill != "health-steward"
             or atom.required_evidence_ids

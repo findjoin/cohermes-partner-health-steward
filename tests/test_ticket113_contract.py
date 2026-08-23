@@ -2,6 +2,7 @@ import importlib
 import unittest
 from dataclasses import FrozenInstanceError
 
+from partner_health_steward.initialization import stable_digest
 from tests.ticket113_case_registry import CASE_REGISTRY, CONTRACT_CASE_IDS
 
 
@@ -37,7 +38,7 @@ def _profile_wire() -> dict[str, object]:
         "requested_model": "synthetic-health-model",
         "allowed_actual_models": ["synthetic-health-model", "synthetic-health-model-alias"],
         "configuration_generation": 7,
-        "input_measurement_method": "synthetic-conservative-upper-bound-v1",
+        "input_measurement_method": "synthetic-utf8-byte-upper-bound-v1",
         "fixed_wrapper_tokens": 96,
         "output_reservation_tokens": 512,
         "common_context_lower_bound_tokens": 4096,
@@ -54,7 +55,12 @@ def _request_wire() -> dict[str, object]:
             {"role": "system", "content": "synthetic policy"},
             {"role": "user", "content": "synthetic health question"},
         ],
-        "final_input_digest": "sha256:" + "d" * 64,
+        "final_input_digest": stable_digest(
+            {"messages": [
+                {"role": "system", "content": "synthetic policy"},
+                {"role": "user", "content": "synthetic health question"},
+            ]}
+        ),
         "final_input_upper_bound_tokens": 3000,
         "output_reservation_tokens": 512,
         "strict_schema_name": "nondiagnostic-candidate-v1",

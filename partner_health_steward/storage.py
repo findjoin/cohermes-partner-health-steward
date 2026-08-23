@@ -3064,6 +3064,36 @@ class EncryptedStateStore:
         row = self._execute("SELECT state FROM effects WHERE effect_id = ?", (effect_id,)).fetchone()
         return None if row is None else row[0]
 
+    def model_effect_for_source(self, source_causal_id: str) -> StoredEffect | None:
+        """Return the unique model effect durably bound to one business source."""
+
+        validate_opaque_text(source_causal_id, "effect business source causal identifier")
+        matches: list[StoredEffect] = []
+        rows = self._execute(
+            "SELECT effect_id, state, nonce, ciphertext FROM effects ORDER BY effect_id"
+        ).fetchall()
+        for effect_id, state, nonce, ciphertext in rows:
+            payload = self._decode_effect_payload(
+                state,
+                self._open(f"effect:{effect_id}:{state}", nonce, ciphertext),
+            )
+            intent = (
+                payload
+                if type(payload) is EffectIntent
+                else payload.intent
+                if type(payload) in {ClaimingEffect, ExecutingEffect, TerminalEffect}
+                else None
+            )
+            if (
+                type(intent) is EffectIntent
+                and intent.effect_kind == "model-work"
+                and intent.business_source_causal_id == source_causal_id
+            ):
+                matches.append(StoredEffect(state=state, payload=payload))
+        if len(matches) > 1:
+            raise KeyUnavailable("multiple model effects bound to one business source")
+        return None if not matches else matches[0]
+
     def unresolved_effects(self) -> tuple[str, ...]:
         return tuple(
             row[0]

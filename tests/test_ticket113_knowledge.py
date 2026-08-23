@@ -119,6 +119,35 @@ class Ticket113KnowledgeTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "knowledge-missing")
         self.assertEqual(harness.attempts, [])
 
+    def test_registry_orders_publication_times_by_instant_not_iso_text(self) -> None:
+        publisher = KnowledgePublisher()
+        earlier = publisher.publish(
+            replace(
+                _publication(),
+                content="earlier instant",
+                published_at="2026-01-01T01:00:00+02:00",
+            ),
+            release_version="v1",
+        )
+        later = publisher.publish(
+            replace(
+                _publication(),
+                content="later instant",
+                published_at="2026-01-01T00:30:00+00:00",
+            ),
+            release_version="v2",
+        )
+        registry = ImmutableKnowledgeRegistry()
+        registry.stage(earlier)
+        registry.stage(later)
+
+        resolved = registry.resolve(
+            "sleep-general",
+            at="2026-01-02T00:00:00+00:00",
+        )
+
+        self.assertEqual(resolved, later)
+
 
 if __name__ == "__main__":
     unittest.main()

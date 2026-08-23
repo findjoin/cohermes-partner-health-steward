@@ -48,6 +48,12 @@ from .initialization import (
     OwnerInitialization,
     stable_digest,
 )
+from .model_contract import (
+    StrictHealthLLM,
+    StrictModelAdapter,
+    StrictModelOutcome,
+    StrictModelRequest,
+)
 from .probe import ProbeReport, ProbeState
 
 
@@ -761,9 +767,41 @@ class HealthPlugin:
             return None
         return self._core.claim_effect_execution(intent)
 
+    def execute_strict_health_model(
+        self,
+        llm: StrictHealthLLM,
+        request: StrictModelRequest,
+        source_causal_id: str,
+        grant: EffectExecutionGrant | None,
+        adapter: StrictModelAdapter,
+    ) -> StrictModelOutcome:
+        """Execute one exact request through the core-owned model boundary."""
+
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return StrictModelOutcome(
+                disposition="failed-closed",
+                model_effect="not-started",
+                reason_code="model-effect-authorization-required",
+                candidate=None,
+            )
+        return self._core.execute_strict_health_model(
+            llm,
+            request,
+            source_causal_id,
+            grant,
+            adapter,
+        )
+
     def model_effect_report(self, effect_id: str) -> ModelEffectReport | None:
         """Expose only the core-verified, content-free terminal model report."""
 
         if not self._core.admission_policy_matches(self._admission_policy):
             return None
         return self._core.model_effect_report(effect_id)
+
+    def model_answer_recovery_status(self, source_causal_id: str) -> str:
+        """Return the core-owned retry/freeze projection for one daily source."""
+
+        if not self._core.admission_policy_matches(self._admission_policy):
+            return "unavailable"
+        return self._core.model_answer_recovery_status(source_causal_id)

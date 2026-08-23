@@ -327,6 +327,7 @@ class EffectIntent:
     effect_kind: str
     intent_digest: str
     authority: AuthoritySnapshot
+    business_source_causal_id: str | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.effect_id, "effect_id")
@@ -334,14 +335,22 @@ class EffectIntent:
         validate_opaque_text(self.intent_digest, "intent_digest")
         if type(self.authority) is not AuthoritySnapshot:
             raise AuthorityValidationError("invalid effect authority")
+        if self.business_source_causal_id is not None:
+            validate_opaque_text(
+                self.business_source_causal_id,
+                "effect business source causal identifier",
+            )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored: dict[str, object] = {
             "effect_id": self.effect_id,
             "effect_kind": self.effect_kind,
             "intent_digest": self.intent_digest,
             "authority": self.authority.to_storage(),
         }
+        if self.business_source_causal_id is not None:
+            stored["business_source_causal_id"] = self.business_source_causal_id
+        return stored
 
     def to_wire_metadata(self) -> dict[str, object]:
         """Return the one nested authority shape used by response metadata."""
@@ -350,16 +359,28 @@ class EffectIntent:
 
     @classmethod
     def from_storage(cls, value: object) -> "EffectIntent":
-        stored = _required_mapping(
-            value,
-            frozenset({"effect_id", "effect_kind", "intent_digest", "authority"}),
-            "effect intent",
+        legacy_fields = frozenset(
+            {"effect_id", "effect_kind", "intent_digest", "authority"}
         )
+        if not isinstance(value, Mapping) or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"business_source_causal_id"},
+        ):
+            raise AuthorityValidationError("invalid effect intent")
+        stored = value
         return cls(
             effect_id=validate_opaque_text(stored["effect_id"], "effect_id"),
             effect_kind=validate_opaque_text(stored["effect_kind"], "effect_kind"),
             intent_digest=validate_opaque_text(stored["intent_digest"], "intent_digest"),
             authority=AuthoritySnapshot.from_storage(stored["authority"]),
+            business_source_causal_id=(
+                None
+                if "business_source_causal_id" not in stored
+                else validate_opaque_text(
+                    stored["business_source_causal_id"],
+                    "effect business source causal identifier",
+                )
+            ),
         )
 
     @classmethod
@@ -515,6 +536,7 @@ class ExecutingEffect:
     intent: EffectIntent
     lease: ExecutionLease
     vault_claim_ref: str
+    model_attempt_started: bool = False
 
     def __post_init__(self) -> None:
         if type(self.intent) is not EffectIntent:
@@ -523,6 +545,12 @@ class ExecutingEffect:
         if type(self.lease) is not ExecutionLease:
             raise AuthorityValidationError("invalid executing effect lease")
         validate_opaque_text(self.vault_claim_ref, "vault claim reference")
+        if type(self.model_attempt_started) is not bool:
+            raise AuthorityValidationError("invalid model attempt marker")
+        if self.model_attempt_started and self.intent.effect_kind != "model-work":
+            raise AuthorityValidationError(
+                "model attempt marker requires a model effect"
+            )
         if (
             self.lease.effect_id != self.intent.effect_id
             or self.lease.intent_digest != self.intent.intent_digest
@@ -535,19 +563,32 @@ class ExecutingEffect:
             "intent": self.intent.to_storage(),
             "lease": self.lease.to_storage(),
             "vault_claim_ref": self.vault_claim_ref,
+            "model_attempt_started": self.model_attempt_started,
         }
 
     @classmethod
     def from_storage(cls, value: object) -> "ExecutingEffect":
-        stored = _required_mapping(
-            value,
+        if type(value) is not dict or frozenset(value) not in {
             frozenset({"intent", "lease", "vault_claim_ref"}),
-            "executing effect",
-        )
+            frozenset(
+                {
+                    "intent",
+                    "lease",
+                    "vault_claim_ref",
+                    "model_attempt_started",
+                }
+            ),
+        }:
+            raise AuthorityValidationError("invalid executing effect")
+        stored = value
+        started = stored.get("model_attempt_started", False)
+        if type(started) is not bool:
+            raise AuthorityValidationError("invalid model attempt marker")
         return cls(
             intent=EffectIntent.from_storage(stored["intent"]),
             lease=ExecutionLease.from_storage(stored["lease"]),
             vault_claim_ref=validate_opaque_text(stored["vault_claim_ref"], "vault claim reference"),
+            model_attempt_started=started,
         )
 
 

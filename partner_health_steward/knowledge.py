@@ -299,7 +299,13 @@ class ImmutableKnowledgeRegistry:
         ]
         if not releases:
             return KnowledgeGap(topic, "knowledge-missing")
-        release = max(releases, key=lambda item: (item.published_at, item.release_version))
+        release = max(
+            releases,
+            key=lambda item: (
+                datetime.fromisoformat(item.published_at),
+                item.release_version,
+            ),
+        )
         if release.withdrawn:
             return KnowledgeGap(topic, "knowledge-withdrawn")
         if at_time >= datetime.fromisoformat(release.expires_at):

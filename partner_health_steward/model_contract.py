@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Protocol
@@ -254,7 +255,11 @@ class ModelMessage:
     content: str
 
     def __post_init__(self) -> None:
-        if self.role not in {"system", "user", "assistant"}:
+        if type(self.role) is not str or self.role not in {
+            "system",
+            "user",
+            "assistant",
+        }:
             raise ModelContractViolation("invalid model message role")
         _text(self.content, "model message content")
 
@@ -284,6 +289,10 @@ class StrictModelRequest:
         if type(self.messages) is not tuple or not self.messages or any(type(item) is not ModelMessage for item in self.messages):
             raise ModelContractViolation("invalid model messages")
         _sha(self.final_input_digest, "final input digest")
+        if self.final_input_digest != stable_digest(
+            {"messages": [ModelMessage.to_wire(item) for item in self.messages]}
+        ):
+            raise ModelContractViolation("final input digest does not match messages")
         _integer(self.final_input_upper_bound_tokens, "final input upper bound tokens", positive=True)
         _integer(self.output_reservation_tokens, "output reservation tokens", positive=True)
         _text(self.strict_schema_name, "strict schema name")
@@ -291,9 +300,11 @@ class StrictModelRequest:
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "route": self.route.to_wire(),
-            "capability_profile": self.capability_profile.to_wire(),
-            "messages": [item.to_wire() for item in self.messages],
+            "route": FirstHopRoute.to_wire(self.route),
+            "capability_profile": CapabilityProfile.to_wire(
+                self.capability_profile
+            ),
+            "messages": [ModelMessage.to_wire(item) for item in self.messages],
             "final_input_digest": self.final_input_digest,
             "final_input_upper_bound_tokens": self.final_input_upper_bound_tokens,
             "output_reservation_tokens": self.output_reservation_tokens,
@@ -305,7 +316,57 @@ class StrictModelRequest:
     def digest(self) -> str:
         """Content-address the exact final request admitted to the model seam."""
 
-        return stable_digest(self.to_wire())
+        return stable_digest(StrictModelRequest.to_wire(self))
+
+    def canonical_copy(self) -> "StrictModelRequest":
+        """Rebuild an exact request without caller-owned instance attributes."""
+
+        if type(self) is not StrictModelRequest:
+            raise ModelContractViolation("invalid strict model request")
+        route = object.__getattribute__(self, "route")
+        capability_profile = object.__getattribute__(self, "capability_profile")
+        messages = object.__getattribute__(self, "messages")
+        if (
+            type(route) is not FirstHopRoute
+            or type(capability_profile) is not CapabilityProfile
+            or type(messages) is not tuple
+            or not messages
+            or any(type(item) is not ModelMessage for item in messages)
+        ):
+            raise ModelContractViolation("invalid strict model authority")
+        FirstHopRoute.__post_init__(route)
+        CapabilityProfile.__post_init__(capability_profile)
+        for item in messages:
+            ModelMessage.__post_init__(item)
+        return StrictModelRequest.from_wire(
+            {
+                "route": FirstHopRoute.to_wire(route),
+                "capability_profile": CapabilityProfile.to_wire(
+                    capability_profile
+                ),
+                "messages": [ModelMessage.to_wire(item) for item in messages],
+                "final_input_digest": object.__getattribute__(
+                    self,
+                    "final_input_digest",
+                ),
+                "final_input_upper_bound_tokens": object.__getattribute__(
+                    self,
+                    "final_input_upper_bound_tokens",
+                ),
+                "output_reservation_tokens": object.__getattribute__(
+                    self,
+                    "output_reservation_tokens",
+                ),
+                "strict_schema_name": object.__getattribute__(
+                    self,
+                    "strict_schema_name",
+                ),
+                "strict_schema_digest": object.__getattribute__(
+                    self,
+                    "strict_schema_digest",
+                ),
+            }
+        )
 
     @classmethod
     def from_wire(cls, value: object) -> "StrictModelRequest":
@@ -358,16 +419,45 @@ class ModelTransportResult:
         if any(type(value) is not bool for value in (self.fallback_observed, self.truncated, self.terminal_proven)):
             raise ModelContractViolation("invalid model result facts")
         if self.status == "completed":
-            if not self.terminal_proven or self.structured_output is None or self.incomplete_reason is not None or self.failure_reason is not None:
+            if (
+                not self.terminal_proven
+                or not isinstance(self.structured_output, Mapping)
+                or self.incomplete_reason is not None
+                or self.failure_reason is not None
+            ):
                 raise ModelContractViolation("invalid completed model result")
+            try:
+                frozen_output = _freeze_json(
+                    _thaw_json(self.structured_output),
+                    "structured model output",
+                )
+            except ModelContractViolation:
+                raise
+            except Exception as exc:
+                raise ModelContractViolation(
+                    "invalid structured model output"
+                ) from exc
+            if not isinstance(frozen_output, Mapping):
+                raise ModelContractViolation("invalid structured model output")
+            object.__setattr__(self, "structured_output", frozen_output)
         elif self.structured_output is not None:
             raise ModelContractViolation("non-completed result cannot carry structured output")
-        if self.status == "incomplete" and self.incomplete_reason is None:
-            raise ModelContractViolation("incomplete reason required")
-        if self.status == "failed" and self.failure_reason is None:
-            raise ModelContractViolation("failure reason required")
+        if self.status in {"incomplete", "failed"} and not self.terminal_proven:
+            raise ModelContractViolation("known model result must prove terminality")
+        if self.status == "incomplete" and (
+            self.incomplete_reason is None or self.failure_reason is not None
+        ):
+            raise ModelContractViolation("exclusive incomplete reason required")
+        if self.status == "failed" and (
+            self.failure_reason is None or self.incomplete_reason is not None
+        ):
+            raise ModelContractViolation("exclusive failure reason required")
         if self.status == "unknown" and self.terminal_proven:
             raise ModelContractViolation("unknown result cannot prove terminality")
+        if self.status == "unknown" and (
+            self.incomplete_reason is not None or self.failure_reason is not None
+        ):
+            raise ModelContractViolation("unknown result cannot claim a terminal reason")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -384,6 +474,11 @@ class ModelTransportResult:
             "terminal_proven": self.terminal_proven,
             "structured_output": None if self.structured_output is None else _thaw_json(self.structured_output),
         }
+
+    def canonical_copy(self) -> "ModelTransportResult":
+        """Revalidate one observed result without instance-level method hooks."""
+
+        return ModelTransportResult.from_wire(ModelTransportResult.to_wire(self))
 
     @classmethod
     def from_wire(cls, value: object) -> "ModelTransportResult":
@@ -483,33 +578,52 @@ class StrictHealthLLM:
 
         return stable_digest(
             {
-                "route": self._route.to_wire(),
-                "capability_profile": self._capability_profile.to_wire(),
+                "route": FirstHopRoute.to_wire(self._route),
+                "capability_profile": CapabilityProfile.to_wire(
+                    self._capability_profile
+                ),
                 "strict_schema_name": self._strict_schema_name,
                 "strict_schema_digest": self._strict_schema_digest,
             }
         )
 
-    @staticmethod
-    def _report(result: ModelTransportResult, reason_code: str | None) -> ModelEffectReport:
-        to_wire = getattr(result, "to_wire", None)
-        result_identity = (
-            to_wire()
-            if callable(to_wire)
-            else {
-                "requested_model": result.requested_model,
-                "actual_model": result.actual_model,
-                "status": result.status,
-                "usage_input_tokens": getattr(result, "usage_input_tokens", 0),
-                "usage_output_tokens": getattr(result, "usage_output_tokens", 0),
-                "fallback_observed": result.fallback_observed,
-                "truncated": result.truncated,
-                "terminal_proven": result.terminal_proven,
-                "structured_output_digest": stable_digest(
-                    getattr(result, "structured_output", None)
-                ),
-            }
+    def canonical_copy(self) -> "StrictHealthLLM":
+        """Rebuild current authority without caller-owned method shadows."""
+
+        if type(self) is not StrictHealthLLM:
+            raise ModelContractViolation("invalid current model authority")
+        route = object.__getattribute__(self, "_route")
+        capability_profile = object.__getattribute__(self, "_capability_profile")
+        if (
+            type(route) is not FirstHopRoute
+            or type(capability_profile) is not CapabilityProfile
+        ):
+            raise ModelContractViolation("invalid current model authority")
+        FirstHopRoute.__post_init__(route)
+        CapabilityProfile.__post_init__(capability_profile)
+        return StrictHealthLLM(
+            FirstHopRoute.from_wire(FirstHopRoute.to_wire(route)),
+            CapabilityProfile.from_wire(
+                CapabilityProfile.to_wire(capability_profile)
+            ),
+            strict_schema_name=object.__getattribute__(
+                self,
+                "_strict_schema_name",
+            ),
+            strict_schema_digest=object.__getattribute__(
+                self,
+                "_strict_schema_digest",
+            ),
         )
+
+    @staticmethod
+    def _report(
+        result: ModelTransportResult,
+        reason_code: str | None,
+        *,
+        candidate_digest: str | None = None,
+    ) -> ModelEffectReport:
+        result_identity = ModelTransportResult.to_wire(result)
         return ModelEffectReport(
             model_status=result.status,
             transport_attempted=True,
@@ -520,13 +634,13 @@ class StrictHealthLLM:
             truncated=result.truncated,
             reason_code=reason_code,
             result_digest=stable_digest(result_identity),
+            candidate_digest=candidate_digest,
         )
 
-    def execute(
+    def preflight(
         self,
         request: StrictModelRequest,
-        adapter: StrictModelAdapter,
-    ) -> StrictModelOutcome:
+    ) -> StrictModelOutcome | None:
         if request.route.route_id != self._route.route_id:
             return StrictModelOutcome(
                 disposition="failed-closed",
@@ -605,16 +719,91 @@ class StrictHealthLLM:
             + request.capability_profile.fixed_wrapper_tokens
             + request.output_reservation_tokens
         )
-        if required_capacity > request.capability_profile.common_context_lower_bound_tokens:
+        measured_input_upper_bound = len(
+            json.dumps(
+                [item.to_wire() for item in request.messages],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        if (
+            not request.capability_profile.synthetic
+            or request.capability_profile.input_measurement_method
+            != "synthetic-utf8-byte-upper-bound-v1"
+            or request.final_input_upper_bound_tokens < measured_input_upper_bound
+            or required_capacity
+            > request.capability_profile.common_context_lower_bound_tokens
+        ):
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect="not-started",
                 reason_code="capacity-unavailable",
                 candidate=None,
             )
-        result = adapter.execute(request.to_wire())
+        return None
+
+    def transport_unknown_outcome(
+        self,
+        request: StrictModelRequest,
+    ) -> StrictModelOutcome:
+        """Return the only result allowed after an unclassifiable transport attempt."""
+
+        preflight = StrictHealthLLM.preflight(self, request)
+        if preflight is not None:
+            return preflight
+        report = ModelEffectReport(
+            model_status="unknown",
+            transport_attempted=True,
+            terminal_proven=False,
+            requested_model=request.route.requested_model,
+            actual_model=None,
+            fallback_observed=False,
+            truncated=False,
+            reason_code="model-effect-unknown",
+            result_digest=stable_digest(
+                {
+                    "kind": "transport-attempt-unknown-v1",
+                    "strict_request_digest": stable_digest(
+                        StrictModelRequest.to_wire(request)
+                    ),
+                }
+            ),
+        )
+        return StrictModelOutcome(
+            disposition="unknown",
+            model_effect="unknown",
+            reason_code="model-effect-unknown",
+            candidate=None,
+            model_report=report,
+        )
+
+    def resolve_transport_result(
+        self,
+        request: StrictModelRequest,
+        result: ModelTransportResult,
+    ) -> StrictModelOutcome:
+        """Validate one already-observed exact transport result without I/O."""
+
+        preflight = StrictHealthLLM.preflight(self, request)
+        if preflight is not None:
+            return preflight
+        if type(result) is not ModelTransportResult:
+            return StrictHealthLLM.transport_unknown_outcome(self, request)
+        if result.status == "unknown":
+            report = StrictHealthLLM._report(result, "model-effect-unknown")
+            return StrictModelOutcome(
+                disposition="unknown",
+                model_effect="unknown",
+                reason_code="model-effect-unknown",
+                candidate=None,
+                model_report=report,
+            )
         if result.requested_model != request.route.requested_model:
-            report = self._report(result, "transport-requested-model-drift")
+            report = StrictHealthLLM._report(
+                result,
+                "transport-requested-model-drift",
+            )
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -623,7 +812,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.fallback_observed:
-            report = self._report(result, "fallback-observed")
+            report = StrictHealthLLM._report(result, "fallback-observed")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -632,7 +821,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.actual_model not in request.capability_profile.allowed_actual_models:
-            report = self._report(result, "actual-model-drift")
+            report = StrictHealthLLM._report(result, "actual-model-drift")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -641,7 +830,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.truncated:
-            report = self._report(result, "model-output-truncated")
+            report = StrictHealthLLM._report(result, "model-output-truncated")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -656,7 +845,7 @@ class StrictHealthLLM:
             try:
                 validated = NonDiagnosticCandidate.from_wire(candidate)
             except NonDiagnosticContractViolation:
-                report = self._report(result, "strict-schema-error")
+                report = StrictHealthLLM._report(result, "strict-schema-error")
                 return StrictModelOutcome(
                     disposition="failed-closed",
                     model_effect="completed",
@@ -664,7 +853,12 @@ class StrictHealthLLM:
                     candidate=None,
                     model_report=report,
                 )
-            report = self._report(result, None)
+            candidate_digest = stable_digest(validated.to_wire())
+            report = StrictHealthLLM._report(
+                result,
+                None,
+                candidate_digest=candidate_digest,
+            )
             return StrictModelOutcome(
                 disposition="candidate",
                 model_effect="completed",
@@ -673,7 +867,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.status == "incomplete":
-            report = self._report(result, "model-incomplete")
+            report = StrictHealthLLM._report(result, "model-incomplete")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect="incomplete",
@@ -683,22 +877,13 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.status == "failed":
-            report = self._report(result, "model-failed")
+            report = StrictHealthLLM._report(result, "model-failed")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect="failed",
                 reason_code="model-failed",
                 candidate=None,
                 transport_reason=result.failure_reason,
-                model_report=report,
-            )
-        if result.status == "unknown":
-            report = self._report(result, "model-effect-unknown")
-            return StrictModelOutcome(
-                disposition="unknown",
-                model_effect="unknown",
-                reason_code="model-effect-unknown",
-                candidate=None,
                 model_report=report,
             )
         raise NotImplementedError("remaining strict-port result cases are not implemented")

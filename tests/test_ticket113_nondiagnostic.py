@@ -111,16 +111,46 @@ def _candidate(owner: EvidenceCard, knowledge: KnowledgeRelease) -> NonDiagnosti
     )
 
 
-def _pipeline(owner: EvidenceCard, knowledge: KnowledgeRelease) -> NonDiagnosticReplyPipeline:
+def _pipeline(
+    owner: EvidenceCard,
+    knowledge: KnowledgeRelease,
+    *,
+    knowledge_valid_at: str = "2026-08-25T00:00:00+00:00",
+) -> NonDiagnosticReplyPipeline:
     return NonDiagnosticReplyPipeline(
         current_owner_cards=(owner,),
         current_knowledge_releases=(knowledge,),
+        knowledge_valid_at=knowledge_valid_at,
         approved_claims=_claims(),
         approved_templates=(_template(),),
     )
 
 
 class Ticket113NonDiagnosticTests(unittest.TestCase):
+    def test_knowledge_currentness_is_rechecked_at_each_render(self) -> None:
+        owner = _owner_card()
+        knowledge = _knowledge_release()
+        pipeline = _pipeline(owner, knowledge)
+
+        with self.assertRaises(NonDiagnosticContractViolation):
+            pipeline.render(
+                _candidate(owner, knowledge),
+                knowledge_valid_at=knowledge.expires_at,
+            )
+
+    def test_withdrawn_or_expired_knowledge_is_not_current(self) -> None:
+        owner = _owner_card()
+        knowledge = _knowledge_release()
+        invalid = (
+            replace(knowledge, withdrawn=True),
+            replace(knowledge, expires_at="2026-08-25T00:00:00+00:00"),
+        )
+
+        for release in invalid:
+            with self.subTest(release=release):
+                with self.assertRaises(NonDiagnosticContractViolation):
+                    _pipeline(owner, release)
+
     def test_113_a4_c01_current_card_references_are_accepted(self) -> None:
         owner = _owner_card()
         knowledge = _knowledge_release()
