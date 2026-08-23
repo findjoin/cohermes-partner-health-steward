@@ -7,7 +7,9 @@ import struct
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
+from .admission import SourceEnvelope
 from .authority import EffectIntent, MAX_OPAQUE_TEXT_BYTES
+from .initialization import OwnerInitialization, SkillUseProof
 
 
 PROTOCOL_VERSION = 1
@@ -67,6 +69,56 @@ class CommandPayload(_WireValue):
 class ProbePayload(CommandPayload):
     def to_wire(self) -> dict[str, object]:
         return {}
+
+
+@dataclass(frozen=True)
+class InboundAdmitPayload(CommandPayload):
+    envelope: SourceEnvelope
+
+    def __post_init__(self) -> None:
+        if type(self.envelope) is not SourceEnvelope:
+            raise ProtocolViolation("invalid source envelope")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"envelope": self.envelope.to_storage()}
+
+
+@dataclass(frozen=True)
+class InitializationPreparePayload(CommandPayload):
+    initialization: OwnerInitialization
+    skill_proof: SkillUseProof
+
+    def __post_init__(self) -> None:
+        if type(self.initialization) is not OwnerInitialization:
+            raise ProtocolViolation("invalid owner initialization")
+        if type(self.skill_proof) is not SkillUseProof:
+            raise ProtocolViolation("invalid health-init proof")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "initialization": self.initialization.to_storage(),
+            "skill_proof": self.skill_proof.to_storage(),
+        }
+
+
+@dataclass(frozen=True)
+class NativeCursorResultPayload(CommandPayload):
+    source_causal_id: str
+    native_cursor: str
+    status: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.source_causal_id, "source causal identifier")
+        _bounded_text(self.native_cursor, "native cursor")
+        if type(self.status) is not str or self.status not in {"advanced", "unknown"}:
+            raise ProtocolViolation("invalid native cursor status")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "source_causal_id": self.source_causal_id,
+            "native_cursor": self.native_cursor,
+            "status": self.status,
+        }
 
 
 @dataclass(frozen=True)
@@ -166,6 +218,9 @@ class EffectResultPayload(CommandPayload):
 
 _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
     "probe": ProbePayload,
+    "inbound.admit": InboundAdmitPayload,
+    "initialization.prepare": InitializationPreparePayload,
+    "cursor.result": NativeCursorResultPayload,
     "state.candidate": StateCandidatePayload,
     "state.prepare": StateCandidatePayload,
     "state.commit": StateCommitPayload,
@@ -176,6 +231,9 @@ _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
 
 _ACTION_SCOPES = {
     "probe": "probe",
+    "inbound.admit": "inbound:admit",
+    "initialization.prepare": "initialization:prepare",
+    "cursor.result": "cursor:result",
     "state.candidate": "state:candidate",
     "state.prepare": "state:prepare",
     "state.commit": "state:commit",
@@ -209,6 +267,36 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
     if payload_type is ProbePayload:
         _strict_mapping(value, frozenset(), "payload")
         return ProbePayload()
+    if payload_type is InboundAdmitPayload:
+        fields = _strict_mapping(value, frozenset({"envelope"}), "payload")
+        try:
+            envelope = SourceEnvelope.from_storage(fields["envelope"])
+        except (TypeError, ValueError) as exc:
+            raise ProtocolViolation("invalid source envelope") from exc
+        return InboundAdmitPayload(envelope)
+    if payload_type is InitializationPreparePayload:
+        fields = _strict_mapping(
+            value,
+            frozenset({"initialization", "skill_proof"}),
+            "payload",
+        )
+        try:
+            initialization = OwnerInitialization.from_storage(fields["initialization"])
+            proof = SkillUseProof.from_storage(fields["skill_proof"])
+        except (TypeError, ValueError) as exc:
+            raise ProtocolViolation("invalid initialization payload") from exc
+        return InitializationPreparePayload(initialization, proof)
+    if payload_type is NativeCursorResultPayload:
+        fields = _strict_mapping(
+            value,
+            frozenset({"source_causal_id", "native_cursor", "status"}),
+            "payload",
+        )
+        return NativeCursorResultPayload(
+            _bounded_text(fields["source_causal_id"], "source causal identifier"),
+            _bounded_text(fields["native_cursor"], "native cursor"),
+            _bounded_text(fields["status"], "native cursor status"),
+        )
     if payload_type is StateCandidatePayload:
         fields = _strict_mapping(
             value,

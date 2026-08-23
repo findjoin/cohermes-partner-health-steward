@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Protocol, TypeVar
 
+from .admission import AdmissionPolicy, NativeCursorDirective, SourceEnvelope, SourceReceipt
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -32,12 +33,23 @@ from .contract import (
     EffectIntentMeta,
     EffectRequestPayload,
     EffectResultPayload,
+    InboundAdmitPayload,
+    InitializationPreparePayload,
+    NativeCursorResultPayload,
     ProbeMeta,
     ProtocolViolation,
     Response,
     StateCandidatePayload,
     StateCommitPayload,
     canonicalize_command,
+)
+from .initialization import (
+    HealthInitAttestor,
+    HealthInitAsset,
+    InitialPortrait,
+    InitializationDraft,
+    InitializationProjection,
+    stable_digest,
 )
 from .current_head import (
     AdvanceRequest,
@@ -410,6 +422,9 @@ class HealthCore:
         *,
         execution_capability_vault: ExecutionCapabilityVault | None = None,
         writer_fence_vault: WriterFenceVault | None = None,
+        admission_policy: AdmissionPolicy | None = None,
+        health_init_verifier: HealthInitAttestor | None = None,
+        health_init_asset: HealthInitAsset | None = None,
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -422,6 +437,9 @@ class HealthCore:
         # public fence string are intentionally insufficient to probe healthy,
         # advance current-head, acquire an execution lease, or release one.
         self._writer_fence_vault = writer_fence_vault
+        self._admission_policy = admission_policy
+        self._health_init_verifier = health_init_verifier
+        self._health_init_asset = health_init_asset
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
@@ -1225,6 +1243,12 @@ class HealthCore:
                     prepared.target.transition_id,
                     prepared,
                 )
+                initialization = self._store.initialization()
+                if (
+                    initialization is not None
+                    and initialization.draft.record_id == prepared.target.record_id
+                ):
+                    self._store.write_initialization("prepared", initialization.draft)
             self._store.clear_pending_command(command.causal_id)
 
     def _mark_state_commit_ambiguous(
@@ -1262,6 +1286,12 @@ class HealthCore:
                     prepared.target.transition_id,
                     prepared,
                 )
+                initialization = self._store.initialization()
+                if (
+                    initialization is not None
+                    and initialization.draft.record_id == prepared.target.record_id
+                ):
+                    self._store.write_initialization("unknown", initialization.draft)
 
     def _persist_state_commit_success(
         self,
@@ -1315,6 +1345,12 @@ class HealthCore:
                 prepared.target.transition_id,
                 committed,
             )
+            initialization = self._store.initialization()
+            if (
+                initialization is not None
+                and initialization.draft.record_id == prepared.target.record_id
+            ):
+                self._store.write_initialization("committed", initialization.draft)
             self._store.clear_pending_command(command.causal_id)
             self._store.save_receipt(command, response)
             self._store.clear_current_head_observation(binding)
@@ -1981,6 +2017,16 @@ class HealthCore:
         payload = command.payload
         if not isinstance(payload, StateCommitPayload):
             raise ProtocolViolation("invalid commit payload")
+        if self._admission_policy is not None:
+            initialization = self._store.initialization()
+            if (
+                initialization is None
+                or payload.record_id != initialization.draft.record_id
+            ):
+                return self._persist_rejection(
+                    command,
+                    "generic-initialization-action-denied",
+                )
         current = self._store.record(payload.record_id)
         if current is None or current.state not in {"prepared", "unknown"}:
             return None
@@ -2183,6 +2229,19 @@ class HealthCore:
             self._latch_terminal()
             return _Handled(Response("unavailable", command.causal_id, self._closed_reason), False)
 
+        if command.action == "initialization.prepare" and self._store.initialization() is not None:
+            return _Handled(
+                Response("rejected", command.causal_id, "initialization already exists"),
+                True,
+            )
+        if command.action == "effect.request" and self._admission_policy is not None:
+            initialization = self._store.initialization()
+            if initialization is None or initialization.phase != "enabled":
+                return _Handled(
+                    Response("rejected", command.causal_id, "initialization-required"),
+                    True,
+                )
+
         if command.action not in _PROBE_BYPASS_ACTIONS:
             report = self._probe_for_head(head)
             if report.state is ProbeState.HEALTHY and self._current_writer_proof(head) is None:
@@ -2194,12 +2253,166 @@ class HealthCore:
                 return _Handled(Response("unavailable", command.causal_id, report.reason_code), False)
 
         if command.action in _STATE_ACTIONS:
+            if self._admission_policy is not None:
+                payload = command.payload
+                initialization = self._store.initialization()
+                if (
+                    command.action in {"state.candidate", "state.prepare"}
+                    or not isinstance(payload, StateCommitPayload)
+                    or initialization is None
+                    or payload.record_id != initialization.draft.record_id
+                ):
+                    return _Handled(
+                        Response(
+                            "rejected",
+                            command.causal_id,
+                            "generic-initialization-action-denied",
+                        ),
+                        True,
+                    )
             return self._handle_state(command, head)
+        if command.action == "inbound.admit":
+            return self._handle_inbound_admit(command)
+        if command.action == "initialization.prepare":
+            return self._handle_initialization_prepare(command, head)
+        if command.action == "cursor.result":
+            return self._handle_native_cursor_result(command)
         if command.action == "effect.request":
             return self._handle_effect_request(command, head)
         if command.action == "effect.result":
             raise StoreUnavailable("effect result must use the remote handler")
         raise ProtocolViolation("unknown action")
+
+    def _handle_inbound_admit(self, command: CommandEnvelope) -> _Handled:
+        payload = command.payload
+        policy = self._admission_policy
+        if not isinstance(payload, InboundAdmitPayload):
+            raise ProtocolViolation("invalid inbound payload")
+        if type(policy) is not AdmissionPolicy or not policy.accepts(payload.envelope):
+            return _Handled(
+                Response("rejected", command.causal_id, "unique-private-source-denied"),
+                False,
+            )
+        if type(payload.envelope.body) is not str:
+            raise ProtocolViolation("source body is required")
+        if payload.envelope.causal_id != command.causal_id:
+            raise ProtocolViolation("source causal identifier mismatch")
+        self._store.save_source_envelope(payload.envelope)
+        return _Handled(
+            Response("accepted", command.causal_id, "initialization-source-admitted"),
+            True,
+        )
+
+    def _handle_initialization_prepare(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> _Handled:
+        payload = command.payload
+        verifier = self._health_init_verifier
+        approved_asset = self._health_init_asset
+        if not isinstance(payload, InitializationPreparePayload):
+            raise ProtocolViolation("invalid initialization payload")
+        initialization = payload.initialization
+        reason = initialization.incomplete_reason
+        if reason is not None:
+            return _Handled(Response("rejected", command.causal_id, reason), True)
+        fact = payload.skill_proof.skill_use
+        asset_matches = (
+            type(approved_asset) is HealthInitAsset
+            and fact.canonical_name == approved_asset.canonical_name
+            and fact.version == approved_asset.version
+            and fact.asset_digest == approved_asset.asset_digest
+            and fact.disclosure_version == approved_asset.disclosure_version
+        )
+        if (
+            type(verifier) is not HealthInitAttestor
+            or not asset_matches
+            or not verifier.verify(payload.skill_proof, initialization)
+        ):
+            return _Handled(
+                Response("rejected", command.causal_id, "health-init-proof-required"),
+                True,
+            )
+        source = self._store.source_envelope(initialization.admission_causal_id)
+        policy = self._admission_policy
+        if (
+            source is None
+            or type(policy) is not AdmissionPolicy
+            or not policy.accepts(source)
+            or source.causal_id != initialization.admission_causal_id
+        ):
+            return _Handled(
+                Response("rejected", command.causal_id, "initialization-source-required"),
+                True,
+            )
+        if self._store.initialization() is not None:
+            raise ProtocolViolation("initialization already exists")
+
+        portrait = InitialPortrait()
+        content = {
+            "owner": initialization.to_storage(),
+            "source_causal_id": source.causal_id,
+            "skill_use": payload.skill_proof.skill_use.to_storage(),
+            "key_id": self._store.key_id,
+            "prepared_authority": head.to_storage(),
+            "initial_portrait": portrait.to_storage(),
+        }
+        revision_digest = stable_digest(content)
+        transition_id = "initialization-transition:" + revision_digest.removeprefix("sha256:")
+        record_id = "owner-initialization"
+        draft = InitializationDraft(
+            owner=initialization,
+            source_causal_id=source.causal_id,
+            skill_use=payload.skill_proof.skill_use,
+            key_id=self._store.key_id,
+            prepared_authority=head,
+            record_id=record_id,
+            revision_digest=revision_digest,
+            transition_id=transition_id,
+            initial_portrait=portrait,
+        )
+        target = RevisionTarget(
+            record_id=record_id,
+            revision_digest=revision_digest,
+            transition_id=transition_id,
+            payload_digest=draft.content_digest,
+        )
+        self._store.write_record(
+            record_id,
+            "prepared",
+            revision_digest,
+            transition_id,
+            PreparedTransition(target=target, base=head),
+        )
+        self._store.write_initialization("prepared", draft)
+        return _Handled(
+            Response("accepted", command.causal_id, "initialization-prepared"),
+            True,
+        )
+
+    def _handle_native_cursor_result(self, command: CommandEnvelope) -> _Handled:
+        payload = command.payload
+        if not isinstance(payload, NativeCursorResultPayload):
+            raise ProtocolViolation("invalid native cursor result")
+        initialization = self._store.initialization()
+        if initialization is None or initialization.phase != "enabled":
+            raise ProtocolViolation("initialization-finalize-required")
+        if payload.source_causal_id != initialization.draft.source_causal_id:
+            raise ProtocolViolation("native cursor source mismatch")
+        receipt = self._store.source_receipt(payload.source_causal_id)
+        if receipt is None or receipt.envelope.native_cursor != payload.native_cursor:
+            raise ProtocolViolation("native cursor mismatch")
+        self._store.mark_native_cursor_state(payload.source_causal_id, payload.status)
+        if payload.status == "unknown":
+            return _Handled(
+                Response("unknown", command.causal_id, "native-cursor-unknown"),
+                True,
+            )
+        return _Handled(
+            Response("accepted", command.causal_id, "native-cursor-advanced"),
+            True,
+        )
 
     def _handle_state(self, command: CommandEnvelope, head: AuthoritySnapshot) -> _Handled:
         payload = command.payload
@@ -2309,6 +2522,15 @@ class HealthCore:
                 committed,
                 committed.committed,
             )
+            initialization = self._store.initialization()
+            if (
+                initialization is not None
+                and initialization.draft.record_id == record_id
+            ):
+                self._store.write_initialization("enabled", initialization.draft)
+                self._store.mark_source_business_committed(
+                    initialization.draft.source_causal_id
+                )
             self._closed_reason = None
             return _Handled(Response("accepted", command.causal_id, "revision-finalized"), True)
 
@@ -2695,6 +2917,78 @@ class HealthCore:
             pass
         return None
 
+    def source_envelope(self, causal_id: str) -> SourceEnvelope | None:
+        """Return one admitted envelope through the managed core read seam."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            try:
+                if self._probe_open().state is not ProbeState.HEALTHY:
+                    return None
+                return self._store.source_envelope(causal_id)
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
+    def source_receipt(self, causal_id: str) -> SourceReceipt | None:
+        """Return one content-bearing receipt only through the managed read seam."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            try:
+                if self._probe_open().state is not ProbeState.HEALTHY:
+                    return None
+                return self._store.source_receipt(causal_id)
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
+    def initialization_status(self) -> InitializationProjection:
+        """Return the durable product phase without treating probe liveness as enablement."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return InitializationProjection.cannot_confirm()
+            try:
+                self._store.verify_key()
+                stored = self._store.initialization()
+                if stored is None:
+                    return InitializationProjection.uninitialized()
+                return stored.draft.projection(
+                    phase=stored.phase,
+                    enabled=stored.phase == "enabled",
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return InitializationProjection.cannot_confirm()
+
+    def native_cursor_directive(self, causal_id: str) -> NativeCursorDirective | None:
+        """Release one exact native cursor only after initialization finalizes."""
+
+        with self._lifecycle_lock:
+            if self._closed or not self.health_writes_allowed():
+                return None
+            try:
+                initialization = self._store.initialization()
+                receipt = self._store.source_receipt(causal_id)
+                if (
+                    initialization is None
+                    or initialization.phase != "enabled"
+                    or initialization.draft.source_causal_id != causal_id
+                    or receipt is None
+                    or receipt.managed_cursor_state != "committed"
+                    or receipt.native_cursor_state != "ready"
+                ):
+                    return None
+                directive = NativeCursorDirective(
+                    source_causal_id=causal_id,
+                    native_cursor=receipt.envelope.native_cursor,
+                    initialization_transition_id=initialization.draft.transition_id,
+                )
+                self._store.mark_native_cursor_state(causal_id, "executing")
+                return directive
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
     def probe(self) -> ProbeReport:
         with self._lifecycle_lock:
             if self._closed:
@@ -2809,12 +3103,36 @@ class HealthCore:
         )
 
     def health_writes_allowed(self) -> bool:
-        return self.probe().state is ProbeState.HEALTHY
+        if self.probe().state is not ProbeState.HEALTHY:
+            return False
+        if self._admission_policy is None:
+            # Ticket 110 compatibility: deployments without the Ticket 111
+            # admission surface retain the lower-level trusted-boundary gate.
+            return True
+        try:
+            initialization = self._store.initialization()
+            if initialization is None or initialization.phase != "enabled":
+                return False
+            draft = initialization.draft
+            source = self._store.source_envelope(draft.source_causal_id)
+            return (
+                draft.key_id == self._store.key_id
+                and type(self._admission_policy) is AdmissionPolicy
+                and self._admission_policy.accepts(source)
+            )
+        except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+            return False
 
     def model_effects_allowed(self) -> bool:
         return self._execution_capability_vault is not None and self.health_writes_allowed()
 
     def outbound_effects_allowed(self) -> bool:
+        if self._admission_policy is not None:
+            # Ticket 111 records only the configured support-contact boundary
+            # and the owner's initialization approval.  It deliberately does
+            # not create a delivery outbox, per-effect approval, or receipt,
+            # so no owner/contact send may be advertised as executable yet.
+            return False
         return self._execution_capability_vault is not None and self.health_writes_allowed()
 
     def _guard_current_head_call(

@@ -14,6 +14,7 @@ from typing import Iterator, Mapping, Protocol
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .admission import SourceEnvelope, SourceReceipt
 from .authority import (
     AuthoritySnapshot,
     AuthorityValidationError,
@@ -26,9 +27,11 @@ from .authority import (
     TerminalEffect,
     holder_id_for,
     validate_committed_transition,
+    validate_opaque_text,
     validate_ticket110_effect_kind,
 )
 from .contract import CommandEnvelope, EffectResultPayload, ProtocolViolation, Response, StateCommitPayload
+from .initialization import InitializationDraft
 
 
 class KeyUnavailable(RuntimeError):
@@ -41,6 +44,14 @@ class StoreUnavailable(RuntimeError):
 
 class CausalIdConflict(RuntimeError):
     """A causal ID was reused with a different command envelope."""
+
+
+@dataclass(frozen=True)
+class StoredInitialization:
+    """One encrypted owner-initialization aggregate and its durable phase."""
+
+    phase: str
+    draft: InitializationDraft
 
 
 @dataclass(frozen=True)
@@ -427,6 +438,26 @@ class EncryptedStateStore:
             )
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_envelopes_v1 (
+                causal_id TEXT PRIMARY KEY,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_initialization_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                record_id TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
         self._commit("health state initialization unavailable")
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
@@ -536,6 +567,8 @@ class EncryptedStateStore:
             "pending_effect_results_v1",
             "terminal_observation_v1",
             "current_head_observation_guard_v1",
+            "source_envelopes_v1",
+            "owner_initialization_v1",
         )
         if any(self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None for table in populated_tables):
             return
@@ -573,6 +606,13 @@ class EncryptedStateStore:
             ).fetchall(),
             "current_head_observation_guard": self._execute(
                 "SELECT slot, nonce, ciphertext FROM current_head_observation_guard_v1 ORDER BY slot"
+            ).fetchall(),
+            "source_envelopes": self._execute(
+                "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY causal_id"
+            ).fetchall(),
+            "owner_initialization": self._execute(
+                "SELECT slot, record_id, phase, nonce, ciphertext "
+                "FROM owner_initialization_v1 ORDER BY slot"
             ).fetchall(),
         }
 
@@ -1136,6 +1176,198 @@ class EncryptedStateStore:
                     raise CausalIdConflict("causal-id-conflict") from exc
             self._refresh_integrity_manifest(connection)
 
+    def save_source_envelope(self, envelope: SourceEnvelope) -> None:
+        """Persist one admitted source observation inside the caller transaction."""
+
+        if type(envelope) is not SourceEnvelope:
+            raise AuthorityValidationError("invalid source envelope")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            related_causal_id = None
+            if envelope.message_id is not None:
+                rows = connection.execute(
+                    "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY rowid"
+                ).fetchall()
+                for causal_id, existing_nonce, existing_ciphertext in rows:
+                    existing = SourceReceipt.from_storage(
+                        self._open(
+                            f"source-envelope:{causal_id}",
+                            existing_nonce,
+                            existing_ciphertext,
+                        )
+                    ).envelope
+                    if (
+                        existing.channel == envelope.channel
+                        and existing.partner_id == envelope.partner_id
+                        and existing.sender_id == envelope.sender_id
+                        and existing.conversation_id == envelope.conversation_id
+                        and existing.message_id == envelope.message_id
+                    ):
+                        related_causal_id = causal_id
+                        break
+            receipt = SourceReceipt(
+                envelope=envelope,
+                relation="first-observation" if related_causal_id is None else "possible-replay",
+                related_causal_id=related_causal_id,
+                managed_cursor_state="held",
+                native_cursor_state="not-ready",
+            )
+            nonce, ciphertext = self._seal(
+                f"source-envelope:{envelope.causal_id}",
+                receipt.to_storage(),
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO source_envelopes_v1(causal_id, nonce, ciphertext) VALUES (?, ?, ?)",
+                    (envelope.causal_id, nonce, ciphertext),
+                )
+            except sqlite3.IntegrityError as exc:
+                existing = self.source_envelope(envelope.causal_id)
+                if existing != envelope:
+                    raise CausalIdConflict("causal-id-conflict") from exc
+            self._refresh_integrity_manifest(connection)
+
+    def source_envelope(self, causal_id: str) -> SourceEnvelope | None:
+        receipt = self.source_receipt(causal_id)
+        return None if receipt is None else receipt.envelope
+
+    def source_receipt(self, causal_id: str) -> SourceReceipt | None:
+        validate_opaque_text(causal_id, "causal_id")
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM source_envelopes_v1 WHERE causal_id = ?",
+            (causal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = SourceReceipt.from_storage(
+                self._open(f"source-envelope:{causal_id}", row[0], row[1])
+            )
+        except AuthorityValidationError as exc:
+            raise KeyUnavailable("invalid source receipt") from exc
+        if receipt.envelope.causal_id != causal_id:
+            raise KeyUnavailable("source envelope causal identifier mismatch")
+        return receipt
+
+    def mark_source_business_committed(self, causal_id: str) -> SourceReceipt:
+        receipt = self.source_receipt(causal_id)
+        if receipt is None:
+            raise AuthorityValidationError("initialization source required")
+        if receipt.managed_cursor_state == "committed":
+            return receipt
+        return self._replace_source_receipt(receipt.with_business_committed())
+
+    def mark_native_cursor_state(self, causal_id: str, state: str) -> SourceReceipt:
+        receipt = self.source_receipt(causal_id)
+        if receipt is None or receipt.managed_cursor_state != "committed":
+            raise AuthorityValidationError("native cursor is not ready")
+        if state not in {"executing", "advanced", "unknown"}:
+            raise AuthorityValidationError("invalid native cursor result")
+        if receipt.native_cursor_state == state:
+            return receipt
+        expected = "ready" if state == "executing" else "executing"
+        if receipt.native_cursor_state != expected:
+            raise AuthorityValidationError("native cursor result is terminal")
+        return self._replace_source_receipt(receipt.with_native_cursor_state(state))
+
+    def _replace_source_receipt(self, receipt: SourceReceipt) -> SourceReceipt:
+        causal_id = receipt.envelope.causal_id
+        nonce, ciphertext = self._seal(
+            f"source-envelope:{causal_id}",
+            receipt.to_storage(),
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            cursor = connection.execute(
+                "UPDATE source_envelopes_v1 SET nonce = ?, ciphertext = ? WHERE causal_id = ?",
+                (nonce, ciphertext, causal_id),
+            )
+            if cursor.rowcount != 1:
+                raise AuthorityValidationError("initialization source required")
+            self._refresh_integrity_manifest(connection)
+        return receipt
+
+    def write_initialization(self, phase: str, draft: InitializationDraft) -> None:
+        """Create or advance the singleton initialization aggregate.
+
+        Callers normally hold the outer command transaction.  Nested store
+        transactions deliberately share that transaction, so the aggregate,
+        generic transition record, and command receipt commit or roll back as
+        one unit.
+        """
+
+        if phase not in {"prepared", "committed", "unknown", "enabled"}:
+            raise AuthorityValidationError("invalid initialization phase")
+        if type(draft) is not InitializationDraft:
+            raise AuthorityValidationError("invalid initialization draft")
+        nonce, ciphertext = self._seal(
+            f"owner-initialization:{draft.record_id}:{phase}",
+            draft.to_storage(),
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            existing = connection.execute(
+                "SELECT record_id, phase, nonce, ciphertext "
+                "FROM owner_initialization_v1 WHERE slot = 1"
+            ).fetchone()
+            if existing is not None:
+                current = self._decode_initialization(*existing)
+                if current.draft != draft:
+                    raise AuthorityValidationError("initialization already exists")
+                allowed = {
+                    "prepared": {"prepared", "unknown", "committed"},
+                    "unknown": {"unknown", "prepared", "committed"},
+                    "committed": {"committed", "enabled"},
+                    "enabled": {"enabled"},
+                }
+                if phase not in allowed[current.phase]:
+                    raise AuthorityValidationError("invalid initialization transition")
+            connection.execute(
+                """
+                INSERT INTO owner_initialization_v1(slot, record_id, phase, nonce, ciphertext)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(slot) DO UPDATE SET
+                    record_id=excluded.record_id,
+                    phase=excluded.phase,
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext
+                """,
+                (draft.record_id, phase, nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+
+    def initialization(self) -> StoredInitialization | None:
+        row = self._execute(
+            "SELECT record_id, phase, nonce, ciphertext "
+            "FROM owner_initialization_v1 WHERE slot = 1"
+        ).fetchone()
+        return None if row is None else self._decode_initialization(*row)
+
+    def _decode_initialization(
+        self,
+        record_id: object,
+        phase: object,
+        nonce: object,
+        ciphertext: object,
+    ) -> StoredInitialization:
+        if type(record_id) is not str or not record_id:
+            raise KeyUnavailable("invalid initialization record identifier")
+        if type(phase) is not str or phase not in {"prepared", "committed", "unknown", "enabled"}:
+            raise KeyUnavailable("invalid initialization phase")
+        try:
+            draft = InitializationDraft.from_storage(
+                self._open(
+                    f"owner-initialization:{record_id}:{phase}",
+                    nonce,
+                    ciphertext,
+                )
+            )
+        except AuthorityValidationError as exc:
+            raise KeyUnavailable("invalid initialization aggregate") from exc
+        if draft.record_id != record_id:
+            raise KeyUnavailable("initialization record identifier mismatch")
+        return StoredInitialization(phase=phase, draft=draft)
+
     def write_record(
         self,
         record_id: str,
@@ -1379,6 +1611,42 @@ class EncryptedStateStore:
         for causal_id, nonce, ciphertext in receipt_rows:
             self._decode_receipt(causal_id, nonce, ciphertext)
 
+        source_rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY causal_id"
+        ).fetchall()
+        for causal_id, nonce, ciphertext in source_rows:
+            try:
+                receipt = SourceReceipt.from_storage(
+                    self._open(f"source-envelope:{causal_id}", nonce, ciphertext)
+                )
+            except AuthorityValidationError as exc:
+                raise KeyUnavailable("invalid source envelope") from exc
+            if receipt.envelope.causal_id != causal_id:
+                raise KeyUnavailable("source envelope causal identifier mismatch")
+
+        initialization_rows = self._execute(
+            "SELECT record_id, phase, nonce, ciphertext "
+            "FROM owner_initialization_v1 ORDER BY slot"
+        ).fetchall()
+        if len(initialization_rows) > 1:
+            raise KeyUnavailable("multiple initialization aggregates")
+        for row in initialization_rows:
+            initialization = self._decode_initialization(*row)
+            record = self.record(initialization.draft.record_id)
+            expected_record_phase = {
+                "prepared": "prepared",
+                "unknown": "unknown",
+                "committed": "committed",
+                "enabled": "final",
+            }[initialization.phase]
+            if (
+                record is None
+                or record.state != expected_record_phase
+                or record.revision_digest != initialization.draft.revision_digest
+                or record.transition_id != initialization.draft.transition_id
+            ):
+                raise KeyUnavailable("initialization transition mismatch")
+
         # A terminal latch must itself be authenticated; its row is also part
         # of the signed inventory above, so raw deletion cannot silently reopen
         # the state domain.
@@ -1414,6 +1682,12 @@ class EncryptedStateStore:
         observation_guard_rows = self._execute(
             "SELECT nonce, ciphertext FROM current_head_observation_guard_v1"
         ).fetchall()
+        source_rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1"
+        ).fetchall()
+        initialization_rows = self._execute(
+            "SELECT record_id, phase, nonce, ciphertext FROM owner_initialization_v1"
+        ).fetchall()
         return repr(
             (
                 record_rows,
@@ -1424,6 +1698,8 @@ class EncryptedStateStore:
                 pending_effect_rows,
                 terminal_rows,
                 observation_guard_rows,
+                source_rows,
+                initialization_rows,
             )
         ).encode("utf-8")
 
@@ -1483,6 +1759,18 @@ class EncryptedStateStore:
         """
 
         wire = command.to_wire()
+        if command.action == "inbound.admit":
+            payload = wire.get("payload")
+            if not isinstance(payload, dict):
+                raise KeyUnavailable("invalid inbound receipt")
+            envelope = payload.get("envelope")
+            if not isinstance(envelope, dict):
+                raise KeyUnavailable("invalid inbound receipt")
+            body = envelope.get("body")
+            if type(body) is not str:
+                raise KeyUnavailable("invalid inbound receipt")
+            envelope["body"] = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+            return wire
         if command.action != "effect.result":
             return wire
         payload = wire["payload"]

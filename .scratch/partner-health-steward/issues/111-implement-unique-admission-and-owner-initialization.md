@@ -1,7 +1,7 @@
 # 111 - 实现唯一准入与主人初始化
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)
 
