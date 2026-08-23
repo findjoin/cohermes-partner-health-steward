@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
-
 
 class ProbeState(str, Enum):
     HEALTHY = "healthy"
@@ -20,7 +18,7 @@ class ProbeReport:
     content: None = None
     checks: tuple[str, ...] = ()
 
-    def to_wire(self) -> dict[str, Any]:
+    def to_wire(self) -> dict[str, object]:
         return {
             "state": self.state.value,
             "reason_code": self.reason_code,

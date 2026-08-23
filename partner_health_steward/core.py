@@ -2,168 +2,3387 @@
 
 from __future__ import annotations
 
-from typing import Any
+import hashlib
+import secrets
+import threading
+from dataclasses import dataclass
+from typing import Callable, Protocol, TypeVar
 
-from .contract import CommandEnvelope, ProtocolViolation, Response
-from .current_head import HeadConflict, HeadTerminal, HeadTimeout, HeadUnknown
+from .authority import (
+    AuthoritySnapshot,
+    AuthorityValidationError,
+    ClaimingEffect,
+    CommittedTransition,
+    ExecutionCapabilityBinding,
+    EffectExecutionGrant,
+    EffectIntent,
+    ExecutingEffect,
+    ExecutionLease,
+    PreparedTransition,
+    RevisionTarget,
+    TerminalEffect,
+    WriterHolderClaim,
+    WriterFenceProof,
+    holder_id_for,
+    validate_ticket110_effect_kind,
+)
+from .contract import (
+    CommandEnvelope,
+    CommitMeta,
+    EffectIntentMeta,
+    EffectRequestPayload,
+    EffectResultPayload,
+    ProbeMeta,
+    ProtocolViolation,
+    Response,
+    StateCandidatePayload,
+    StateCommitPayload,
+    canonicalize_command,
+)
+from .current_head import (
+    AdvanceRequest,
+    AdvanceIdentity,
+    AppliedTransition,
+    CurrentHeadError,
+    CurrentHeadPort,
+    ExecutionLeaseIdentity,
+    ExecutionLeaseNotFound,
+    ExecutionLeaseReceipt,
+    ExecutionLeaseRequest,
+    ExecutionLeaseRelease,
+    HeadConflict,
+    HeadRead,
+    HeadSnapshot,
+    HeadTerminal,
+    HeadTimeout,
+    HeadUnknown,
+    TransitionNotFound,
+)
 from .probe import ProbeReport, ProbeState
-from .storage import EncryptedStateStore, KeyUnavailable
+from .storage import (
+    CausalIdConflict,
+    CurrentHeadRecoveryBinding,
+    EncryptedStateStore,
+    KeyUnavailable,
+    StoreUnavailable,
+)
+
+
+_STATE_ACTIONS = frozenset({"state.candidate", "state.prepare", "state.commit", "state.finalize"})
+_TRANSITION_RECOVERY_ACTIONS = frozenset({"state.commit", "state.finalize"})
+_PROBE_BYPASS_ACTIONS = _TRANSITION_RECOVERY_ACTIONS | frozenset({"effect.result"})
+_PERSISTENT_CLOSE_REASONS = frozenset(
+    {"effect-result-unknown", "health-key-unavailable", "current-head-terminal"}
+)
+_CurrentHeadValue = TypeVar("_CurrentHeadValue")
+
+
+class MalformedCurrentHeadResponse(CurrentHeadError):
+    """A port returned an invalid typed value, not a retryable I/O outcome."""
+
+
+@dataclass(frozen=True)
+class _Handled:
+    response: Response
+    persist_receipt: bool
+
+
+@dataclass(frozen=True)
+class _BoundRecoveryPreflightFailure:
+    """A live recovery preflight result that is safe or unsafe to retry."""
+
+    response: Response
+    resumable_by_same_live_writer: bool
+
+
+@dataclass(frozen=True)
+class _WriterProofValidation:
+    """Classify a local-closure writer check without losing its safety meaning."""
+
+    proof: WriterFenceProof | None
+    resumable_by_same_live_writer: bool
+
+
+@dataclass(frozen=True)
+class CloseReport:
+    """Observable result of an orderly host-capability handoff attempt."""
+
+    complete: bool
+    reason_code: str | None = None
+    failed_writer_namespaces: tuple[tuple[str, str], ...] = ()
+    failed_execution_authorities: tuple[AuthoritySnapshot, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.complete) is not bool:
+            raise ValueError("invalid close completion")
+        if self.reason_code is not None and type(self.reason_code) is not str:
+            raise ValueError("invalid close reason")
+
+
+class ExecutionCapabilitySession(Protocol):
+    """Host-private, exclusive capability holder for one authority domain."""
+
+    def mint(self, binding: ExecutionCapabilityBinding) -> str | None: ...
+
+    def recover(self, binding: ExecutionCapabilityBinding, holder_id: str) -> str | None: ...
+
+    def active(self) -> bool: ...
+
+    def release(self) -> None: ...
+
+
+class ExecutionCapabilityVault(Protocol):
+    """Non-SQLite holder for effect completion capabilities.
+
+    A production implementation belongs in a host-bound secret facility.  It
+    must issue one non-serialisable, exclusive session per current authority;
+    it must not be copied with the encrypted health-state database.
+    """
+
+    def acquire_or_resume_session(
+        self,
+        authority: AuthoritySnapshot,
+        writer_proof: WriterFenceProof,
+    ) -> ExecutionCapabilitySession | None: ...
+
+
+class WriterHolderSession(Protocol):
+    """Host-private holder for one installation/site writer namespace."""
+
+    def active(self) -> bool: ...
+
+    def proof_for(self, authority: AuthoritySnapshot) -> WriterFenceProof | None: ...
+
+    def release(self) -> None: ...
+
+
+class WriterFenceVault(Protocol):
+    """Host-private source of non-serialisable writer holder sessions."""
+
+    def acquire_or_resume(
+        self,
+        installation_id: str,
+        site: str,
+        holder: WriterHolderClaim,
+    ) -> WriterHolderSession | None: ...
+
+
+class _InMemoryWriterHolderSession:
+    """Synthetic host session; the raw capability remains in its vault."""
+
+    def __init__(
+        self,
+        vault: "InMemoryWriterFenceVault",
+        installation_id: str,
+        site: str,
+        holder: WriterHolderClaim,
+    ) -> None:
+        self._vault = vault
+        self._installation_id = installation_id
+        self._site = site
+        self._holder = holder
+
+    def active(self) -> bool:
+        return self._vault._session_is_active(self)
+
+    def proof_for(self, authority: AuthoritySnapshot) -> WriterFenceProof | None:
+        if (
+            not self.active()
+            or
+            not isinstance(authority, AuthoritySnapshot)
+            or authority.installation_id != self._installation_id
+            or authority.site != self._site
+        ):
+            return None
+        return self._vault._proof_for(authority)
+
+    def release(self) -> None:
+        self._vault._release_session(self)
+
+
+class InMemoryWriterFenceVault:
+    """Synthetic host vault; raw writer capabilities never enter SQLite.
+
+    A session proves possession of the installation/site host namespace before
+    core consumes an exact response-loss binding.  It can then mint a proof
+    for the *live* fence read after that binding becomes generic.  Neither the
+    session nor its capability is serialised, exposed through Plugin, or sent
+    through the command protocol.
+    """
+
+    def __init__(self) -> None:
+        self._capabilities: dict[tuple[str, str, str], str] = {}
+        self._sessions: dict[tuple[str, str], _InMemoryWriterHolderSession] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(authority: AuthoritySnapshot) -> tuple[str, str, str]:
+        return (authority.installation_id, authority.site, authority.writer_fence)
+
+    def bind(self, authority: AuthoritySnapshot, capability: str) -> None:
+        if not isinstance(authority, AuthoritySnapshot):
+            raise ValueError("invalid writer authority")
+        with self._lock:
+            self._capabilities[self._key(authority)] = capability
+
+    def acquire_or_resume(
+        self,
+        installation_id: str,
+        site: str,
+        holder: WriterHolderClaim,
+    ) -> WriterHolderSession | None:
+        if (
+            not isinstance(installation_id, str)
+            or not installation_id
+            or not isinstance(site, str)
+            or not site
+            or not isinstance(holder, WriterHolderClaim)
+        ):
+            return None
+        namespace = (installation_id, site)
+        with self._lock:
+            if not any(key[:2] == namespace for key in self._capabilities):
+                return None
+            session = self._sessions.get(namespace)
+            if session is not None and session.active():
+                return session if session._holder == holder else None
+            session = _InMemoryWriterHolderSession(self, installation_id, site, holder)
+            self._sessions[namespace] = session
+            return session
+
+    def _session_is_active(self, session: _InMemoryWriterHolderSession) -> bool:
+        with self._lock:
+            return self._sessions.get((session._installation_id, session._site)) is session
+
+    def _release_session(self, session: _InMemoryWriterHolderSession) -> None:
+        with self._lock:
+            namespace = (session._installation_id, session._site)
+            if self._sessions.get(namespace) is session:
+                self._sessions.pop(namespace, None)
+
+    def _proof_for(self, authority: AuthoritySnapshot) -> WriterFenceProof | None:
+        if not isinstance(authority, AuthoritySnapshot) or authority.terminal:
+            return None
+        with self._lock:
+            capability = self._capabilities.get(self._key(authority))
+        if capability is None:
+            return None
+        return WriterFenceProof(authority=authority, capability=capability)
+
+
+class _InMemoryExecutionCapabilitySession:
+    """Synthetic exclusive session; production uses a host secret facility."""
+
+    def __init__(
+        self,
+        vault: "InMemoryExecutionCapabilityVault",
+        authority: AuthoritySnapshot,
+        holder_key: str,
+    ) -> None:
+        self._vault = vault
+        self._authority = authority
+        self._holder_key = holder_key
+
+    def mint(self, binding: ExecutionCapabilityBinding) -> str | None:
+        if binding.authority != self._authority:
+            return None
+        return self._vault._mint(self, binding)
+
+    def recover(self, binding: ExecutionCapabilityBinding, holder_id: str) -> str | None:
+        if binding.authority != self._authority:
+            return None
+        return self._vault._recover(self, binding, holder_id)
+
+    def active(self) -> bool:
+        return self._vault._session_is_active(self)
+
+    def release(self) -> None:
+        self._vault._release_session(self)
+
+
+class InMemoryExecutionCapabilityVault:
+    """Synthetic host-local vault used by the Ticket 110 harness.
+
+    The durable secret namespace (capabilities and writer-holder fingerprint)
+    outlives an individual core instance.  The active session does not: it is
+    an exclusive process lease.  A second live core cannot obtain it, while a
+    test-only crash hook models an OS-owned lease being released on process
+    death so the same host can recover an acquire response loss.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._sessions: dict[AuthoritySnapshot, _InMemoryExecutionCapabilitySession] = {}
+        self._holder_keys: dict[AuthoritySnapshot, str] = {}
+        self._capabilities: dict[ExecutionCapabilityBinding, tuple[str, str]] = {}
+
+    @staticmethod
+    def _holder_key(proof: WriterFenceProof) -> str | None:
+        if not isinstance(proof, WriterFenceProof):
+            return None
+        return hashlib.sha256(proof.capability.encode("utf-8")).hexdigest()
+
+    def acquire_or_resume_session(
+        self,
+        authority: AuthoritySnapshot,
+        writer_proof: WriterFenceProof,
+    ) -> ExecutionCapabilitySession | None:
+        if (
+            not isinstance(authority, AuthoritySnapshot)
+            or authority.terminal
+            or not isinstance(writer_proof, WriterFenceProof)
+            or writer_proof.authority != authority
+        ):
+            return None
+        holder_key = self._holder_key(writer_proof)
+        if holder_key is None:
+            return None
+        with self._lock:
+            registered = self._holder_keys.get(authority)
+            if registered is not None and not secrets.compare_digest(registered, holder_key):
+                return None
+            if authority in self._sessions:
+                # Never hand a live core's completion capability to another
+                # in-process core.  A true process death releases this lease.
+                return None
+            self._holder_keys[authority] = holder_key
+            session = _InMemoryExecutionCapabilitySession(self, authority, holder_key)
+            self._sessions[authority] = session
+            return session
+
+    def _mint(
+        self,
+        session: _InMemoryExecutionCapabilitySession,
+        binding: ExecutionCapabilityBinding,
+    ) -> str | None:
+        with self._lock:
+            if not self._session_is_active(session):
+                return None
+            existing = self._capabilities.get(binding)
+            if existing is not None:
+                holder_key, capability = existing
+                return capability if secrets.compare_digest(holder_key, session._holder_key) else None
+            capability = secrets.token_urlsafe(32)
+            self._capabilities[binding] = (session._holder_key, capability)
+            return capability
+
+    def _recover(
+        self,
+        session: _InMemoryExecutionCapabilitySession,
+        binding: ExecutionCapabilityBinding,
+        holder_id: str,
+    ) -> str | None:
+        with self._lock:
+            if not self._session_is_active(session):
+                return None
+            existing = self._capabilities.get(binding)
+            if existing is None:
+                return None
+            holder_key, capability = existing
+            if (
+                not secrets.compare_digest(holder_key, session._holder_key)
+                or holder_id_for(capability) != holder_id
+            ):
+                return None
+            return capability
+
+    def _session_is_active(self, session: _InMemoryExecutionCapabilitySession) -> bool:
+        with self._lock:
+            return self._sessions.get(session._authority) is session
+
+    def _release_session(self, session: _InMemoryExecutionCapabilitySession) -> None:
+        with self._lock:
+            if self._sessions.get(session._authority) is session:
+                self._sessions.pop(session._authority, None)
+
+    def simulate_process_crash_for_test(self) -> None:
+        """Release synthetic process leases but retain host-private secrets."""
+
+        with self._lock:
+            self._sessions.clear()
 
 
 class HealthCore:
-    def __init__(self, store: EncryptedStateStore, current_head: Any) -> None:
+    def __init__(
+        self,
+        store: EncryptedStateStore,
+        current_head: CurrentHeadPort,
+        *,
+        execution_capability_vault: ExecutionCapabilityVault | None = None,
+        writer_fence_vault: WriterFenceVault | None = None,
+    ) -> None:
         self._store = store
         self._current_head = current_head
         self._closed_reason: str | None = None
+        # No fallback vault is safe: a host must explicitly inject its private,
+        # non-serialisable capability authority before the core may execute an
+        # intent.  SQLite stores only a holder hash and a public claim reference.
+        self._execution_capability_vault = execution_capability_vault
+        # No default writer proof is safe.  A copied database and a copied
+        # public fence string are intentionally insufficient to probe healthy,
+        # advance current-head, acquire an execution lease, or release one.
+        self._writer_fence_vault = writer_fence_vault
+        self._writer_holder_claim = WriterHolderClaim(
+            "writer-holder:" + secrets.token_urlsafe(24)
+        )
+        self._writer_holder_sessions: dict[tuple[str, str], WriterHolderSession] = {}
+        # Serializes lifecycle handoff with every public operation that can
+        # mint or consume a writer proof.  ``close`` must not release its host
+        # holder while an already-admitted CAS or lease release still carries
+        # a valid proof to current-head.
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
+        self._execution_capability_sessions: dict[AuthoritySnapshot, ExecutionCapabilitySession] = {}
+        self._terminal_seen = False
+        self._current_head_guard_depth = 0
+        self._current_head_guard_binding: CurrentHeadRecoveryBinding | None = None
+        # A mutable current-head call whose response may have been lost keeps
+        # its exact recovery binding durable.  A generic guard is deliberately
+        # kept for every other interrupted observation: only the former can
+        # ever be closed by replaying the original causal command.
+        self._current_head_guard_preserved = False
+        # A failed clear can leave our own durable guard behind even though
+        # this process is still alive.  Retain that provenance in memory so a
+        # recovered store can clear it; a restarted core has no such proof and
+        # therefore remains fail-closed.
+        self._current_head_guard_owned = False
+
+    def close(self) -> CloseReport:
+        """Disable this core and report whether host authority really handed off.
+
+        The core becomes unusable on the first call even when a host release
+        faults.  Failed sessions remain retained solely so a later ``close``
+        can retry their release; callers must not mistake a disabled old core
+        for a completed writer/capability handoff.
+        """
+
+        with self._lifecycle_lock:
+            # The lifecycle lock first drains every admitted public operation.
+            # Only then can a new core acquire the namespace, so no old
+            # WriterFenceProof remains usable after orderly handoff.
+            self._closed = True
+            failed_writer: list[tuple[str, str]] = []
+            for namespace, session in tuple(self._writer_holder_sessions.items()):
+                if self._release_host_session(session):
+                    self._writer_holder_sessions.pop(namespace, None)
+                else:
+                    failed_writer.append(namespace)
+
+            failed_execution: list[AuthoritySnapshot] = []
+            for authority, session in tuple(self._execution_capability_sessions.items()):
+                if self._release_host_session(session):
+                    self._execution_capability_sessions.pop(authority, None)
+                else:
+                    failed_execution.append(authority)
+
+            if failed_writer:
+                return CloseReport(
+                    complete=False,
+                    reason_code="writer-handoff-incomplete",
+                    failed_writer_namespaces=tuple(failed_writer),
+                    failed_execution_authorities=tuple(failed_execution),
+                )
+            if failed_execution:
+                return CloseReport(
+                    complete=False,
+                    reason_code="execution-capability-handoff-incomplete",
+                    failed_execution_authorities=tuple(failed_execution),
+                )
+            return CloseReport(complete=True)
+
+    @staticmethod
+    def _release_host_session(session: object) -> bool:
+        """Prove that a host session no longer holds its namespace."""
+
+        if not callable(getattr(session, "release", None)) or not callable(getattr(session, "active", None)):
+            return False
+        try:
+            session.release()
+        except Exception:
+            return False
+        try:
+            return session.active() is False
+        except Exception:
+            return False
+
+    def _current_writer_proof(self, authority: AuthoritySnapshot) -> WriterFenceProof | None:
+        """Return a host proof only after the remote adapter validates it live."""
+
+        return self._current_writer_proof_validation(authority).proof
+
+    def _current_writer_proof_validation(
+        self,
+        authority: AuthoritySnapshot,
+    ) -> _WriterProofValidation:
+        """Keep explicit nonterminal validation loss distinct from malformed I/O.
+
+        A local business/receipt close may restore its exact recovery binding
+        only when the validation failure itself proves no terminal or malformed
+        adapter result was observed.  Conflating those cases would make a
+        response-lost CAS or lease release replayable after an unsafe remote
+        boundary.
+        """
+
+        proof = self._writer_proof_from_vault(authority)
+        if proof is None:
+            # This is a host-local absence; no current-head observation was
+            # made, so the same live holder may later retry its local close.
+            return _WriterProofValidation(None, resumable_by_same_live_writer=True)
+        try:
+            # The port gets a disposable copy.  Retain an independent proof
+            # for any later CAS/lease operation so a validator cannot mutate
+            # the authority or bearer field it was asked to inspect.
+            port_proof = self._canonical_writer_proof_for_port(proof)
+            retained_proof = self._canonical_writer_proof_for_port(proof)
+        except CurrentHeadError:
+            return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+        try:
+            valid = self._guard_current_head_call(
+                lambda: self._current_head.validate_writer_fence(port_proof)
+            )
+        except HeadTerminal:
+            self._latch_terminal()
+            return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+        except (HeadConflict, HeadTimeout, HeadUnknown):
+            return _WriterProofValidation(None, resumable_by_same_live_writer=True)
+        except CurrentHeadError:
+            return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+        except Exception:
+            return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+        if valid is True:
+            return _WriterProofValidation(retained_proof, resumable_by_same_live_writer=False)
+        if valid is False:
+            # A decoded false is a definite live-fence rejection.  It cannot
+            # reopen an exact post-mutation closure binding.
+            return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+        return _WriterProofValidation(None, resumable_by_same_live_writer=False)
+
+    def _writer_proof_from_vault(self, authority: AuthoritySnapshot) -> WriterFenceProof | None:
+        """Mint an exact fence proof from a host session without remote I/O."""
+
+        session = self._writer_holder_session(authority)
+        if session is None:
+            return None
+        try:
+            proof = session.proof_for(authority)
+        except Exception:
+            return None
+        if type(proof) is not WriterFenceProof or type(proof.authority) is not AuthoritySnapshot:
+            return None
+        try:
+            canonical = self._canonical_writer_proof_for_port(proof)
+        except CurrentHeadError:
+            return None
+        if canonical.authority != authority:
+            return None
+        return canonical
+
+    def _writer_holder_session(self, authority: AuthoritySnapshot) -> WriterHolderSession | None:
+        """Return a local holder session without reading or writing current-head."""
+
+        if self._closed or not isinstance(authority, AuthoritySnapshot) or authority.terminal:
+            return None
+        vault = self._writer_fence_vault
+        if vault is None:
+            return None
+        namespace = (authority.installation_id, authority.site)
+        cached = self._writer_holder_sessions.get(namespace)
+        if cached is not None:
+            try:
+                if cached.active():
+                    return cached
+            except Exception:
+                pass
+            self._writer_holder_sessions.pop(namespace, None)
+        try:
+            session = vault.acquire_or_resume(
+                authority.installation_id,
+                authority.site,
+                self._writer_holder_claim,
+            )
+        except Exception:
+            return None
+        if (
+            session is None
+            or not callable(getattr(session, "active", None))
+            or not callable(getattr(session, "proof_for", None))
+            or not callable(getattr(session, "release", None))
+        ):
+            return None
+        try:
+            if not session.active():
+                return None
+        except Exception:
+            return None
+        self._writer_holder_sessions[namespace] = session
+        return session
+
+    def _writer_entry_preflight(self, causal_id: str | None = None) -> Response | None:
+        """Require a host-local writer credential before arming any tripwire.
+
+        A core that merely holds a copied SQLite file must not be able to write
+        a generic current-head crash guard and die before its first remote read.
+        The finalized authority is local encrypted state, so this check neither
+        observes current-head nor creates a terminal-observation hazard.  The
+        later guarded live validation remains mandatory before every mutation.
+        """
+
+        authority = self._store.finalized_authority()
+        if authority is None:
+            return Response("unavailable", causal_id, "local-finalized-authority-missing")
+        if self._writer_holder_session(authority) is None:
+            return Response("unavailable", causal_id, "current-writer-holder-missing")
+        return None
+
+    def _bound_recovery_local_writer_preflight(
+        self,
+        expected_authority: AuthoritySnapshot,
+    ) -> Response | None:
+        """Require host-local ownership before touching an exact guard.
+
+        A copied SQLite file must not be able to consume an exact ambiguous
+        mutation binding merely by attempting recovery.  This check is purely
+        local: it neither observes current-head nor changes the durable guard.
+        """
+
+        if not isinstance(expected_authority, AuthoritySnapshot):
+            return Response("unavailable", reason_code="current-head-observation-incomplete")
+        if self._writer_holder_session(expected_authority) is None:
+            return Response("unavailable", reason_code="current-writer-holder-missing")
+        return None
+
+    def _bound_recovery_live_writer_preflight(
+        self,
+        expected_authority: AuthoritySnapshot,
+        *,
+        installation_mismatch_reason: str,
+        site_mismatch_reason: str,
+        writer_fence_mismatch_reason: str,
+    ) -> AuthoritySnapshot | _BoundRecoveryPreflightFailure:
+        """Validate live authority only after exact recovery became generic.
+
+        Callers must first pass the host-local proof check and atomically move
+        the exact response-loss binding to a generic tripwire.  A terminal
+        observation or hard stop here can therefore never leave the old CAS or
+        release replayable.  Only a *returned*, explicitly nonterminal
+        transport/validation failure may later restore that exact binding in
+        the same live core.
+        """
+
+        try:
+            authority = self._read_head()
+        except HeadTerminal:
+            self._latch_terminal()
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code=self._closed_reason),
+                resumable_by_same_live_writer=False,
+            )
+        except HeadUnknown:
+            return _BoundRecoveryPreflightFailure(
+                Response("unknown", reason_code="current-head-unknown"),
+                resumable_by_same_live_writer=True,
+            )
+        except (HeadConflict, HeadTimeout):
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code="current-head-unavailable"),
+                resumable_by_same_live_writer=True,
+            )
+        except CurrentHeadError:
+            # An invalid or unclassified adapter response is not evidence that
+            # current-head was nonterminal.  Retain the generic tripwire.
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code="current-head-unavailable"),
+                resumable_by_same_live_writer=False,
+            )
+
+        # A response-loss binding belongs to one installation/site namespace.
+        # A different current writer must not consume it and terminalize copied
+        # business state merely because a lease/transition lookup still returns
+        # a historical receipt from the old namespace.
+        if authority.installation_id != expected_authority.installation_id:
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code=installation_mismatch_reason),
+                resumable_by_same_live_writer=False,
+            )
+        if authority.site != expected_authority.site:
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code=site_mismatch_reason),
+                resumable_by_same_live_writer=False,
+            )
+        if authority.writer_fence != expected_authority.writer_fence:
+            # A response-loss binding is tied to the exact writer fence that
+            # owned the CAS or release.  Installation/site continuity alone
+            # is not an authenticated F1-to-F2 handoff proof.
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code=writer_fence_mismatch_reason),
+                resumable_by_same_live_writer=False,
+            )
+
+        # Use the same disposable port proof / retained proof discipline as
+        # ordinary writes.  Recovery must not be the one path that lets a
+        # validator mutate a vault-owned authority or bearer object.
+        validation = self._current_writer_proof_validation(authority)
+        if validation.proof is None:
+            return _BoundRecoveryPreflightFailure(
+                Response("unavailable", reason_code="current-writer-holder-missing"),
+                resumable_by_same_live_writer=validation.resumable_by_same_live_writer,
+            )
+        return authority
+
+    def _latch_terminal(self) -> None:
+        # Set the in-process latch first.  A transient local storage failure
+        # after observing terminal must never let a later nonterminal read
+        # reopen the same core while durable latching is retried.
+        self._terminal_seen = True
+        try:
+            self._store.latch_terminal_observation()
+        except KeyUnavailable:
+            self._closed_reason = "health-key-unavailable"
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
+        else:
+            self._closed_reason = "current-head-terminal"
+
+    def _terminal_closed(self) -> bool:
+        if self._terminal_seen:
+            self._latch_terminal()
+            return True
+        if self._current_head_guard_owned and self._current_head_guard_depth == 0:
+            if self._current_head_guard_preserved:
+                self._closed_reason = "current-head-observation-incomplete"
+                return True
+            # The prior guarded call definitely returned in this live core.
+            # Retrying a failed clear is safe here; after process loss this
+            # provenance disappears and the persisted guard below closes the
+            # new core instead.
+            self._store.clear_current_head_observation(self._current_head_guard_binding)
+            self._current_head_guard_owned = False
+            self._current_head_guard_binding = None
+        if self._store.terminal_observed():
+            self._terminal_seen = True
+            self._closed_reason = "current-head-terminal"
+            return True
+        # A guard owned by this live core protects the current operation.  Only
+        # an orphaned durable guard (with no matching in-process depth) proves
+        # that a previous current-head observation was interrupted by a crash.
+        if (
+            self._current_head_guard_depth == 0
+            and self._store.current_head_observation_incomplete()
+        ):
+            self._closed_reason = "current-head-observation-incomplete"
+            return True
+        return False
+
+    def _enter_current_head_guard(
+        self,
+        binding: CurrentHeadRecoveryBinding | None = None,
+    ) -> None:
+        self._store.arm_current_head_observation(binding)
+        self._current_head_guard_owned = True
+        self._current_head_guard_binding = binding
+        if self._current_head_guard_depth == 0:
+            self._current_head_guard_preserved = False
+        self._current_head_guard_depth += 1
+
+    def _exit_current_head_guard(self) -> None:
+        if self._current_head_guard_depth < 1:
+            raise StoreUnavailable("current-head observation guard underflow")
+        self._current_head_guard_depth -= 1
+        if (
+            self._current_head_guard_depth == 0
+            and not self._terminal_seen
+            and not self._current_head_guard_preserved
+            and self._current_head_guard_owned
+        ):
+            self._store.clear_current_head_observation(self._current_head_guard_binding)
+            self._current_head_guard_owned = False
+            self._current_head_guard_binding = None
+
+    def _retarget_current_head_guard(
+        self,
+        binding: CurrentHeadRecoveryBinding | None,
+    ) -> None:
+        """Durably move a live tripwire between observation phases.
+
+        A command-specific binding is valid only while its one mutable remote
+        call is in flight.  The caller must therefore enter with the generic
+        guard, bind immediately before the call, then restore generic before
+        any post-write read or local business transaction.
+        """
+
+        if self._current_head_guard_depth < 1:
+            raise StoreUnavailable("current-head observation guard is not active")
+        if self._current_head_guard_binding == binding:
+            return
+        self._store.replace_current_head_observation(
+            self._current_head_guard_binding,
+            binding,
+        )
+        self._current_head_guard_binding = binding
+
+    def _begin_interrupted_current_head_recovery(
+        self,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> None:
+        """Consume a mutable-call binding before any recovery observation.
+
+        If recovery itself crashes, its generic guard remains deliberately
+        non-recoverable.  In particular a terminal read after a successful CAS
+        can never be mistaken for permission to replay that earlier CAS.
+        """
+
+        self._store.replace_current_head_observation(binding, None)
+        self._current_head_guard_binding = None
+        self._current_head_guard_owned = True
+        self._current_head_guard_preserved = False
+        self._current_head_guard_depth += 1
+
+    def _restore_recovery_binding_after_returned_preflight_failure(
+        self,
+        binding: CurrentHeadRecoveryBinding,
+        *,
+        still_owned: Callable[[], bool],
+    ) -> None:
+        """Rebind only after a known nonterminal preflight result returned.
+
+        The exact binding has already become generic before this method runs.
+        This is intentionally narrower than general recovery: transition and
+        lease lookup results remain generic once observed, because they can
+        close response-loss ambiguity.  A returned timeout/unknown or a
+        decoded nonterminal writer-proof rejection is the only phase in which
+        the same live writer may safely retry the preflight.
+        """
+
+        # Preserve generic protection by default.  If this local state changed
+        # or the retarget write fails, a later call must not clear the tripwire.
+        self._current_head_guard_preserved = True
+        if self._terminal_seen or not still_owned():
+            return
+        self._current_head_guard_depth += 1
+        try:
+            self._retarget_current_head_guard(binding)
+        finally:
+            self._current_head_guard_depth -= 1
+
+    def _preserve_exact_local_closure_binding(
+        self,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> None:
+        """Bind only the original command around an already-confirmed local close."""
+
+        self._current_head_guard_preserved = True
+        self._retarget_current_head_guard(binding)
+
+    def _retain_local_closure_guard_after_writer_validation(
+        self,
+        binding: CurrentHeadRecoveryBinding,
+        validation: _WriterProofValidation,
+    ) -> None:
+        """Retain B only after an explicitly nonterminal validation failure."""
+
+        if validation.resumable_by_same_live_writer and not self._terminal_seen:
+            self._preserve_exact_local_closure_binding(binding)
+            return
+        # An invalid adapter response, unexpected exception, or terminal
+        # observation has consumed the safe replay lane.  Keep generic guard
+        # through the caller's finally block and across process loss.
+        self._current_head_guard_preserved = True
+
+    def _state_recovery_binding_still_owned(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+    ) -> bool:
+        payload = command.payload
+        if not isinstance(payload, StateCommitPayload):
+            return False
+        stored = self._store.record(payload.record_id)
+        pending = self._store.pending_for_record(payload.record_id)
+        return (
+            stored is not None
+            and stored.state in {"prepared", "unknown"}
+            and stored.payload == prepared
+            and pending is not None
+            and pending.remote_attempted
+            and pending.command.to_wire() == command.to_wire()
+        )
+
+    def _effect_recovery_binding_still_owned(
+        self,
+        command: CommandEnvelope,
+        execution: ExecutingEffect,
+    ) -> bool:
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            return False
+        stored = self._store.effect(payload.effect_id)
+        pending = self._store.pending_effect_result(payload.effect_id)
+        if (
+            stored is None
+            or stored.state != "executing"
+            or stored.payload != execution
+            or pending is None
+            or not pending.remote_attempted
+        ):
+            return False
+        try:
+            return pending.matches(command, execution)
+        except ProtocolViolation:
+            return False
 
     def handle(self, command: CommandEnvelope) -> Response:
-        previous = self._store.receipt(command.causal_id)
-        if previous is not None:
-            return Response("replayed", command.causal_id, "duplicate-causal-id")
+        """Apply one command, atomically recording its exact terminal replay response."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                # Do not derive a response field from a direct caller object
+                # after orderly shutdown; the core no longer owns a writer
+                # namespace and must not reopen it just to replay a receipt.
+                return Response("unavailable", reason_code="current-writer-holder-missing")
+            return self._handle_open(command)
+
+    def _handle_open(self, command: CommandEnvelope) -> Response:
+        """Run one admitted command while its writer holder remains live."""
 
         try:
-            response = self._handle_new(command)
+            command = canonicalize_command(command)
+        except ProtocolViolation:
+            # The object itself is untrusted, including its causal ID.  Do not
+            # derive a receipt, pending journal, or response field from it.
+            return Response("rejected", reason_code="invalid-command-envelope")
+
+        try:
+            with self._store.serialized():
+                with self._store.transaction():
+                    previous = self._store.receipt(command)
+                    if previous is not None:
+                        guard = self._store.current_head_observation_guard()
+                        if guard is not None and guard.binding is not None and guard.binding.matches(command):
+                            self._store.clear_current_head_observation(guard.binding)
+                        return previous
+                    # An unresolved remote operation reserves its causal ID for
+                    # the exact original command until transition lookup closes
+                    # it.  This only validates an existing reservation; a new
+                    # state.commit reservation is durably written below.
+                    self._store.pending_command(command)
+
+                # A completed terminal latch outranks any residual tripwire:
+                # the latter may remain because the terminal path deliberately
+                # avoids clearing it, but it must never mask the irreversible
+                # terminal result on replay or after restart.
+                if self._store.terminal_observed():
+                    self._terminal_seen = True
+                    self._closed_reason = "current-head-terminal"
+                    return Response("unavailable", command.causal_id, self._closed_reason)
+
+                interrupted = self._store.current_head_observation_guard()
+                if interrupted is not None:
+                    return self._recover_interrupted_current_head_observation(command, interrupted.binding)
+
+                if self._terminal_closed():
+                    return Response("unavailable", command.causal_id, self._closed_reason)
+
+                writer_entry = self._writer_entry_preflight(command.causal_id)
+                if writer_entry is not None:
+                    return writer_entry
+
+                preflight = self._prewrite_remote_journal(command)
+                if preflight is not None:
+                    return preflight
+
+                if command.action == "state.commit":
+                    return self._handle_state_commit_remote(command)
+                if command.action == "effect.result":
+                    return self._handle_effect_result_remote(command)
+
+                # Commit a *generic* observation tripwire before entering the
+                # command.  The exact causal binding is installed later, in a
+                # separately committed phase immediately around CAS/release;
+                # it must never cover a post-write confirmation read.
+                self._enter_current_head_guard()
+                try:
+                    with self._store.transaction():
+                        # The journal write is deliberately a separate committed
+                        # transaction before CAS.  Recheck receipt afterward so an
+                        # independently completed replay remains exact.
+                        previous = self._store.receipt(command)
+                        if previous is not None:
+                            return previous
+                        handled = self._handle_new(command)
+                        if handled.persist_receipt:
+                            self._store.save_receipt(command, handled.response)
+                    return handled.response
+                finally:
+                    self._exit_current_head_guard()
         except ProtocolViolation as exc:
-            response = Response("rejected", command.causal_id, str(exc))
+            return self._persist_rejection(command, str(exc))
+        except CausalIdConflict as exc:
+            return Response("rejected", command.causal_id, str(exc) or "causal-id-conflict")
         except KeyUnavailable:
             self._closed_reason = "health-key-unavailable"
-            response = Response("unavailable", command.causal_id, self._closed_reason)
-        self._store.save_receipt(command.causal_id, response.status, response.reason_code)
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+
+    def _handle_state_commit_remote(self, command: CommandEnvelope) -> Response:
+        """Complete a state commit without holding SQLite across remote CAS.
+
+        The three durable phases are deliberately explicit:
+
+        ``generic -> exact command binding -> generic -> exact command
+        binding -> local record/receipt/guard clear``.
+
+        The first bound phase covers only CAS response ambiguity.  The second
+        starts after all post-CAS reads are complete, so a failed local commit
+        remains recoverable without allowing a terminal confirmation read to
+        replay the old CAS.
+        """
+
+        payload = command.payload
+        if not isinstance(payload, StateCommitPayload):
+            raise ProtocolViolation("invalid commit payload")
+        # Terminal observation outranks a stale envelope.  Perform this read
+        # before validating the prepared generation/fence so a terminal head
+        # can never be reported as a protocol rejection.
+        try:
+            preflight_head = self._read_head()
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except HeadUnknown:
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except (HeadConflict, HeadTimeout, CurrentHeadError):
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        stored = self._store.record(payload.record_id)
+        if stored is None or stored.state not in {"prepared", "unknown"}:
+            raise ProtocolViolation("record is not prepared")
+        if not isinstance(stored.payload, PreparedTransition):
+            raise KeyUnavailable("invalid prepared state")
+        prepared = stored.payload
+        if not prepared.target.matches_commit(
+            record_id=payload.record_id,
+            revision_digest=payload.revision_digest,
+            transition_id=payload.transition_id,
+        ):
+            raise ProtocolViolation("record transition changed")
+        if (
+            command.generation != prepared.base.generation
+            or payload.writer_fence != prepared.base.writer_fence
+        ):
+            if command.generation == preflight_head.generation:
+                mismatch = self._prepared_mismatch_reason(
+                    prepared.base,
+                    preflight_head,
+                    payload.writer_fence,
+                )
+                if mismatch is not None:
+                    self._closed_reason = mismatch
+                    return Response("unavailable", command.causal_id, mismatch)
+            raise ProtocolViolation("generation mismatch")
+        pending = self._store.pending_for_record(payload.record_id)
+        if pending is None:
+            return Response("unavailable", command.causal_id, "pending-command-missing")
+        if pending.command.to_wire() != command.to_wire():
+            return Response("rejected", command.causal_id, "causal-id-conflict")
+        if not pending.remote_attempted:
+            return Response("unavailable", command.causal_id, "pending-command-not-attempted")
+
+        binding = CurrentHeadRecoveryBinding.from_command(command)
+        self._enter_current_head_guard()
+        try:
+            try:
+                head = self._read_head()
+            except HeadUnknown:
+                return Response("unknown", command.causal_id, "current-head-unknown")
+            except HeadTerminal:
+                self._latch_terminal()
+                return Response("unavailable", command.causal_id, self._closed_reason)
+            except (HeadConflict, HeadTimeout, CurrentHeadError):
+                return Response("unavailable", command.causal_id, "current-head-unavailable")
+
+            committed = self._resolve_state_commit_remote(
+                command,
+                prepared,
+                stored.state,
+                head,
+                binding,
+            )
+            if isinstance(committed, Response):
+                return committed
+            return self._persist_state_commit_success(command, prepared, committed, binding)
+        finally:
+            self._exit_current_head_guard()
+
+    def _resolve_state_commit_remote(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+        current_state: str,
+        head: AuthoritySnapshot,
+        binding: CurrentHeadRecoveryBinding,
+        *,
+        recovery_only: bool = False,
+    ) -> CommittedTransition | Response:
+        """Return a fully confirmed transition, without any SQLite business write."""
+
+        should_lookup = recovery_only or current_state == "unknown" or head != prepared.base
+        if should_lookup:
+            recovered = self._finalization_authority(
+                "unknown" if current_state == "unknown" else "prepared",
+                prepared,
+                head,
+                binding,
+            )
+            if not isinstance(recovered, _Handled):
+                return recovered
+            if recovered.response.reason_code != "transition-not-found":
+                return self._with_causal_id(recovered, command.causal_id).response
+            if recovery_only:
+                # Once an exact response-loss binding is being recovered, a
+                # missing transition is not evidence that the original CAS did
+                # not happen.  Never issue another mutation from recovery:
+                # terminal observation, adapter reset, and response loss are
+                # observationally indistinguishable at this boundary.
+                self._current_head_guard_preserved = True
+                return Response("unavailable", command.causal_id, "transition-recovery-unconfirmed")
+            if head != prepared.base:
+                self._rollback_unapplied_state_commit(command, prepared, current_state)
+                return Response("unavailable", command.causal_id, "current-head-conflict")
+
+        writer_proof = self._current_writer_proof(prepared.base)
+        if writer_proof is None:
+            return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        request = AdvanceRequest(
+            expected=prepared.base,
+            transition_id=prepared.target.transition_id,
+            revision_digest=prepared.target.revision_digest,
+            writer_fence=prepared.base.writer_fence,
+            operation_digest=binding.command_digest,
+            writer_proof=writer_proof,
+        )
+        try:
+            updated = self._advance_head(request, recovery_binding=binding)
+        except HeadConflict:
+            self._rollback_unapplied_state_commit(command, prepared, current_state)
+            return Response("unavailable", command.causal_id, "current-head-conflict")
+        except HeadTimeout:
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unknown", command.causal_id, "current-head-timeout")
+        except HeadUnknown:
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except CurrentHeadError:
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+
+        # The successful response is not authority proof.  This generic read
+        # is intentionally outside both mutable and local-commit bindings.
+        try:
+            confirmed = self._confirm_advanced_head(updated)
+        except HeadUnknown:
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except HeadTerminal:
+            self._latch_terminal()
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except (HeadConflict, HeadTimeout, CurrentHeadError):
+            self._mark_state_commit_ambiguous(command, prepared)
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        return CommittedTransition(prepared=prepared, committed=confirmed)
+
+    def _rollback_unapplied_state_commit(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+        current_state: str,
+    ) -> None:
+        """Release only an exact CAS journal proved not to have applied."""
+
+        with self._store.transaction():
+            payload = command.payload
+            if not isinstance(payload, StateCommitPayload):
+                raise KeyUnavailable("invalid commit payload")
+            stored = self._store.record(payload.record_id)
+            pending = self._store.pending_for_record(payload.record_id)
+            if (
+                stored is None
+                or stored.state not in {"prepared", "unknown"}
+                or stored.payload != prepared
+                or pending is None
+                or pending.command.to_wire() != command.to_wire()
+            ):
+                raise StoreUnavailable("state commit recovery state changed")
+            if current_state == "unknown":
+                self._store.write_record(
+                    prepared.target.record_id,
+                    "prepared",
+                    prepared.target.revision_digest,
+                    prepared.target.transition_id,
+                    prepared,
+                )
+            self._store.clear_pending_command(command.causal_id)
+
+    def _mark_state_commit_ambiguous(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+    ) -> None:
+        """Record only the ambiguity that followed an already-owned CAS.
+
+        The original pending command remains intact.  Its exact recovery binding
+        is the sole authority that may later perform a read-only transition
+        lookup, so this helper must never clear either the journal or guard.
+        """
+
+        payload = command.payload
+        if not isinstance(payload, StateCommitPayload):
+            raise KeyUnavailable("invalid commit payload")
+        with self._store.transaction():
+            stored = self._store.record(payload.record_id)
+            pending = self._store.pending_for_record(payload.record_id)
+            if (
+                stored is None
+                or stored.state not in {"prepared", "unknown"}
+                or stored.payload != prepared
+                or pending is None
+                or pending.command.to_wire() != command.to_wire()
+                or not pending.remote_attempted
+            ):
+                raise StoreUnavailable("state commit ambiguity state changed")
+            if stored.state != "unknown":
+                self._store.write_record(
+                    prepared.target.record_id,
+                    "unknown",
+                    prepared.target.revision_digest,
+                    prepared.target.transition_id,
+                    prepared,
+                )
+
+    def _persist_state_commit_success(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+        committed: CommittedTransition,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> Response:
+        """Atomically write record, exact receipt, pending clear, and guard clear."""
+
+        # The remote transition is confirmed, but no local business write may
+        # close it after this core has lost the current writer.  A later exact
+        # replay remains journaled and can perform lookup-only recovery.
+        writer_validation = self._current_writer_proof_validation(committed.committed)
+        if writer_validation.proof is None:
+            self._retain_local_closure_guard_after_writer_validation(binding, writer_validation)
+            return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+
+        response = Response(
+            "accepted",
+            command.causal_id,
+            "current-head-advanced",
+            CommitMeta(committed.committed.generation, committed.committed.writer_fence),
+        )
+        # Preserve the newly bound tripwire if the following local transaction
+        # rolls back or its COMMIT response is lost.  The original causal
+        # command can then repeat read-only transition recovery after restart.
+        self._preserve_exact_local_closure_binding(binding)
+        with self._store.transaction():
+            guard = self._store.current_head_observation_guard()
+            payload = command.payload
+            if not isinstance(payload, StateCommitPayload):
+                raise KeyUnavailable("invalid commit payload")
+            current = self._store.record(payload.record_id)
+            pending = self._store.pending_for_record(payload.record_id)
+            if (
+                guard is None
+                or guard.binding != binding
+                or current is None
+                or current.state not in {"prepared", "unknown"}
+                or current.payload != prepared
+                or pending is None
+                or pending.command.to_wire() != command.to_wire()
+                or not pending.remote_attempted
+            ):
+                raise StoreUnavailable("state commit persistence changed")
+            self._store.write_record(
+                prepared.target.record_id,
+                "committed",
+                prepared.target.revision_digest,
+                prepared.target.transition_id,
+                committed,
+            )
+            self._store.clear_pending_command(command.causal_id)
+            self._store.save_receipt(command, response)
+            self._store.clear_current_head_observation(binding)
+        self._current_head_guard_owned = False
+        self._current_head_guard_binding = None
+        self._current_head_guard_preserved = False
         return response
 
-    def _handle_new(self, command: CommandEnvelope) -> Response:
-        if command.action == "probe":
-            report = self.probe()
-            return Response("accepted", command.causal_id, report.reason_code, {"probe_state": report.state.value})
+    def _handle_effect_result_remote(self, command: CommandEnvelope) -> Response:
+        """Terminalize a controlled effect with the same three-phase discipline."""
+
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            raise ProtocolViolation("invalid effect result payload")
+        stored = self._store.effect(payload.effect_id)
+        if stored is None or stored.state in {"accepted", "rejected", "unknown"}:
+            raise ProtocolViolation("effect-intent-required")
+        if stored.state != "executing" or not isinstance(stored.payload, ExecutingEffect):
+            raise ProtocolViolation("effect-execution-required")
+        execution = stored.payload
+        if payload.intent_digest != execution.intent.intent_digest:
+            raise ProtocolViolation("effect-intent-required")
+        if payload.terminal is not True:
+            raise ProtocolViolation("effect result is incomplete")
+        if payload.lease_id != execution.lease.lease_id:
+            raise ProtocolViolation("effect-execution-capability-required")
         try:
-            head = self._read_head_or_close()
-        except HeadUnknown:
-            self._closed_reason = "current-head-unknown"
-            return Response("unknown", command.causal_id, self._closed_reason)
-        except (HeadConflict, HeadTimeout):
-            self._closed_reason = "current-head-unavailable"
-            return Response("unavailable", command.causal_id, self._closed_reason)
-        if command.generation != head.generation:
+            holder_id = holder_id_for(payload.completion_capability)
+        except ValueError as exc:
+            raise ProtocolViolation("effect-execution-capability-required") from exc
+        if holder_id != execution.lease.holder_id:
+            raise ProtocolViolation("effect-execution-capability-required")
+        pending = self._store.pending_effect_result(payload.effect_id)
+        if pending is None:
+            return Response("unavailable", command.causal_id, "effect-result-owner-missing")
+        if not pending.matches(command, execution):
+            return Response("rejected", command.causal_id, "causal-id-conflict")
+        if not pending.remote_attempted and command.generation != execution.lease.authority.generation:
             raise ProtocolViolation("generation mismatch")
 
-        # Finalize is the only recovery write allowed while an otherwise healthy
-        # path is stopped by an explicit prepared/committed crash state.
-        transition_recovery = command.action in {"state.commit", "state.finalize"}
-        if not transition_recovery and not self.health_writes_allowed():
-            return Response("unavailable", command.causal_id, self._closed_reason or "health-path-closed")
+        binding = CurrentHeadRecoveryBinding.from_command(command)
+        self._enter_current_head_guard()
+        try:
+            receipt = self._confirm_effect_result_remote(command, execution, pending, binding)
+            if isinstance(receipt, Response):
+                return receipt
+            return self._persist_effect_result_success(command, execution, receipt, binding)
+        finally:
+            self._exit_current_head_guard()
 
-        if command.action in {"state.candidate", "state.prepare", "state.commit", "state.finalize"}:
-            return self._handle_state(command, head)
+    def _confirm_effect_result_remote(
+        self,
+        command: CommandEnvelope,
+        execution: ExecutingEffect,
+        pending: object,
+        binding: CurrentHeadRecoveryBinding,
+        *,
+        allow_release: bool = True,
+    ) -> ExecutionLeaseReceipt | Response:
+        """Prove a released lease before any terminal SQLite mutation."""
+
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            raise KeyUnavailable("invalid effect result payload")
+        identity = ExecutionLeaseIdentity(
+            expected=execution.lease.authority,
+            effect_id=execution.lease.effect_id,
+            intent_digest=execution.lease.intent_digest,
+            writer_fence=execution.lease.authority.writer_fence,
+            holder_id=execution.lease.holder_id,
+        )
+        try:
+            receipt = self._lookup_execution_lease(identity)
+        except HeadUnknown:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unknown", command.causal_id, "effect-lease-unknown"),
+            )
+        except HeadTerminal:
+            self._latch_terminal()
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, self._closed_reason),
+            )
+        except ExecutionLeaseNotFound:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-not-found"),
+            )
+        except HeadConflict:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-lookup-conflict"),
+            )
+        except HeadTimeout:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-timeout"),
+            )
+        except MalformedCurrentHeadResponse:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-malformed"),
+            )
+        except CurrentHeadError:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-lookup-unclassified"),
+            )
+        if receipt.lease != execution.lease:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-mismatch"),
+            )
+        if receipt.released:
+            if not getattr(pending, "remote_attempted", False):
+                return self._unattempted_effect_result_response(
+                    command,
+                    execution,
+                    pending,
+                    Response("unavailable", command.causal_id, "effect-release-unconfirmed"),
+                )
+            # A released lease is historical proof for one exact terminal
+            # command, never generic authority for a cloned local effect row.
+            if receipt.released_operation_digest != binding.command_digest:
+                self._current_head_guard_preserved = True
+                return Response("unavailable", command.causal_id, "effect-release-owner-mismatch")
+            return receipt
+        if not allow_release:
+            # A recovery binding proves only that the original release may
+            # already have happened.  Once it is consumed into generic guard,
+            # an active lease is not permission to issue a second side effect.
+            return Response("unavailable", command.causal_id, "effect-release-unconfirmed")
+
+        try:
+            live = self._read_head()
+        except HeadUnknown:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unknown", command.causal_id, "effect-lease-unknown"),
+            )
+        except HeadTerminal:
+            self._latch_terminal()
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, self._closed_reason),
+            )
+        except HeadConflict:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-read-conflict"),
+            )
+        except HeadTimeout:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-timeout"),
+            )
+        except MalformedCurrentHeadResponse:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-malformed"),
+            )
+        except CurrentHeadError:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "effect-lease-read-unclassified"),
+            )
+        if execution.lease.authority.mismatch_reason(live) is not None:
+            self._closed_reason = "effect-intent-stale"
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, self._closed_reason),
+            )
+        if command.generation != live.generation:
+            self._clear_unattempted_effect_result(command, execution, pending)
+            raise ProtocolViolation("generation mismatch")
+        writer_proof = self._current_writer_proof(live)
+        if writer_proof is None:
+            return self._unattempted_effect_result_response(
+                command,
+                execution,
+                pending,
+                Response("unavailable", command.causal_id, "current-writer-holder-missing"),
+            )
+
+        if not getattr(pending, "remote_attempted", False):
+            if not self._completion_capability_is_held(
+                execution,
+                payload.completion_capability,
+                writer_proof,
+            ):
+                return self._unattempted_effect_result_response(
+                    command,
+                    execution,
+                    pending,
+                    Response("unavailable", command.causal_id, "effect-execution-capability-unavailable"),
+                )
+            self._store.mark_pending_effect_result_attempted(command, execution)
+        try:
+            self._release_execution_lease(
+                execution.lease,
+                writer_proof=writer_proof,
+                recovery_binding=binding,
+            )
+        except HeadUnknown:
+            return Response("unknown", command.causal_id, "effect-lease-unknown")
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except ExecutionLeaseNotFound:
+            return Response("unavailable", command.causal_id, "effect-lease-not-found")
+        except HeadConflict:
+            return Response("unavailable", command.causal_id, "effect-lease-release-conflict")
+        except HeadTimeout:
+            return Response("unavailable", command.causal_id, "effect-lease-timeout")
+        except MalformedCurrentHeadResponse:
+            return Response("unavailable", command.causal_id, "effect-lease-malformed")
+        except CurrentHeadError:
+            return Response("unavailable", command.causal_id, "effect-lease-release-unclassified")
+
+        # The release response is not completion proof.  This read executes
+        # under generic guard, before the local terminal/receipt binding.
+        try:
+            receipt = self._lookup_execution_lease(identity)
+        except HeadUnknown:
+            return Response("unknown", command.causal_id, "effect-lease-unknown")
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except MalformedCurrentHeadResponse:
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-lease-malformed")
+        except ExecutionLeaseNotFound:
+            return Response("unavailable", command.causal_id, "effect-lease-not-found")
+        except HeadConflict:
+            return Response("unavailable", command.causal_id, "effect-lease-lookup-conflict")
+        except HeadTimeout:
+            return Response("unavailable", command.causal_id, "effect-lease-timeout")
+        except CurrentHeadError:
+            return Response("unavailable", command.causal_id, "effect-lease-lookup-unclassified")
+        if receipt.lease != execution.lease or not receipt.released:
+            return Response("unavailable", command.causal_id, "effect-lease-unavailable")
+        if receipt.released_operation_digest != binding.command_digest:
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-release-owner-mismatch")
+        return receipt
+
+    def _clear_unattempted_effect_result(
+        self,
+        command: CommandEnvelope,
+        execution: ExecutingEffect,
+        pending: object,
+    ) -> None:
+        if not getattr(pending, "remote_attempted", False):
+            self._store.clear_unattempted_pending_effect_result(command, execution)
+
+    def _unattempted_effect_result_response(
+        self,
+        command: CommandEnvelope,
+        execution: ExecutingEffect,
+        pending: object,
+        response: Response,
+    ) -> Response:
+        self._clear_unattempted_effect_result(command, execution, pending)
+        return response
+
+    def _persist_effect_result_success(
+        self,
+        command: CommandEnvelope,
+        execution: ExecutingEffect,
+        receipt: ExecutionLeaseReceipt,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> Response:
+        """Atomically terminalize the effect, save replay, and clear its guard."""
+
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            raise KeyUnavailable("invalid effect result payload")
+        if receipt.lease != execution.lease or not receipt.released:
+            raise StoreUnavailable("effect release was not confirmed")
+        if receipt.released_operation_digest != binding.command_digest:
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-release-owner-mismatch")
+        # A release receipt proves historical effect completion.  It does not
+        # authorize a cloned or stale local core to write the terminal business
+        # row and replay receipt.  Revalidate the *current* writer immediately
+        # before that atomic local closure; the live authority may legitimately
+        # have advanced after the receipt was released.
+        try:
+            live = self._read_head()
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except HeadUnknown:
+            self._preserve_exact_local_closure_binding(binding)
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except (HeadConflict, HeadTimeout):
+            self._preserve_exact_local_closure_binding(binding)
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        except CurrentHeadError:
+            # An invalid or unclassified live read cannot prove the remote is
+            # nonterminal.  It consumes the exact release-replay lane.
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        if live.installation_id != execution.lease.authority.installation_id:
+            # A live authority mismatch is a confirmed boundary change, not a
+            # retryable local closure fault.  Keep generic guard forever.
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-installation-mismatch")
+        if live.site != execution.lease.authority.site:
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-site-mismatch")
+        if live.writer_fence != execution.lease.authority.writer_fence:
+            # A released lease is historical F1 proof.  Without a distinct,
+            # authenticated handoff fact, a live F2 writer cannot use it to
+            # terminalize this core's local business row or replay receipt.
+            self._current_head_guard_preserved = True
+            return Response("unavailable", command.causal_id, "effect-writer-fence-mismatch")
+        writer_validation = self._current_writer_proof_validation(live)
+        if writer_validation.proof is None:
+            self._retain_local_closure_guard_after_writer_validation(binding, writer_validation)
+            return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        terminal_effect = TerminalEffect(
+            execution=execution,
+            status=payload.status,
+            result_digest=payload.result_digest,
+        )
+        response = Response(
+            "unknown" if payload.status == "unknown" else ("accepted" if payload.status == "accepted" else "rejected"),
+            command.causal_id,
+            "effect-result-unknown" if payload.status == "unknown" else "effect-terminal",
+        )
+        self._preserve_exact_local_closure_binding(binding)
+        with self._store.transaction():
+            guard = self._store.current_head_observation_guard()
+            current = self._store.effect(payload.effect_id)
+            pending = self._store.pending_effect_result(payload.effect_id)
+            if (
+                guard is None
+                or guard.binding != binding
+                or current is None
+                or current.state != "executing"
+                or current.payload != execution
+                or pending is None
+                or not pending.matches(command, execution)
+            ):
+                raise StoreUnavailable("effect result persistence changed")
+            self._store.write_effect(payload.effect_id, payload.status, terminal_effect)
+            self._store.clear_pending_effect_result(command, execution)
+            self._store.save_receipt(command, response)
+            self._store.clear_current_head_observation(binding)
+        self._current_head_guard_owned = False
+        self._current_head_guard_binding = None
+        self._current_head_guard_preserved = False
+        if payload.status == "unknown":
+            self._closed_reason = "effect-result-unknown"
+        return response
+
+    def _recover_interrupted_current_head_observation(
+        self,
+        command: CommandEnvelope,
+        binding: CurrentHeadRecoveryBinding | None,
+    ) -> Response:
+        """Allow only a bound original causal command to close a crash tripwire."""
+
+        if binding is None or not binding.matches(command):
+            nonowner = self._interrupted_nonowner_response(command)
+            if nonowner is not None:
+                return nonowner
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        if command.action == "state.commit":
+            return self._recover_interrupted_state_commit(command, binding)
         if command.action == "effect.result":
-            return self._handle_effect(command)
+            return self._recover_interrupted_effect_result(command, binding)
+        self._closed_reason = "current-head-observation-incomplete"
+        return Response("unavailable", command.causal_id, self._closed_reason)
+
+    def _interrupted_nonowner_response(self, command: CommandEnvelope) -> Response | None:
+        """Report a known conflicting owner without relaxing the tripwire."""
+
+        payload = command.payload
+        if command.action == "state.commit" and isinstance(payload, StateCommitPayload):
+            pending = self._store.pending_for_record(payload.record_id)
+            if pending is not None and pending.command.to_wire() != command.to_wire():
+                return Response("rejected", command.causal_id, "causal-id-conflict")
+        if command.action == "state.finalize" and isinstance(payload, StateCommitPayload):
+            if self._store.pending_for_record(payload.record_id) is not None:
+                return Response("unavailable", command.causal_id, "pending-command-owner-required")
+        if command.action == "effect.result" and isinstance(payload, EffectResultPayload):
+            pending = self._store.pending_effect_result(payload.effect_id)
+            if pending is not None:
+                stored = self._store.effect(payload.effect_id)
+                if (
+                    stored is not None
+                    and stored.state == "executing"
+                    and isinstance(stored.payload, ExecutingEffect)
+                    and not pending.matches(command, stored.payload)
+                ):
+                    return Response("rejected", command.causal_id, "causal-id-conflict")
+        return None
+
+    def _recover_interrupted_state_commit(
+        self,
+        command: CommandEnvelope,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> Response:
+        pending = self._store.pending_command(command)
+        payload = command.payload
+        if (
+            pending is None
+            or not pending.remote_attempted
+            or not isinstance(payload, StateCommitPayload)
+        ):
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        stored = self._store.record(payload.record_id)
+        if (
+            stored is None
+            or stored.state not in {"prepared", "unknown"}
+            or not isinstance(stored.payload, PreparedTransition)
+        ):
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        prepared = stored.payload
+        if not prepared.target.matches_commit(
+            record_id=payload.record_id,
+            revision_digest=payload.revision_digest,
+            transition_id=payload.transition_id,
+        ):
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        local_writer_preflight = self._bound_recovery_local_writer_preflight(prepared.base)
+        if local_writer_preflight is not None:
+            return Response(
+                local_writer_preflight.status,
+                command.causal_id,
+                local_writer_preflight.reason_code,
+                local_writer_preflight.meta,
+            )
+
+        # The host proved the old writer capability without observing remote
+        # state.  Consume B before *any* remote read or writer validation: a
+        # terminal response plus a hard stop can now leave only generic guard.
+        self._begin_interrupted_current_head_recovery(binding)
+        preflight_failure: _BoundRecoveryPreflightFailure | None = None
+        try:
+            live = self._bound_recovery_live_writer_preflight(
+                prepared.base,
+                installation_mismatch_reason="prepared-installation-mismatch",
+                site_mismatch_reason="prepared-site-mismatch",
+                writer_fence_mismatch_reason="prepared-writer-fence-mismatch",
+            )
+            if isinstance(live, _BoundRecoveryPreflightFailure):
+                preflight_failure = live
+                recovered: CommittedTransition | Response = Response(
+                    live.response.status,
+                    command.causal_id,
+                    live.response.reason_code,
+                    live.response.meta,
+                )
+            else:
+                recovered = self._resolve_state_commit_remote(
+                    command,
+                    prepared,
+                    stored.state,
+                    live,
+                    binding,
+                    recovery_only=True,
+                )
+        except BaseException:
+            # This recovery phase owns a generic guard.  An unexpected process
+            # stop or adapter exception must not let a later call clear it.
+            self._current_head_guard_preserved = True
+            raise
+        finally:
+            self._current_head_guard_depth -= 1
+        if isinstance(recovered, Response):
+            retryable_lookup_failure = (
+                preflight_failure is None
+                and recovered.reason_code
+                in {
+                    "current-head-unknown",
+                    "current-head-timeout",
+                }
+            )
+            if (
+                (
+                    preflight_failure is not None
+                    and preflight_failure.resumable_by_same_live_writer
+                )
+                or retryable_lookup_failure
+            ) and not self._terminal_seen:
+                self._restore_recovery_binding_after_returned_preflight_failure(
+                    binding,
+                    still_owned=lambda: self._state_recovery_binding_still_owned(command, prepared),
+                )
+            else:
+                # A transition lookup has consumed the response-loss recovery
+                # lane, or the live adapter result was malformed/terminal.
+                # Retain generic protection rather than making B replayable.
+                self._current_head_guard_preserved = True
+            return recovered
+        # All remote reads/lookup confirmation have completed under the
+        # generic recovery guard.  Rebind only for the atomic local closure.
+        self._current_head_guard_depth += 1
+        try:
+            response = self._persist_state_commit_success(command, prepared, recovered, binding)
+            if self._current_head_guard_owned:
+                self._current_head_guard_preserved = True
+            return response
+        finally:
+            self._current_head_guard_depth -= 1
+
+    def _recover_interrupted_effect_result(
+        self,
+        command: CommandEnvelope,
+        binding: CurrentHeadRecoveryBinding,
+    ) -> Response:
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        stored = self._store.effect(payload.effect_id)
+        pending = self._store.pending_effect_result(payload.effect_id)
+        if (
+            stored is None
+            or stored.state != "executing"
+            or not isinstance(stored.payload, ExecutingEffect)
+            or pending is None
+            or not pending.remote_attempted
+        ):
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        execution = stored.payload
+        try:
+            if not pending.matches(command, execution):
+                self._closed_reason = "current-head-observation-incomplete"
+                return Response("unavailable", command.causal_id, self._closed_reason)
+        except ProtocolViolation:
+            self._closed_reason = "current-head-observation-incomplete"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        local_writer_preflight = self._bound_recovery_local_writer_preflight(
+            execution.lease.authority
+        )
+        if local_writer_preflight is not None:
+            return Response(
+                local_writer_preflight.status,
+                command.causal_id,
+                local_writer_preflight.reason_code,
+                local_writer_preflight.meta,
+            )
+
+        # The host-local old-fence proof is the only check allowed while B is
+        # still present.  All remote observation, including live writer
+        # validation, runs after B becomes generic.
+        self._begin_interrupted_current_head_recovery(binding)
+        preflight_failure: _BoundRecoveryPreflightFailure | None = None
+        try:
+            live = self._bound_recovery_live_writer_preflight(
+                execution.lease.authority,
+                installation_mismatch_reason="effect-installation-mismatch",
+                site_mismatch_reason="effect-site-mismatch",
+                writer_fence_mismatch_reason="effect-writer-fence-mismatch",
+            )
+            if isinstance(live, _BoundRecoveryPreflightFailure):
+                preflight_failure = live
+                receipt: ExecutionLeaseReceipt | Response = Response(
+                    live.response.status,
+                    command.causal_id,
+                    live.response.reason_code,
+                    live.response.meta,
+                )
+            else:
+                receipt = self._confirm_effect_result_remote(
+                    command,
+                    execution,
+                    pending,
+                    binding,
+                    allow_release=False,
+                )
+        except BaseException:
+            self._current_head_guard_preserved = True
+            raise
+        finally:
+            self._current_head_guard_depth -= 1
+        if isinstance(receipt, Response):
+            retryable_lookup_failure = (
+                preflight_failure is None
+                and receipt.reason_code in {"effect-lease-unknown", "effect-lease-timeout"}
+            )
+            if (
+                (
+                    preflight_failure is not None
+                    and preflight_failure.resumable_by_same_live_writer
+                )
+                or retryable_lookup_failure
+            ) and not self._terminal_seen:
+                self._restore_recovery_binding_after_returned_preflight_failure(
+                    binding,
+                    still_owned=lambda: self._effect_recovery_binding_still_owned(command, execution),
+                )
+            else:
+                self._current_head_guard_preserved = True
+            return receipt
+        self._current_head_guard_depth += 1
+        try:
+            response = self._persist_effect_result_success(command, execution, receipt, binding)
+            if self._current_head_guard_owned:
+                self._current_head_guard_preserved = True
+            return response
+        finally:
+            self._current_head_guard_depth -= 1
+
+    def _prewrite_remote_journal(self, command: CommandEnvelope) -> Response | None:
+        """Persist exact causal ownership before any remote mutation."""
+
+        state_preflight = self._prewrite_commit_journal(command)
+        if state_preflight is not None or command.action != "effect.result":
+            return state_preflight
+        return self._prewrite_effect_result_journal(command)
+
+    def _prewrite_commit_journal(self, command: CommandEnvelope) -> Response | None:
+        """Durably bind a fresh remote commit to its exact causal command.
+
+        A prepared row alone cannot prove who owns an ambiguous remote CAS.  A
+        new commit therefore gets an encrypted record-scoped journal only while
+        current-head still exactly equals the authority saved at prepare time.
+        Existing journals are never replaced by a different causal ID.
+        """
+
+        if command.action != "state.commit":
+            return None
+        payload = command.payload
+        if not isinstance(payload, StateCommitPayload):
+            raise ProtocolViolation("invalid commit payload")
+        current = self._store.record(payload.record_id)
+        if current is None or current.state not in {"prepared", "unknown"}:
+            return None
+        if not isinstance(current.payload, PreparedTransition):
+            raise KeyUnavailable("invalid prepared state")
+        prepared = current.payload
+        if not prepared.target.matches_commit(
+            record_id=payload.record_id,
+            revision_digest=payload.revision_digest,
+            transition_id=payload.transition_id,
+        ):
+            return None
+        # An unknown row without its original journal is not eligible for any
+        # new command to claim; it remains fail-closed for operator recovery.
+        if current.state == "unknown":
+            pending = self._store.pending_for_record(payload.record_id)
+            if pending is not None and pending.command.to_wire() != command.to_wire():
+                raise CausalIdConflict("causal-id-conflict")
+            return None
+        if (
+            command.generation != prepared.base.generation
+            or payload.writer_fence != prepared.base.writer_fence
+        ):
+            return None
+        existing_pending = self._store.pending_for_record(payload.record_id)
+        if existing_pending is not None:
+            if existing_pending.command.to_wire() != command.to_wire():
+                raise CausalIdConflict("causal-id-conflict")
+            if existing_pending.remote_attempted:
+                # This journal already crossed the pre-CAS phase boundary;
+                # leave recovery to the state handler rather than erasing an
+                # operation whose remote outcome may be ambiguous.
+                return None
+        try:
+            head = self._read_head()
+        except HeadUnknown:
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except (HeadConflict, HeadTimeout):
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        except HeadTerminal:
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except CurrentHeadError:
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        # Leave terminal and stale authority responses to the normal state
+        # handler, but only journal a CAS that is still safe to issue.
+        if head != prepared.base:
+            return None
+        # Owning a durable CAS-recovery lane is itself authority-sensitive.
+        # A copied database plus the public fence text must not be able to
+        # reserve/poison a real writer's causal ID before the later CAS check.
+        if self._current_writer_proof(head) is None:
+            return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        # Recheck the encrypted local record and reserve in one SQLite write
+        # transaction.  The reservation is explicitly *unattempted* until a
+        # second remote read proves it is still safe to call CAS.
+        if not self._store.reserve_pending_commit(command, prepared):
+            return None
+        try:
+            confirmed = self._read_head()
+        except HeadUnknown:
+            self._store.clear_unattempted_pending_command(command)
+            return Response("unknown", command.causal_id, "current-head-unknown")
+        except (HeadConflict, HeadTimeout):
+            self._store.clear_unattempted_pending_command(command)
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        except HeadTerminal:
+            self._store.clear_unattempted_pending_command(command)
+            self._latch_terminal()
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except CurrentHeadError:
+            self._store.clear_unattempted_pending_command(command)
+            return Response("unavailable", command.causal_id, "current-head-unavailable")
+        if confirmed != prepared.base:
+            # No remote operation has been attempted for an explicitly
+            # unattempted journal.  Do not turn a stale local preflight into an
+            # unrecoverable causal reservation.
+            self._store.clear_unattempted_pending_command(command)
+            return Response("unavailable", command.causal_id, "current-head-conflict")
+        if self._current_writer_proof(confirmed) is None:
+            # No remote CAS was attempted, so a lost holder proof can safely
+            # release this still-unattempted reservation instead of leaving a
+            # stale process to deny the live writer forever.
+            self._store.clear_unattempted_pending_command(command)
+            return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        self._store.mark_pending_remote_attempted(command)
+        return None
+
+    def _prewrite_effect_result_journal(self, command: CommandEnvelope) -> Response | None:
+        """Reserve an effect terminal result before its remote lease release.
+
+        Unlike an ordinary receipt, this durable record never includes the raw
+        completion capability.  It binds its holder hash and the complete
+        command authority so a later causal ID cannot claim a response-lost
+        remote release.
+        """
+
+        payload = command.payload
+        if not isinstance(payload, EffectResultPayload):
+            raise ProtocolViolation("invalid effect result payload")
+        if payload.terminal is not True:
+            # Validation must precede durable ownership reservation; otherwise
+            # an invalid partial result could permanently seize this effect's
+            # causal recovery lane without ever touching current-head.
+            raise ProtocolViolation("effect result is incomplete")
+        stored = self._store.effect(payload.effect_id)
+        if stored is None or stored.state != "executing":
+            return None
+        if not isinstance(stored.payload, ExecutingEffect):
+            raise KeyUnavailable("invalid executing effect")
+        execution = stored.payload
+        existing = self._store.pending_effect_result(payload.effect_id)
+        if existing is None:
+            if command.generation != execution.lease.authority.generation:
+                # A fresh terminal result is authorized only at the generation
+                # that issued its execution lease.  An exact already-attempted
+                # causal replay may later close a released lease after another
+                # writer has advanced current-head; it is handled by recovery.
+                raise ProtocolViolation("generation mismatch")
+            try:
+                live = self._read_head()
+            except HeadUnknown:
+                return Response("unknown", command.causal_id, "effect-lease-unknown")
+            except HeadTerminal:
+                self._latch_terminal()
+                return Response("unavailable", command.causal_id, self._closed_reason)
+            except (HeadConflict, HeadTimeout, CurrentHeadError):
+                return Response("unavailable", command.causal_id, "effect-lease-unavailable")
+            if execution.lease.authority.mismatch_reason(live) is not None:
+                return Response("unavailable", command.causal_id, "effect-intent-stale")
+            # As with a state CAS journal, a fresh effect-result reservation is
+            # durable ownership.  Require a live host-only writer proof before
+            # it reaches SQLite, otherwise a clone can DoS the real executor.
+            if self._current_writer_proof(live) is None:
+                return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        # Reservation also validates effect/intent/lease/holder binding.  The
+        # attempted marker is committed immediately before the remote release:
+        # a crash after it can only be recovered by this exact causal command.
+        self._store.reserve_pending_effect_result(command, execution)
+        return None
+
+    def _persist_rejection(self, command: CommandEnvelope, reason_code: str) -> Response:
+        response = Response("rejected", command.causal_id, reason_code)
+        try:
+            with self._store.transaction():
+                if self._store.has_pending_causal_id(command.causal_id):
+                    return response
+                self._store.save_receipt(command, response)
+        except (CausalIdConflict, KeyUnavailable):
+            # A malformed command never gets to rewrite state; inability to save
+            # a synthetic rejection is still fail-closed.
+            self._closed_reason = "health-key-unavailable"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
+            return Response("unavailable", command.causal_id, self._closed_reason)
+        return response
+
+    def _handle_new(self, command: CommandEnvelope) -> _Handled:
+        if command.action == "probe":
+            report = self.probe()
+            return _Handled(
+                Response("accepted", command.causal_id, report.reason_code, ProbeMeta(report.state.value)),
+                False,
+            )
+
+        try:
+            head = self._read_head()
+        except HeadUnknown:
+            return _Handled(Response("unknown", command.causal_id, "current-head-unknown"), False)
+        except (HeadConflict, HeadTimeout):
+            return _Handled(Response("unavailable", command.causal_id, "current-head-unavailable"), False)
+        except HeadTerminal:
+            self._latch_terminal()
+            return _Handled(Response("unavailable", command.causal_id, self._closed_reason), False)
+        except CurrentHeadError:
+            return _Handled(Response("unavailable", command.causal_id, "current-head-unavailable"), False)
+
+        # A response-lost commit retries with the original prepared generation;
+        # its state-specific branch below can only reconcile an existing
+        # encrypted ``unknown`` operation by transition lookup.
+        if command.generation != head.generation and command.action not in {"state.commit", "effect.result"}:
+            raise ProtocolViolation("generation mismatch")
+        if command.action == "effect.result" and command.generation != head.generation:
+            payload = command.payload
+            if not isinstance(payload, EffectResultPayload):
+                raise ProtocolViolation("invalid effect result payload")
+            stored = self._store.effect(payload.effect_id)
+            pending = self._store.pending_effect_result(payload.effect_id)
+            if (
+                stored is None
+                or stored.state != "executing"
+                or not isinstance(stored.payload, ExecutingEffect)
+                or pending is None
+                or not pending.remote_attempted
+                or not pending.matches(command, stored.payload)
+            ):
+                raise ProtocolViolation("generation mismatch")
+        if head.terminal:
+            self._latch_terminal()
+            return _Handled(Response("unavailable", command.causal_id, self._closed_reason), False)
+
+        if command.action not in _PROBE_BYPASS_ACTIONS:
+            report = self._probe_for_head(head)
+            if report.state is ProbeState.HEALTHY and self._current_writer_proof(head) is None:
+                return _Handled(
+                    Response("unavailable", command.causal_id, "current-writer-holder-missing"),
+                    False,
+                )
+            if report.state is not ProbeState.HEALTHY:
+                return _Handled(Response("unavailable", command.causal_id, report.reason_code), False)
+
+        if command.action in _STATE_ACTIONS:
+            return self._handle_state(command, head)
+        if command.action == "effect.request":
+            return self._handle_effect_request(command, head)
+        if command.action == "effect.result":
+            raise StoreUnavailable("effect result must use the remote handler")
         raise ProtocolViolation("unknown action")
 
-    def _handle_state(self, command: CommandEnvelope, head: Any) -> Response:
-        payload = dict(command.payload)
-        record_id = payload["record_id"]
-        revision = payload["revision_digest"]
-        transition = payload["transition_id"]
+    def _handle_state(self, command: CommandEnvelope, head: AuthoritySnapshot) -> _Handled:
+        payload = command.payload
+        if not isinstance(payload, (StateCandidatePayload, StateCommitPayload)):
+            raise ProtocolViolation("invalid state payload")
+        record_id = payload.record_id
+        revision_digest = payload.revision_digest
+        transition_id = payload.transition_id
         current = self._store.record(record_id)
+
         if command.action == "state.candidate":
-            self._store.write_record(record_id, "candidate", revision, transition, payload)
-            return Response("accepted", command.causal_id, "candidate-recorded")
-        if current is None or current[0] not in {"candidate", "prepared", "committed"}:
-            raise ProtocolViolation("record is not prepared for this action")
-        if command.action == "state.prepare":
-            self._store.write_record(record_id, "prepared", revision, transition, payload)
-            return Response("accepted", command.causal_id, "revision-prepared")
-        if command.action == "state.commit":
-            if current[0] != "prepared":
-                raise ProtocolViolation("record is not prepared")
-            try:
-                updated = self._current_head.conditional_advance(
-                    expected_generation=head.generation,
-                    expected_revision_digest=head.revision_digest,
-                    transition_id=transition,
-                    revision_digest=revision,
-                    writer_fence=payload.get("writer_fence"),
-                )
-            except HeadConflict:
-                self._closed_reason = "current-head-conflict"
-                return Response("unavailable", command.causal_id, self._closed_reason)
-            except HeadTimeout:
-                self._closed_reason = "current-head-timeout"
-                return Response("unavailable", command.causal_id, self._closed_reason)
-            except HeadUnknown:
-                self._store.write_record(record_id, "unknown", revision, transition, payload)
-                self._closed_reason = "current-head-unknown"
-                return Response("unknown", command.causal_id, self._closed_reason)
-            except HeadTerminal:
-                self._closed_reason = "current-head-terminal"
-                return Response("unavailable", command.causal_id, self._closed_reason)
-            self._store.write_record(record_id, "committed", revision, transition, {**payload, "writer_fence": updated.writer_fence})
-            return Response(
-                "accepted",
-                command.causal_id,
-                "current-head-advanced",
-                {"generation": updated.generation, "writer_fence": updated.writer_fence},
+            if not isinstance(payload, StateCandidatePayload):
+                raise ProtocolViolation("invalid candidate payload")
+            target = RevisionTarget(
+                record_id=payload.record_id,
+                revision_digest=payload.revision_digest,
+                transition_id=payload.transition_id,
+                payload_digest=payload.payload_digest,
             )
+            if current is not None:
+                raise ProtocolViolation("record already exists")
+            self._store.write_record(
+                target.record_id,
+                "candidate",
+                target.revision_digest,
+                target.transition_id,
+                target,
+            )
+            return _Handled(Response("accepted", command.causal_id, "candidate-recorded"), True)
+
+        if current is None:
+            raise ProtocolViolation("record is required for this action")
+        current_state = current.state
+        current_revision = current.revision_digest
+        current_transition = current.transition_id
+        current_payload = current.payload
+        if current_revision != revision_digest or current_transition != transition_id:
+            raise ProtocolViolation("record transition changed")
+
+        if command.action == "state.prepare":
+            if not isinstance(payload, StateCandidatePayload):
+                raise ProtocolViolation("invalid prepare payload")
+            target = RevisionTarget(
+                record_id=payload.record_id,
+                revision_digest=payload.revision_digest,
+                transition_id=payload.transition_id,
+                payload_digest=payload.payload_digest,
+            )
+            if current_state != "candidate":
+                raise ProtocolViolation("record is not a candidate")
+            if not isinstance(current_payload, RevisionTarget):
+                raise KeyUnavailable("invalid candidate state")
+            candidate = current_payload
+            if candidate != target:
+                raise ProtocolViolation("record transition changed")
+            prepared = PreparedTransition(target=target, base=head)
+            self._store.write_record(
+                target.record_id,
+                "prepared",
+                target.revision_digest,
+                target.transition_id,
+                prepared,
+            )
+            return _Handled(Response("accepted", command.causal_id, "revision-prepared"), True)
+
         if command.action == "state.finalize":
-            if current[0] not in {"prepared", "committed"}:
-                raise ProtocolViolation("record is not ready to finalize")
-            if (
-                payload["writer_fence"] != head.writer_fence
-                or revision != head.revision_digest
-                or transition != head.transition_id
-            ):
+            if not isinstance(payload, StateCommitPayload):
+                raise ProtocolViolation("invalid finalize payload")
+            writer_fence = payload.writer_fence
+            if writer_fence != head.writer_fence:
                 self._closed_reason = "stale-writer-fence"
-                return Response("unavailable", command.causal_id, self._closed_reason)
-            self._store.write_record(record_id, "final", revision, transition, payload)
+                return _Handled(Response("unavailable", command.causal_id, self._closed_reason), False)
+            if current_state in {"prepared", "unknown"}:
+                pending = self._store.pending_for_record(record_id)
+                if pending is not None:
+                    # A pending journal belongs to the original state.commit.
+                    # Only that exact command may reconcile its ambiguous CAS;
+                    # a separate finalize causal ID cannot claim or erase it.
+                    return _Handled(
+                        Response("unavailable", command.causal_id, "pending-command-owner-required"),
+                        False,
+                    )
+                return _Handled(
+                    Response("unavailable", command.causal_id, "pending-command-missing"),
+                    False,
+                )
+            if current_state != "committed":
+                raise ProtocolViolation("record is not ready to finalize")
+            committed = self._finalization_authority(current_state, current_payload, head)
+            if isinstance(committed, _Handled):
+                return self._with_causal_id(committed, command.causal_id)
+            if not committed.prepared.target.matches_commit(
+                record_id=record_id,
+                revision_digest=revision_digest,
+                transition_id=transition_id,
+            ):
+                raise ProtocolViolation("record transition changed")
+            if self._current_writer_proof(head) is None:
+                return _Handled(
+                    Response("unavailable", command.causal_id, "current-writer-holder-missing"),
+                    False,
+                )
+            self._store.write_finalized_record(
+                record_id,
+                revision_digest,
+                transition_id,
+                committed,
+                committed.committed,
+            )
             self._closed_reason = None
-            return Response("accepted", command.causal_id, "revision-finalized")
+            return _Handled(Response("accepted", command.causal_id, "revision-finalized"), True)
+
         raise ProtocolViolation("unknown state action")
 
-    def _handle_effect(self, command: CommandEnvelope) -> Response:
-        payload = dict(command.payload)
-        state = payload["status"]
-        if not payload["terminal"]:
-            raise ProtocolViolation("effect result is incomplete")
-        self._store.write_effect(payload["effect_id"], state, payload)
-        if state == "unknown":
-            self._closed_reason = "effect-result-unknown"
-            return Response("unknown", command.causal_id, self._closed_reason)
-        return Response("accepted" if state == "accepted" else "rejected", command.causal_id, "effect-terminal")
+    def _finalization_authority(
+        self,
+        state: str,
+        payload: object,
+        head: AuthoritySnapshot,
+        binding: CurrentHeadRecoveryBinding | None = None,
+    ) -> CommittedTransition | _Handled:
+        if state == "committed":
+            if not isinstance(payload, CommittedTransition):
+                raise KeyUnavailable("invalid committed state")
+            committed = payload
+            mismatch = committed.committed.mismatch_reason(head)
+            if mismatch is not None:
+                self._closed_reason = "stale-writer-fence"
+                return _Handled(Response("unavailable", None, self._closed_reason), False)
+            if not self._target_matches_authority(committed.prepared, head):
+                return _Handled(Response("unavailable", None, "transition-recovery-mismatch"), False)
+            return committed
+
+        if not isinstance(payload, PreparedTransition):
+            raise KeyUnavailable("invalid prepared state")
+        if binding is None:
+            return _Handled(Response("unavailable", None, "transition-recovery-unconfirmed"), False)
+        prepared = payload
+        if prepared.base.installation_id != head.installation_id:
+            self._closed_reason = "prepared-installation-mismatch"
+            return _Handled(Response("unavailable", None, self._closed_reason), False)
+        recovery_request = AdvanceIdentity(
+            expected=prepared.base,
+            transition_id=prepared.target.transition_id,
+            revision_digest=prepared.target.revision_digest,
+            writer_fence=prepared.base.writer_fence,
+            operation_digest=binding.command_digest,
+        )
+        try:
+            lookup_receipt = self._lookup_transition(recovery_request)
+        except HeadUnknown:
+            return _Handled(Response("unknown", None, "current-head-unknown"), False)
+        except TransitionNotFound:
+            return _Handled(Response("unavailable", None, "transition-not-found"), False)
+        except HeadConflict:
+            return _Handled(Response("unavailable", None, "current-head-lookup-conflict"), False)
+        except HeadTimeout:
+            return _Handled(Response("unavailable", None, "current-head-timeout"), False)
+        except HeadTerminal:
+            self._latch_terminal()
+            return _Handled(Response("unavailable", None, self._closed_reason), False)
+        except MalformedCurrentHeadResponse:
+            return _Handled(Response("unavailable", None, "current-head-malformed"), False)
+        except CurrentHeadError:
+            return _Handled(Response("unavailable", None, "current-head-lookup-unclassified"), False)
+        if lookup_receipt.request != recovery_request:
+            return _Handled(Response("unavailable", None, "transition-lookup-expected-mismatch"), False)
+        lookup = lookup_receipt.applied.as_authority()
+        if lookup.mismatch_reason(head) is not None:
+            return _Handled(Response("unavailable", None, "current-head-transition-lookup-mismatch"), False)
+        try:
+            # A lookup receipt is historical proof, not a current authority
+            # proof.  Re-read after lookup so another writer cannot overtake
+            # this transition between remote recovery and local acceptance.
+            confirmed = self._confirm_advanced_head(lookup)
+        except HeadUnknown:
+            return _Handled(Response("unknown", None, "current-head-unknown"), False)
+        except HeadTerminal:
+            self._latch_terminal()
+            return _Handled(Response("unavailable", None, self._closed_reason), False)
+        except HeadConflict:
+            return _Handled(Response("unavailable", None, "current-head-confirmation-conflict"), False)
+        except HeadTimeout:
+            return _Handled(Response("unavailable", None, "current-head-timeout"), False)
+        except MalformedCurrentHeadResponse:
+            return _Handled(Response("unavailable", None, "current-head-malformed"), False)
+        except CurrentHeadError:
+            return _Handled(Response("unavailable", None, "current-head-confirmation-unclassified"), False)
+        if not self._target_matches_authority(prepared, lookup):
+            return _Handled(Response("unavailable", None, "transition-recovery-mismatch"), False)
+        return CommittedTransition(prepared=prepared, committed=confirmed)
+
+    @staticmethod
+    def _with_causal_id(handled: _Handled, causal_id: str) -> _Handled:
+        return _Handled(
+            Response(
+                handled.response.status,
+                causal_id,
+                handled.response.reason_code,
+                handled.response.meta,
+            ),
+            handled.persist_receipt,
+        )
+
+    def _handle_effect_request(self, command: CommandEnvelope, head: AuthoritySnapshot) -> _Handled:
+        payload = command.payload
+        if not isinstance(payload, EffectRequestPayload):
+            raise ProtocolViolation("invalid effect request payload")
+        effect_kind = payload.effect_kind
+        if effect_kind == "contact-delivery":
+            return _Handled(
+                Response("rejected", command.causal_id, "contact-delivery-not-supported-in-ticket-110"),
+                True,
+            )
+        if effect_kind != "model-work":
+            return _Handled(
+                Response("rejected", command.causal_id, "delivery-not-supported-in-ticket-110"),
+                True,
+            )
+        intent = EffectIntent(
+            effect_id=self._effect_id(command.causal_id),
+            effect_kind=effect_kind,
+            intent_digest=payload.request_digest,
+            authority=head,
+        )
+        self._store.write_effect(intent.effect_id, "intent", intent)
+        return _Handled(
+            Response("accepted", command.causal_id, "effect-intent-issued", EffectIntentMeta(intent)),
+            True,
+        )
+
+    @staticmethod
+    def _effect_id(causal_id: str) -> str:
+        """Derive a bounded opaque effect ID from an already bounded causal ID."""
+
+        return "effect:" + hashlib.sha256(causal_id.encode("utf-8")).hexdigest()
+
+    def _execution_capability_session(
+        self,
+        authority: AuthoritySnapshot,
+        writer_proof: WriterFenceProof,
+    ) -> ExecutionCapabilitySession | None:
+        session = self._execution_capability_sessions.get(authority)
+        if session is not None:
+            try:
+                if session.active():
+                    return session
+            except Exception:
+                pass
+        self._execution_capability_sessions.pop(authority, None)
+        vault = self._execution_capability_vault
+        if vault is None:
+            return None
+        session = vault.acquire_or_resume_session(authority, writer_proof)
+        if (
+            session is None
+            or not callable(getattr(session, "active", None))
+            or not callable(getattr(session, "mint", None))
+            or not callable(getattr(session, "recover", None))
+            or not callable(getattr(session, "release", None))
+        ):
+            return None
+        try:
+            if not session.active():
+                return None
+        except Exception:
+            return None
+        self._execution_capability_sessions[authority] = session
+        return session
+
+    def _completion_capability_is_held(
+        self,
+        execution: ExecutingEffect,
+        completion_capability: str,
+        writer_proof: WriterFenceProof,
+    ) -> bool:
+        """Verify a raw completion bearer locally, never at current-head."""
+
+        try:
+            holder_id = holder_id_for(completion_capability)
+        except ValueError:
+            return False
+        if holder_id != execution.lease.holder_id:
+            return False
+        session = self._execution_capability_session(execution.intent.authority, writer_proof)
+        if session is None:
+            return False
+        expected = session.recover(ExecutionCapabilityBinding.for_execution(execution), holder_id)
+        return expected is not None and secrets.compare_digest(expected, completion_capability)
+
+    @staticmethod
+    def _canonical_effect_intent_from_caller(value: object) -> EffectIntent | None:
+        """Accept only an exact, primitive-safe copy of a core-issued intent."""
+
+        if type(value) is not EffectIntent:
+            return None
+        try:
+            authority = value.authority
+            if type(authority) is not AuthoritySnapshot:
+                return None
+            validate_ticket110_effect_kind(value.effect_kind)
+            return EffectIntent(
+                effect_id=value.effect_id,
+                effect_kind=value.effect_kind,
+                intent_digest=value.intent_digest,
+                authority=AuthoritySnapshot(
+                    installation_id=authority.installation_id,
+                    generation=authority.generation,
+                    revision_digest=authority.revision_digest,
+                    transition_id=authority.transition_id,
+                    writer_fence=authority.writer_fence,
+                    terminal=authority.terminal,
+                    site=authority.site,
+                ),
+            )
+        except Exception:
+            return None
+
+    def claim_effect_execution(self, intent: EffectIntent) -> EffectExecutionGrant | None:
+        """Claim an effect under a durable terminal-observation tripwire."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            return self._claim_effect_execution_open(intent)
+
+    def _claim_effect_execution_open(self, intent: EffectIntent) -> EffectExecutionGrant | None:
+        """Run an admitted effect claim while its writer holder remains live."""
+
+        requested_intent = self._canonical_effect_intent_from_caller(intent)
+        if requested_intent is None:
+            return None
+        try:
+            with self._store.serialized():
+                self._store.verify_key()
+                if self._terminal_closed():
+                    return None
+                if self._writer_entry_preflight() is not None:
+                    return None
+                # Claim performs remote reads/acquire after local claim state is
+                # written.  Persist the terminal tripwire before entering that
+                # transaction so a process stop cannot lose a terminal read.
+                self._enter_current_head_guard()
+                try:
+                    return self._claim_effect_execution_guarded(requested_intent)
+                finally:
+                    self._exit_current_head_guard()
+        except KeyUnavailable:
+            self._closed_reason = "health-key-unavailable"
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
+        return None
+
+    def _claim_effect_execution_guarded(self, intent: EffectIntent) -> EffectExecutionGrant | None:
+        """Issue an unforgeable completion grant only after a proved lease claim.
+
+        The durable ``claiming`` phase is committed before the remote acquire.
+        It contains only ``H(completion_capability)``; a cloned store can see
+        the binding but cannot re-acquire, execute, or terminalize the effect.
+        The same core can recover a lost acquire response using its local
+        capability, then must read back both the remote lease and authority.
+        """
+
+        try:
+            with self._store.serialized():
+                self._store.verify_key()
+                if self._terminal_closed():
+                    return None
+
+                capability: str | None = None
+                claim: ClaimingEffect | None = None
+                issued_intent: EffectIntent | None = None
+                with self._store.transaction():
+                    head = self._read_head()
+                    if head.terminal:
+                        self._latch_terminal()
+                        return None
+                    writer_proof = self._current_writer_proof(head)
+                    if writer_proof is None:
+                        return None
+                    authority = self._store.finalized_authority()
+                    if authority is None or authority.mismatch_reason(head) is not None:
+                        return None
+                    if not self._store.verify_integrity(authority):
+                        return None
+                    if self._store.has_pending_commands():
+                        return None
+                    unresolved_states = self._store.unresolved_states()
+                    if any(state in {"prepared", "committed", "unknown"} for state in unresolved_states):
+                        return None
+                    stored = self._store.effect(intent.effect_id)
+                    if stored is None:
+                        return None
+                    unresolved_effects = self._store.unresolved_effects()
+                    if unresolved_effects != (intent.effect_id,):
+                        return None
+                    if stored.state == "intent" and type(stored.payload) is EffectIntent:
+                        issued_intent = stored.payload
+                        if issued_intent != intent or issued_intent.authority.mismatch_reason(head) is not None:
+                            return None
+                        session = self._execution_capability_session(issued_intent.authority, writer_proof)
+                        if session is None:
+                            return None
+                        provisional_claim = ClaimingEffect(
+                            intent=issued_intent,
+                            holder_id="holder:pending",
+                            vault_claim_ref="claim:" + secrets.token_urlsafe(24),
+                        )
+                        binding = ExecutionCapabilityBinding.for_claim(provisional_claim)
+                        capability = session.mint(binding)
+                        if capability is None:
+                            return None
+                        claim = ClaimingEffect(
+                            intent=issued_intent,
+                            holder_id=holder_id_for(capability),
+                            vault_claim_ref=provisional_claim.vault_claim_ref,
+                        )
+                        self._store.write_effect(issued_intent.effect_id, "claiming", claim)
+                    elif stored.state == "claiming" and type(stored.payload) is ClaimingEffect:
+                        claim = stored.payload
+                        issued_intent = claim.intent
+                        if type(issued_intent) is not EffectIntent or issued_intent != intent:
+                            return None
+                        if issued_intent.authority.mismatch_reason(head) is not None:
+                            return None
+                        session = self._execution_capability_session(issued_intent.authority, writer_proof)
+                        if session is None:
+                            return None
+                        capability = session.recover(
+                            ExecutionCapabilityBinding.for_claim(claim),
+                            claim.holder_id,
+                        )
+                        if capability is None or holder_id_for(capability) != claim.holder_id:
+                            # A process that did not mint the capability may
+                            # observe the unresolved claim but cannot take it.
+                            return None
+                    else:
+                        return None
+
+                if capability is None or claim is None or issued_intent is None:
+                    return None
+                # The first durable phase has committed.  Remote acquisition
+                # occurs outside the SQLite transaction so an I/O failure can
+                # never roll it back and hand the effect to another holder.
+                head = self._read_head()
+                if head.terminal:
+                    self._latch_terminal()
+                    return None
+                if issued_intent.authority.mismatch_reason(head) is not None:
+                    return None
+                writer_proof = self._current_writer_proof(head)
+                if writer_proof is None:
+                    return None
+                request = ExecutionLeaseRequest(
+                    expected=head,
+                    effect_id=issued_intent.effect_id,
+                    intent_digest=issued_intent.intent_digest,
+                    writer_fence=head.writer_fence,
+                    holder_id=claim.holder_id,
+                    writer_proof=writer_proof,
+                )
+                acquired = self._acquire_execution_lease(request)
+                observed = self._lookup_execution_lease(request.identity())
+                if acquired != observed or observed.released:
+                    return None
+                confirmed = self._read_head()
+                if confirmed.terminal:
+                    self._latch_terminal()
+                    return None
+                if observed.lease.authority.mismatch_reason(confirmed) is not None:
+                    return None
+                execution = ExecutingEffect(
+                    intent=issued_intent,
+                    lease=observed.lease,
+                    vault_claim_ref=claim.vault_claim_ref,
+                )
+                with self._store.transaction():
+                    stored = self._store.effect(issued_intent.effect_id)
+                    if stored is None or stored.state != "claiming" or stored.payload != claim:
+                        return None
+                    self._store.write_effect(issued_intent.effect_id, "executing", execution)
+                return EffectExecutionGrant(
+                    lease=observed.lease,
+                    completion_capability=capability,
+                )
+        except KeyUnavailable:
+            self._closed_reason = "health-key-unavailable"
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
+        except HeadTerminal:
+            self._latch_terminal()
+        except (ExecutionLeaseNotFound, HeadConflict, HeadTimeout, HeadUnknown, CurrentHeadError):
+            pass
+        return None
 
     def probe(self) -> ProbeReport:
-        if self._closed_reason in {"current-head-unknown", "effect-result-unknown", "health-key-unavailable"}:
-            return ProbeReport(ProbeState.UNKNOWN, self._closed_reason)
+        with self._lifecycle_lock:
+            if self._closed:
+                return ProbeReport(ProbeState.UNAVAILABLE, "current-writer-holder-missing")
+            return self._probe_open()
+
+    def _probe_open(self) -> ProbeReport:
+        # A probe must never observe this SQLite connection between a business
+        # write and its replay receipt.  Share the same writer lane as handle()
+        # so health/model/outbound gates see only committed domain snapshots.
+        with self._store.serialized():
+            try:
+                self._store.verify_key()
+                interrupted = self._store.current_head_observation_guard()
+                if interrupted is not None and interrupted.binding is not None:
+                    # A bound guard can be closed only by its original causal
+                    # command.  It is never healthy, but reporting UNKNOWN
+                    # preserves the distinction from an unbound terminal/read
+                    # tripwire while model and outbound gates remain closed.
+                    reason = (
+                        "effect-result-unknown"
+                        if interrupted.binding.action == "effect.result"
+                        else "current-head-recovery-required"
+                    )
+                    return ProbeReport(ProbeState.UNKNOWN, reason)
+                if self._terminal_closed():
+                    return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+                writer_entry = self._writer_entry_preflight()
+                if writer_entry is not None:
+                    reason = writer_entry.reason_code or "current-writer-holder-missing"
+                    state = (
+                        ProbeState.UNKNOWN
+                        if reason == "local-finalized-authority-missing"
+                        else ProbeState.UNAVAILABLE
+                    )
+                    return ProbeReport(state, reason)
+                self._enter_current_head_guard()
+                try:
+                    head = self._read_head()
+                    report = self._probe_for_head(head)
+                    if report.state is ProbeState.HEALTHY and self._current_writer_proof(head) is None:
+                        return ProbeReport(ProbeState.UNAVAILABLE, "current-writer-holder-missing")
+                    return report
+                finally:
+                    self._exit_current_head_guard()
+            except KeyUnavailable:
+                self._closed_reason = "health-key-unavailable"
+                return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+            except StoreUnavailable:
+                self._closed_reason = "health-state-unavailable"
+                return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+            except HeadUnknown:
+                return ProbeReport(ProbeState.UNKNOWN, "current-head-unknown")
+            except (HeadConflict, HeadTimeout):
+                return ProbeReport(ProbeState.UNKNOWN, "current-head-unavailable")
+            except HeadTerminal:
+                self._latch_terminal()
+                return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+            except CurrentHeadError:
+                return ProbeReport(ProbeState.UNAVAILABLE, "current-head-unavailable")
+
+    def _probe_for_head(self, head: AuthoritySnapshot) -> ProbeReport:
         try:
-            self._store.verify_key()
-            head = self._current_head.read().head
+            # Take one SQLite snapshot: plaintext row labels are indexes, not
+            # proof, so validate every encrypted payload before a healthy
+            # response can escape this method.
+            with self._store.transaction():
+                self._store.verify_key()
+                if self._terminal_closed():
+                    return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+                authority = self._store.finalized_authority()
+                if head.terminal:
+                    self._latch_terminal()
+                    return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
+                if authority is None:
+                    return ProbeReport(ProbeState.UNKNOWN, "local-finalized-authority-missing")
+                mismatch_reason = authority.mismatch_reason(head)
+                if mismatch_reason is not None:
+                    return ProbeReport(ProbeState.UNKNOWN, mismatch_reason)
+                if not self._store.verify_integrity(authority):
+                    return ProbeReport(ProbeState.UNKNOWN, "local-finalized-record-missing")
+                if self._store.has_pending_commands():
+                    return ProbeReport(ProbeState.UNKNOWN, "local-pending-command")
+                unresolved = self._store.unresolved_states()
+                if "unknown" in unresolved:
+                    return ProbeReport(ProbeState.UNKNOWN, "local-transition-unknown")
+                if any(state in {"prepared", "committed"} for state in unresolved):
+                    return ProbeReport(ProbeState.UNKNOWN, "local-transition-unresolved")
+                if self._store.unresolved_effects():
+                    return ProbeReport(ProbeState.UNKNOWN, "effect-result-unknown")
         except KeyUnavailable:
             self._closed_reason = "health-key-unavailable"
             return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
-        except HeadUnknown:
-            return ProbeReport(ProbeState.UNKNOWN, "current-head-unknown")
-        except (HeadConflict, HeadTimeout):
-            return ProbeReport(ProbeState.UNKNOWN, "current-head-unavailable")
-        if head.terminal:
-            return ProbeReport(ProbeState.UNAVAILABLE, "terminal-deletion")
-        unresolved = self._store.unresolved_states()
-        if "unknown" in unresolved:
-            return ProbeReport(ProbeState.UNKNOWN, "local-transition-unknown")
-        if any(state in {"prepared", "committed"} for state in unresolved):
-            return ProbeReport(ProbeState.UNKNOWN, "local-transition-unresolved")
-        if self._closed_reason is not None:
+        except StoreUnavailable:
+            self._closed_reason = "health-state-unavailable"
             return ProbeReport(ProbeState.UNAVAILABLE, self._closed_reason)
-        return ProbeReport(ProbeState.HEALTHY, "contract-ok", checks=("key-boundary", "current-head", "single-writer"))
+        if self._closed_reason in _PERSISTENT_CLOSE_REASONS:
+            state = ProbeState.UNKNOWN if self._closed_reason == "effect-result-unknown" else ProbeState.UNAVAILABLE
+            return ProbeReport(state, self._closed_reason)
+        # A successful full proof clears only non-persistent/transient errors.
+        self._closed_reason = None
+        return ProbeReport(
+            ProbeState.HEALTHY,
+            "contract-ok",
+            checks=(
+                "key-boundary",
+                "current-head",
+                "local-finalized-authority",
+                "local-finalized-record",
+                "single-writer",
+            ),
+        )
 
     def health_writes_allowed(self) -> bool:
         return self.probe().state is ProbeState.HEALTHY
 
     def model_effects_allowed(self) -> bool:
-        return self.health_writes_allowed()
+        return self._execution_capability_vault is not None and self.health_writes_allowed()
 
     def outbound_effects_allowed(self) -> bool:
-        return self.health_writes_allowed()
+        return self._execution_capability_vault is not None and self.health_writes_allowed()
 
-    def _read_head_or_close(self) -> Any:
+    def _guard_current_head_call(
+        self,
+        operation: Callable[[], _CurrentHeadValue],
+    ) -> _CurrentHeadValue:
+        """Persist a tripwire before an operation that may observe terminal.
+
+        If terminal is observed but persisting its permanent latch fails, the
+        already-committed guard survives a process restart and keeps the state
+        domain fail-closed instead of accepting a recreated old head.
+        """
+
+        if self._current_head_guard_depth > 0:
+            try:
+                return operation()
+            except HeadTerminal:
+                self._terminal_seen = True
+                raise
+        self._store.arm_current_head_observation()
         try:
-            return self._current_head.read().head
-        except (HeadUnknown, HeadConflict, HeadTimeout):
+            value = operation()
+        except HeadTerminal:
+            # Keep the guard until _latch_terminal() durably closes it.
             raise
+        except BaseException:
+            self._store.clear_current_head_observation()
+            raise
+        self._store.clear_current_head_observation()
+        return value
+
+    def _guard_mutable_current_head_call(
+        self,
+        binding: CurrentHeadRecoveryBinding,
+        operation: Callable[[], _CurrentHeadValue],
+    ) -> _CurrentHeadValue:
+        """Run one mutable remote call under an exact response-loss binding.
+
+        The caller normally already owns a generic guard.  The binding swap is
+        a separate committed SQLite transaction because this method is never
+        called from the business-write/receipt transaction.  On a successful
+        response it immediately returns to generic protection before any
+        follow-up observation.  Ambiguous transport failures retain the exact
+        binding; terminal observations durably retarget to generic or latch
+        terminal before their error can escape.
+        """
+
+        entered_here = False
+        if self._current_head_guard_depth == 0:
+            self._enter_current_head_guard()
+            entered_here = True
+        try:
+            self._retarget_current_head_guard(binding)
+            try:
+                value = operation()
+            except HeadTerminal:
+                # A terminal observation must never leave a replayable CAS or
+                # release binding behind if latching crashes immediately after.
+                self._terminal_seen = True
+                self._current_head_guard_preserved = True
+                try:
+                    # Prefer a generic handoff.  If its SQLite write fails,
+                    # persist the independent terminal latch before exposing
+                    # that failure; a later restart then checks the latch
+                    # before any old exact binding.
+                    self._retarget_current_head_guard(None)
+                except BaseException:
+                    try:
+                        self._latch_terminal()
+                    except BaseException:
+                        # If both durable writes fail the exact binding cannot
+                        # be safely transformed by this store.  Keep the live
+                        # latch and rethrow; a host-durable tombstone is needed
+                        # for stronger guarantees beyond this skeleton.
+                        pass
+                    raise
+                # Generic guard is already durable, so a latch failure still
+                # leaves restart fail-closed rather than replayable.
+                self._latch_terminal()
+                raise
+            except HeadConflict:
+                # A conflict proves this specific mutation did not apply.
+                self._retarget_current_head_guard(None)
+                raise
+            except (HeadUnknown, HeadTimeout):
+                # Only declared transport ambiguity permits one bound
+                # read-only recovery attempt.
+                self._current_head_guard_preserved = True
+                raise
+            except MalformedCurrentHeadResponse:
+                # A malformed response arrived after the mutable adapter call
+                # returned.  The operation may have completed remotely, so
+                # retain B for this exact causal command's lookup-only
+                # recovery.  A missing receipt closes B into generic
+                # protection; recovery never retries the mutation.
+                self._current_head_guard_preserved = True
+                raise
+            except CurrentHeadError:
+                # An unclassified adapter error has no typed response phase.
+                # It is not a retry or recovery contract, so consume B into
+                # generic protection before exposing the error.
+                self._current_head_guard_preserved = True
+                self._retarget_current_head_guard(None)
+                raise
+            except BaseException:
+                self._current_head_guard_preserved = True
+                raise
+            try:
+                self._retarget_current_head_guard(None)
+            except BaseException:
+                # CAS/release may have succeeded; never let finally erase the
+                # prior binding merely because the phase handoff failed.
+                self._current_head_guard_preserved = True
+                raise
+            return value
+        finally:
+            if entered_here:
+                self._exit_current_head_guard()
+
+    @staticmethod
+    def _canonical_authority_from_port(value: object) -> AuthoritySnapshot:
+        """Rebuild a port authority from exact built-in primitive fields."""
+
+        if type(value) is not HeadSnapshot:
+            raise MalformedCurrentHeadResponse("invalid current-head authority")
+        try:
+            return AuthoritySnapshot(
+                installation_id=value.installation_id,
+                generation=value.generation,
+                revision_digest=value.revision_digest,
+                transition_id=value.transition_id,
+                writer_fence=value.writer_fence,
+                terminal=value.terminal,
+                site=value.site,
+            )
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head authority") from exc
+
+    @staticmethod
+    def _canonical_head_snapshot_from_port(value: object) -> HeadSnapshot:
+        """Rebuild a port snapshot without trusting subclass methods/equality."""
+
+        if type(value) is not HeadSnapshot:
+            raise MalformedCurrentHeadResponse("invalid current-head snapshot")
+        try:
+            return HeadSnapshot(
+                installation_id=value.installation_id,
+                generation=value.generation,
+                revision_digest=value.revision_digest,
+                transition_id=value.transition_id,
+                writer_fence=value.writer_fence,
+                terminal=value.terminal,
+                site=value.site,
+            )
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head snapshot") from exc
+
+    @staticmethod
+    def _canonical_authority_value_from_port(value: object) -> AuthoritySnapshot:
+        """Rebuild a nested non-head authority returned in a receipt."""
+
+        if type(value) is not AuthoritySnapshot:
+            raise MalformedCurrentHeadResponse("invalid receipt authority")
+        try:
+            return AuthoritySnapshot(
+                installation_id=value.installation_id,
+                generation=value.generation,
+                revision_digest=value.revision_digest,
+                transition_id=value.transition_id,
+                writer_fence=value.writer_fence,
+                terminal=value.terminal,
+                site=value.site,
+            )
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid receipt authority") from exc
+
+    @classmethod
+    def _canonical_advance_identity_from_port(cls, value: object) -> AdvanceIdentity:
+        if type(value) is not AdvanceIdentity:
+            raise MalformedCurrentHeadResponse("invalid current-head transition identity")
+        try:
+            return AdvanceIdentity(
+                expected=cls._canonical_authority_value_from_port(value.expected),
+                transition_id=value.transition_id,
+                revision_digest=value.revision_digest,
+                writer_fence=value.writer_fence,
+                operation_digest=value.operation_digest,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head transition identity") from exc
+
+    @classmethod
+    def _canonical_transition_receipt_from_port(cls, value: object) -> AppliedTransition:
+        if type(value) is not AppliedTransition:
+            raise MalformedCurrentHeadResponse("invalid current-head transition receipt")
+        try:
+            return AppliedTransition(
+                request=cls._canonical_advance_identity_from_port(value.request),
+                applied=cls._canonical_head_snapshot_from_port(value.applied),
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head transition receipt") from exc
+
+    @classmethod
+    def _canonical_writer_proof_for_port(cls, value: object) -> WriterFenceProof:
+        """Copy a host proof before an untrusted port can mutate its fields."""
+
+        if type(value) is not WriterFenceProof:
+            raise MalformedCurrentHeadResponse("invalid current-head writer proof")
+        try:
+            return WriterFenceProof(
+                authority=cls._canonical_authority_value_from_port(value.authority),
+                capability=value.capability,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head writer proof") from exc
+
+    @classmethod
+    def _canonical_advance_request_for_port(cls, value: object) -> AdvanceRequest:
+        """Create an adapter-owned copy and retain no mutable caller fields."""
+
+        if type(value) is not AdvanceRequest:
+            raise MalformedCurrentHeadResponse("invalid current-head advance request")
+        try:
+            expected = cls._canonical_authority_value_from_port(value.expected)
+            proof = cls._canonical_writer_proof_for_port(value.writer_proof)
+            return AdvanceRequest(
+                expected=expected,
+                transition_id=value.transition_id,
+                revision_digest=value.revision_digest,
+                writer_fence=value.writer_fence,
+                operation_digest=value.operation_digest,
+                writer_proof=proof,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head advance request") from exc
+
+    @classmethod
+    def _canonical_execution_lease_identity_for_port(
+        cls,
+        value: object,
+    ) -> ExecutionLeaseIdentity:
+        if type(value) is not ExecutionLeaseIdentity:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease identity")
+        try:
+            return ExecutionLeaseIdentity(
+                expected=cls._canonical_authority_value_from_port(value.expected),
+                effect_id=value.effect_id,
+                intent_digest=value.intent_digest,
+                writer_fence=value.writer_fence,
+                holder_id=value.holder_id,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease identity") from exc
+
+    @classmethod
+    def _canonical_execution_lease_for_port(cls, value: object) -> ExecutionLease:
+        if type(value) is not ExecutionLease:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease")
+        try:
+            return ExecutionLease(
+                lease_id=value.lease_id,
+                effect_id=value.effect_id,
+                intent_digest=value.intent_digest,
+                authority=cls._canonical_authority_value_from_port(value.authority),
+                holder_id=value.holder_id,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease") from exc
+
+    @classmethod
+    def _canonical_execution_lease_request_for_port(cls, value: object) -> ExecutionLeaseRequest:
+        if type(value) is not ExecutionLeaseRequest:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease request")
+        try:
+            return ExecutionLeaseRequest(
+                expected=cls._canonical_authority_value_from_port(value.expected),
+                effect_id=value.effect_id,
+                intent_digest=value.intent_digest,
+                writer_fence=value.writer_fence,
+                holder_id=value.holder_id,
+                writer_proof=cls._canonical_writer_proof_for_port(value.writer_proof),
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease request") from exc
+
+    @classmethod
+    def _canonical_execution_lease_release_for_port(cls, value: object) -> ExecutionLeaseRelease:
+        if type(value) is not ExecutionLeaseRelease:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease release")
+        try:
+            return ExecutionLeaseRelease(
+                lease=cls._canonical_execution_lease_for_port(value.lease),
+                writer_proof=cls._canonical_writer_proof_for_port(value.writer_proof),
+                operation_digest=value.operation_digest,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease release") from exc
+
+    def _read_head(self) -> AuthoritySnapshot:
+        def read_authority() -> AuthoritySnapshot:
+            try:
+                read = self._current_head.read()
+            except CurrentHeadError:
+                raise
+            except AuthorityValidationError as exc:
+                raise MalformedCurrentHeadResponse("invalid current-head read") from exc
+            except Exception as exc:
+                raise CurrentHeadError("current-head read unavailable") from exc
+            if type(read) is not HeadRead:
+                raise MalformedCurrentHeadResponse("invalid current-head read")
+            authority = self._canonical_authority_from_port(read.head)
+            if authority.terminal:
+                raise HeadTerminal("terminal current head")
+            return authority
+
+        return self._guard_current_head_call(read_authority)
+
+    def _advance_head(
+        self,
+        request: AdvanceRequest,
+        *,
+        recovery_binding: CurrentHeadRecoveryBinding | None = None,
+    ) -> AuthoritySnapshot:
+        if recovery_binding is None:
+            raise StoreUnavailable("state CAS requires a durable recovery binding")
+        # Keep a private desired identity.  The adapter receives a distinct
+        # object and may not change the operation digest that later authorizes
+        # local commit/replay closure by mutating its call argument.
+        retained_request = self._canonical_advance_request_for_port(request)
+        expected_identity = retained_request.identity()
+        outbound = self._canonical_advance_request_for_port(request)
+
+        def advance() -> AuthoritySnapshot:
+            try:
+                updated = self._current_head.conditional_advance(outbound)
+            except CurrentHeadError:
+                raise
+            except AuthorityValidationError as exc:
+                raise MalformedCurrentHeadResponse("invalid current-head advance") from exc
+            except Exception as exc:
+                raise CurrentHeadError("current-head advance unavailable") from exc
+            try:
+                applied = self._canonical_head_snapshot_from_port(updated)
+                return AppliedTransition(request=expected_identity, applied=applied).applied.as_authority()
+            except MalformedCurrentHeadResponse:
+                raise
+            except Exception as exc:
+                raise MalformedCurrentHeadResponse("invalid current-head advance") from exc
+
+        entered_here = False
+        if self._current_head_guard_depth == 0:
+            self._enter_current_head_guard()
+            entered_here = True
+        try:
+            applied = self._guard_mutable_current_head_call(recovery_binding, advance)
+            # A successful CAS response carries no durable ownership of the
+            # command digest.  Read the receipt back under the pre-call
+            # identity so a port-side mutation cannot turn A's remote CAS into
+            # B's local receipt.
+            try:
+                receipt = self._lookup_transition(expected_identity)
+            except (HeadUnknown, HeadTimeout):
+                self._preserve_exact_local_closure_binding(recovery_binding)
+                raise
+            except (TransitionNotFound, HeadConflict, MalformedCurrentHeadResponse, CurrentHeadError):
+                self._current_head_guard_preserved = True
+                raise
+            if receipt.request != expected_identity:
+                self._current_head_guard_preserved = True
+                raise MalformedCurrentHeadResponse("current-head advance receipt identity mismatch")
+            confirmed = receipt.applied.as_authority()
+            if applied.mismatch_reason(confirmed) is not None:
+                self._current_head_guard_preserved = True
+                raise MalformedCurrentHeadResponse("current-head advance receipt mismatch")
+            return confirmed
+        finally:
+            if entered_here:
+                self._exit_current_head_guard()
+
+    def _confirm_advanced_head(self, advanced: AuthoritySnapshot) -> AuthoritySnapshot:
+        """Require a post-CAS read to prove every returned authority field."""
+
+        confirmed = self._read_head()
+        if confirmed.terminal:
+            raise HeadTerminal("terminal current head")
+        if advanced.mismatch_reason(confirmed) is not None:
+            raise CurrentHeadError("current-head advance confirmation mismatch")
+        return confirmed
+
+    def _lookup_transition(self, request: AdvanceIdentity) -> AppliedTransition:
+        expected = self._canonical_advance_identity_from_port(request)
+        outbound = self._canonical_advance_identity_from_port(request)
+
+        def lookup() -> AppliedTransition:
+            try:
+                receipt = self._current_head.lookup_transition(outbound)
+            except CurrentHeadError:
+                raise
+            except AuthorityValidationError as exc:
+                raise MalformedCurrentHeadResponse("invalid current-head transition receipt") from exc
+            except Exception as exc:
+                raise CurrentHeadError("current-head lookup unavailable") from exc
+            canonical = self._canonical_transition_receipt_from_port(receipt)
+            if canonical.request != expected:
+                raise CurrentHeadError("current-head transition lookup request mismatch")
+            return canonical
+
+        return self._guard_current_head_call(lookup)
+
+    def _acquire_execution_lease(self, request: ExecutionLeaseRequest) -> ExecutionLeaseReceipt:
+        retained_request = self._canonical_execution_lease_request_for_port(request)
+        expected = retained_request.identity()
+        outbound = self._canonical_execution_lease_request_for_port(request)
+
+        def acquire() -> ExecutionLeaseReceipt:
+            try:
+                receipt = self._current_head.acquire_execution_lease(outbound)
+            except CurrentHeadError:
+                raise
+            except Exception as exc:
+                raise CurrentHeadError("current-head execution lease unavailable") from exc
+            return self._validate_execution_lease_receipt(expected, receipt)
+
+        return self._guard_current_head_call(acquire)
+
+    def _lookup_execution_lease(self, identity: ExecutionLeaseIdentity) -> ExecutionLeaseReceipt:
+        expected = self._canonical_execution_lease_identity_for_port(identity)
+        outbound = self._canonical_execution_lease_identity_for_port(identity)
+
+        def lookup() -> ExecutionLeaseReceipt:
+            try:
+                receipt = self._current_head.lookup_execution_lease(outbound)
+            except CurrentHeadError:
+                raise
+            except Exception as exc:
+                raise CurrentHeadError("current-head execution lease lookup unavailable") from exc
+            return self._validate_execution_lease_receipt(expected, receipt)
+
+        return self._guard_current_head_call(lookup)
+
+    def _release_execution_lease(
+        self,
+        lease: ExecutionLease,
+        *,
+        writer_proof: WriterFenceProof | None = None,
+        recovery_binding: CurrentHeadRecoveryBinding | None = None,
+    ) -> ExecutionLeaseReceipt:
+        if recovery_binding is None:
+            raise StoreUnavailable("execution lease release requires a durable recovery binding")
+        if writer_proof is None:
+            raise CurrentHeadError("execution lease release lacks writer proof")
+        release = ExecutionLeaseRelease(
+            lease=lease,
+            writer_proof=writer_proof,
+            operation_digest=recovery_binding.command_digest,
+        )
+        retained_release = self._canonical_execution_lease_release_for_port(release)
+        outbound = self._canonical_execution_lease_release_for_port(release)
+        identity = ExecutionLeaseIdentity(
+            expected=retained_release.lease.authority,
+            effect_id=retained_release.lease.effect_id,
+            intent_digest=retained_release.lease.intent_digest,
+            writer_fence=retained_release.lease.authority.writer_fence,
+            holder_id=retained_release.lease.holder_id,
+        )
+
+        def release() -> ExecutionLeaseReceipt:
+            try:
+                receipt = self._current_head.release_execution_lease(outbound)
+            except CurrentHeadError:
+                raise
+            except Exception as exc:
+                raise CurrentHeadError("current-head execution lease release unavailable") from exc
+            return self._validate_execution_lease_receipt(identity, receipt)
+
+        return self._guard_mutable_current_head_call(recovery_binding, release)
+
+    @staticmethod
+    def _validate_execution_lease_receipt(
+        identity: ExecutionLeaseIdentity,
+        receipt: object,
+    ) -> ExecutionLeaseReceipt:
+        if type(identity) is not ExecutionLeaseIdentity or type(receipt) is not ExecutionLeaseReceipt:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease receipt")
+        try:
+            if type(receipt.request) is not ExecutionLeaseIdentity:
+                raise MalformedCurrentHeadResponse("invalid current-head execution lease receipt")
+            request = ExecutionLeaseIdentity(
+                expected=HealthCore._canonical_authority_value_from_port(receipt.request.expected),
+                effect_id=receipt.request.effect_id,
+                intent_digest=receipt.request.intent_digest,
+                writer_fence=receipt.request.writer_fence,
+                holder_id=receipt.request.holder_id,
+            )
+            if request != identity:
+                raise CurrentHeadError("execution lease request mismatch")
+            # Reconstructing every returned typed value forces all exact
+            # authority, effect ID, digest, and writer-fence invariants at the
+            # adapter boundary even if an untrusted port mutates a frozen
+            # dataclass object after construction.
+            if type(receipt.lease) is not ExecutionLease:
+                raise MalformedCurrentHeadResponse("invalid current-head execution lease receipt")
+            lease = ExecutionLease(
+                lease_id=receipt.lease.lease_id,
+                effect_id=receipt.lease.effect_id,
+                intent_digest=receipt.lease.intent_digest,
+                authority=HealthCore._canonical_authority_value_from_port(receipt.lease.authority),
+                holder_id=receipt.lease.holder_id,
+            )
+            return ExecutionLeaseReceipt(
+                request=request,
+                lease=lease,
+                released=receipt.released,
+                released_operation_digest=receipt.released_operation_digest,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except CurrentHeadError:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head execution lease receipt") from exc
+
+    @staticmethod
+    def _prepared_mismatch_reason(
+        prepared: AuthoritySnapshot,
+        head: AuthoritySnapshot,
+        writer_fence: str,
+    ) -> str | None:
+        if prepared.installation_id != head.installation_id:
+            return "prepared-installation-mismatch"
+        if prepared.site != head.site:
+            return "prepared-site-mismatch"
+        if writer_fence != prepared.writer_fence or prepared.writer_fence != head.writer_fence:
+            return "stale-writer-fence"
+        if (
+            prepared.generation != head.generation
+            or prepared.revision_digest != head.revision_digest
+            or prepared.transition_id != head.transition_id
+            or prepared.terminal != head.terminal
+        ):
+            return "stale-writer-fence"
+        return None
+
+    @staticmethod
+    def _target_matches_authority(prepared: PreparedTransition, authority: AuthoritySnapshot) -> bool:
+        return (
+            authority.installation_id == prepared.base.installation_id
+            and authority.site == prepared.base.site
+            and authority.generation == prepared.base.generation + 1
+            and authority.revision_digest == prepared.target.revision_digest
+            and authority.transition_id == prepared.target.transition_id
+            and authority.writer_fence == prepared.base.writer_fence
+            and not authority.terminal
+        )

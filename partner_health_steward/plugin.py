@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .authority import EffectExecutionGrant, EffectIntent
 from .contract import CommandEnvelope, ProtocolViolation, Response, decode_frame, encode_raw_response
 from .core import HealthCore
 from .probe import ProbeReport
@@ -12,15 +13,16 @@ class HealthPlugin:
         self._core = core
 
     def invoke(self, command: CommandEnvelope, *, peer_id: str) -> Response:
-        if peer_id != "plugin":
+        if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
-        if command.peer != "plugin":
-            raise ProtocolViolation("untrusted command peer")
+        # Do not read fields from a caller-provided Python object here.  Core
+        # canonicalizes it through the strict wire parser before any command
+        # field can reach state or authority handling.
         return self._core.handle(command)
 
     def handle_frame(self, frame: bytes, *, peer_id: str) -> bytes:
         try:
-            if peer_id != "plugin":
+            if type(peer_id) is not str or peer_id != "plugin":
                 raise ProtocolViolation("untrusted peer")
             command = decode_frame(frame)
             response = self.invoke(command, peer_id=peer_id)
@@ -41,3 +43,8 @@ class HealthPlugin:
 
     def outbound_effects_allowed(self) -> bool:
         return self._core.outbound_effects_allowed()
+
+    def claim_effect_execution(self, intent: EffectIntent) -> EffectExecutionGrant | None:
+        """Return the non-durable completion grant before an adapter may act."""
+
+        return self._core.claim_effect_execution(intent)

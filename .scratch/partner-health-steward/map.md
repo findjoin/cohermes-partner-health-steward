@@ -115,7 +115,7 @@ Type: wayfinder:map
 
 ## Not yet specified
 
-- 统一 HOW 已完成路线选择；当前实现承接已发布为[首发健康管家 Plugin 实现 Spec](spec.md)，覆盖实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚，不建立竞争计划。实现 Tickets 110—119 已按依赖顺序发布；当前唯一未阻塞 Frontier 为 [Ticket 110：建立 Plugin/core 受信边界与合成验证骨架](issues/110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)。本 Map 继续作为路线索引，不直接承载代码实现。
+- 统一 HOW 已完成路线选择；当前实现承接已发布为[首发健康管家 Plugin 实现 Spec](spec.md)，覆盖实现依赖、测试、真实微信验收、外部许可与医学审核、部署、迁移及回滚，不建立竞争计划。实现 Tickets 110—119 已按依赖顺序发布；[Ticket 110：建立 Plugin/core 受信边界与合成验证骨架](issues/110-establish-plugin-core-trust-boundary-and-synthetic-harness.md)已完成，其 Answer 是当前基础边界的实现上下文指针。后继实现票继续按现有依赖顺序推进，本 Map 不直接承载代码实现。
 
 ## Out of scope
 
