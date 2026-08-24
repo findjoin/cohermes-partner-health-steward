@@ -586,13 +586,45 @@ class DailyReviewEngine:
                 True,
             )
         if ledger.pending is not None and ledger.pending.key == key:
-            return DailyReviewDecision(
+            if (
+                ledger.pending.state_digest == state_digest
+                and ledger.pending.changed is changed_flag
+                and ledger.pending.action_refs == refs
+            ):
+                return DailyReviewDecision(
+                    ledger,
+                    key,
+                    "resume-current-day",
+                    None,
+                    ledger.pending.notification_required,
+                    True,
+                )
+            refreshed = DailyReviewPending(
+                key=key,
+                state_digest=state_digest,
+                changed=changed_flag,
+                action_refs=refs,
+                prepared_at_utc=observed,
+                prepare_digest=_pending_digest(
+                    key,
+                    state_digest,
+                    changed_flag,
+                    refs,
+                    observed,
+                ),
+            )
+            refreshed_ledger = replace(
                 ledger,
+                version=ledger.version + 1,
+                pending=refreshed,
+            )
+            return DailyReviewDecision(
+                refreshed_ledger,
                 key,
-                "resume-current-day",
+                "current-day-pending-refreshed",
                 None,
-                ledger.pending.notification_required,
-                True,
+                refreshed.notification_required,
+                False,
             )
         pending = DailyReviewPending(
             key=key,

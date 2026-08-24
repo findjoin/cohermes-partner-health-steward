@@ -1369,12 +1369,14 @@ class TaskEngine:
         candidate: TaskCandidate,
         *,
         committed_at_utc: str,
+        cancelled_task_refs: tuple[str, ...] = (),
     ) -> TaskTransition:
         return TaskEngine._admit_candidate(
             state,
             candidate,
             committed_at_utc=committed_at_utc,
             explicit_predecessor_id=None,
+            cancelled_task_refs=cancelled_task_refs,
         )
 
     @staticmethod
@@ -1384,6 +1386,7 @@ class TaskEngine:
         *,
         committed_at_utc: str,
         explicit_predecessor_id: str | None,
+        cancelled_task_refs: tuple[str, ...] = (),
     ) -> TaskTransition:
         if type(state) is not TaskRuntimeState:
             raise TaskContractViolation("invalid task runtime state")
@@ -1461,6 +1464,8 @@ class TaskEngine:
             + candidate.semantic_digest.removeprefix("sha256:")[:32]
             + f":{ordinal}"
         )
+        if task_id in cancelled_task_refs:
+            raise TaskContractViolation("task admission was cancelled by owner")
         task = ManagedTask(
             task_id=task_id,
             version=1,
@@ -1761,6 +1766,40 @@ class TaskEngine:
         )
 
     @staticmethod
+    def apply_owner_cancellation(
+        state: TaskRuntimeState,
+        task_id: str,
+        *,
+        control_ref: str,
+        effective_at_utc: str,
+    ) -> TaskTransition:
+        """Apply an owner task-control fact without rewriting prior terminals."""
+
+        if type(state) is not TaskRuntimeState:
+            raise TaskContractViolation("invalid task runtime state")
+        _text(control_ref, "owner task cancellation control reference")
+        task = state.task(task_id)
+        if task.primary_label == "active":
+            cancelled = TaskEngine.cancel(
+                state,
+                task.task_id,
+                cancelled_at_utc=effective_at_utc,
+                reason_code="owner-task-cancelled",
+            )
+            return TaskTransition(
+                cancelled.state,
+                cancelled.task_id,
+                "owner-cancelled",
+            )
+        if task.primary_label == "cancelled":
+            return TaskTransition(state, task.task_id, "owner-cancelled", True)
+        return TaskTransition(
+            state,
+            task.task_id,
+            "owner-cancel-terminal-preserved",
+        )
+
+    @staticmethod
     def fail(
         state: TaskRuntimeState,
         task_id: str,
@@ -1921,6 +1960,7 @@ class TaskEngine:
         successor_candidate: TaskCandidate,
         *,
         committed_at_utc: str,
+        cancelled_task_refs: tuple[str, ...] = (),
     ) -> TaskTransition:
         predecessor = state.task(predecessor_task_id)
         at = _utc_time(committed_at_utc, "task successor commit time")
@@ -1929,6 +1969,7 @@ class TaskEngine:
             successor_candidate,
             committed_at_utc=at,
             explicit_predecessor_id=predecessor.task_id,
+            cancelled_task_refs=cancelled_task_refs,
         )
         successor = transition.state.task(transition.task_id)
         if successor.task_id == predecessor.task_id:

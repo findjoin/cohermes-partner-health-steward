@@ -48,14 +48,22 @@ from .coordination import (
     DailyTurnDraft,
     DailyTurnResult,
 )
+from .delivery import DeliveryOutboxState
+from .health_commands import (
+    HealthCommandContractViolation,
+    HealthCommandReceipt,
+    TrustedHealthCommand,
+)
 from .initialization import (
     InitializationDisclosureChallenge,
     InitializationDraft,
     stable_digest,
 )
 from .owner_authority import OwnerPreparedMutation
+from .review import DailyReviewLedger
 from .settings import OwnerSettingsState
 from .status import StatusContractViolation, StatusProjection, StatusTransition
+from .tasks import TaskRuntimeState
 
 
 class KeyUnavailable(RuntimeError):
@@ -68,6 +76,244 @@ class StoreUnavailable(RuntimeError):
 
 class CausalIdConflict(RuntimeError):
     """A causal ID was reused with a different command envelope."""
+
+
+@dataclass(frozen=True)
+class Ticket115PreparedMutation:
+    """One complete Ticket 115 aggregate revision awaiting current-head CAS."""
+
+    prepared: PreparedTransition
+    owner_id: str
+    installation_id: str
+    base_task_digest: str
+    base_review_digest: str
+    base_delivery_digest: str
+    task_state: TaskRuntimeState
+    review_state: DailyReviewLedger
+    delivery_state: DeliveryOutboxState
+    health_command_receipt: HealthCommandReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.prepared) is not PreparedTransition:
+            raise AuthorityValidationError("invalid ticket115 preparation")
+        validate_opaque_text(self.owner_id, "ticket115 owner identifier")
+        validate_opaque_text(
+            self.installation_id,
+            "ticket115 installation identifier",
+        )
+        for digest, name in (
+            (self.base_task_digest, "ticket115 base task digest"),
+            (self.base_review_digest, "ticket115 base review digest"),
+            (self.base_delivery_digest, "ticket115 base delivery digest"),
+        ):
+            _owner_recovery_digest(digest, name)
+        if (
+            type(self.task_state) is not TaskRuntimeState
+            or type(self.review_state) is not DailyReviewLedger
+            or type(self.delivery_state) is not DeliveryOutboxState
+        ):
+            raise AuthorityValidationError("invalid ticket115 aggregate payload")
+        if self.health_command_receipt is not None and (
+            type(self.health_command_receipt) is not HealthCommandReceipt
+        ):
+            raise AuthorityValidationError("invalid ticket115 health command receipt")
+        authorities = {
+            (self.task_state.owner_id, self.task_state.installation_id),
+            (self.review_state.owner_id, self.review_state.installation_id),
+            (self.delivery_state.owner_id, self.delivery_state.installation_id),
+        }
+        if authorities != {(self.owner_id, self.installation_id)}:
+            raise AuthorityValidationError("ticket115 aggregate authority mismatch")
+        if self.prepared.base.installation_id != self.installation_id:
+            raise AuthorityValidationError("ticket115 preparation installation mismatch")
+        target = self.prepared.target
+        if target.revision_digest != self.next_state_digest:
+            raise AuthorityValidationError("ticket115 revision digest mismatch")
+        if target.payload_digest != self.mutation_digest:
+            raise AuthorityValidationError("ticket115 mutation digest mismatch")
+
+    @staticmethod
+    def state_digest(
+        task_state: TaskRuntimeState,
+        review_state: DailyReviewLedger,
+        delivery_state: DeliveryOutboxState,
+    ) -> str:
+        return stable_digest(
+            {
+                "kind": "ticket115-authoritative-state-v1",
+                "task_state": task_state.to_storage(),
+                "review_state": review_state.to_storage(),
+                "delivery_state": delivery_state.to_wire(),
+            }
+        )
+
+    @property
+    def next_state_digest(self) -> str:
+        return self.state_digest(
+            self.task_state,
+            self.review_state,
+            self.delivery_state,
+        )
+
+    @property
+    def mutation_digest(self) -> str:
+        return self._mutation_digest(
+            base_task_digest=self.base_task_digest,
+            base_review_digest=self.base_review_digest,
+            base_delivery_digest=self.base_delivery_digest,
+            next_state_digest=self.next_state_digest,
+            health_command_receipt=self.health_command_receipt,
+        )
+
+    @staticmethod
+    def _mutation_digest(
+        *,
+        base_task_digest: str,
+        base_review_digest: str,
+        base_delivery_digest: str,
+        next_state_digest: str,
+        health_command_receipt: HealthCommandReceipt | None,
+    ) -> str:
+        value: dict[str, object] = {
+            "kind": "ticket115-prepared-mutation-v1",
+            "base": {
+                "task": base_task_digest,
+                "review": base_review_digest,
+                "delivery": base_delivery_digest,
+            },
+            "next_state_digest": next_state_digest,
+        }
+        if health_command_receipt is not None:
+            value["health_command_receipt"] = (
+                health_command_receipt.to_storage()
+            )
+        return stable_digest(value)
+
+    @classmethod
+    def prepare(
+        cls,
+        *,
+        base: AuthoritySnapshot,
+        current_task_state: TaskRuntimeState,
+        current_review_state: DailyReviewLedger,
+        current_delivery_state: DeliveryOutboxState,
+        task_state: TaskRuntimeState,
+        review_state: DailyReviewLedger,
+        delivery_state: DeliveryOutboxState,
+        health_command_receipt: HealthCommandReceipt | None = None,
+    ) -> "Ticket115PreparedMutation":
+        base_digests = (
+            stable_digest(current_task_state.to_storage()),
+            stable_digest(current_review_state.to_storage()),
+            stable_digest(current_delivery_state.to_wire()),
+        )
+        next_state_digest = cls.state_digest(
+            task_state,
+            review_state,
+            delivery_state,
+        )
+        mutation_digest = cls._mutation_digest(
+            base_task_digest=base_digests[0],
+            base_review_digest=base_digests[1],
+            base_delivery_digest=base_digests[2],
+            next_state_digest=next_state_digest,
+            health_command_receipt=health_command_receipt,
+        )
+        identity = stable_digest(
+            {
+                "kind": "ticket115-transition-v1",
+                "base": base.to_storage(),
+                "mutation_digest": mutation_digest,
+            }
+        ).removeprefix("sha256:")
+        prepared = PreparedTransition(
+            target=RevisionTarget(
+                record_id="ticket115-mutation:" + identity,
+                revision_digest=next_state_digest,
+                transition_id="transition:ticket115:" + identity,
+                payload_digest=mutation_digest,
+            ),
+            base=base,
+        )
+        return cls(
+            prepared=prepared,
+            owner_id=task_state.owner_id,
+            installation_id=task_state.installation_id,
+            base_task_digest=base_digests[0],
+            base_review_digest=base_digests[1],
+            base_delivery_digest=base_digests[2],
+            task_state=task_state,
+            review_state=review_state,
+            delivery_state=delivery_state,
+            health_command_receipt=health_command_receipt,
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "prepared": self.prepared.to_storage(),
+            "owner_id": self.owner_id,
+            "installation_id": self.installation_id,
+            "base_task_digest": self.base_task_digest,
+            "base_review_digest": self.base_review_digest,
+            "base_delivery_digest": self.base_delivery_digest,
+            "task_state": self.task_state.to_storage(),
+            "review_state": self.review_state.to_storage(),
+            "delivery_state": self.delivery_state.to_wire(),
+            "health_command_receipt": (
+                None
+                if self.health_command_receipt is None
+                else self.health_command_receipt.to_storage()
+            ),
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "Ticket115PreparedMutation":
+        legacy_fields = frozenset(
+            {
+                "prepared",
+                "owner_id",
+                "installation_id",
+                "base_task_digest",
+                "base_review_digest",
+                "base_delivery_digest",
+                "task_state",
+                "review_state",
+                "delivery_state",
+            }
+        )
+        if (
+            type(value) is not dict
+            or frozenset(value)
+            not in {legacy_fields, legacy_fields | {"health_command_receipt"}}
+        ):
+            raise KeyUnavailable("invalid ticket115 prepared mutation")
+        stored = value
+        try:
+            receipt_wire = stored.get("health_command_receipt")
+            return cls(
+                prepared=PreparedTransition.from_storage(stored["prepared"]),
+                owner_id=stored["owner_id"],  # type: ignore[arg-type]
+                installation_id=stored["installation_id"],  # type: ignore[arg-type]
+                base_task_digest=stored["base_task_digest"],  # type: ignore[arg-type]
+                base_review_digest=stored["base_review_digest"],  # type: ignore[arg-type]
+                base_delivery_digest=stored["base_delivery_digest"],  # type: ignore[arg-type]
+                task_state=TaskRuntimeState.from_storage(stored["task_state"]),
+                review_state=DailyReviewLedger.from_storage(stored["review_state"]),
+                delivery_state=DeliveryOutboxState.from_wire(
+                    stored["delivery_state"]
+                ),
+                health_command_receipt=(
+                    None
+                    if receipt_wire is None
+                    else HealthCommandReceipt.from_storage(receipt_wire)
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, AuthorityValidationError):
+                raise
+            raise AuthorityValidationError(
+                "invalid ticket115 prepared mutation"
+            ) from exc
 
 
 def _owner_recovery_digest(value: object, name: str) -> str:
@@ -1438,6 +1684,25 @@ class EncryptedStateStore:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS ticket115_health_command_receipts_v1 (
+                causal_id TEXT PRIMARY KEY,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticket115_mutations_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                record_id TEXT NOT NULL UNIQUE,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS daily_reviews_v1 (
                 slot INTEGER PRIMARY KEY CHECK(slot = 1),
                 nonce BLOB NOT NULL,
@@ -1612,6 +1877,8 @@ class EncryptedStateStore:
             )
             ticket115_tables = (
                 "task_runtime_v1",
+                "ticket115_health_command_receipts_v1",
+                "ticket115_mutations_v1",
                 "daily_reviews_v1",
                 "owner_outbox_v1",
                 "owner_delivery_observations_v1",
@@ -1619,8 +1886,23 @@ class EncryptedStateStore:
             migration_tables: tuple[str, ...] | None = None
             migration_shape: dict[str, bool] | None = None
             pre_ticket115_migration = False
+            pre_health_command_migration = False
             if isinstance(fingerprint, str):
                 if (
+                    fingerprint
+                    == self._pre_ticket115_health_command_integrity_fingerprint()
+                    and self._execute(
+                        "SELECT 1 FROM "
+                        "ticket115_health_command_receipts_v1 LIMIT 1"
+                    ).fetchone()
+                    is None
+                ):
+                    migration_tables = (
+                        "ticket115_health_command_receipts_v1",
+                    )
+                    migration_shape = {}
+                    pre_health_command_migration = True
+                elif (
                     fingerprint
                     == self._pre_ticket115_integrity_fingerprint()
                     and all(
@@ -1730,7 +2012,9 @@ class EncryptedStateStore:
                     current_stored != stored
                     or fingerprint
                     != (
-                        self._pre_ticket115_integrity_fingerprint()
+                        self._pre_ticket115_health_command_integrity_fingerprint()
+                        if pre_health_command_migration
+                        else self._pre_ticket115_integrity_fingerprint()
                         if pre_ticket115_migration
                         else self._integrity_fingerprint(**migration_shape)
                     )
@@ -1764,6 +2048,8 @@ class EncryptedStateStore:
             "owner_mutations_v1",
             "business_status_v1",
             "task_runtime_v1",
+            "ticket115_health_command_receipts_v1",
+            "ticket115_mutations_v1",
             "daily_reviews_v1",
             "owner_outbox_v1",
             "owner_delivery_observations_v1",
@@ -1795,6 +2081,7 @@ class EncryptedStateStore:
         include_ticket114: bool | None = None,
         include_ticket114_status: bool | None = None,
         include_ticket115: bool | None = None,
+        include_ticket115_health_commands: bool | None = None,
     ) -> str:
         """Hash every mutable domain row except the manifest itself."""
 
@@ -1809,6 +2096,8 @@ class EncryptedStateStore:
             include_ticket114_status = include_ticket114
         if include_ticket115 is None:
             include_ticket115 = include_ticket114_status
+        if include_ticket115_health_commands is None:
+            include_ticket115_health_commands = include_ticket115
 
         tables = {
             "records": self._execute(
@@ -1900,6 +2189,10 @@ class EncryptedStateStore:
                         "SELECT slot, nonce, ciphertext "
                         "FROM task_runtime_v1 ORDER BY slot"
                     ).fetchall(),
+                    "ticket115_mutations": self._execute(
+                        "SELECT slot, record_id, nonce, ciphertext "
+                        "FROM ticket115_mutations_v1 ORDER BY slot"
+                    ).fetchall(),
                     "daily_reviews": self._execute(
                         "SELECT slot, nonce, ciphertext "
                         "FROM daily_reviews_v1 ORDER BY slot"
@@ -1915,6 +2208,12 @@ class EncryptedStateStore:
                     ).fetchall(),
                 }
             )
+        if include_ticket115_health_commands:
+            tables["ticket115_health_command_receipts"] = self._execute(
+                "SELECT causal_id, nonce, ciphertext "
+                "FROM ticket115_health_command_receipts_v1 "
+                "ORDER BY causal_id"
+            ).fetchall()
 
         def wire_value(value: object) -> object:
             if isinstance(value, bytes):
@@ -1943,6 +2242,15 @@ class EncryptedStateStore:
         return EncryptedStateStore._integrity_fingerprint(
             self,
             include_ticket115=False,
+        )
+
+    def _pre_ticket115_health_command_integrity_fingerprint(self) -> str:
+        """Return Ticket 115's signed shape before trusted command receipts."""
+
+        return EncryptedStateStore._integrity_fingerprint(
+            self,
+            include_ticket115=True,
+            include_ticket115_health_commands=False,
         )
 
     def _refresh_integrity_manifest(self, connection: sqlite3.Connection) -> None:
@@ -2185,6 +2493,115 @@ class EncryptedStateStore:
         ):
             raise CausalIdConflict("causal-id-conflict")
         return stored.response
+
+    @staticmethod
+    def _health_command_receipt_aad(causal_id: str) -> str:
+        return "ticket115-health-command-receipt:" + causal_id
+
+    def _decode_health_command_receipt(
+        self,
+        causal_id: str,
+        nonce: bytes,
+        ciphertext: bytes,
+    ) -> HealthCommandReceipt:
+        try:
+            wire = self._open(
+                self._health_command_receipt_aad(causal_id),
+                nonce,
+                ciphertext,
+            )
+            receipt = HealthCommandReceipt.from_storage(wire)
+        except HealthCommandContractViolation as exc:
+            raise KeyUnavailable("invalid health command receipt") from exc
+        if receipt.causal_id != causal_id:
+            raise KeyUnavailable(
+                "health command receipt causal identifier mismatch"
+            )
+        if receipt.to_storage() != wire:
+            raise KeyUnavailable("health command receipt round-trip mismatch")
+        return receipt
+
+    def _health_command_receipt_for_causal_id(
+        self,
+        causal_id: str,
+    ) -> HealthCommandReceipt | None:
+        validate_opaque_text(causal_id, "health command causal identifier")
+        row = self._execute(
+            "SELECT nonce, ciphertext "
+            "FROM ticket115_health_command_receipts_v1 "
+            "WHERE causal_id = ?",
+            (causal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._decode_health_command_receipt(causal_id, row[0], row[1])
+
+    def lookup_health_command_receipt(
+        self,
+        command: TrustedHealthCommand,
+    ) -> HealthCommandReceipt | None:
+        """Return an exact replay or reject reuse of its causal identifier."""
+
+        if type(command) is not TrustedHealthCommand:
+            raise AuthorityValidationError("trusted health command required")
+        receipt = self._health_command_receipt_for_causal_id(
+            command.causal_id
+        )
+        if receipt is not None and not hmac.compare_digest(
+            receipt.command_digest,
+            command.command_digest,
+        ):
+            raise CausalIdConflict("causal-id-conflict")
+        return receipt
+
+    def _write_health_command_receipt(
+        self,
+        connection: sqlite3.Connection,
+        receipt: HealthCommandReceipt,
+    ) -> bool:
+        if type(receipt) is not HealthCommandReceipt:
+            raise AuthorityValidationError("health command receipt required")
+        existing = self._health_command_receipt_for_causal_id(
+            receipt.causal_id
+        )
+        if existing is not None:
+            if not hmac.compare_digest(
+                existing.command_digest,
+                receipt.command_digest,
+            ):
+                raise CausalIdConflict("causal-id-conflict")
+            if existing != receipt:
+                raise AuthorityValidationError(
+                    "health command receipt result conflict"
+                )
+            return False
+        nonce, ciphertext = self._seal(
+            self._health_command_receipt_aad(receipt.causal_id),
+            receipt.to_storage(),
+        )
+        try:
+            connection.execute(
+                "INSERT INTO ticket115_health_command_receipts_v1("
+                "causal_id, nonce, ciphertext) VALUES (?, ?, ?)",
+                (receipt.causal_id, nonce, ciphertext),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise CausalIdConflict("causal-id-conflict") from exc
+        return True
+
+    def save_health_command_receipt(
+        self,
+        receipt: HealthCommandReceipt,
+    ) -> None:
+        """Persist one encrypted immutable Ticket 115 replay receipt."""
+
+        if type(receipt) is not HealthCommandReceipt:
+            raise AuthorityValidationError("health command receipt required")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            changed = self._write_health_command_receipt(connection, receipt)
+            if changed:
+                self._refresh_integrity_manifest(connection)
 
     def pending_command(self, command: CommandEnvelope) -> PendingCommand | None:
         row = self._execute(
@@ -3392,6 +3809,146 @@ class EncryptedStateStore:
             (nonce, ciphertext),
         )
 
+    def _ticket115_states(
+        self,
+        owner_id: str,
+        installation_id: str,
+    ) -> tuple[TaskRuntimeState, DailyReviewLedger, DeliveryOutboxState]:
+        task_state = self.task_runtime()
+        review_state = self.daily_review_ledger()
+        return (
+            TaskRuntimeState.empty(owner_id, installation_id)
+            if task_state is None
+            else task_state,
+            DailyReviewLedger.empty(owner_id, installation_id)
+            if review_state is None
+            else review_state,
+            self.delivery_outbox_state(owner_id, installation_id),
+        )
+
+    @staticmethod
+    def _ticket115_state_digests(
+        states: tuple[
+            TaskRuntimeState,
+            DailyReviewLedger,
+            DeliveryOutboxState,
+        ],
+    ) -> tuple[str, str, str]:
+        task_state, review_state, delivery_state = states
+        return (
+            stable_digest(task_state.to_storage()),
+            stable_digest(review_state.to_storage()),
+            stable_digest(delivery_state.to_wire()),
+        )
+
+    def ticket115_mutation_for_record(
+        self,
+        record_id: str,
+    ) -> Ticket115PreparedMutation | None:
+        validate_opaque_text(record_id, "ticket115 mutation record identifier")
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM ticket115_mutations_v1 "
+            "WHERE record_id = ?",
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            mutation = Ticket115PreparedMutation.from_storage(
+                self._open(
+                    f"ticket115-mutation:{record_id}",
+                    row[0],
+                    row[1],
+                )
+            )
+        except (AuthorityValidationError, TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid ticket115 prepared mutation") from exc
+        if mutation.prepared.target.record_id != record_id:
+            raise KeyUnavailable("ticket115 mutation record mismatch")
+        return mutation
+
+    def pending_ticket115_mutation(self) -> Ticket115PreparedMutation | None:
+        rows = self._execute(
+            "SELECT record_id FROM ticket115_mutations_v1 ORDER BY slot"
+        ).fetchall()
+        if len(rows) > 1:
+            raise KeyUnavailable("multiple ticket115 prepared mutations")
+        return None if not rows else self.ticket115_mutation_for_record(rows[0][0])
+
+    def ticket115_mutation_base_is_current(
+        self,
+        mutation: Ticket115PreparedMutation,
+    ) -> bool:
+        if type(mutation) is not Ticket115PreparedMutation:
+            return False
+        current = self._ticket115_states(
+            mutation.owner_id,
+            mutation.installation_id,
+        )
+        return self._ticket115_state_digests(current) == (
+            mutation.base_task_digest,
+            mutation.base_review_digest,
+            mutation.base_delivery_digest,
+        )
+
+    def prepare_ticket115_mutation(
+        self,
+        mutation: Ticket115PreparedMutation,
+    ) -> None:
+        """Durably bind one aggregate body to its invisible prepared revision."""
+
+        if type(mutation) is not Ticket115PreparedMutation:
+            raise AuthorityValidationError("ticket115 preparation required")
+        target = mutation.prepared.target
+        nonce, ciphertext = self._seal(
+            f"ticket115-mutation:{target.record_id}",
+            mutation.to_storage(),
+        )
+        record_nonce, record_ciphertext = self._seal(
+            f"record:{target.record_id}:prepared",
+            mutation.prepared.to_storage(),
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            if self.pending_ticket115_mutation() is not None:
+                raise AuthorityValidationError(
+                    "ticket115 mutation already prepared"
+                )
+            if self.record(target.record_id) is not None:
+                raise AuthorityValidationError(
+                    "ticket115 mutation record already exists"
+                )
+            if not self.ticket115_mutation_base_is_current(mutation):
+                raise AuthorityValidationError("ticket115 mutation base changed")
+            local_authority = self.finalized_authority()
+            if local_authority != mutation.prepared.base:
+                raise AuthorityValidationError(
+                    "ticket115 preparation authority changed"
+                )
+            self._validate_record_write(
+                target.record_id,
+                "prepared",
+                target.revision_digest,
+                target.transition_id,
+                mutation.prepared,
+            )
+            self._write_record_row(
+                connection,
+                target.record_id,
+                "prepared",
+                target.revision_digest,
+                target.transition_id,
+                record_nonce,
+                record_ciphertext,
+            )
+            connection.execute(
+                "INSERT INTO ticket115_mutations_v1("
+                "slot, record_id, nonce, ciphertext"
+                ") VALUES (1, ?, ?, ?)",
+                (target.record_id, nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+
     def _write_daily_review_ledger(
         self,
         connection: sqlite3.Connection,
@@ -3562,6 +4119,59 @@ class EncryptedStateStore:
                     ),
                 )
 
+    def _commit_ticket115_facts_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_state: TaskRuntimeState | None,
+        review_state: DailyReviewLedger | None,
+        delivery_state: DeliveryOutboxState | None,
+    ) -> None:
+        notifying_reviews = (
+            ()
+            if review_state is None
+            else self._new_notifying_review_records(review_state)
+        )
+        if notifying_reviews:
+            if delivery_state is None:
+                raise AuthorityValidationError(
+                    "notifying daily review requires atomic outbox state"
+                )
+            current_delivery = self.delivery_outbox_state(
+                delivery_state.owner_id,
+                delivery_state.installation_id,
+            )
+            current_intents = {
+                record.intent.intent_id
+                for record in current_delivery.records
+            }
+            new_records = tuple(
+                record
+                for record in delivery_state.records
+                if record.intent.intent_id not in current_intents
+            )
+            for review in notifying_reviews:
+                matching = tuple(
+                    record
+                    for record in new_records
+                    if record.intent.effect_kind == "owner-delivery"
+                    and record.intent.business_fact_ref == review.key.value
+                    and record.intent.business_revision_digest
+                    == review.result_digest
+                    and record.intent.source_ref in review.action_refs
+                )
+                if len(matching) != 1:
+                    raise AuthorityValidationError(
+                        "notifying daily review requires its exact new "
+                        "owner-delivery intent"
+                    )
+        if task_state is not None:
+            self._write_task_runtime(connection, task_state)
+        if review_state is not None:
+            self._write_daily_review_ledger(connection, review_state)
+        if delivery_state is not None:
+            self._write_delivery_outbox(connection, delivery_state)
+
     def commit_ticket115_facts(
         self,
         *,
@@ -3601,50 +4211,90 @@ class EncryptedStateStore:
             raise AuthorityValidationError("ticket115 authority mismatch")
         with self.transaction() as connection:
             self._assert_integrity_manifest_before_mutation()
-            notifying_reviews = (
-                ()
-                if review_state is None
-                else self._new_notifying_review_records(review_state)
+            self._commit_ticket115_facts_in_transaction(
+                connection,
+                task_state=task_state,
+                review_state=review_state,
+                delivery_state=delivery_state,
             )
-            if notifying_reviews:
-                if delivery_state is None:
-                    raise AuthorityValidationError(
-                        "notifying daily review requires atomic outbox state"
-                    )
-                current_delivery = self.delivery_outbox_state(
-                    delivery_state.owner_id,
-                    delivery_state.installation_id,
+            self._refresh_integrity_manifest(connection)
+
+    def finalize_ticket115_mutation(
+        self,
+        record_id: str,
+        committed: CommittedTransition,
+    ) -> None:
+        """Atomically expose the prepared aggregates and advance local authority."""
+
+        validate_opaque_text(record_id, "ticket115 mutation record identifier")
+        committed = validate_committed_transition(committed)
+        mutation = self.ticket115_mutation_for_record(record_id)
+        if mutation is None or mutation.prepared != committed.prepared:
+            raise AuthorityValidationError("ticket115 mutation commitment mismatch")
+        target = committed.prepared.target
+        self._validate_record_write(
+            record_id,
+            "final",
+            target.revision_digest,
+            target.transition_id,
+            committed,
+        )
+        record_nonce, record_ciphertext = self._seal(
+            f"record:{record_id}:final",
+            committed.to_storage(),
+        )
+        authority_nonce, authority_ciphertext = self._seal_finalized_authority(
+            committed.committed,
+            record_id,
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            current = self.record(record_id)
+            durable = self.ticket115_mutation_for_record(record_id)
+            if (
+                current is None
+                or current.state != "committed"
+                or current.payload != committed
+                or durable != mutation
+                or not self.ticket115_mutation_base_is_current(mutation)
+            ):
+                raise AuthorityValidationError(
+                    "ticket115 mutation finalization changed"
                 )
-                current_intents = {
-                    record.intent.intent_id
-                    for record in current_delivery.records
-                }
-                new_records = tuple(
-                    record
-                    for record in delivery_state.records
-                    if record.intent.intent_id not in current_intents
+            self._commit_ticket115_facts_in_transaction(
+                connection,
+                task_state=mutation.task_state,
+                review_state=mutation.review_state,
+                delivery_state=mutation.delivery_state,
+            )
+            if mutation.health_command_receipt is not None:
+                self._write_health_command_receipt(
+                    connection,
+                    mutation.health_command_receipt,
                 )
-                for review in notifying_reviews:
-                    matching = tuple(
-                        record
-                        for record in new_records
-                        if record.intent.effect_kind == "owner-delivery"
-                        and record.intent.business_fact_ref == review.key.value
-                        and record.intent.business_revision_digest
-                        == review.result_digest
-                        and record.intent.source_ref in review.action_refs
-                    )
-                    if len(matching) != 1:
-                        raise AuthorityValidationError(
-                            "notifying daily review requires its exact new "
-                            "owner-delivery intent"
-                        )
-            if task_state is not None:
-                self._write_task_runtime(connection, task_state)
-            if review_state is not None:
-                self._write_daily_review_ledger(connection, review_state)
-            if delivery_state is not None:
-                self._write_delivery_outbox(connection, delivery_state)
+            self._write_record_row(
+                connection,
+                record_id,
+                "final",
+                target.revision_digest,
+                target.transition_id,
+                record_nonce,
+                record_ciphertext,
+            )
+            self._write_finalized_authority_row(
+                connection,
+                authority_nonce,
+                authority_ciphertext,
+            )
+            cursor = connection.execute(
+                "DELETE FROM ticket115_mutations_v1 "
+                "WHERE slot = 1 AND record_id = ?",
+                (record_id,),
+            )
+            if cursor.rowcount != 1:
+                raise AuthorityValidationError(
+                    "ticket115 mutation finalization changed"
+                )
             self._refresh_integrity_manifest(connection)
 
     def remember_task_runtime(self, state: object) -> None:
@@ -3764,8 +4414,10 @@ class EncryptedStateStore:
     def finalize_owner_mutation(
         self,
         prepared: OwnerPreparedMutation | OwnerPreparedCorrectionRecovery,
+        *,
+        task_state: TaskRuntimeState | None = None,
     ) -> StoredOwnerMutation:
-        """Atomically publish settings and redact the prepared recovery body."""
+        """Atomically publish settings, task control, and the terminal receipt."""
 
         if type(prepared) not in {
             OwnerPreparedMutation,
@@ -3792,6 +4444,12 @@ class EncryptedStateStore:
                 durable_prepared.request.expected_settings_version
             )
             next_settings = durable_prepared.next_settings
+        if task_state is not None and (
+            type(task_state) is not TaskRuntimeState
+            or task_state.owner_id != next_settings.owner_id
+            or task_state.installation_id != next_settings.installation_id
+        ):
+            raise AuthorityValidationError("owner task runtime authority mismatch")
         record_id = prepared.record_id
         terminal = OwnerMutationTerminalReceipt.for_finalization(
             durable_prepared
@@ -3882,6 +4540,8 @@ class EncryptedStateStore:
                 "nonce=excluded.nonce, ciphertext=excluded.ciphertext",
                 (settings_nonce, settings_ciphertext),
             )
+            if task_state is not None:
+                self._write_task_runtime(connection, task_state)
             stored = StoredOwnerMutation(
                 phase="finalized",
                 prepared=None,
@@ -4904,6 +5564,48 @@ class EncryptedStateStore:
             raise KeyUnavailable("multiple daily review ledgers")
         task_state = self.task_runtime()
         review_state = self.daily_review_ledger()
+        mutation_rows = self._execute(
+            "SELECT record_id FROM ticket115_mutations_v1 ORDER BY slot"
+        ).fetchall()
+        if len(mutation_rows) > 1:
+            raise KeyUnavailable("multiple ticket115 prepared mutations")
+        mutation = (
+            None
+            if not mutation_rows
+            else self.ticket115_mutation_for_record(mutation_rows[0][0])
+        )
+        if mutation is not None:
+            record = self.record(mutation.prepared.target.record_id)
+            record_prepared = (
+                None
+                if record is None
+                else record.payload
+                if type(record.payload) is PreparedTransition
+                else record.payload.prepared
+                if type(record.payload) is CommittedTransition
+                else None
+            )
+            if (
+                record is None
+                or record.state not in {"prepared", "unknown", "committed"}
+                or record_prepared != mutation.prepared
+                or not self.ticket115_mutation_base_is_current(mutation)
+            ):
+                raise KeyUnavailable("ticket115 mutation transition mismatch")
+        unresolved_ticket115_records = self._execute(
+            "SELECT record_id FROM health_records "
+            "WHERE record_id LIKE 'ticket115-mutation:%' "
+            "AND state IN ('prepared', 'unknown', 'committed')"
+        ).fetchall()
+        if (
+            len(unresolved_ticket115_records) != (0 if mutation is None else 1)
+            or (
+                mutation is not None
+                and unresolved_ticket115_records[0][0]
+                != mutation.prepared.target.record_id
+            )
+        ):
+            raise KeyUnavailable("ticket115 mutation body missing")
         orphan = self._execute(
             "SELECT 1 FROM owner_delivery_observations_v1 AS observation "
             "LEFT JOIN owner_outbox_v1 AS intent "
@@ -4958,6 +5660,12 @@ class EncryptedStateStore:
             )
         }:
             raise KeyUnavailable("ticket115 owner settings authority mismatch")
+        if current_owner_settings is not None and mutation is not None and (
+            mutation.owner_id != current_owner_settings.owner_id
+            or mutation.installation_id
+            != current_owner_settings.installation_id
+        ):
+            raise KeyUnavailable("ticket115 mutation owner settings mismatch")
 
     def verify_integrity(self, expected_authority: AuthoritySnapshot) -> bool:
         """Authenticate every local row before a probe can report healthy.
@@ -5032,6 +5740,17 @@ class EncryptedStateStore:
         ).fetchall()
         for causal_id, nonce, ciphertext in receipt_rows:
             self._decode_receipt(causal_id, nonce, ciphertext)
+
+        health_command_receipt_rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext "
+            "FROM ticket115_health_command_receipts_v1 ORDER BY causal_id"
+        ).fetchall()
+        for causal_id, nonce, ciphertext in health_command_receipt_rows:
+            self._decode_health_command_receipt(
+                causal_id,
+                nonce,
+                ciphertext,
+            )
 
         source_rows = self._execute(
             "SELECT causal_id, nonce, ciphertext FROM source_envelopes_v1 ORDER BY causal_id"
@@ -5355,6 +6074,10 @@ class EncryptedStateStore:
         receipt_rows = self._execute(
             "SELECT causal_id, nonce, ciphertext FROM command_receipts_v2"
         ).fetchall()
+        health_command_receipt_rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext "
+            "FROM ticket115_health_command_receipts_v1"
+        ).fetchall()
         pending_rows = self._execute(
             "SELECT causal_id, record_id, nonce, ciphertext FROM pending_commands_v1"
         ).fetchall()
@@ -5393,6 +6116,10 @@ class EncryptedStateStore:
         task_runtime_rows = self._execute(
             "SELECT slot, nonce, ciphertext FROM task_runtime_v1"
         ).fetchall()
+        ticket115_mutation_rows = self._execute(
+            "SELECT slot, record_id, nonce, ciphertext "
+            "FROM ticket115_mutations_v1"
+        ).fetchall()
         daily_review_rows = self._execute(
             "SELECT slot, nonce, ciphertext FROM daily_reviews_v1"
         ).fetchall()
@@ -5410,6 +6137,7 @@ class EncryptedStateStore:
                 effect_rows,
                 authority_rows,
                 receipt_rows,
+                health_command_receipt_rows,
                 pending_rows,
                 pending_effect_rows,
                 terminal_rows,
@@ -5422,6 +6150,7 @@ class EncryptedStateStore:
                 owner_mutation_rows,
                 business_status_rows,
                 task_runtime_rows,
+                ticket115_mutation_rows,
                 daily_review_rows,
                 owner_outbox_rows,
                 owner_delivery_rows,

@@ -164,6 +164,7 @@ class Ticket115StorageMigrationTests(unittest.TestCase):
                 self.assertTrue(
                     {
                         "task_runtime_v1",
+                        "ticket115_mutations_v1",
                         "daily_reviews_v1",
                         "owner_outbox_v1",
                         "owner_delivery_observations_v1",

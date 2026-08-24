@@ -79,6 +79,34 @@ def acceptance_for(
 
 
 class Ticket115TaskValueTests(unittest.TestCase):
+    def test_owner_cancellation_closes_active_task_and_releases_its_claim(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        claimed = TaskEngine.claim(
+            created.state,
+            created.task_id,
+            holder_id="worker:A",
+            lease_id="lease:A",
+            acquired_at_utc="2026-08-24T02:01:00+00:00",
+        )
+
+        cancelled = TaskEngine.apply_owner_cancellation(
+            claimed.state,
+            created.task_id,
+            control_ref="owner-control:cancel-sleep-follow-up",
+            effective_at_utc="2026-08-24T02:02:00+00:00",
+        )
+
+        task = cancelled.state.task(created.task_id)
+        self.assertEqual(cancelled.outcome, "owner-cancelled")
+        self.assertEqual(task.primary_label, "cancelled")
+        self.assertEqual(task.phase, "closed")
+        self.assertEqual(task.terminal_fact.reason_code, "owner-task-cancelled")
+        self.assertEqual(cancelled.state.active_claims, ())
+
     def test_tasking_public_surface_exports_governed_value_types(self) -> None:
         for name in (
             "TASK_APPROVAL_STATUSES",
@@ -523,8 +551,9 @@ class Ticket115DailyReviewTests(unittest.TestCase):
             installation_id=INSTALLATION,
             timezone_name="Asia/Shanghai",
             observed_at_utc="2026-08-24T15:45:00+00:00",
-            current_state_digest="sha256:" + "3" * 64,
-            changed=False,
+            current_state_digest=SHA_TWO,
+            changed=True,
+            action_refs=("task:sleep",),
         )
         committed = DailyReviewEngine.commit(
             resumed,

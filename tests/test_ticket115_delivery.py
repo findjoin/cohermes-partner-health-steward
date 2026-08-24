@@ -7,9 +7,12 @@ import unittest
 from partner_health_steward.delivery import (
     DeliveryContractViolation,
     DeliveryOutboxState,
-    OwnerDeliveryAdapter,
+    OwnerDeliveryCompletion,
     OwnerDeliveryEngine,
+    OwnerDeliverySendIntent,
     OwnerDeliveryTransportResult,
+    OwnerDeliveryWireAdapter,
+    OwnerWeixinDestination,
 )
 
 
@@ -75,6 +78,66 @@ def _attempted_state():
 
 
 class Ticket115DeliveryTests(unittest.TestCase):
+    def test_plugin_transport_contract_exposes_only_owner_weixin_send_fields(self) -> None:
+        destination = OwnerWeixinDestination(
+            partner_id="partner-A",
+            owner_sender_id=OWNER,
+            conversation_id="conversation-owner-A",
+            channel="weixin",
+            entrypoint="health_weixin",
+        )
+        send_intent = OwnerDeliverySendIntent(
+            intent_id="outbox:" + ("1" * 64),
+            attempt_ref="owner-delivery-attempt:" + ("2" * 64),
+            destination=destination,
+            payload_ref="owner-message:daily-review:2026-08-24",
+            payload_digest="sha256:" + ("3" * 64),
+            idempotency_key="health-owner-delivery:v1:" + ("4" * 64),
+        )
+        completion = OwnerDeliveryCompletion(
+            intent_id=send_intent.intent_id,
+            attempt_ref=send_intent.attempt_ref,
+            status="accepted",
+            result_ref="weixin-result:accepted:1",
+            evidence_ref="weixin-response:accepted:1",
+            observed_at_utc="2026-08-24T02:00:04+00:00",
+        )
+
+        self.assertEqual(
+            send_intent.to_wire(),
+            {
+                "intent_id": "outbox:" + ("1" * 64),
+                "attempt_ref": "owner-delivery-attempt:" + ("2" * 64),
+                "destination": {
+                    "partner_id": "partner-A",
+                    "owner_sender_id": OWNER,
+                    "conversation_id": "conversation-owner-A",
+                    "channel": "weixin",
+                    "entrypoint": "health_weixin",
+                },
+                "payload_ref": "owner-message:daily-review:2026-08-24",
+                "payload_digest": "sha256:" + ("3" * 64),
+                "idempotency_key": "health-owner-delivery:v1:" + ("4" * 64),
+            },
+        )
+        self.assertEqual(
+            OwnerDeliverySendIntent.from_wire(send_intent.to_wire()),
+            send_intent,
+        )
+        self.assertEqual(
+            OwnerDeliveryCompletion.from_wire(completion.to_wire()),
+            completion,
+        )
+        changed_conversation = OwnerWeixinDestination(
+            partner_id="partner-A",
+            owner_sender_id=OWNER,
+            conversation_id="conversation-owner-A-v2",
+        )
+        self.assertTrue(destination.route_id.startswith("health-weixin-route:v1:"))
+        self.assertNotEqual(destination.route_id, changed_conversation.route_id)
+        self.assertNotIn("business_fact_ref", send_intent.to_wire())
+        self.assertNotIn("source_ref", send_intent.to_wire())
+
     def test_stable_idempotency_key_is_bound_to_authoritative_intent(self) -> None:
         first = _intent()
         recovered = _intent(formed_at_utc="2026-08-24T02:05:00+00:00")
@@ -297,18 +360,15 @@ class Ticket115DeliveryTests(unittest.TestCase):
                 evidence_ref="weixin-receipt:delivered:1",
             )
 
-        class SyntheticAdapter:
-            def __init__(self) -> None:
-                self.sent = []
+        class WireAdapter:
+            def send(self, intent: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "accepted",
+                    "result_ref": str(intent["idempotency_key"]),
+                    "evidence_ref": "weixin-response:accepted:wire",
+                }
 
-            def send(self, intent):
-                self.sent.append(intent)
-                return accepted
-
-        adapter = SyntheticAdapter()
-        self.assertIsInstance(adapter, OwnerDeliveryAdapter)
-        self.assertEqual(adapter.send(_intent()), accepted)
-        self.assertEqual(adapter.sent, [_intent()])
+        self.assertIsInstance(WireAdapter(), OwnerDeliveryWireAdapter)
 
     def test_unknown_freezes_automatic_retry_without_erasing_later_proof(self) -> None:
         state, intent_id = _attempted_state()

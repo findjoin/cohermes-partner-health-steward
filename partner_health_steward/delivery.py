@@ -98,6 +98,12 @@ def _utc_datetime(value: object, name: str) -> datetime:
     return datetime.fromisoformat(_utc(value, name))
 
 
+def validate_owner_delivery_observed_at(value: object) -> str:
+    """Validate the timestamp before a transport side effect is attempted."""
+
+    return _utc(value, "owner delivery observation time")
+
+
 def _mapping(
     value: object,
     fields: frozenset[str],
@@ -307,6 +313,174 @@ class OutboxIntent:
 
 
 @dataclass(frozen=True)
+class OwnerWeixinDestination:
+    """The exact configured private Weixin owner route for one send."""
+
+    partner_id: str
+    owner_sender_id: str
+    conversation_id: str
+    channel: str = "weixin"
+    entrypoint: str = "health_weixin"
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.partner_id, "owner delivery partner"),
+            (self.owner_sender_id, "owner delivery sender"),
+            (self.conversation_id, "owner delivery conversation"),
+        ):
+            _text(value, name)
+        if self.channel != "weixin" or self.entrypoint != "health_weixin":
+            raise DeliveryContractViolation("invalid owner Weixin destination")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "partner_id": self.partner_id,
+            "owner_sender_id": self.owner_sender_id,
+            "conversation_id": self.conversation_id,
+            "channel": self.channel,
+            "entrypoint": self.entrypoint,
+        }
+
+    @property
+    def route_id(self) -> str:
+        digest = stable_digest(
+            {
+                "contract": "owner-weixin-destination-v1",
+                **self.to_wire(),
+            }
+        )
+        return "health-weixin-route:v1:" + digest.removeprefix("sha256:")
+
+    @classmethod
+    def from_wire(cls, value: object) -> "OwnerWeixinDestination":
+        fields = _mapping(
+            value,
+            frozenset(
+                {
+                    "partner_id",
+                    "owner_sender_id",
+                    "conversation_id",
+                    "channel",
+                    "entrypoint",
+                }
+            ),
+            "owner Weixin destination",
+        )
+        return cls(**fields)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class OwnerDeliverySendIntent:
+    """The bounded value Plugin may hand to the Weixin transport."""
+
+    intent_id: str
+    attempt_ref: str
+    destination: OwnerWeixinDestination
+    payload_ref: str
+    payload_digest: str
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.intent_id, "owner delivery intent identifier"),
+            (self.attempt_ref, "owner delivery attempt reference"),
+            (self.payload_ref, "owner delivery payload reference"),
+            (self.idempotency_key, "owner delivery idempotency key"),
+        ):
+            _text(value, name)
+        if type(self.destination) is not OwnerWeixinDestination:
+            raise DeliveryContractViolation("invalid owner Weixin destination")
+        _sha256(self.payload_digest, "owner delivery payload digest")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "intent_id": self.intent_id,
+            "attempt_ref": self.attempt_ref,
+            "destination": self.destination.to_wire(),
+            "payload_ref": self.payload_ref,
+            "payload_digest": self.payload_digest,
+            "idempotency_key": self.idempotency_key,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object) -> "OwnerDeliverySendIntent":
+        fields = _mapping(
+            value,
+            frozenset(
+                {
+                    "intent_id",
+                    "attempt_ref",
+                    "destination",
+                    "payload_ref",
+                    "payload_digest",
+                    "idempotency_key",
+                }
+            ),
+            "owner delivery send intent",
+        )
+        return cls(
+            intent_id=fields["intent_id"],  # type: ignore[arg-type]
+            attempt_ref=fields["attempt_ref"],  # type: ignore[arg-type]
+            destination=OwnerWeixinDestination.from_wire(fields["destination"]),
+            payload_ref=fields["payload_ref"],  # type: ignore[arg-type]
+            payload_digest=fields["payload_digest"],  # type: ignore[arg-type]
+            idempotency_key=fields["idempotency_key"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class OwnerDeliveryCompletion:
+    """The complete transport observation Plugin returns to core."""
+
+    intent_id: str
+    attempt_ref: str
+    status: str
+    result_ref: str
+    evidence_ref: str
+    observed_at_utc: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.intent_id, "owner delivery intent identifier"),
+            (self.attempt_ref, "owner delivery attempt reference"),
+            (self.result_ref, "owner delivery transport result reference"),
+            (self.evidence_ref, "owner delivery transport evidence reference"),
+        ):
+            _text(value, name)
+        if self.status not in OWNER_DELIVERY_TRANSPORT_STATUSES:
+            raise DeliveryContractViolation("invalid owner delivery transport status")
+        _utc(self.observed_at_utc, "owner delivery observation time")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "intent_id": self.intent_id,
+            "attempt_ref": self.attempt_ref,
+            "status": self.status,
+            "result_ref": self.result_ref,
+            "evidence_ref": self.evidence_ref,
+            "observed_at_utc": self.observed_at_utc,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object) -> "OwnerDeliveryCompletion":
+        fields = _mapping(
+            value,
+            frozenset(
+                {
+                    "intent_id",
+                    "attempt_ref",
+                    "status",
+                    "result_ref",
+                    "evidence_ref",
+                    "observed_at_utc",
+                }
+            ),
+            "owner delivery completion",
+        )
+        return cls(**fields)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
 class OwnerDeliveryTransportResult:
     """The only immediate outcomes an owner-delivery adapter may report."""
 
@@ -340,11 +514,15 @@ class OwnerDeliveryTransportResult:
 
 
 @runtime_checkable
-class OwnerDeliveryAdapter(Protocol):
-    """Host adapter seam; channel-specific behavior stays behind ``send``."""
+class OwnerDeliveryWireAdapter(Protocol):
+    """Plugin transport seam; only strict wire values cross this boundary."""
 
-    def send(self, intent: OutboxIntent, /) -> OwnerDeliveryTransportResult:
-        """Attempt the exact intent once using its stable idempotency key."""
+    def send(
+        self,
+        intent: Mapping[str, object],
+        /,
+    ) -> Mapping[str, object]:
+        """Attempt one serialized Weixin send and return its serialized result."""
 
 
 @dataclass(frozen=True)
@@ -1138,9 +1316,6 @@ class OwnerDeliveryEngine:
         )
 
 
-DeliveryEngine = OwnerDeliveryEngine
-
-
 __all__ = [
     "CONTACT_DELIVERY_ENABLED",
     "DELIVERY_EFFECT_KINDS",
@@ -1148,15 +1323,18 @@ __all__ = [
     "DELIVERY_OBSERVATION_KINDS",
     "OWNER_DELIVERY_TRANSPORT_STATUSES",
     "DeliveryContractViolation",
-    "DeliveryEngine",
     "DeliveryFact",
     "DeliveryLease",
     "DeliveryOutboxState",
     "DeliveryTransition",
     "OutboxIntent",
     "OutboxRecord",
-    "OwnerDeliveryAdapter",
+    "OwnerDeliveryCompletion",
     "OwnerDeliveryEngine",
+    "OwnerDeliverySendIntent",
     "OwnerDeliveryTransportResult",
+    "OwnerDeliveryWireAdapter",
+    "OwnerWeixinDestination",
     "owner_delivery_idempotency_key",
+    "validate_owner_delivery_observed_at",
 ]
