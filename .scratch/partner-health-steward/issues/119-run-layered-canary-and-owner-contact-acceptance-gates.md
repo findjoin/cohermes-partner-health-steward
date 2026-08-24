@@ -91,8 +91,8 @@ G01—G06、G09 的测试通过不替代 G07、G08、G10—G12。G08 永远不�
 2. **Automated evidence collector**：实现只读、无秘密的 gate runner/collector，复用 Ticket 118 的单一验证入口。完成标准：G01—G06 的合成执行能生成可重复 ledger，不会越过失败层。
 3. **Fault and external preflight**：实现 G07—G12 的证据/授权/target isolation preflight、no-go 和 rollback 状态检查。完成标准：前置未过为 `blocked`；当前 frontier 缺批准为 `not-authorized`；已执行但权威不足为 `cannot-confirm`；绝不误报 passed。
 4. **Approved execution**：按顺序执行当时已经获得明确授权的 gate；每层完成即冻结证据和 digest。完成标准：每个已执行 gate 有完整 ledger，后续执行符合依赖与批准。
-5. **Independent acceptance review**：对报告、原始证据、产品声明和剩余风险做独立 Standards/Spec 审查。完成标准：119-A1—A7 全部有证据，任何未执行或未通过 gate 都明确阻止相应声明。
-6. **Ticket completion decision**：实现 Agent 不作 `resolved` 决定。每次 no-go/未知/未授权尝试只冻结一份 run record，Ticket 继续保持未完成；只有同一 release digest 的全部强制 gate `passed`，独立 reviewer 才能写 `product acceptance: passed` 的 `## Answer` 并决定 `resolved`。
+5. **Fresh-context acceptance review**：冻结最终报告、原始证据引用、产品声明和待审 checkpoint，再启动下面规定的 Standards/Spec 双轴 reviewer。完成标准：119-A1—A7 全部有证据，两个 reviewer 审查同一 release/run/commit identity，任何未执行或未通过 gate 都明确阻止相应声明。
+6. **Ticket completion decision**：同一个顶层 Agent 可以编排闭票，但每次 no-go/未知/未授权尝试只冻结一份 run record，Ticket 继续保持未完成；只有同一 release digest 的全部强制 gate `passed` 且两个 fresh-context reviewer 均通过，顶层 Agent 才能写 `product acceptance: passed` 的 `## Answer` 并决定 `resolved`。
 
 ### Verification and stop conditions
 
@@ -106,5 +106,11 @@ G01—G06、G09 的测试通过不替代 G07、G08、G10—G12。G08 永远不�
 
 列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。任何真实模型、微信、联系人、主人、current-head、删除、迁移、部署、许可接受或医学审核动作必须在执行前取得对应的明确批准；缺批准就记录 `not-authorized` 并停止该分支。不得把报告生成、自动测试、安装、接口接受或单次通过写成 active、产品验收或稳定运行。
 
-实施 Agent 在交审前于本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试/实际 gate、证据路径、命令/结果摘要和 release/run identity；独立 reviewer 才能写 `## Answer` 并决定是否 `resolved`。
+实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试/实际 gate、证据路径、命令/结果摘要和 release/run identity。直接编写实现或执行 canary 的上下文不能把自评当作审查证据，必须执行以下双轴门：
+
+1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。同一 release digest 的全部强制 gate `passed` 后，提交无秘密的最终 ledger、证据引用和实施记录，确认工作区无未提交或未跟踪实现/证据文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整范围、相关文件最终状态、稳定证据引用和测试结果，不继承实施/canary 推理或完成判断，并在最终 verdict 中共同引用同一个 base、commit、tree、release digest 和 run identity。
+2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、G01—G12、禁止替代物和每个 `119-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/证据定位、A1—A7 verdict、全部强制 gate verdict、产品验收 verdict 和总 verdict。
+3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、授权边界、目标隔离、最小披露、release/run 身份、证据真实性、claim linter、回滚和稳定性声明，为每项 finding 标注 P0—P3，并输出文件/证据定位和总 verdict。
+4. 任一强制 gate 为 `failed`、`cannot-confirm`、`not-authorized` 或 `blocked`，任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或存在未解决的 P0/P1/P2 finding，都阻止 `product acceptance: passed` 和闭票。顶层 Agent 修复或在新授权下执行后必须形成新的 checkpoint、重跑受影响 gate 与验证，并让两个 reviewer 对同一新身份重新给出最终 verdict；任何生产代码、测试、配置、release、ledger 或证据引用在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响本票产品验收且记录为后继工作时才可保留。
+5. 全部强制 gate 对同一 release digest `passed` 且两轴对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree/release/run identity、最终 Case/gate 映射、验证命令/结果、`product acceptance: passed` 以及仍不足以宣称长期稳定的证据。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer 或任一强制 gate 未通过，本票保持 `claimed`。
 

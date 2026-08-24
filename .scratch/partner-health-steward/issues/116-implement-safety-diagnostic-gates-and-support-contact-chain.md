@@ -85,7 +85,7 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 4. **Diagnostic revision authority**：实现完整正向诊断 schema/current 唯一性、确定性渲染、退出和后继链。完成标准：116-A4、A9 通过，权威 unknown 时无判断冒充 current。
 5. **Support-contact chain**：消费/校验 Ticket 114 的单联系人批准，实现最小 alert intent、撤回/更换后的失败关闭、纠正和 Ticket 115 ledger 集成。完成标准：116-A5、A6 通过，无第二联系人批准真相，主人提示不受联系人失败影响。
 6. **Stop-recording and status integration**：实现无正文临时安全边界和 typed facts。完成标准：116-A7、A8 通过，停止记录与 staged 范围不产生隐藏正文或虚假 active。
-7. **Regression and review**：运行本票及全量验证，并进行安全重点的 Standards/Spec 双轴审查。完成标准：所有原始复选项和 116-A1—A9 有“测试 + 实现位置 + 结果”映射，外部权利/审核/验收仍真实标记，Ticket 保持 `claimed` 等待独立审查。
+7. **Regression and review**：运行本票及全量验证，冻结待审 diff，再启动下面规定的 fresh-context Standards/Spec 双轴审查。完成标准：所有原始复选项和 116-A1—A9 有“测试 + 实现位置 + 结果”映射，外部权利/审核/验收仍真实标记，两轴最终 verdict 均为通过。
 
 ### Verification and stop conditions
 
@@ -96,7 +96,13 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 - `python -m compileall -q partner_health_steward tests`
 - `git diff --check`
 
-列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。需要接受许可、医学签字、调用真实模型/联系人/微信、读取真实健康资料，或发现当前 BMI/安全路线不可实施时，立即停止并交还明确外部决定或 CAN 前提；不得伪造批准、用免责声明激活范围、降级安全验收或把合成证据冒充真实验收。实现 Agent 不得标记 `resolved`。
+列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。需要接受许可、医学签字、调用真实模型/联系人/微信、读取真实健康资料，或发现当前 BMI/安全路线不可实施时，立即停止并交还明确外部决定或 CAN 前提；不得伪造批准、用免责声明激活范围、降级安全验收或把合成证据冒充真实验收。
 
-实施 Agent 在交审前于本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity；独立 reviewer 才能写 `## Answer` 并决定是否 `resolved`。
+实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity。随后同一个顶层任务可以自行完成闭票编排，但直接编写实现的上下文不能把自评当作审查证据，必须执行以下双轴门：
+
+1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。完成实现证据和全部验证后创建待审 checkpoint commit，确认工作区无未提交或未跟踪实现文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整实施范围、该范围涉及文件的最终状态和测试证据，不继承实施推理或实施 Agent 的完成判断，并在最终 verdict 中共同引用同一个 base、commit 与 tree hash。
+2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `116-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/行号证据、A1—A9 verdict 和总 verdict；外部许可、医学审核、真实模型/联系人/微信和产品验收仍按实际证据保持未激活或待后继 Ticket。
+3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、安全失败关闭、Plugin/core 权威边界、最小披露、测试真实性、回归和可维护性，为每项 finding 标注 P0—P3，并输出文件/行号证据和总 verdict。
+4. 任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或未解决的 P0/P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须形成新的 checkpoint commit、重跑受影响测试与全量验证，并让两个 reviewer 对新 commit 重新给出最终 verdict；任何生产代码、测试、配置或迁移在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
+5. 两轴均对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree identity、最终 Case 映射、验证命令/结果，以及仍属后继 Ticket 的真实外部门。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
 

@@ -77,7 +77,7 @@ release 只绑定 Ticket 117 migration 协议、schema、builder、semantic-regi
 3. **Pinned host contract**：取得/验证固定 Hermes v0.20.0/commit 的 allowlisted 原始文件，记录原始 hash/提取器/patch/assertion，并把实际 Plugin/Adapter 加载到真实 lifecycle/registration interface；fixture 只注入故障。完成标准：118-A2、A5 通过，离线来源复验成功且不含真实 Partner 配置。
 4. **Socket and adapter contract**：实现/验证 peer、framing、result terminality、co-stop 和 no-bypass。完成标准：118-A3、A4 通过，所有普通/历史写入口不可达。
 5. **Preflight/upgrade/rollback**：实现无秘密检查清单和机器可读结果，验证 schema/bundle/fence drift。完成标准：118-A6、A7 通过，unknown 不会被脚本转成 pass。
-6. **Regression and review**：运行本票、全量与静态 secret/path 检查，完成 Standards/Spec 双轴审查。完成标准：所有原始复选项和 118-A1—A7 有“测试 + 实现位置 + 结果”映射，真实绑定继续明确待 Ticket 119/单独批准验证，Ticket 保持 `claimed` 等待独立审查。
+6. **Regression and review**：运行本票、全量与静态 secret/path 检查，冻结待审 diff，再启动下面规定的 fresh-context Standards/Spec 双轴审查。完成标准：所有原始复选项和 118-A1—A7 有“测试 + 实现位置 + 结果”映射，真实绑定继续明确待 Ticket 119/单独批准验证，两轴最终 verdict 均为通过。
 
 ### Verification and stop conditions
 
@@ -89,7 +89,13 @@ release 只绑定 Ticket 117 migration 协议、schema、builder、semantic-regi
 - `python -m compileall -q partner_health_steward tests`
 - `git diff --check`
 
-列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。需要访问真实 Partner、真实服务、凭据、微信、模型、云资源或接受外部许可/审核时立即停止；若固定 Hermes artifact 与所选 HOW 的必要宿主合同存在根本冲突，停止并返回 CAN，不得静默 patch 成新路线。实现 Agent 不得标记 `resolved`。
+列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。需要访问真实 Partner、真实服务、凭据、微信、模型、云资源或接受外部许可/审核时立即停止；若固定 Hermes artifact 与所选 HOW 的必要宿主合同存在根本冲突，停止并返回 CAN，不得静默 patch 成新路线。
 
-实施 Agent 在交审前于本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity；独立 reviewer 才能写 `## Answer` 并决定是否 `resolved`。
+实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity。随后同一个顶层任务可以自行完成闭票编排，但直接编写实现的上下文不能把自评当作审查证据，必须执行以下双轴门：
+
+1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。完成实现证据和全部验证后创建待审 checkpoint commit，确认工作区无未提交或未跟踪实现文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整实施范围、该范围涉及文件的最终状态和测试证据，不继承实施推理或实施 Agent 的完成判断，并在最终 verdict 中共同引用同一个 base、commit 与 tree hash。
+2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `118-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/行号证据、A1—A7 verdict 和总 verdict；真实 Partner、服务、凭据、微信、模型、云资源、许可和审核仍按实际证据保持待 Ticket 119/单独批准验证。
+3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、可复现 release、真实 pinned host 合同、Plugin/core 无旁路、secret/path 扫描、测试真实性、回归和可维护性，为每项 finding 标注 P0—P3，并输出文件/行号证据和总 verdict。
+4. 任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或未解决的 P0/P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须形成新的 checkpoint commit、重跑受影响测试、全量验证与静态扫描，并让两个 reviewer 对新 commit 重新给出最终 verdict；任何生产代码、测试、配置、release 或迁移在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
+5. 两轴均对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree identity、最终 Case 映射、验证命令/结果，以及仍待 Ticket 119/单独批准的真实外部门。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
 
