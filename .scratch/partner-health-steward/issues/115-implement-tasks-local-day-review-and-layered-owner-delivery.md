@@ -89,7 +89,7 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 4. **Transactional outbox**：实现业务事实 + intent 原子提交和事务外 effect claim。完成标准：115-A4 通过，所有故障点都能恢复为一个真实状态。
 5. **Delivery ledger**：实现稳定幂等身份、分层 evidence authority、独立的 TaskClaimLease 与既有 ExecutionLease 回归、执行前重检及 unknown freeze。完成标准：115-A5、A6 通过，重启 epoch 后旧 task holder 无权提交，既有 effect fence schema 未改，低层 producer 无高层写权，可能已离站 effect 没有自动重试路径。
 6. **Status and mandatory delivery integration**：把无正文 task/review/delivery facts 接入 Ticket 114 projector，并形成一次状态变化通知/必要行动请求。完成标准：115-A7、A8 通过，普通通知关闭和支持暂停不吞掉必要结果。
-7. **Regression and review**：运行本票及全量验证并做 Standards/Spec 双轴审查。完成标准：所有原始复选项和 115-A1—A8 有“测试 + 实现位置 + 结果”映射，Ticket 保持 `claimed` 等待独立审查。
+7. **Regression and review**：运行本票及全量验证，冻结待审 diff，再启动下面规定的 fresh-context Standards/Spec 双轴审查。完成标准：所有原始复选项和 115-A1—A8 有“测试 + 实现位置 + 结果”映射，两轴最终 verdict 均为通过。
 
 ### Verification and stop conditions
 
@@ -100,9 +100,15 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 - `python -m compileall -q partner_health_steward tests`
 - `git diff --check`
 
-列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。若必须接真实 Weixin、把 Ticket 116 的安全联系人效果提前并入普通投递、无法取得 Ticket 114 的当前控制/时区/status 接缝，或发现会改变已选路线的事实，立即停止并报告。不得用 heartbeat、布尔 `sent`、重试循环或降低验收继续；实现 Agent 不得标记 `resolved`。
+列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。若必须接真实 Weixin、把 Ticket 116 的安全联系人效果提前并入普通投递、无法取得 Ticket 114 的当前控制/时区/status 接缝，或发现会改变已选路线的事实，立即停止并报告。不得用 heartbeat、布尔 `sent`、重试循环或降低验收继续。
 
-实施 Agent 在交审前于本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity；独立 reviewer 才能写 `## Answer` 并决定是否 `resolved`。
+实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity。随后同一个顶层任务可以自行完成闭票编排，但直接编写实现的上下文不能把自评当作审查证据，必须执行以下双轴门：
+
+1. 冻结待审代码后启动两个全新上下文的 reviewer Agent；reviewer 只读取当前仓库、权威合同、实际 diff 和测试证据，不继承实施推理或实施 Agent 的完成判断。
+2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `115-Ax-Cyy`，输出带文件/行号证据的 findings、A1—A8 verdict 和总 verdict。
+3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、Plugin/core 权威边界、测试真实性、回归和可维护性，输出带文件/行号证据的 findings 和总 verdict。
+4. 任一 A Case 非绿、验证失败、硬规范违规或未解决的 P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须重跑受影响测试与全量验证，并让两个 reviewer 对最终 diff 重新给出 verdict；P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
+5. 两轴均对最终 diff 给出通过后，顶层 Agent 才能追加 `## Answer`，记录两个 reviewer 的证据、最终 Case 映射、验证命令/结果和 commit identity，并把本票标为 `resolved`。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
 
 ## Previous implementation evidence (old-contract baseline)
 
