@@ -1,7 +1,7 @@
 # 115 - 实现任务当地日复盘与分层主人投递
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-implement-strict-health-llm-governed-knowledge-and-nondiagnostic-answer.md), [114 - 实现主人设置数据权利与业务状态](114-implement-owner-settings-data-rights-and-business-status.md)
 
@@ -26,7 +26,16 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 - Plugin 只通过 wire-shaped health command、controlled effect 和 managed read 接缝调用 core。适配器在 SQLite 事务外执行；稳定幂等键绑定完整权威意图，形成、提交、尝试、接口接受、送达、已读和未知保持独立事实。
 - `prepared -> authorized-in-flight` 短时两阶段 marker 防止 managed read 把正常 handoff 误判为 orphan，也原子阻止并发/重复授权。适配器已发送但终态提交失败时保留 in-flight marker，TTL/重启恢复只冻结为 `unknown`，不会第二次调用 transport。
 - 实现提交：`d1450bc`（任务、复盘和投递主体）、`5e94d3c`（发送前当前性加固）、`6a25954`（wire authority、原子恢复、路由代际和重复发送竞态闭合）。
-- `python -m unittest discover -s tests -p "test_ticket115_*.py"` -> `Ran 102 tests in 73.756s ... OK`。
+- `python -m unittest discover -s tests -p "test_ticket115_*.py"` -> `Ran 102 tests in 68.359s ... OK`。
 - `python -m unittest discover -s tests` -> `Ran 675 tests in 216.122s ... OK`。
 - `python -m compileall -q partner_health_steward tests` -> exit `0`；`git diff --check` -> exit `0`，仅有既存 LF/CRLF 转换提示，无 whitespace error。
 - 验证环境：Python `3.11.6`、SQLite `3.42.0`、`cryptography 3.3.1`。证据只覆盖本地合成 Plugin/core；真实 Hermes、Weixin、模型、部署和生产 canary 仍由后继 Tickets 验收。
+
+## Answer
+
+独立复审结论：Ticket 115 已满足当前实现 Spec 与本票验收矩阵，可标记为 `resolved`。
+
+- **Spec 轴：**任务权威、当地日复盘、原子 outbox、分层投递、当前性复核、未知冻结和恢复均有实现与合成覆盖；复审发现的路由配置代际硬编码已改为当前代际，并由 generation 2 重新同意和投递用例证明。适配器发送后终态失败的重复发送窗口已由两阶段 marker、TTL 恢复和故障注入用例闭合。
+- **Standards 轴：**无硬性规范违规。复审指出的 freshness 重复逻辑已抽为共享 helper；旧 typed `OwnerDeliveryAdapter` 与 `DeliveryEngine` 兼容出口已移除，生产边界只保留 `OwnerDeliveryWireAdapter`。HealthCore 的集中复杂性符合 ADR 0021 的既定架构决定。
+- 验证结果：Ticket 115 `102/102`、项目全量 `675/675`、`compileall` 和 `git diff --check` 全部通过；最终实现提交为 `6a25954`，实施证据提交为 `af80dc7`。
+- 结论仅覆盖本地合成 Plugin/core 与 fake transport；真实 Partner Hermes、Weixin、模型、部署、医学审核和生产 canary 仍不属于本票验收。
