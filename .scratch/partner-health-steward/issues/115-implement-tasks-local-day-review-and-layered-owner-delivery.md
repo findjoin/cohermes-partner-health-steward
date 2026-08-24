@@ -104,11 +104,11 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 
 实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity。随后同一个顶层任务可以自行完成闭票编排，但直接编写实现的上下文不能把自评当作审查证据，必须执行以下双轴门：
 
-1. 冻结待审代码后启动两个全新上下文的 reviewer Agent；reviewer 只读取当前仓库、权威合同、实际 diff 和测试证据，不继承实施推理或实施 Agent 的完成判断。
-2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `115-Ax-Cyy`，输出带文件/行号证据的 findings、A1—A8 verdict 和总 verdict。
-3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、Plugin/core 权威边界、测试真实性、回归和可维护性，输出带文件/行号证据的 findings 和总 verdict。
-4. 任一 A Case 非绿、验证失败、硬规范违规或未解决的 P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须重跑受影响测试与全量验证，并让两个 reviewer 对最终 diff 重新给出 verdict；P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
-5. 两轴均对最终 diff 给出通过后，顶层 Agent 才能追加 `## Answer`，记录两个 reviewer 的证据、最终 Case 映射、验证命令/结果和 commit identity，并把本票标为 `resolved`。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
+1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。完成实现证据和全部验证后创建待审 checkpoint commit，确认工作区无未提交或未跟踪实现文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整实施范围、该范围涉及文件的最终状态和测试证据，不继承实施推理或实施 Agent 的完成判断，并在最终 verdict 中共同引用同一个 base、commit 与 tree hash。
+2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `115-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/行号证据、A1—A8 verdict 和总 verdict。
+3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、Plugin/core 权威边界、测试真实性、回归和可维护性，为每项 finding 标注 P0—P3，并输出文件/行号证据和总 verdict。
+4. 任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或未解决的 P0/P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须形成新的 checkpoint commit、重跑受影响测试与全量验证，并让两个 reviewer 对新 commit 重新给出最终 verdict；任何生产代码、测试、配置或迁移在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
+5. 两轴均对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree identity、最终 Case 映射和验证命令/结果。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
 
 ## Previous implementation evidence (old-contract baseline)
 
