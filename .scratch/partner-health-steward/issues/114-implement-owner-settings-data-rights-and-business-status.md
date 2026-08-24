@@ -1,7 +1,7 @@
 # 114 - 实现主人设置数据权利与业务状态
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [111 - 实现唯一准入与主人初始化](111-implement-unique-admission-and-owner-initialization.md), [112 - 实现七 Skill 协调与日常证据画像处理](112-implement-seven-skill-coordination-and-daily-evidence-portrait-turn.md)
 
@@ -141,4 +141,15 @@ Blocked by: [111 - 实现唯一准入与主人初始化](111-implement-unique-ad
 - `python -m compileall -q partner_health_steward tests` → exit 0。
 - `git diff --check` → exit 0；仅报告现有 LF/CRLF 转换 warning，无 whitespace error。
 - 验证环境：Python `3.11.6`；SQLite `3.42.0`；`cryptography 3.3.1`。
+
+## Answer
+
+独立 reviewer 复核结论：Ticket 114 已满足当前 implementation contract 与 114-A1—A9 验收矩阵，可标记为 `resolved`。
+
+- 主人设置保留 Ticket 111 的 `contact_window` 时间段语义；五类普通通知和支持联系人均支持显式 `not-configured`。暂停主动支持、停止新增记录、任务取消、执行批准及联系人控制保持独立，并以对象自身 version 判断 currentness、以 current-head generation/fence 完成命令 CAS。
+- `ManagedRightsService` 只消费 `HealthCore.daily_state`/`DailyHealthState` 的 owner-scoped 受管投影；纠正只先形成 draft，正式 revision 复用 Ticket 112 的 `prepare → commit → finalize` 唯一写入链。prepared owner correction、终态 receipt 和停止记录来源保持无正文，跨重启恢复不会建立第二套持久真相。
+- `StatusProjector` 只接受 core-sealed capability facts；未知、过期、伪造或后续尚未实现的 producer 均不能冒充 `active`。登记账本的 208 个 Case ID、method locator 与 observable 已双向核对为唯一、完整且真实可执行，未发现 skip、xfail 或占位测试。
+- 已核验实现提交 `09dc2f5d0a6b6e26aa484177e7f591dbc4967634`：Ticket 114 `210/210`、Ticket 111—113 回归 `228/228`、项目全量 `573/573` 均通过；`compileall` 与 `git diff --check` 通过。独立审查最终 P0/P1/P2 均为 0。
+
+本结论仅覆盖本地合成 Plugin/core 合同与当前代码证据；未操作服务器，也不代表真实 Hermes/Weixin、模型、投递或生产 canary 已验收。实现路线与下一张已解锁票见[项目 Map](../map.md)，由 Ticket 115 继续承接任务、当地日复盘与分层主人投递。
 
