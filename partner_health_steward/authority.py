@@ -52,17 +52,17 @@ def validate_opaque_text(value: object, name: str) -> str:
     return value
 
 
-def validate_ticket110_effect_kind(value: object) -> str:
-    """Accept only the controlled-effect kind implemented by Ticket 110.
+def validate_controlled_effect_kind(value: object) -> str:
+    """Accept controlled effects implemented through the current ticket set.
 
-    Delivery intents require a committed business record, an approved outbox,
-    and a delivery receipt.  Those facts do not exist in this skeleton, so
-    every durable controlled-effect boundary must reject them.
+    Ticket 110 introduced model work. Ticket 115 adds owner delivery after a
+    committed outbox binding. Contact delivery remains disabled until Ticket
+    116 supplies its separate danger, approval, and minimum-payload contract.
     """
 
     effect_kind = validate_opaque_text(value, "effect_kind")
-    if effect_kind != "model-work":
-        raise AuthorityValidationError("effect kind not supported in ticket 110")
+    if effect_kind not in {"model-work", "owner-delivery"}:
+        raise AuthorityValidationError("effect kind not supported")
     return effect_kind
 
 
@@ -331,7 +331,7 @@ class EffectIntent:
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.effect_id, "effect_id")
-        validate_ticket110_effect_kind(self.effect_kind)
+        validate_controlled_effect_kind(self.effect_kind)
         validate_opaque_text(self.intent_digest, "intent_digest")
         if type(self.authority) is not AuthoritySnapshot:
             raise AuthorityValidationError("invalid effect authority")
@@ -410,7 +410,7 @@ class ExecutionCapabilityBinding:
     def for_claim(cls, claim: "ClaimingEffect") -> "ExecutionCapabilityBinding":
         if type(claim) is not ClaimingEffect:
             raise AuthorityValidationError("invalid execution capability claim")
-        validate_ticket110_effect_kind(claim.intent.effect_kind)
+        validate_controlled_effect_kind(claim.intent.effect_kind)
         return cls(
             authority=claim.intent.authority,
             effect_id=claim.intent.effect_id,
@@ -422,7 +422,7 @@ class ExecutionCapabilityBinding:
     def for_execution(cls, execution: "ExecutingEffect") -> "ExecutionCapabilityBinding":
         if type(execution) is not ExecutingEffect:
             raise AuthorityValidationError("invalid execution capability execution")
-        validate_ticket110_effect_kind(execution.intent.effect_kind)
+        validate_controlled_effect_kind(execution.intent.effect_kind)
         return cls(
             authority=execution.intent.authority,
             effect_id=execution.intent.effect_id,
@@ -446,7 +446,7 @@ class ClaimingEffect:
     def __post_init__(self) -> None:
         if type(self.intent) is not EffectIntent:
             raise AuthorityValidationError("invalid claiming effect intent")
-        validate_ticket110_effect_kind(self.intent.effect_kind)
+        validate_controlled_effect_kind(self.intent.effect_kind)
         validate_opaque_text(self.holder_id, "effect holder identifier")
         validate_opaque_text(self.vault_claim_ref, "vault claim reference")
 
@@ -541,7 +541,7 @@ class ExecutingEffect:
     def __post_init__(self) -> None:
         if type(self.intent) is not EffectIntent:
             raise AuthorityValidationError("invalid executing effect intent")
-        validate_ticket110_effect_kind(self.intent.effect_kind)
+        validate_controlled_effect_kind(self.intent.effect_kind)
         if type(self.lease) is not ExecutionLease:
             raise AuthorityValidationError("invalid executing effect lease")
         validate_opaque_text(self.vault_claim_ref, "vault claim reference")
@@ -604,7 +604,7 @@ class TerminalEffect:
     def __post_init__(self) -> None:
         if type(self.execution) is not ExecutingEffect:
             raise AuthorityValidationError("invalid terminal execution")
-        validate_ticket110_effect_kind(self.execution.intent.effect_kind)
+        validate_controlled_effect_kind(self.execution.intent.effect_kind)
         if type(self.status) is not str or self.status not in {"accepted", "rejected", "unknown"}:
             raise AuthorityValidationError("invalid effect status")
         validate_opaque_text(self.result_digest, "result_digest")

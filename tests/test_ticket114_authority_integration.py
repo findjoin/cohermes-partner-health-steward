@@ -3652,11 +3652,10 @@ class Ticket114AuthorityIntegrationTests(unittest.TestCase):
         self.assertIsNone(result.transition)
         self.assertTrue(
             {
-                "tasks",
-                "daily_review",
-                "delivery",
                 "safety",
                 "diagnostic_scope",
+                "model_route",
+                "question_answering",
             }
             <= set(result.projection.affected_core_domains)
         )

@@ -2857,6 +2857,15 @@ class EvidenceCard:
                 "recorded_at": self.recorded_at, "card_version": self.card_version,
                 "card_form": self.card_form, **claim}
 
+    @property
+    def revision_digest(self) -> str:
+        return stable_digest(
+            {
+                "contract": "evidence-card-revision-v1",
+                "card": self.to_storage(),
+            }
+        )
+
     @classmethod
     def from_storage(cls, value: object) -> "EvidenceCard":
         f = _mapping(value, frozenset({"evidence_id", "source_causal_id", "content", "evidence_type",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from .answer_resolution import ModelEffectReport
 from .admission import (
     AdmissionPolicy,
@@ -43,7 +45,19 @@ from .coordination import (
     DailySkillRuntime,
     DailyTurnDraft,
 )
-from .core import DailyTurnStatus, HealthCore, OwnerMutationStatus
+from .core import (
+    DailyTurnStatus,
+    HealthCore,
+    OwnerDeliveryExecutionResult,
+    OwnerDeliverySubmission,
+    OwnerMutationStatus,
+)
+from .delivery import (
+    DeliveryOutboxState,
+    DeliveryTransition,
+    OutboxIntent,
+    OwnerDeliveryTransportResult,
+)
 from .initialization import (
     HealthInitAsset,
     HealthInitRuntime,
@@ -62,6 +76,11 @@ from .model_contract import (
 from .nondiagnostic import NonDiagnosticCandidate
 from .owner_authority import OwnerMutationContext, OwnerMutationRequest
 from .probe import ProbeReport, ProbeState
+from .review import (
+    DailyReviewDecision,
+    DailyReviewLedger,
+    LocalDayKey,
+)
 from .rights import (
     ManagedExport,
     ManagedObject,
@@ -70,6 +89,183 @@ from .rights import (
 )
 from .settings import OwnerSettingsState
 from .status import BusinessStatusResult
+from .tasks import (
+    TaskAcceptance,
+    TaskCandidate,
+    TaskRuntimeState,
+    TaskTransition,
+)
+
+
+class _WireOwnerDeliveryAdapter:
+    """Translate the stable Plugin transport seam into core's typed adapter."""
+
+    def __init__(self, transport: object) -> None:
+        self._transport = transport
+
+    def send(self, intent: object) -> OwnerDeliveryTransportResult:
+        if type(intent) is not OutboxIntent:
+            raise TypeError("invalid owner-delivery transport intent")
+        send = getattr(self._transport, "send", None)
+        if not callable(send):
+            raise TypeError("owner-delivery transport send is not callable")
+        result = send(intent.to_wire())
+        if type(result) is not dict:
+            raise TypeError("owner-delivery transport must return a wire mapping")
+        return OwnerDeliveryTransportResult.from_wire(result)
+
+
+def _wire_fields(
+    value: object,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ProtocolViolation("invalid Ticket 115 wire payload")
+    keys = frozenset(value)
+    if not required.issubset(keys) or not keys.issubset(required | optional):
+        raise ProtocolViolation("invalid Ticket 115 wire fields")
+    return value
+
+
+def _task_transition_wire(transition: TaskTransition) -> dict[str, object]:
+    return {
+        "task_id": transition.task_id,
+        "outcome": transition.outcome,
+        "replayed": transition.replayed,
+        "task": transition.state.task(transition.task_id).to_storage(),
+    }
+
+
+def _review_decision_wire(decision: DailyReviewDecision) -> dict[str, object]:
+    pending = decision.ledger.pending
+    prepare_digest = (
+        decision.record.prepare_digest
+        if decision.record is not None
+        else (
+            pending.prepare_digest
+            if pending is not None and pending.key == decision.key
+            else None
+        )
+    )
+    return {
+        "key": decision.key.to_storage(),
+        "outcome": decision.outcome,
+        "record": None if decision.record is None else decision.record.to_storage(),
+        "notification_required": decision.notification_required,
+        "replayed": decision.replayed,
+        "prepare_digest": prepare_digest,
+    }
+
+
+def _review_decision_from_wire(
+    value: object,
+    ledger: DailyReviewLedger,
+) -> DailyReviewDecision:
+    fields = _wire_fields(
+        value,
+        frozenset(
+            {
+                "key",
+                "outcome",
+                "record",
+                "notification_required",
+                "replayed",
+                "prepare_digest",
+            }
+        ),
+    )
+    key = LocalDayKey.from_storage(fields["key"])
+    outcome = validate_opaque_text(fields["outcome"], "review decision outcome")
+    record_wire = fields["record"]
+    notification_required = fields["notification_required"]
+    replayed = fields["replayed"]
+    if type(notification_required) is not bool or type(replayed) is not bool:
+        raise ProtocolViolation("invalid review decision flags")
+    prepare_digest = fields["prepare_digest"]
+    if prepare_digest is not None:
+        prepare_digest = validate_opaque_text(
+            prepare_digest,
+            "review preparation digest",
+        )
+    if outcome == "already-completed":
+        record = ledger.record_for(key)
+        if (
+            record is None
+            or record_wire != record.to_storage()
+            or prepare_digest != record.prepare_digest
+            or notification_required
+            or not replayed
+        ):
+            raise ProtocolViolation("invalid completed review decision")
+    elif outcome == "old-local-day-suppressed":
+        if (
+            record_wire is not None
+            or prepare_digest is not None
+            or notification_required
+            or not replayed
+        ):
+            raise ProtocolViolation("invalid suppressed review decision")
+        record = None
+    elif outcome in {"prepared", "stale-pending-replaced", "resume-current-day"}:
+        pending = ledger.pending
+        if (
+            pending is None
+            or pending.key != key
+            or prepare_digest != pending.prepare_digest
+            or record_wire is not None
+            or notification_required != pending.notification_required
+            or replayed != (outcome == "resume-current-day")
+        ):
+            raise ProtocolViolation("invalid pending review decision")
+        record = None
+    else:
+        raise ProtocolViolation("unsupported review decision outcome")
+    return DailyReviewDecision(
+        ledger=ledger,
+        key=key,
+        outcome=outcome,
+        record=record,
+        notification_required=notification_required,
+        replayed=replayed,
+    )
+
+
+def _delivery_transition_wire(transition: DeliveryTransition) -> dict[str, object]:
+    return {
+        "intent_id": transition.intent_id,
+        "outcome": transition.outcome,
+        "replayed": transition.replayed,
+        "current_layer": transition.record.current_layer,
+    }
+
+
+def _owner_delivery_submission_from_wire(
+    value: object,
+) -> OwnerDeliverySubmission:
+    fields = _wire_fields(
+        value,
+        frozenset(
+            {
+                "effect_request_id",
+                "source_task_id",
+                "payload_ref",
+                "payload_digest",
+                "formed_at_utc",
+                "submitted_at_utc",
+            }
+        ),
+        frozenset({"notification_kind"}),
+    )
+    return OwnerDeliverySubmission(
+        effect_request_id=fields["effect_request_id"],  # type: ignore[arg-type]
+        source_task_id=fields["source_task_id"],  # type: ignore[arg-type]
+        payload_ref=fields["payload_ref"],  # type: ignore[arg-type]
+        payload_digest=fields["payload_digest"],  # type: ignore[arg-type]
+        formed_at_utc=fields["formed_at_utc"],  # type: ignore[arg-type]
+        submitted_at_utc=fields["submitted_at_utc"],  # type: ignore[arg-type]
+        notification_kind=fields.get("notification_kind", "review_summary"),  # type: ignore[arg-type]
+    )
 
 
 class HealthPlugin:
@@ -717,6 +913,244 @@ class HealthPlugin:
         if type(view) is not dict:
             raise AuthorityValidationError("owner-settings-read-unavailable")
         return view
+
+    def _require_ticket115_peer(self, peer_id: str) -> None:
+        if type(peer_id) is not str or peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        if not self._core.admission_policy_matches(self._admission_policy):
+            raise AuthorityValidationError("ticket115-entry-unavailable")
+
+    def managed_ticket115_read(self, *, peer_id: str) -> dict[str, object]:
+        """Return the bounded Ticket 115 managed-read wire projection."""
+
+        self._require_ticket115_peer(peer_id)
+        view = self._core.managed_ticket115_read()
+        if type(view) is not dict:
+            raise AuthorityValidationError("ticket115-read-unavailable")
+        return view
+
+    def health_operation(
+        self,
+        action: str,
+        payload: Mapping[str, object],
+        *,
+        peer_id: str,
+    ) -> dict[str, object]:
+        """Run one Ticket 115 health operation through wire-shaped values."""
+
+        self._require_ticket115_peer(peer_id)
+        action = validate_opaque_text(action, "health operation")
+        if type(payload) is not dict:
+            raise ProtocolViolation("invalid health operation payload")
+        if action == "task.admit":
+            fields = _wire_fields(payload, frozenset({"candidate", "committed_at_utc"}))
+            transition = self._core.admit_task_candidate(
+                TaskCandidate.from_storage(fields["candidate"]),
+                committed_at_utc=fields["committed_at_utc"],  # type: ignore[arg-type]
+            )
+            return _task_transition_wire(transition)
+        if action == "task.claim":
+            fields = _wire_fields(
+                payload,
+                frozenset({"task_id", "holder_id", "lease_id", "acquired_at_utc"}),
+                frozenset({"lease_seconds"}),
+            )
+            transition = self._core.claim_task(
+                fields["task_id"],  # type: ignore[arg-type]
+                holder_id=fields["holder_id"],  # type: ignore[arg-type]
+                lease_id=fields["lease_id"],  # type: ignore[arg-type]
+                acquired_at_utc=fields["acquired_at_utc"],  # type: ignore[arg-type]
+                lease_seconds=fields.get("lease_seconds", 300),  # type: ignore[arg-type]
+            )
+            return _task_transition_wire(transition)
+        if action == "task.release":
+            fields = _wire_fields(
+                payload,
+                frozenset({"lease_id", "holder_id", "observed_at_utc"}),
+            )
+            return _task_transition_wire(
+                self._core.release_task_claim(
+                    fields["lease_id"],  # type: ignore[arg-type]
+                    holder_id=fields["holder_id"],  # type: ignore[arg-type]
+                    observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
+                )
+            )
+        if action == "task.advance":
+            fields = _wire_fields(
+                payload,
+                frozenset({"task_id", "phase", "advanced_at_utc"}),
+            )
+            return _task_transition_wire(
+                self._core.advance_task_phase(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    phase=fields["phase"],  # type: ignore[arg-type]
+                    advanced_at_utc=fields["advanced_at_utc"],  # type: ignore[arg-type]
+                )
+            )
+        if action == "task.solve":
+            fields = _wire_fields(payload, frozenset({"acceptance"}))
+            return _task_transition_wire(
+                self._core.solve_task(TaskAcceptance.from_storage(fields["acceptance"]))
+            )
+        if action in {"task.cancel", "task.fail"}:
+            time_field = "cancelled_at_utc" if action == "task.cancel" else "failed_at_utc"
+            fields = _wire_fields(
+                payload,
+                frozenset({"task_id", time_field}),
+                frozenset({"reason_code"}),
+            )
+            transition = (
+                self._core.cancel_task(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    cancelled_at_utc=fields[time_field],  # type: ignore[arg-type]
+                    reason_code=fields.get("reason_code", "task-cancelled"),  # type: ignore[arg-type]
+                )
+                if action == "task.cancel"
+                else self._core.fail_task(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    failed_at_utc=fields[time_field],  # type: ignore[arg-type]
+                    reason_code=fields.get("reason_code", "no-reasonable-path"),  # type: ignore[arg-type]
+                )
+            )
+            return _task_transition_wire(transition)
+        if action == "task.link-successor":
+            fields = _wire_fields(
+                payload,
+                frozenset({"predecessor_task_id", "successor_candidate", "committed_at_utc"}),
+            )
+            return _task_transition_wire(
+                self._core.link_task_successor(
+                    fields["predecessor_task_id"],  # type: ignore[arg-type]
+                    TaskCandidate.from_storage(fields["successor_candidate"]),
+                    committed_at_utc=fields["committed_at_utc"],  # type: ignore[arg-type]
+                )
+            )
+        if action == "review.prepare":
+            fields = _wire_fields(
+                payload,
+                frozenset({"observed_at_utc"}),
+                frozenset({"action_refs", "changed"}),
+            )
+            action_refs = fields.get("action_refs", [])
+            if type(action_refs) is not list:
+                raise ProtocolViolation("invalid review action references")
+            return _review_decision_wire(
+                self._core.prepare_daily_review(
+                    observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
+                    action_refs=tuple(action_refs),  # type: ignore[arg-type]
+                    changed=fields.get("changed", False),  # type: ignore[arg-type]
+                )
+            )
+        if action == "review.commit":
+            fields = _wire_fields(
+                payload,
+                frozenset({"decision", "completed_at_utc"}),
+                frozenset({"delivery"}),
+            )
+            delivery = fields.get("delivery")
+            return _review_decision_wire(
+                self._core.commit_daily_review(
+                    _review_decision_from_wire(
+                        fields["decision"],
+                        self._core.daily_review_ledger(),
+                    ),
+                    completed_at_utc=fields["completed_at_utc"],  # type: ignore[arg-type]
+                    delivery=(
+                        None
+                        if delivery is None
+                        else _owner_delivery_submission_from_wire(delivery)
+                    ),
+                )
+            )
+        if action == "delivery.observe":
+            fields = _wire_fields(
+                payload,
+                frozenset(
+                    {
+                        "intent_id",
+                        "kind",
+                        "attempt_ref",
+                        "result_ref",
+                        "evidence_ref",
+                        "observed_at_utc",
+                    }
+                ),
+            )
+            return _delivery_transition_wire(
+                self._core.record_owner_delivery_observation(
+                    fields["intent_id"],  # type: ignore[arg-type]
+                    kind=fields["kind"],  # type: ignore[arg-type]
+                    attempt_ref=fields["attempt_ref"],  # type: ignore[arg-type]
+                    result_ref=fields["result_ref"],  # type: ignore[arg-type]
+                    evidence_ref=fields["evidence_ref"],  # type: ignore[arg-type]
+                    observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
+                )
+            )
+        raise ProtocolViolation("unsupported Ticket 115 health operation")
+
+    def controlled_effect(
+        self,
+        action: str,
+        payload: Mapping[str, object],
+        *,
+        grant: EffectExecutionGrant | None = None,
+        transport: object | None = None,
+        peer_id: str,
+    ) -> dict[str, object]:
+        """Run one controlled owner-delivery effect through stable wire seams."""
+
+        self._require_ticket115_peer(peer_id)
+        action = validate_opaque_text(action, "controlled effect action")
+        if type(payload) is not dict:
+            raise ProtocolViolation("invalid controlled effect payload")
+        if action == "owner-delivery.issue":
+            fields = _wire_fields(payload, frozenset({"intent_id"}))
+            return {
+                "response": self._core.issue_owner_delivery_effect(
+                    fields["intent_id"]  # type: ignore[arg-type]
+                ).to_wire()
+            }
+        if action == "owner-delivery.claim":
+            fields = _wire_fields(
+                payload,
+                frozenset({"intent_id", "acquired_at_utc"}),
+                frozenset({"lease_seconds"}),
+            )
+            if type(grant) is not EffectExecutionGrant:
+                raise ProtocolViolation("controlled effect grant required")
+            return {
+                "transition": _delivery_transition_wire(
+                    self._core.claim_owner_delivery(
+                        fields["intent_id"],  # type: ignore[arg-type]
+                        grant,
+                        acquired_at_utc=fields["acquired_at_utc"],  # type: ignore[arg-type]
+                        lease_seconds=fields.get("lease_seconds", 300),  # type: ignore[arg-type]
+                    )
+                )
+            }
+        if action == "owner-delivery.execute":
+            fields = _wire_fields(
+                payload,
+                frozenset({"intent_id", "attempted_at_utc"}),
+                frozenset({"observed_at_utc"}),
+            )
+            if type(grant) is not EffectExecutionGrant or transport is None:
+                raise ProtocolViolation("controlled effect grant and transport required")
+            result = self._core.execute_owner_delivery(
+                fields["intent_id"],  # type: ignore[arg-type]
+                grant,
+                _WireOwnerDeliveryAdapter(transport),
+                attempted_at_utc=fields["attempted_at_utc"],  # type: ignore[arg-type]
+                observed_at_utc=fields.get("observed_at_utc"),  # type: ignore[arg-type]
+            )
+            return {
+                "transport_result": result.transport_result.to_wire(),
+                "effect_response": result.effect_response.to_wire(),
+                "delivery_transition": _delivery_transition_wire(
+                    result.delivery_transition
+                ),
+            }
+        raise ProtocolViolation("unsupported Ticket 115 controlled effect")
 
     def business_status(self, *, peer_id: str) -> BusinessStatusResult:
         """Expose only the projected tri-state, never raw capability facts."""

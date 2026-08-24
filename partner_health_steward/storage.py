@@ -31,7 +31,7 @@ from .authority import (
     holder_id_for,
     validate_committed_transition,
     validate_opaque_text,
-    validate_ticket110_effect_kind,
+    validate_controlled_effect_kind,
 )
 from .contract import (
     CommandEnvelope,
@@ -81,6 +81,22 @@ def _owner_recovery_digest(value: object, name: str) -> str:
         int(value.removeprefix("sha256:"), 16)
     except ValueError as exc:
         raise AuthorityValidationError(f"invalid {name}") from exc
+    return value
+
+
+def _strict_storage_mapping(
+    value: object,
+    fields: frozenset[str],
+    name: str,
+) -> Mapping[str, object]:
+    if type(value) is not dict or set(value) != fields:
+        raise KeyUnavailable(f"invalid {name}")
+    return value
+
+
+def _strict_storage_list(value: object, name: str) -> list[object]:
+    if type(value) is not list:
+        raise KeyUnavailable(f"invalid {name}")
     return value
 
 
@@ -1411,6 +1427,67 @@ class EncryptedStateStore:
             )
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_runtime_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_reviews_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_outbox_v1 (
+                intent_id TEXT PRIMARY KEY,
+                state_version INTEGER NOT NULL CHECK(state_version >= 1),
+                phase TEXT NOT NULL CHECK(
+                    phase IN ('committed', 'claiming', 'executing', 'terminal')
+                ),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_delivery_observations_v1 (
+                observation_id TEXT PRIMARY KEY,
+                intent_id TEXT NOT NULL,
+                layer TEXT NOT NULL CHECK(
+                    layer IN (
+                        'formed',
+                        'submitted',
+                        'attempted',
+                        'accepted',
+                        'rejected',
+                        'delivered',
+                        'read',
+                        'unknown'
+                    )
+                ),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                FOREIGN KEY(intent_id) REFERENCES owner_outbox_v1(intent_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE INDEX IF NOT EXISTS owner_delivery_observations_intent_v1
+            ON owner_delivery_observations_v1(intent_id, observation_id)
+            """
+        )
         self._commit("health state initialization unavailable")
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
@@ -1533,10 +1610,29 @@ class EncryptedStateStore:
                 "owner_mutations_v1",
                 *ticket114_status_tables,
             )
+            ticket115_tables = (
+                "task_runtime_v1",
+                "daily_reviews_v1",
+                "owner_outbox_v1",
+                "owner_delivery_observations_v1",
+            )
             migration_tables: tuple[str, ...] | None = None
             migration_shape: dict[str, bool] | None = None
+            pre_ticket115_migration = False
             if isinstance(fingerprint, str):
                 if (
+                    fingerprint
+                    == self._pre_ticket115_integrity_fingerprint()
+                    and all(
+                        self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        is None
+                        for table in ticket115_tables
+                    )
+                ):
+                    migration_tables = ticket115_tables
+                    migration_shape = {}
+                    pre_ticket115_migration = True
+                elif (
                     fingerprint
                     == self._integrity_fingerprint(
                         include_ticket114_status=False,
@@ -1544,10 +1640,13 @@ class EncryptedStateStore:
                     and all(
                         self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                         is None
-                        for table in ticket114_status_tables
+                        for table in (*ticket114_status_tables, *ticket115_tables)
                     )
                 ):
-                    migration_tables = ticket114_status_tables
+                    migration_tables = (
+                        *ticket114_status_tables,
+                        *ticket115_tables,
+                    )
                     migration_shape = {"include_ticket114_status": False}
                 elif (
                     fingerprint
@@ -1555,10 +1654,10 @@ class EncryptedStateStore:
                     and all(
                         self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                         is None
-                        for table in ticket114_tables
+                        for table in (*ticket114_tables, *ticket115_tables)
                     )
                 ):
-                    migration_tables = ticket114_tables
+                    migration_tables = (*ticket114_tables, *ticket115_tables)
                     migration_shape = {"include_ticket114": False}
                 elif (
                     fingerprint
@@ -1569,10 +1668,18 @@ class EncryptedStateStore:
                     and all(
                         self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                         is None
-                        for table in (*ticket112_tables, *ticket114_tables)
+                        for table in (
+                            *ticket112_tables,
+                            *ticket114_tables,
+                            *ticket115_tables,
+                        )
                     )
                 ):
-                    migration_tables = (*ticket112_tables, *ticket114_tables)
+                    migration_tables = (
+                        *ticket112_tables,
+                        *ticket114_tables,
+                        *ticket115_tables,
+                    )
                     migration_shape = {
                         "include_ticket112": False,
                         "include_ticket114": False,
@@ -1591,6 +1698,7 @@ class EncryptedStateStore:
                             *ticket111_tables,
                             *ticket112_tables,
                             *ticket114_tables,
+                            *ticket115_tables,
                         )
                     )
                 ):
@@ -1598,6 +1706,7 @@ class EncryptedStateStore:
                         *ticket111_tables,
                         *ticket112_tables,
                         *ticket114_tables,
+                        *ticket115_tables,
                     )
                     migration_shape = {
                         "include_ticket111": False,
@@ -1620,7 +1729,11 @@ class EncryptedStateStore:
                 if (
                     current_stored != stored
                     or fingerprint
-                    != self._integrity_fingerprint(**migration_shape)
+                    != (
+                        self._pre_ticket115_integrity_fingerprint()
+                        if pre_ticket115_migration
+                        else self._integrity_fingerprint(**migration_shape)
+                    )
                     or any(
                         connection.execute(
                             f"SELECT 1 FROM {table} LIMIT 1"
@@ -1650,6 +1763,10 @@ class EncryptedStateStore:
             "owner_settings_v1",
             "owner_mutations_v1",
             "business_status_v1",
+            "task_runtime_v1",
+            "daily_reviews_v1",
+            "owner_outbox_v1",
+            "owner_delivery_observations_v1",
         )
         if any(self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None for table in populated_tables):
             return
@@ -1677,6 +1794,7 @@ class EncryptedStateStore:
         include_ticket112: bool | None = None,
         include_ticket114: bool | None = None,
         include_ticket114_status: bool | None = None,
+        include_ticket115: bool | None = None,
     ) -> str:
         """Hash every mutable domain row except the manifest itself."""
 
@@ -1689,6 +1807,8 @@ class EncryptedStateStore:
             include_ticket114 = include_ticket112
         if include_ticket114_status is None:
             include_ticket114_status = include_ticket114
+        if include_ticket115 is None:
+            include_ticket115 = include_ticket114_status
 
         tables = {
             "records": self._execute(
@@ -1773,6 +1893,28 @@ class EncryptedStateStore:
                 "SELECT slot, nonce, ciphertext "
                 "FROM business_status_v1 ORDER BY slot"
             ).fetchall()
+        if include_ticket115:
+            tables.update(
+                {
+                    "task_runtime": self._execute(
+                        "SELECT slot, nonce, ciphertext "
+                        "FROM task_runtime_v1 ORDER BY slot"
+                    ).fetchall(),
+                    "daily_reviews": self._execute(
+                        "SELECT slot, nonce, ciphertext "
+                        "FROM daily_reviews_v1 ORDER BY slot"
+                    ).fetchall(),
+                    "owner_outbox": self._execute(
+                        "SELECT intent_id, state_version, phase, nonce, ciphertext "
+                        "FROM owner_outbox_v1 ORDER BY intent_id"
+                    ).fetchall(),
+                    "owner_delivery_observations": self._execute(
+                        "SELECT observation_id, intent_id, layer, nonce, ciphertext "
+                        "FROM owner_delivery_observations_v1 "
+                        "ORDER BY observation_id"
+                    ).fetchall(),
+                }
+            )
 
         def wire_value(value: object) -> object:
             if isinstance(value, bytes):
@@ -1789,6 +1931,19 @@ class EncryptedStateStore:
         }
         encoded = json.dumps(wire_tables, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def _pre_ticket115_integrity_fingerprint(self) -> str:
+        """Return the signed shape immediately before Ticket 115.
+
+        Call the base implementation directly so older test and deployment
+        subclasses that override ``_integrity_fingerprint`` with the Ticket
+        114 signature remain compatible during startup migration.
+        """
+
+        return EncryptedStateStore._integrity_fingerprint(
+            self,
+            include_ticket115=False,
+        )
 
     def _refresh_integrity_manifest(self, connection: sqlite3.Connection) -> None:
         fingerprint = self._integrity_fingerprint()
@@ -2969,6 +3124,537 @@ class EncryptedStateStore:
             )
             self._refresh_integrity_manifest(connection)
             return previous
+
+    @staticmethod
+    def _task_runtime_wire(state: object) -> dict[str, object]:
+        from .tasking import TaskRuntimeState
+
+        if type(state) is not TaskRuntimeState:
+            raise AuthorityValidationError("invalid task runtime aggregate")
+        return state.to_storage()
+
+    @staticmethod
+    def _task_runtime_from_wire(value: object) -> object:
+        from .tasking import TaskRuntimeState
+
+        try:
+            return TaskRuntimeState.from_storage(value)
+        except (TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid task runtime aggregate") from exc
+
+    def task_runtime(self) -> object | None:
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM task_runtime_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            wire = self._open("task-runtime:v1", row[0], row[1])
+            state = self._task_runtime_from_wire(wire)
+        except (ImportError, TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid task runtime aggregate") from exc
+        if self._task_runtime_wire(state) != wire:
+            raise KeyUnavailable("task runtime round-trip mismatch")
+        return state
+
+    @staticmethod
+    def _daily_review_ledger_wire(ledger: object) -> dict[str, object]:
+        from .review import DailyReviewLedger
+
+        if type(ledger) is not DailyReviewLedger:
+            raise AuthorityValidationError("invalid daily review ledger")
+        return ledger.to_storage()
+
+    @staticmethod
+    def _daily_review_ledger_from_wire(value: object) -> object:
+        from .review import DailyReviewLedger
+
+        try:
+            return DailyReviewLedger.from_storage(value)
+        except (TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid daily review ledger") from exc
+
+    def daily_review_ledger(self) -> object | None:
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM daily_reviews_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        wire = self._open(
+            "daily-review-ledger:v1",
+            row[0],
+            row[1],
+        )
+        ledger = self._daily_review_ledger_from_wire(wire)
+        if self._daily_review_ledger_wire(ledger) != wire:
+            raise KeyUnavailable("daily review ledger round-trip mismatch")
+        return ledger
+
+    def daily_review(self, review_key: str) -> object | None:
+        validate_opaque_text(review_key, "daily review key")
+        ledger = self.daily_review_ledger()
+        if ledger is None:
+            return None
+        for record in ledger.completed:
+            if record.key.value == review_key:
+                return record
+        if ledger.pending is not None and ledger.pending.key.value == review_key:
+            return ledger.pending
+        return None
+
+    @staticmethod
+    def _delivery_phase(record: object) -> str:
+        from .delivery import OutboxRecord
+
+        if type(record) is not OutboxRecord:
+            raise AuthorityValidationError("invalid owner outbox record")
+        if any(
+            record.has_fact(kind)
+            for kind in (
+                "accepted",
+                "rejected",
+                "delivered",
+                "read",
+                "unknown",
+            )
+        ):
+            return "terminal"
+        if record.has_fact("attempted"):
+            return "executing"
+        if record.leases:
+            return "claiming"
+        return "committed"
+
+    @staticmethod
+    def _delivery_observation_id(intent_id: str, layer: str) -> str:
+        return (
+            "delivery-observation:"
+            + stable_digest(
+                {"intent_id": intent_id, "layer": layer}
+            ).removeprefix("sha256:")
+        )
+
+    def delivery_outbox_state(
+        self,
+        owner_id: str,
+        installation_id: str,
+    ) -> object:
+        from .delivery import (
+            DELIVERY_FACT_KINDS,
+            DeliveryFact,
+            DeliveryLease,
+            DeliveryOutboxState,
+            OutboxIntent,
+            OutboxRecord,
+        )
+
+        validate_opaque_text(owner_id, "delivery owner")
+        validate_opaque_text(installation_id, "delivery installation")
+        rows = self._execute(
+            "SELECT intent_id, state_version, phase, nonce, ciphertext "
+            "FROM owner_outbox_v1 ORDER BY intent_id"
+        ).fetchall()
+        if not rows:
+            if self._execute(
+                "SELECT 1 FROM owner_delivery_observations_v1 LIMIT 1"
+            ).fetchone() is not None:
+                raise KeyUnavailable("delivery observation has no outbox intent")
+            return DeliveryOutboxState.empty(owner_id, installation_id)
+        versions: set[int] = set()
+        records: list[OutboxRecord] = []
+        fact_order = {
+            kind: index for index, kind in enumerate(DELIVERY_FACT_KINDS)
+        }
+        for intent_id, state_version, phase, nonce, ciphertext in rows:
+            if (
+                type(intent_id) is not str
+                or type(state_version) is not int
+                or state_version < 1
+                or phase
+                not in {"committed", "claiming", "executing", "terminal"}
+            ):
+                raise KeyUnavailable("invalid owner outbox row")
+            versions.add(state_version)
+            value = _strict_storage_mapping(
+                self._open(
+                    f"owner-outbox:{intent_id}:{phase}",
+                    nonce,
+                    ciphertext,
+                ),
+                frozenset({"intent", "leases"}),
+                "owner outbox record",
+            )
+            try:
+                intent = OutboxIntent.from_wire(value["intent"])
+                leases = tuple(
+                    DeliveryLease.from_wire(item)
+                    for item in _strict_storage_list(
+                        value["leases"], "delivery leases"
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise KeyUnavailable("invalid owner outbox record") from exc
+            if (
+                intent.to_wire() != value["intent"]
+                or [lease.to_wire() for lease in leases] != value["leases"]
+            ):
+                raise KeyUnavailable("owner outbox round-trip mismatch")
+            if (
+                intent.intent_id != intent_id
+                or intent.owner_id != owner_id
+                or intent.installation_id != installation_id
+            ):
+                raise KeyUnavailable("owner outbox authority mismatch")
+            fact_rows = self._execute(
+                "SELECT observation_id, layer, nonce, ciphertext "
+                "FROM owner_delivery_observations_v1 "
+                "WHERE intent_id = ? ORDER BY observation_id",
+                (intent_id,),
+            ).fetchall()
+            facts: list[DeliveryFact] = []
+            for observation_id, layer, fact_nonce, fact_ciphertext in fact_rows:
+                if type(layer) is not str or layer not in fact_order:
+                    raise KeyUnavailable("invalid delivery observation layer")
+                expected_id = self._delivery_observation_id(intent_id, layer)
+                if observation_id != expected_id:
+                    raise KeyUnavailable("delivery observation identifier mismatch")
+                try:
+                    fact_wire = self._open(
+                        f"owner-delivery-observation:{observation_id}:"
+                        f"{intent_id}:{layer}",
+                        fact_nonce,
+                        fact_ciphertext,
+                    )
+                    fact = DeliveryFact.from_wire(
+                        fact_wire
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise KeyUnavailable(
+                        "invalid delivery observation"
+                    ) from exc
+                if fact.kind != layer:
+                    raise KeyUnavailable("delivery observation layer mismatch")
+                if fact.to_wire() != fact_wire:
+                    raise KeyUnavailable(
+                        "delivery observation round-trip mismatch"
+                    )
+                facts.append(fact)
+            facts.sort(key=lambda fact: fact_order[fact.kind])
+            try:
+                record = OutboxRecord(
+                    intent=intent,
+                    facts=tuple(facts),
+                    leases=leases,
+                )
+            except (TypeError, ValueError) as exc:
+                raise KeyUnavailable("invalid owner outbox record") from exc
+            if self._delivery_phase(record) != phase:
+                raise KeyUnavailable("owner outbox phase mismatch")
+            records.append(record)
+        if len(versions) != 1:
+            raise KeyUnavailable("owner outbox version mismatch")
+        version = next(iter(versions))
+        try:
+            return DeliveryOutboxState(
+                owner_id=owner_id,
+                installation_id=installation_id,
+                version=version,
+                records=tuple(records),
+            )
+        except (TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid delivery outbox aggregate") from exc
+
+    def _write_task_runtime(
+        self,
+        connection: sqlite3.Connection,
+        state: object,
+    ) -> None:
+        current = self.task_runtime()
+        if current == state:
+            return
+        if current is not None and (
+            current.owner_id != state.owner_id
+            or current.installation_id != state.installation_id
+            or state.version != current.version + 1
+        ):
+            raise AuthorityValidationError("stale task runtime version")
+        if current is None and state.version not in {0, 1}:
+            raise AuthorityValidationError("invalid initial task runtime version")
+        nonce, ciphertext = self._seal(
+            "task-runtime:v1",
+            self._task_runtime_wire(state),
+        )
+        connection.execute(
+            "INSERT INTO task_runtime_v1(slot, nonce, ciphertext) "
+            "VALUES (1, ?, ?) "
+            "ON CONFLICT(slot) DO UPDATE SET "
+            "nonce=excluded.nonce, ciphertext=excluded.ciphertext",
+            (nonce, ciphertext),
+        )
+
+    def _write_daily_review_ledger(
+        self,
+        connection: sqlite3.Connection,
+        state: object,
+    ) -> None:
+        current = self.daily_review_ledger()
+        if current == state:
+            return
+        if current is not None and (
+            current.owner_id != state.owner_id
+            or current.installation_id != state.installation_id
+            or state.version != current.version + 1
+        ):
+            raise AuthorityValidationError("stale daily review ledger version")
+        if current is None and state.version not in {0, 1}:
+            raise AuthorityValidationError("invalid initial daily review version")
+        nonce, ciphertext = self._seal(
+            "daily-review-ledger:v1",
+            self._daily_review_ledger_wire(state),
+        )
+        connection.execute(
+            "INSERT INTO daily_reviews_v1(slot, nonce, ciphertext) "
+            "VALUES (1, ?, ?) "
+            "ON CONFLICT(slot) DO UPDATE SET "
+            "nonce=excluded.nonce, ciphertext=excluded.ciphertext",
+            (nonce, ciphertext),
+        )
+
+    def _new_notifying_review_records(self, state: object) -> tuple[object, ...]:
+        def identity(record: object) -> tuple[str, str]:
+            return record.key.value, record.result_digest
+
+        current = self.daily_review_ledger()
+        current_records = () if current is None else current.completed
+        next_by_key = {
+            record.key.value: record
+            for record in state.completed
+        }
+        if any(
+            next_by_key.get(record.key.value) != record
+            for record in current_records
+        ):
+            raise AuthorityValidationError(
+                "completed daily review history is append-only"
+            )
+        known = {
+            identity(record)
+            for record in current_records
+        }
+        return tuple(
+            record
+            for record in state.completed
+            if record.notification_required
+            and identity(record) not in known
+        )
+
+    def _write_delivery_outbox(
+        self,
+        connection: sqlite3.Connection,
+        state: object,
+    ) -> None:
+        from .delivery import DeliveryOutboxState
+
+        if type(state) is not DeliveryOutboxState:
+            raise AuthorityValidationError("invalid delivery outbox aggregate")
+        current = self.delivery_outbox_state(
+            state.owner_id,
+            state.installation_id,
+        )
+        if current == state:
+            return
+        if state.version != current.version + 1:
+            raise AuthorityValidationError("stale delivery outbox version")
+        if not state.records:
+            raise AuthorityValidationError(
+                "nonzero delivery outbox cannot discard every intent"
+            )
+        current_by_intent = {
+            record.intent.intent_id: record
+            for record in current.records
+        }
+        next_by_intent = {
+            record.intent.intent_id: record
+            for record in state.records
+        }
+        for intent_id, previous in current_by_intent.items():
+            next_record = next_by_intent.get(intent_id)
+            if next_record is None:
+                raise AuthorityValidationError(
+                    "owner outbox history is append-only"
+                )
+            if next_record.intent != previous.intent:
+                raise AuthorityValidationError(
+                    "owner outbox intent is immutable"
+                )
+            next_facts = {
+                fact.kind: fact
+                for fact in next_record.facts
+            }
+            if any(
+                next_facts.get(fact.kind) != fact
+                for fact in previous.facts
+            ):
+                raise AuthorityValidationError(
+                    "owner delivery facts are append-only"
+                )
+            if next_record.leases[: len(previous.leases)] != previous.leases:
+                raise AuthorityValidationError(
+                    "owner delivery leases are append-only"
+                )
+        for record in state.records:
+            phase = self._delivery_phase(record)
+            intent_id = record.intent.intent_id
+            value = {
+                "intent": record.intent.to_wire(),
+                "leases": [lease.to_wire() for lease in record.leases],
+            }
+            previous = current_by_intent.get(intent_id)
+            if previous is None:
+                nonce, ciphertext = self._seal(
+                    f"owner-outbox:{intent_id}:{phase}",
+                    value,
+                )
+                connection.execute(
+                    "INSERT INTO owner_outbox_v1("
+                    "intent_id, state_version, phase, nonce, ciphertext"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (intent_id, state.version, phase, nonce, ciphertext),
+                )
+            else:
+                nonce, ciphertext = self._seal(
+                    f"owner-outbox:{intent_id}:{phase}",
+                    value,
+                )
+                connection.execute(
+                    "UPDATE owner_outbox_v1 SET "
+                    "state_version = ?, phase = ?, nonce = ?, ciphertext = ? "
+                    "WHERE intent_id = ?",
+                    (state.version, phase, nonce, ciphertext, intent_id),
+                )
+            previous_fact_kinds = (
+                frozenset()
+                if previous is None
+                else frozenset(fact.kind for fact in previous.facts)
+            )
+            for fact in record.facts:
+                if fact.kind in previous_fact_kinds:
+                    continue
+                observation_id = self._delivery_observation_id(
+                    intent_id,
+                    fact.kind,
+                )
+                fact_nonce, fact_ciphertext = self._seal(
+                    f"owner-delivery-observation:{observation_id}:"
+                    f"{intent_id}:{fact.kind}",
+                    fact.to_wire(),
+                )
+                connection.execute(
+                    "INSERT INTO owner_delivery_observations_v1("
+                    "observation_id, intent_id, layer, nonce, ciphertext"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        observation_id,
+                        intent_id,
+                        fact.kind,
+                        fact_nonce,
+                        fact_ciphertext,
+                    ),
+                )
+
+    def commit_ticket115_facts(
+        self,
+        *,
+        task_state: object | None = None,
+        review_state: object | None = None,
+        delivery_state: object | None = None,
+    ) -> None:
+        """Atomically commit task/review facts and their owner outbox state."""
+
+        from .delivery import DeliveryOutboxState
+        from .review import DailyReviewLedger
+        from .tasking import TaskRuntimeState
+
+        if task_state is not None and type(task_state) is not TaskRuntimeState:
+            raise AuthorityValidationError("invalid task runtime aggregate")
+        if review_state is not None and type(review_state) is not DailyReviewLedger:
+            raise AuthorityValidationError("invalid daily review ledger")
+        if delivery_state is not None and type(delivery_state) is not DeliveryOutboxState:
+            raise AuthorityValidationError("invalid delivery outbox aggregate")
+        if task_state is None and review_state is None and delivery_state is None:
+            raise AuthorityValidationError("ticket115 fact required")
+        authorities = set()
+        if task_state is not None:
+            authorities.add((task_state.owner_id, task_state.installation_id))
+        if review_state is not None:
+            authorities.add(
+                (
+                    review_state.owner_id,
+                    review_state.installation_id,
+                )
+            )
+        if delivery_state is not None:
+            authorities.add(
+                (delivery_state.owner_id, delivery_state.installation_id)
+            )
+        if len(authorities) != 1:
+            raise AuthorityValidationError("ticket115 authority mismatch")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            notifying_reviews = (
+                ()
+                if review_state is None
+                else self._new_notifying_review_records(review_state)
+            )
+            if notifying_reviews:
+                if delivery_state is None:
+                    raise AuthorityValidationError(
+                        "notifying daily review requires atomic outbox state"
+                    )
+                current_delivery = self.delivery_outbox_state(
+                    delivery_state.owner_id,
+                    delivery_state.installation_id,
+                )
+                current_intents = {
+                    record.intent.intent_id
+                    for record in current_delivery.records
+                }
+                new_records = tuple(
+                    record
+                    for record in delivery_state.records
+                    if record.intent.intent_id not in current_intents
+                )
+                for review in notifying_reviews:
+                    matching = tuple(
+                        record
+                        for record in new_records
+                        if record.intent.effect_kind == "owner-delivery"
+                        and record.intent.business_fact_ref == review.key.value
+                        and record.intent.business_revision_digest
+                        == review.result_digest
+                        and record.intent.source_ref in review.action_refs
+                    )
+                    if len(matching) != 1:
+                        raise AuthorityValidationError(
+                            "notifying daily review requires its exact new "
+                            "owner-delivery intent"
+                        )
+            if task_state is not None:
+                self._write_task_runtime(connection, task_state)
+            if review_state is not None:
+                self._write_daily_review_ledger(connection, review_state)
+            if delivery_state is not None:
+                self._write_delivery_outbox(connection, delivery_state)
+            self._refresh_integrity_manifest(connection)
+
+    def remember_task_runtime(self, state: object) -> None:
+        self.commit_ticket115_facts(task_state=state)
+
+    def remember_daily_review(self, state: object) -> None:
+        self.commit_ticket115_facts(review_state=state)
+
+    def remember_delivery_outbox(self, state: object) -> None:
+        self.commit_ticket115_facts(delivery_state=state)
 
     def owner_settings(self) -> OwnerSettingsState | None:
         """Return the single encrypted current owner-settings aggregate."""
@@ -4202,6 +4888,77 @@ class EncryptedStateStore:
     def count_effects(self) -> int:
         return int(self._execute("SELECT COUNT(*) FROM effects").fetchone()[0])
 
+    def _verify_ticket115_aggregates(
+        self,
+        current_owner_settings: OwnerSettingsState | None,
+    ) -> None:
+        task_rows = self._execute(
+            "SELECT slot FROM task_runtime_v1 ORDER BY slot"
+        ).fetchall()
+        review_rows = self._execute(
+            "SELECT slot FROM daily_reviews_v1 ORDER BY slot"
+        ).fetchall()
+        if len(task_rows) > 1:
+            raise KeyUnavailable("multiple task runtime aggregates")
+        if len(review_rows) > 1:
+            raise KeyUnavailable("multiple daily review ledgers")
+        task_state = self.task_runtime()
+        review_state = self.daily_review_ledger()
+        orphan = self._execute(
+            "SELECT 1 FROM owner_delivery_observations_v1 AS observation "
+            "LEFT JOIN owner_outbox_v1 AS intent "
+            "ON intent.intent_id = observation.intent_id "
+            "WHERE intent.intent_id IS NULL LIMIT 1"
+        ).fetchone()
+        if orphan is not None:
+            raise KeyUnavailable("delivery observation has no outbox intent")
+
+        delivery_state = None
+        first_outbox = self._execute(
+            "SELECT intent_id, phase, nonce, ciphertext "
+            "FROM owner_outbox_v1 ORDER BY intent_id LIMIT 1"
+        ).fetchone()
+        if first_outbox is not None:
+            from .delivery import OutboxIntent
+
+            intent_id, phase, nonce, ciphertext = first_outbox
+            value = _strict_storage_mapping(
+                self._open(
+                    f"owner-outbox:{intent_id}:{phase}",
+                    nonce,
+                    ciphertext,
+                ),
+                frozenset({"intent", "leases"}),
+                "owner outbox record",
+            )
+            try:
+                first_intent = OutboxIntent.from_wire(value["intent"])
+            except (TypeError, ValueError) as exc:
+                raise KeyUnavailable("invalid owner outbox record") from exc
+            delivery_state = self.delivery_outbox_state(
+                first_intent.owner_id,
+                first_intent.installation_id,
+            )
+        elif self._execute(
+            "SELECT 1 FROM owner_delivery_observations_v1 LIMIT 1"
+        ).fetchone() is not None:
+            raise KeyUnavailable("delivery observation has no outbox intent")
+
+        authorities = {
+            (state.owner_id, state.installation_id)
+            for state in (task_state, review_state, delivery_state)
+            if state is not None
+        }
+        if len(authorities) > 1:
+            raise KeyUnavailable("ticket115 aggregate authority mismatch")
+        if current_owner_settings is not None and authorities and authorities != {
+            (
+                current_owner_settings.owner_id,
+                current_owner_settings.installation_id,
+            )
+        }:
+            raise KeyUnavailable("ticket115 owner settings authority mismatch")
+
     def verify_integrity(self, expected_authority: AuthoritySnapshot) -> bool:
         """Authenticate every local row before a probe can report healthy.
 
@@ -4573,6 +5330,8 @@ class EncryptedStateStore:
         if business_status_rows:
             self.business_status_projection()
 
+        self._verify_ticket115_aggregates(current_owner_settings)
+
         # A terminal latch must itself be authenticated; its row is also part
         # of the signed inventory above, so raw deletion cannot silently reopen
         # the state domain.
@@ -4631,6 +5390,20 @@ class EncryptedStateStore:
         business_status_rows = self._execute(
             "SELECT slot, nonce, ciphertext FROM business_status_v1"
         ).fetchall()
+        task_runtime_rows = self._execute(
+            "SELECT slot, nonce, ciphertext FROM task_runtime_v1"
+        ).fetchall()
+        daily_review_rows = self._execute(
+            "SELECT slot, nonce, ciphertext FROM daily_reviews_v1"
+        ).fetchall()
+        owner_outbox_rows = self._execute(
+            "SELECT intent_id, state_version, phase, nonce, ciphertext "
+            "FROM owner_outbox_v1"
+        ).fetchall()
+        owner_delivery_rows = self._execute(
+            "SELECT observation_id, intent_id, layer, nonce, ciphertext "
+            "FROM owner_delivery_observations_v1"
+        ).fetchall()
         return repr(
             (
                 record_rows,
@@ -4648,6 +5421,10 @@ class EncryptedStateStore:
                 owner_settings_rows,
                 owner_mutation_rows,
                 business_status_rows,
+                task_runtime_rows,
+                daily_review_rows,
+                owner_outbox_rows,
+                owner_delivery_rows,
             )
         ).encode("utf-8")
 
@@ -4849,7 +5626,7 @@ class EncryptedStateStore:
             raise AuthorityValidationError("effect state and payload mismatch")
         if effect_id != intent.effect_id:
             raise AuthorityValidationError("effect identifier mismatch")
-        validate_ticket110_effect_kind(intent.effect_kind)
+        validate_controlled_effect_kind(intent.effect_kind)
 
     @staticmethod
     def _decode_record_payload(
