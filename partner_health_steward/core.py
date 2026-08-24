@@ -4737,14 +4737,9 @@ class HealthCore:
                 settings = self._current_owner_settings(head)
                 outbox = self._ticket115_outbox_state_open(settings)
                 outbox_intent = outbox.record(source_causal_id).intent
-                observed = self._owner_settings_clock()
-                if (
-                    type(observed) is not datetime
-                    or observed.tzinfo is None
-                    or observed.utcoffset() is None
-                ):
+                observed_at_utc = self._owner_delivery_clock_utc_open()
+                if observed_at_utc is None:
                     raise TypeError("owner delivery clock must be timezone-aware")
-                observed_at_utc = observed.astimezone(timezone.utc).isoformat()
             except (
                 AuthorityValidationError,
                 DeliveryContractViolation,
@@ -5318,12 +5313,8 @@ class HealthCore:
                         and candidate_intent.effect_kind == "owner-delivery"
                     ):
                         try:
-                            observed = self._owner_settings_clock()
-                            if (
-                                type(observed) is not datetime
-                                or observed.tzinfo is None
-                                or observed.utcoffset() is None
-                            ):
+                            observed_at_utc = self._owner_delivery_clock_utc_open()
+                            if observed_at_utc is None:
                                 return None
                             settings = self._current_owner_settings(head)
                             outbox_intent = self._ticket115_outbox_state_open(
@@ -5339,9 +5330,7 @@ class HealthCore:
                             if self._owner_delivery_sendable_open(
                                 outbox_intent,
                                 settings,
-                                observed_at_utc=observed.astimezone(
-                                    timezone.utc
-                                ).isoformat(),
+                                observed_at_utc=observed_at_utc,
                             ) is None:
                                 return None
                         except (
@@ -6104,6 +6093,19 @@ class HealthCore:
                     ],
                 }
 
+    def _owner_delivery_clock_utc_open(self) -> str | None:
+        try:
+            observed = self._owner_settings_clock()
+        except Exception:
+            return None
+        if (
+            type(observed) is not datetime
+            or observed.tzinfo is None
+            or observed.utcoffset() is None
+        ):
+            return None
+        return observed.astimezone(timezone.utc).isoformat()
+
     @staticmethod
     def _owner_contact_window_allows(
         settings: OwnerSettingsState,
@@ -6399,6 +6401,7 @@ class HealthCore:
             with self._ticket115_write_authority() as (_, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 intent = outbox.record(intent_id).intent
+                authorization_time = self._owner_delivery_clock_utc_open()
                 execution = self._validated_effect_execution(
                     grant,
                     intent.semantic_digest,
@@ -6406,11 +6409,12 @@ class HealthCore:
                 )
                 if (
                     execution is None
+                    or authorization_time is None
                     or execution.intent.business_source_causal_id != intent_id
                     or self._owner_delivery_sendable_open(
                         intent,
                         settings,
-                        observed_at_utc=acquired_at_utc,
+                        observed_at_utc=authorization_time,
                     )
                     is None
                 ):
@@ -6481,6 +6485,7 @@ class HealthCore:
             with self._ticket115_write_authority() as (_, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 intent = outbox.record(intent_id).intent
+                authorization_time = self._owner_delivery_clock_utc_open()
                 execution = self._validated_effect_execution(
                     grant,
                     intent.semantic_digest,
@@ -6488,11 +6493,12 @@ class HealthCore:
                 )
                 if (
                     execution is None
+                    or authorization_time is None
                     or execution.intent.business_source_causal_id != intent_id
                     or self._owner_delivery_sendable_open(
                         intent,
                         settings,
-                        observed_at_utc=attempted_at_utc,
+                        observed_at_utc=authorization_time,
                         required_lease=execution.lease,
                     )
                     is None
@@ -6519,10 +6525,11 @@ class HealthCore:
             # head, writer proof, settings, task, review, outbox, approval and
             # the exact attempt immediately before leaving for the adapter.
             with self._ticket115_write_authority() as (_, settings):
-                if self._owner_delivery_sendable_open(
+                authorization_time = self._owner_delivery_clock_utc_open()
+                if authorization_time is None or self._owner_delivery_sendable_open(
                     intent,
                     settings,
-                    observed_at_utc=attempted_at_utc,
+                    observed_at_utc=authorization_time,
                     required_lease=execution.lease,
                     expected_attempt_ref=attempt_ref,
                 ) is None:

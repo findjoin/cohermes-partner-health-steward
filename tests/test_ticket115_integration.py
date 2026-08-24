@@ -80,6 +80,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
             "test_114_a1_c17_ticket111_preferences_seed_authoritative_settings"
         )
         self.base.setUp()
+        self.base.owner_clock_value = datetime.fromisoformat(_ATTEMPTED_AT)
         self.execution_vault = InMemoryExecutionCapabilityVault()
         self.status_authority = status.CapabilityFactAuthority(
             authority_id="ticket115-production-status-authority",
@@ -693,6 +694,30 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
         self.assertEqual(issued.status, "rejected")
         self.assertEqual(self.base.store.unresolved_effects(), ())
+
+    def test_backdated_attempt_cannot_bypass_current_local_day(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self.base.owner_clock_value = datetime(
+            2026,
+            8,
+            25,
+            3,
+            5,
+            tzinfo=timezone.utc,
+        )
+        adapter = _RecordingAdapter(self.base.store)
+
+        with self.assertRaises(AuthorityValidationError):
+            self._effect(
+                "owner-delivery.execute",
+                {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+                grant=grant,
+                transport=adapter,
+            )
+
+        self.assertEqual(adapter.calls, 0)
 
     def test_accepted_delivered_and_read_stay_distinct_from_task_solved(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
