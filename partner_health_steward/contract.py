@@ -13,6 +13,10 @@ from .authority import EffectIntent, MAX_OPAQUE_TEXT_BYTES
 from .coordination import DailyTurnDraft, DailyTurnResult
 from .initialization import InitializationDisclosure, OwnerInitialization, SkillUseProof
 from .nondiagnostic import NonDiagnosticCandidate, NonDiagnosticContractViolation
+from .owner_authority import (
+    OwnerAuthorityContractViolation,
+    OwnerMutationRequest,
+)
 
 
 PROTOCOL_VERSION = 1
@@ -123,6 +127,27 @@ class DailyTurnPreparePayload(CommandPayload):
 
     def to_wire(self) -> dict[str, object]:
         wire: dict[str, object] = {"draft": self.draft.to_storage()}
+        if self.candidate is not None:
+            wire["candidate"] = self.candidate.to_wire()
+        return wire
+
+
+@dataclass(frozen=True)
+class OwnerPreparePayload(CommandPayload):
+    request: OwnerMutationRequest
+    candidate: NonDiagnosticCandidate | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not OwnerMutationRequest:
+            raise ProtocolViolation("invalid owner mutation request")
+        if (
+            self.candidate is not None
+            and type(self.candidate) is not NonDiagnosticCandidate
+        ):
+            raise ProtocolViolation("invalid non-diagnostic candidate")
+
+    def to_wire(self) -> dict[str, object]:
+        wire: dict[str, object] = {"request": self.request.to_storage()}
         if self.candidate is not None:
             wire["candidate"] = self.candidate.to_wire()
         return wire
@@ -294,6 +319,7 @@ _PAYLOAD_TYPES: dict[str, type[CommandPayload]] = {
     "initialization.disclose": InitializationDisclosurePayload,
     "initialization.prepare": InitializationPreparePayload,
     "turn.prepare": DailyTurnPreparePayload,
+    "owner.prepare": OwnerPreparePayload,
     "cursor.result": NativeCursorResultPayload,
     "state.candidate": StateCandidatePayload,
     "state.prepare": StateCandidatePayload,
@@ -309,6 +335,7 @@ _ACTION_SCOPES = {
     "initialization.disclose": "initialization:disclose",
     "initialization.prepare": "initialization:prepare",
     "turn.prepare": "turn:prepare",
+    "owner.prepare": "owner:prepare",
     "cursor.result": "cursor:result",
     "state.candidate": "state:candidate",
     "state.prepare": "state:prepare",
@@ -405,6 +432,28 @@ def _parse_payload(action: str, value: object) -> CommandPayload:
         except (TypeError, ValueError, NonDiagnosticContractViolation) as exc:
             raise ProtocolViolation("invalid daily turn payload") from exc
         return DailyTurnPreparePayload(draft, candidate)
+    if payload_type is OwnerPreparePayload:
+        if type(value) is not dict or set(value) not in (
+            {"request"},
+            {"request", "candidate"},
+        ):
+            raise ProtocolViolation("invalid payload fields")
+        fields = value
+        try:
+            request = OwnerMutationRequest.from_storage(fields["request"])
+            candidate = (
+                None
+                if "candidate" not in fields
+                else NonDiagnosticCandidate.from_wire(fields["candidate"])
+            )
+        except (
+            TypeError,
+            ValueError,
+            NonDiagnosticContractViolation,
+            OwnerAuthorityContractViolation,
+        ) as exc:
+            raise ProtocolViolation("invalid owner mutation payload") from exc
+        return OwnerPreparePayload(request, candidate)
     if payload_type is NativeCursorResultPayload:
         fields = _strict_mapping(
             value,
@@ -649,7 +698,15 @@ class CommandEnvelope:
             or self.scope != (expected_scope,)
         ):
             raise ProtocolViolation("permission scope denied")
-        object.__setattr__(self, "payload", _parse_payload(self.action, self.payload))
+        parsed_payload = _parse_payload(self.action, self.payload)
+        if (
+            self.action == "owner.prepare"
+            and type(parsed_payload) is OwnerPreparePayload
+            and self.generation
+            != parsed_payload.request.context.current_head_generation
+        ):
+            raise ProtocolViolation("owner mutation generation mismatch")
+        object.__setattr__(self, "payload", parsed_payload)
 
     def to_wire(self) -> dict[str, object]:
         return {

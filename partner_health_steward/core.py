@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Protocol, TypeVar
 
 from .admission import (
@@ -53,6 +54,7 @@ from .contract import (
     InitializationDisclosurePayload,
     InitializationPreparePayload,
     NativeCursorResultPayload,
+    OwnerPreparePayload,
     ProbeMeta,
     ProtocolViolation,
     Response,
@@ -62,12 +64,16 @@ from .contract import (
 )
 from .coordination import (
     DAILY_HEALTH_SKILL_NAMES,
+    RECORDING_EXCLUDED_CORRECTION_PORTRAIT_REASON,
+    AtomicEvidenceClaim,
     DailyHealthState,
     DailySkillAttestor,
     DailySkillBundle,
     DailyTurnDraft,
     DailyTurnResult,
+    OwnerCorrectionRevision,
     OwnerReplyAtom,
+    PortraitDecision,
 )
 from .initialization import (
     HealthInitAttestor,
@@ -118,12 +124,46 @@ from .current_head import (
     TransitionNotFound,
 )
 from .probe import ProbeReport, ProbeState
+from .owner_authority import (
+    OwnerAuthorityContractViolation,
+    OwnerMutationRequest,
+    OwnerPreparedMutation,
+)
+from .rights import (
+    ManagedExport,
+    ManagedObject,
+    ManagedObjectReference,
+    ManagedRightsProjection,
+    ManagedRightsService,
+    PendingCorrectionDraft,
+    RightsContractViolation,
+)
+from .settings import (
+    ORDINARY_NOTIFICATION_KINDS,
+    OwnerSettingsEngine,
+    OwnerSettingsState,
+    RouteConfigurationUpdate,
+    SettingsContractViolation,
+    SupportContactSettings,
+)
+from .status import (
+    BusinessStatusResult,
+    CapabilityFactAuthority,
+    CapabilityRequirement,
+    CORE_STATUS_DOMAINS,
+    PRODUCTION_STATUS_PRODUCER_CONTRACTS,
+    PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS,
+    PRODUCTION_STATUS_PRODUCER_IDS,
+    StatusContractViolation,
+    StatusProjector,
+)
 from .storage import (
     CausalIdConflict,
     CurrentHeadRecoveryBinding,
     DailyTurnTerminalReceipt,
     EncryptedStateStore,
     KeyUnavailable,
+    OwnerPreparedCorrectionRecovery,
     StoreUnavailable,
 )
 
@@ -209,6 +249,69 @@ class DailyTurnStatus:
         if self.terminal is None:
             raise AuthorityValidationError("daily terminal receipt required")
         return self.terminal.transition_id
+
+
+@dataclass(frozen=True)
+class OwnerMutationStatus:
+    """Health-body-free recovery projection for one owner mutation."""
+
+    command_id: str
+    phase: str
+    record_id: str
+    revision_digest: str
+    transition_id: str
+    prepared_authority: AuthoritySnapshot
+    owner_authority_binding_digest: str
+    settings_version: int
+    settings_result: dict[str, object] | None
+    committed_authority: AuthoritySnapshot | None = None
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.command_id, "owner mutation command identifier"),
+            (self.record_id, "owner mutation record identifier"),
+            (self.revision_digest, "owner mutation revision digest"),
+            (self.transition_id, "owner mutation transition identifier"),
+            (
+                self.owner_authority_binding_digest,
+                "owner mutation authority binding",
+            ),
+        ):
+            validate_opaque_text(value, name)
+        if self.phase not in {"prepared", "unknown", "committed", "finalized"}:
+            raise AuthorityValidationError("invalid owner mutation phase")
+        if type(self.prepared_authority) is not AuthoritySnapshot:
+            raise AuthorityValidationError("invalid owner mutation authority")
+        if self.phase in {"committed", "finalized"}:
+            if type(self.committed_authority) is not AuthoritySnapshot:
+                raise AuthorityValidationError(
+                    "invalid committed owner mutation authority"
+                )
+        elif self.committed_authority is not None:
+            raise AuthorityValidationError(
+                "unexpected committed owner mutation authority"
+            )
+        if type(self.settings_version) is not int or self.settings_version < 1:
+            raise AuthorityValidationError("invalid owner settings version")
+        if self.settings_result is not None:
+            if type(self.settings_result) is not dict:
+                raise AuthorityValidationError("invalid owner settings result")
+            try:
+                normalized = json.loads(
+                    json.dumps(
+                        self.settings_result,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise AuthorityValidationError(
+                    "invalid owner settings result"
+                ) from exc
+            if type(normalized) is not dict:
+                raise AuthorityValidationError("invalid owner settings result")
+            object.__setattr__(self, "settings_result", normalized)
 
 
 @dataclass(frozen=True)
@@ -562,6 +665,12 @@ class HealthCore:
         health_init_asset: HealthInitAsset | None = None,
         daily_skill_verifier: DailySkillAttestor | None = None,
         daily_skill_bundle: DailySkillBundle | None = None,
+        owner_settings_clock: Callable[[], datetime] | None = None,
+        route_configuration_provider: (
+            Callable[[], RouteConfigurationUpdate] | None
+        ) = None,
+        status_fact_authority: CapabilityFactAuthority | None = None,
+        business_status_clock: Callable[[], datetime] | None = None,
         model_authority_digest: str | None = None,
         knowledge_releases: tuple[KnowledgeRelease, ...] = (),
         knowledge_valid_at: str | None = None,
@@ -585,6 +694,41 @@ class HealthCore:
         self._health_init_asset = health_init_asset
         self._daily_skill_verifier = daily_skill_verifier
         self._daily_skill_bundle = daily_skill_bundle
+        if owner_settings_clock is not None and not callable(owner_settings_clock):
+            raise AuthorityValidationError("invalid owner settings clock")
+        self._owner_settings_clock = (
+            owner_settings_clock
+            if owner_settings_clock is not None
+            else lambda: datetime.now(timezone.utc)
+        )
+        if (
+            route_configuration_provider is not None
+            and not callable(route_configuration_provider)
+        ):
+            raise AuthorityValidationError("invalid route configuration provider")
+        self._route_configuration_provider = route_configuration_provider
+        if status_fact_authority is not None:
+            if type(status_fact_authority) is not CapabilityFactAuthority:
+                raise AuthorityValidationError("invalid status fact authority")
+            if any(
+                status_fact_authority.producer_contracts.get(producer_id)
+                != contract_version
+                for producer_id, contract_version
+                in PRODUCTION_STATUS_PRODUCER_CONTRACTS.items()
+            ):
+                raise AuthorityValidationError(
+                    "incomplete production status producer authority"
+                )
+        if business_status_clock is not None and not callable(
+            business_status_clock
+        ):
+            raise AuthorityValidationError("invalid business status clock")
+        self._status_fact_authority = status_fact_authority
+        self._business_status_clock = (
+            business_status_clock
+            if business_status_clock is not None
+            else lambda: datetime.now(timezone.utc)
+        )
         if model_authority_digest is not None and (
             type(model_authority_digest) is not str
             or len(model_authority_digest) != 71
@@ -638,6 +782,19 @@ class HealthCore:
         self._observed_model_preflight_failures: dict[
             tuple[str, str, str], str
         ] = {}
+        # A stopped-recording source is never persisted with its body.  The
+        # exact admitted envelope may exist only for the current live turn so
+        # a body-free temporary answer or an owner correction can still be
+        # attested.  Restart loses this cache by design; exact redelivery can
+        # repopulate it from the keyed native-event fingerprint.
+        self._recording_excluded_sources: dict[str, SourceEnvelope] = {}
+        # A managed-rights correction authorizes one exact stopped-recording
+        # evidence stage.  Only body-free digests live here; restart loses the
+        # transient grant and the owner must form the pending draft again.
+        self._pending_correction_authorizations: dict[
+            str,
+            tuple[str, str],
+        ] = {}
         self._terminal_seen = False
         self._current_head_guard_depth = 0
         self._current_head_guard_binding: CurrentHeadRecoveryBinding | None = None
@@ -666,6 +823,8 @@ class HealthCore:
             # Only then can a new core acquire the namespace, so no old
             # WriterFenceProof remains usable after orderly handoff.
             self._closed = True
+            self._recording_excluded_sources.clear()
+            self._pending_correction_authorizations.clear()
             failed_writer: list[tuple[str, str]] = []
             for namespace, session in tuple(self._writer_holder_sessions.items()):
                 if self._release_host_session(session):
@@ -1161,6 +1320,19 @@ class HealthCore:
                 with self._store.transaction():
                     previous = self._store.receipt(command)
                     if previous is not None:
+                        payload = command.payload
+                        if (
+                            command.action == "inbound.admit"
+                            and isinstance(payload, InboundAdmitPayload)
+                        ):
+                            source_receipt = self._store.source_receipt(
+                                payload.envelope.causal_id
+                            )
+                            if source_receipt is not None:
+                                self._remember_recording_excluded_source(
+                                    source_receipt,
+                                    payload.envelope,
+                                )
                         guard = self._store.current_head_observation_guard()
                         if guard is not None and guard.binding is not None and guard.binding.matches(command):
                             self._store.clear_current_head_observation(guard.binding)
@@ -2530,13 +2702,15 @@ class HealthCore:
                     )
             return self._handle_state(command, head)
         if command.action == "inbound.admit":
-            return self._handle_inbound_admit(command)
+            return self._handle_inbound_admit(command, head)
         if command.action == "initialization.disclose":
             return self._handle_initialization_disclose(command)
         if command.action == "initialization.prepare":
             return self._handle_initialization_prepare(command, head)
         if command.action == "turn.prepare":
             return self._handle_daily_turn_prepare(command, head)
+        if command.action == "owner.prepare":
+            return self._handle_owner_mutation_prepare(command, head)
         if command.action == "cursor.result":
             return self._handle_native_cursor_result(command)
         if command.action == "effect.request":
@@ -2641,19 +2815,61 @@ class HealthCore:
                 False,
             )
         draft = payload.draft
-        source = self._store.source_envelope(draft.source_causal_id)
-        receipt = self._store.source_receipt(draft.source_causal_id)
+        source_binding = self._daily_source_binding(draft.source_causal_id)
+        recording_excluded = (
+            source_binding is not None and source_binding[2]
+        )
+        settings = self._current_owner_settings(head)
+        recording_stage = (
+            draft
+            if draft.turn_kind == "evidence-stage"
+            else draft.evidence_stage
+        )
+        recording_candidates = tuple(
+            candidate
+            for candidate in (recording_stage, draft)
+            if type(candidate) is DailyTurnDraft
+        )
+        if (
+            (settings.recording_stopped or recording_excluded)
+            and (
+                not recording_candidates
+                or any(
+                    not self._recording_excluded_candidate_safe(candidate)
+                    for candidate in recording_candidates
+                )
+            )
+        ):
+            self._store.reject_source_recording(draft.source_causal_id)
+            self._recording_excluded_sources.pop(
+                draft.source_causal_id,
+                None,
+            )
+            self._pending_correction_authorizations.pop(
+                draft.source_causal_id,
+                None,
+            )
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "health-recording-stopped",
+                ),
+                True,
+            )
+        if source_binding is None:
+            source_binding = self._daily_source_binding(draft.source_causal_id)
         state = self._store.daily_state()
         if (
-            source is None
-            or receipt is None
-            or receipt.managed_cursor_state != "held"
-            or source.requested_capability not in DAILY_HEALTH_SKILL_NAMES
+            source_binding is None
+            or source_binding[0].requested_capability
+            not in DAILY_HEALTH_SKILL_NAMES
         ):
             return _Handled(
                 Response("rejected", command.causal_id, "daily-source-required"),
                 True,
             )
+        source, _receipt, _recording_excluded = source_binding
         unresolved = self._store.unresolved_daily_turn()
         if draft.turn_kind == "evidence-stage":
             verified = draft.verify(source, state, bundle, verifier)
@@ -2738,6 +2954,433 @@ class HealthCore:
         return _Handled(
             Response("accepted", command.causal_id, "daily-turn-prepared"),
             True,
+        )
+
+    def _handle_owner_mutation_prepare(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> _Handled:
+        """Prepare one owner mutation without publishing either business state."""
+
+        payload = command.payload
+        if not isinstance(payload, OwnerPreparePayload):
+            raise ProtocolViolation("invalid owner mutation payload")
+        request = payload.request
+        context = request.context
+        policy = self._admission_policy
+        initialization = self._store.initialization()
+        if (
+            type(policy) is not AdmissionPolicy
+            or initialization is None
+            or initialization.phase != "enabled"
+            or not self._initialization_configuration_matches(initialization.draft)
+        ):
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "owner-authority-unavailable",
+                ),
+                False,
+            )
+        if (
+            command.causal_id != context.causal_id
+            or command.generation != context.current_head_generation
+            or context.owner_id != policy.owner_sender_id
+            or context.installation_id != head.installation_id
+        ):
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "owner-authority-mismatch",
+                ),
+                True,
+            )
+        if context.writer_fence != head.writer_fence:
+            return _Handled(
+                Response(
+                    "unavailable",
+                    command.causal_id,
+                    "stale-writer-fence",
+                ),
+                False,
+            )
+
+        current_settings = self._current_owner_settings(head)
+        if request.expected_settings_version != current_settings.version:
+            return _Handled(
+                Response(
+                    "rejected",
+                    command.causal_id,
+                    "owner-settings-version-mismatch",
+                ),
+                True,
+            )
+
+        settings_result: dict[str, object] | None = None
+        next_settings = current_settings
+        if request.settings_command is not None:
+            try:
+                observed_at = self._owner_settings_clock()
+                if (
+                    type(observed_at) is not datetime
+                    or observed_at.tzinfo is None
+                    or observed_at.utcoffset() is None
+                ):
+                    raise ValueError("owner settings clock must be timezone-aware")
+                core_committed_at = observed_at.astimezone(timezone.utc).isoformat()
+            except Exception as exc:
+                raise StoreUnavailable("owner settings clock unavailable") from exc
+            try:
+                transition = OwnerSettingsEngine.apply(
+                    current_settings,
+                    request.settings_command,
+                    core_committed_at_utc=core_committed_at,
+                    current_head_generation=head.generation,
+                    current_writer_fence=head.writer_fence,
+                )
+            except (SettingsContractViolation, TypeError, ValueError) as exc:
+                raise ProtocolViolation("invalid owner settings mutation") from exc
+            next_settings = transition.state
+            settings_result = transition.result
+
+        daily = request.daily_turn_draft
+        daily_result_digest: str | None = None
+        if daily is not None:
+            rejection = self._owner_correction_rejection(
+                request,
+                payload.candidate,
+                initialization.draft,
+                current_settings,
+            )
+            if rejection is not None:
+                return _Handled(
+                    Response("rejected", command.causal_id, rejection),
+                    True,
+                )
+            pending = request.pending_correction
+            if pending is None:
+                raise ProtocolViolation("owner correction metadata missing")
+            revision = pending.revision
+            daily = replace(
+                daily,
+                owner_correction_revision=OwnerCorrectionRevision(
+                    correction_id=revision.correction_id,
+                    object_ref=revision.object_ref,
+                    previous_version=revision.previous_version,
+                    revision_version=revision.revision_version,
+                    reason=revision.reason,
+                    corrected_at_utc=revision.corrected_at_utc,
+                    source_refs=revision.source_refs,
+                    evidence_refs=revision.evidence_refs,
+                    affected_object_refs=revision.affected_object_refs,
+                    disposition_requests=revision.disposition_requests,
+                ),
+            )
+            request = replace(request, daily_turn_draft=daily)
+            expected_result = EncryptedStateStore._daily_result_for_draft(daily)
+            daily_result_digest = stable_digest(expected_result.to_storage())
+        elif self._store.unresolved_daily_turn() is not None:
+            return _Handled(
+                Response("unavailable", command.causal_id, "daily-turn-busy"),
+                False,
+            )
+
+        try:
+            prepared = OwnerPreparedMutation(
+                request=request,
+                next_settings=next_settings,
+                settings_result=settings_result,
+                daily_result_digest=daily_result_digest,
+            )
+        except OwnerAuthorityContractViolation as exc:
+            raise ProtocolViolation("invalid prepared owner mutation") from exc
+        target = RevisionTarget(
+            record_id=prepared.record_id,
+            revision_digest=prepared.revision_digest,
+            transition_id=prepared.transition_id,
+            payload_digest=prepared.payload_digest,
+        )
+        self._store.write_record(
+            target.record_id,
+            "prepared",
+            target.revision_digest,
+            target.transition_id,
+            PreparedTransition(target=target, base=head),
+        )
+        self._store.write_owner_mutation(prepared)
+        if daily is not None:
+            self._store.write_daily_turn("prepared", daily)
+        return _Handled(
+            Response("accepted", command.causal_id, "owner-mutation-prepared"),
+            True,
+        )
+
+    def _owner_correction_rejection(
+        self,
+        request: OwnerMutationRequest,
+        candidate: NonDiagnosticCandidate | None,
+        initialization: InitializationDraft,
+        current_settings: OwnerSettingsState,
+    ) -> str | None:
+        """Revalidate a rights draft through Ticket 112's exact correction chain."""
+
+        pending = request.pending_correction
+        daily = request.daily_turn_draft
+        verifier = self._daily_skill_verifier
+        bundle = self._daily_skill_bundle
+        if (
+            pending is None
+            or daily is None
+            or daily.turn_kind != "complete-turn"
+            or type(verifier) is not DailySkillAttestor
+            or type(bundle) is not DailySkillBundle
+            or not self._initialization_configuration_matches(initialization)
+        ):
+            return "owner-correction-authority-mismatch"
+        state = self._store.daily_state()
+        if pending.base_state_digest != state.digest:
+            return "owner-correction-state-mismatch"
+        if pending.revision.source_refs != (
+            f"source:{daily.source_causal_id}",
+        ):
+            return "owner-correction-source-mismatch"
+        try:
+            projection = self._managed_rights_projection_from_state(
+                state,
+                owner_id=request.context.owner_id,
+                installation_id=request.context.installation_id,
+            )
+            expected_pending = ManagedRightsService.correct(
+                projection,
+                requester_owner_id=request.context.owner_id,
+                permission="health_data.correct",
+                target_ref=pending.target_ref,
+                correction_id=pending.revision.correction_id,
+                reason=pending.revision.reason,
+                corrected_at_utc=pending.revision.corrected_at_utc,
+                replacement_claim=(
+                    pending.maintenance_request.replacement_claim
+                ),
+                correction_source_refs=pending.revision.source_refs,
+                affected_object_refs=pending.revision.affected_object_refs,
+                disposition_requests=pending.revision.disposition_requests,
+            )
+        except RightsContractViolation:
+            return "owner-correction-target-mismatch"
+        if expected_pending != pending:
+            return "owner-correction-target-mismatch"
+        unresolved = self._store.unresolved_daily_turn()
+        stage = daily.evidence_stage
+        if (
+            type(stage) is DailyTurnDraft
+            and (
+                stage.steward_plan.atomic_claims
+                or stage.steward_plan.evidence_maintenance_requests
+                != (pending.maintenance_request,)
+            )
+        ):
+            return "owner-correction-evidence-scope-mismatch"
+        if (
+            unresolved is None
+            or unresolved.phase != "evidence-finalized"
+            or type(stage) is not DailyTurnDraft
+            or unresolved.draft != stage
+            or stage.steward_plan.evidence_maintenance_requests
+            != (pending.maintenance_request,)
+        ):
+            return "owner-correction-evidence-stage-required"
+        source_binding = self._daily_source_binding(daily.source_causal_id)
+        if (
+            source_binding is None
+            or source_binding[0].requested_capability
+            not in DAILY_HEALTH_SKILL_NAMES
+        ):
+            return "daily-source-required"
+        source, _receipt, recording_excluded = source_binding
+        try:
+            post_stage_state = state.apply_evidence_stage(stage)
+        except AuthorityValidationError:
+            return "owner-correction-evidence-stage-invalid"
+        if not daily.verify(
+            source,
+            post_stage_state,
+            bundle,
+            verifier,
+            committed_evidence_stage=stage,
+        ):
+            return "daily-skill-proof-required"
+        if (
+            (current_settings.recording_stopped or recording_excluded)
+            and not self._recording_excluded_correction_completion_safe(
+                daily,
+                pending,
+                request.owner_authority_binding_digest,
+            )
+        ):
+            return "health-recording-stopped"
+        portrait_decisions = tuple(
+            result.decision
+            for result in daily.responsibility_results
+            if result.canonical_name == "health-portrait"
+            and type(result.decision) is PortraitDecision
+            and result.decision.status
+            in {"update", "degrade", "maintain", "withdraw"}
+        )
+        expected_written_topics = {
+            decision.topic_ref
+            for decision in portrait_decisions
+            if decision.status in {"update", "degrade"}
+        }
+        expected_withdrawn_topics = {
+            decision.topic_ref
+            for decision in portrait_decisions
+            if decision.status == "withdraw"
+        }
+        if (
+            {topic.topic_ref for topic in daily.portrait_topics}
+            != expected_written_topics
+            or set(daily.portrait_withdrawals)
+            != expected_withdrawn_topics
+        ):
+            return "owner-correction-affected-scope-mismatch"
+        actual_portrait_refs = {
+            f"portrait-topic:{decision.topic_ref}"
+            for decision in portrait_decisions
+        }
+        declared_portrait_refs = set(
+            pending.revision.affected_object_refs
+        )
+        if actual_portrait_refs != declared_portrait_refs:
+            return "owner-correction-affected-scope-mismatch"
+        dispositions = set(pending.revision.disposition_requests)
+        if actual_portrait_refs and "rejudge" not in dispositions:
+            return "owner-correction-disposition-mismatch"
+        if "withdraw_current" in dispositions:
+            corrected_targets = {
+                change.target_evidence_id
+                for change in stage.evidence_applicability_changes
+                if change.applicability == "corrected"
+            }
+            if corrected_targets != set(pending.revision.evidence_refs):
+                return "owner-correction-disposition-mismatch"
+        return self._daily_answer_resolution_rejection(
+            daily,
+            candidate,
+            post_stage_state,
+        )
+
+    def _recording_excluded_correction_completion_safe(
+        self,
+        daily: DailyTurnDraft,
+        pending: PendingCorrectionDraft,
+        owner_authority_binding_digest: str,
+    ) -> bool:
+        """Accept only the closed first-release correction completion shape."""
+
+        stage = daily.evidence_stage
+        if (
+            type(stage) is not DailyTurnDraft
+            or not stage.recording_excluded_persistence_safe()
+            or not self._recording_excluded_correction_authorization_matches(
+                stage
+            )
+            or stage.steward_plan.evidence_maintenance_requests
+            != (pending.maintenance_request,)
+            or len(stage.evidence_cards) != 1
+            or len(stage.responsibility_results) != 1
+            or daily.owner_authority_binding_digest
+            != owner_authority_binding_digest
+            or daily.owner_correction_revision is not None
+            or daily.model_answer_resolution is not None
+            or daily.evidence_cards
+            or daily.evidence_compactions
+            or daily.evidence_applicability_changes
+            or daily.portrait_topics
+            or daily.evidence_relations
+        ):
+            return False
+        stage_result = stage.responsibility_results[0]
+        card = stage.evidence_cards[0]
+        if stage_result.candidate_refs != (card.evidence_id,):
+            return False
+        continuation = daily.responsibility_results[
+            len(stage.responsibility_results) :
+        ]
+        topics = stage.steward_plan.portrait_topic_refs
+        if (
+            daily.responsibility_results[
+                : len(stage.responsibility_results)
+            ]
+            != stage.responsibility_results
+            or len(continuation) != len(topics)
+            or daily.portrait_withdrawals != topics
+        ):
+            return False
+        portrait_atoms: list[OwnerReplyAtom] = []
+        for result, topic_ref in zip(continuation, topics):
+            expected_decision = PortraitDecision.withdraw(
+                topic_ref,
+                RECORDING_EXCLUDED_CORRECTION_PORTRAIT_REASON,
+            )
+            if (
+                result.canonical_name != "health-portrait"
+                or result.status != "withdraw"
+                or result.decision != expected_decision
+                or result.candidate_refs != (topic_ref,)
+                or result.candidate_change_ids
+            ):
+                return False
+            portrait_atoms.append(
+                OwnerReplyAtom.form(
+                    kind="record-result",
+                    text=f"已撤回画像主题：{topic_ref}。",
+                    source_skill="health-portrait",
+                    source_result_digest=result.result_digest,
+                    required_portrait_topic_refs=(topic_ref,),
+                )
+            )
+        evidence_atom = OwnerReplyAtom.form(
+            kind="record-result",
+            text=f"已记录：{card.content}。",
+            source_skill="health-evidence",
+            source_result_digest=stage_result.result_digest,
+            required_evidence_ids=(card.evidence_id,),
+            required_evidence_change_ids=(
+                stage_result.candidate_change_ids
+            ),
+        )
+        limitation_atom = OwnerReplyAtom.form(
+            kind="limitation",
+            text=(
+                "未形成"
+                + "、".join(card.does_not_prove)
+                + "或健康任务。"
+            ),
+            source_skill="health-evidence",
+            source_result_digest=stage_result.result_digest,
+            required_evidence_ids=(card.evidence_id,),
+        )
+        expected_atoms = (
+            evidence_atom,
+            *portrait_atoms,
+            limitation_atom,
+        )
+        resolution = daily.steward_resolution
+        return (
+            daily.reply_atoms == expected_atoms
+            and resolution is not None
+            and resolution.commit_evidence_ids == (card.evidence_id,)
+            and resolution.commit_portrait_topic_refs == topics
+            and resolution.reply_atom_ids
+            == tuple(atom.atom_id for atom in expected_atoms)
+            and resolution.commit_evidence_change_ids
+            == tuple(
+                change.change_id
+                for change in stage.evidence_applicability_changes
+            )
         )
 
     def _daily_answer_resolution_rejection(
@@ -2926,7 +3569,49 @@ class HealthCore:
             return "deterministic-model-reply-mismatch"
         return None
 
-    def _handle_inbound_admit(self, command: CommandEnvelope) -> _Handled:
+    def _daily_source_binding(
+        self,
+        source_causal_id: str,
+    ) -> tuple[SourceEnvelope, SourceReceipt, bool] | None:
+        """Resolve a daily source without restoring a stopped-recording body."""
+
+        receipt = self._store.source_receipt(source_causal_id)
+        if receipt is None:
+            return None
+        if receipt.managed_cursor_state == "held":
+            source = receipt.envelope
+            if type(source.body) is not str:
+                return None
+            return source, receipt, False
+        if receipt.managed_cursor_state != "recording-excluded":
+            return None
+        source = self._recording_excluded_sources.get(source_causal_id)
+        if (
+            type(source) is not SourceEnvelope
+            or not self._store.source_receipt_matches_exact_delivery(
+                receipt,
+                source,
+            )
+        ):
+            return None
+        return source, receipt, True
+
+    def _remember_recording_excluded_source(
+        self,
+        receipt: SourceReceipt,
+        source: SourceEnvelope,
+    ) -> None:
+        if (
+            receipt.managed_cursor_state == "recording-excluded"
+            and self._store.source_receipt_matches_exact_delivery(receipt, source)
+        ):
+            self._recording_excluded_sources[source.causal_id] = source
+
+    def _handle_inbound_admit(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> _Handled:
         payload = command.payload
         policy = self._admission_policy
         if not isinstance(payload, InboundAdmitPayload):
@@ -2974,10 +3659,20 @@ class HealthCore:
                     ),
                     False,
                 )
+            recording_excluded = self._current_owner_settings(
+                head
+            ).excludes_health_recording(
+                payload.envelope.protocol_timestamp
+            )
             receipt = self._store.save_source_envelope(
                 payload.envelope,
                 confirm_native_replay=True,
+                retain_body=not recording_excluded,
             )
+            if recording_excluded and receipt.managed_cursor_state == "held":
+                receipt = self._store.reject_source_recording(
+                    payload.envelope.causal_id
+                )
             if receipt.relation == "possible-replay":
                 business_source = receipt.business_source_causal_id
                 if business_source is None:
@@ -3030,6 +3725,10 @@ class HealthCore:
                     ),
                     True,
                 )
+            self._remember_recording_excluded_source(
+                receipt,
+                payload.envelope,
+            )
             return _Handled(
                 Response("accepted", command.causal_id, "daily-source-admitted"),
                 True,
@@ -3763,9 +4462,14 @@ class HealthCore:
                     Response("unavailable", command.causal_id, "current-writer-holder-missing"),
                     False,
                 )
+            owner_mutation = (
+                self._store.owner_mutation_for_record(record_id)
+                if transition_kind == "owner"
+                else None
+            )
             daily = (
                 self._store.daily_turn_for_record(record_id)
-                if transition_kind == "daily"
+                if transition_kind in {"daily", "owner"}
                 else None
             )
             self._store.write_finalized_record(
@@ -3783,15 +4487,71 @@ class HealthCore:
                 self._store.mark_source_business_committed_many(
                     initialization.draft.source_causal_ids
                 )
+            elif transition_kind == "owner":
+                if (
+                    owner_mutation is None
+                    or type(owner_mutation.prepared)
+                    not in {
+                        OwnerPreparedMutation,
+                        OwnerPreparedCorrectionRecovery,
+                    }
+                ):
+                    raise KeyUnavailable("owner mutation aggregate missing")
+                prepared_owner = owner_mutation.prepared
+                if (
+                    type(prepared_owner)
+                    is OwnerPreparedCorrectionRecovery
+                    and daily is None
+                ):
+                    raise KeyUnavailable("owner correction aggregate missing")
+                if daily is not None:
+                    if (
+                        daily.draft is None
+                        or daily.draft.turn_kind != "complete-turn"
+                        or (
+                            type(prepared_owner)
+                            is OwnerPreparedCorrectionRecovery
+                            and not prepared_owner.matches_daily(daily.draft)
+                        )
+                        or (
+                            type(prepared_owner) is OwnerPreparedMutation
+                            and daily.draft
+                            != prepared_owner.request.daily_turn_draft
+                        )
+                    ):
+                        raise KeyUnavailable("owner correction aggregate mismatch")
+                    self._store.finalize_daily_turn(daily.draft)
+                    self._store.mark_daily_source_family_business_committed(
+                        daily.draft.source_causal_id
+                    )
+                    self._recording_excluded_sources.pop(
+                        daily.draft.source_causal_id,
+                        None,
+                    )
+                    self._pending_correction_authorizations.pop(
+                        daily.draft.source_causal_id,
+                        None,
+                    )
+                self._store.finalize_owner_mutation(prepared_owner)
             elif transition_kind == "daily":
                 if daily is None:
                     raise KeyUnavailable("daily turn aggregate missing")
+                if daily.draft is None:
+                    raise KeyUnavailable("daily turn draft missing")
                 if daily.draft.turn_kind == "evidence-stage":
                     self._store.finalize_daily_evidence_stage(daily.draft)
                 else:
                     self._store.finalize_daily_turn(daily.draft)
                     self._store.mark_daily_source_family_business_committed(
                         daily.draft.source_causal_id
+                    )
+                    self._recording_excluded_sources.pop(
+                        daily.draft.source_causal_id,
+                        None,
+                    )
+                    self._pending_correction_authorizations.pop(
+                        daily.draft.source_causal_id,
+                        None,
                     )
             self._closed_reason = None
             return _Handled(Response("accepted", command.causal_id, "revision-finalized"), True)
@@ -3914,13 +4674,10 @@ class HealthCore:
                 True,
             )
         if source_causal_id is not None:
-            source = self._store.source_envelope(source_causal_id)
-            source_receipt = self._store.source_receipt(source_causal_id)
+            source_binding = self._daily_source_binding(source_causal_id)
             daily = self._store.daily_turn(source_causal_id)
             if (
-                source is None
-                or source_receipt is None
-                or source_receipt.managed_cursor_state != "held"
+                source_binding is None
                 or daily is None
                 or daily.phase != "evidence-finalized"
             ):
@@ -4228,13 +4985,12 @@ class HealthCore:
                         return self._model_authorization_failure()
                     if self._writer_entry_preflight() is not None:
                         return self._model_authorization_failure()
-                    source = self._store.source_envelope(source_causal_id)
-                    source_receipt = self._store.source_receipt(source_causal_id)
+                    source_binding = self._daily_source_binding(
+                        source_causal_id
+                    )
                     daily = self._store.daily_turn(source_causal_id)
                     if (
-                        source is None
-                        or source_receipt is None
-                        or source_receipt.managed_cursor_state != "held"
+                        source_binding is None
                         or daily is None
                         or daily.phase != "evidence-finalized"
                         or self._model_authority_digest is None
@@ -4521,6 +5277,677 @@ class HealthCore:
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
 
+    def _current_owner_settings(
+        self,
+        authority: AuthoritySnapshot,
+    ) -> OwnerSettingsState:
+        """Load Ticket 114 settings or derive their sole Ticket 111 seed."""
+
+        policy = self._admission_policy
+        initialization = self._store.initialization()
+        if (
+            type(authority) is not AuthoritySnapshot
+            or type(policy) is not AdmissionPolicy
+            or initialization is None
+            or initialization.phase != "enabled"
+            or not self._initialization_configuration_matches(initialization.draft)
+        ):
+            raise AuthorityValidationError("owner-settings-unavailable")
+        stored = self._store.owner_settings()
+        if stored is not None:
+            if (
+                stored.owner_id != policy.owner_sender_id
+                or stored.installation_id != authority.installation_id
+            ):
+                raise AuthorityValidationError("owner-settings-authority-mismatch")
+            return self._project_current_owner_settings(stored)
+
+        owner = initialization.draft.owner
+        configured = owner.support_contact
+        contact: SupportContactSettings | None = None
+        if configured is not None:
+            contact_id = "support-contact:" + stable_digest(
+                {
+                    "owner_id": policy.owner_sender_id,
+                    "installation_id": authority.installation_id,
+                    "contact": configured.to_storage(),
+                }
+            ).removeprefix("sha256:")
+            contact = SupportContactSettings(
+                contact_id=contact_id,
+                version=1,
+                owner_id=policy.owner_sender_id,
+                installation_id=authority.installation_id,
+                identity_label=configured.contact_ref,
+                method_kind=configured.method,
+                method_value=configured.contact_ref,
+                purpose=configured.purpose,
+                minimum_alert_fields=(
+                    "owner_recognizable_name",
+                    "event_time",
+                    "fixed_urgent_help_request",
+                ),
+                route_id=configured.method,
+                route_generation=1,
+                disclosure_version=(
+                    initialization.draft.skill_use.disclosure_version
+                ),
+                dedicated_paused=False,
+                alert_authority_status="invalidated",
+                alert_approval_id=None,
+                alert_authority_binding=None,
+                correction_authority_status="invalidated",
+                correction_authority_id=None,
+                correction_authority_binding=None,
+                max_corrections_per_alert=1,
+            )
+        preferences = owner.preferences
+        seeded = OwnerSettingsEngine.seed(
+            owner_id=policy.owner_sender_id,
+            installation_id=authority.installation_id,
+            version=1,
+            timezone=owner.timezone,
+            preferences={
+                "contact_window": preferences.contact_window,
+                "expression_style": preferences.expression_style,
+                "proactive_contact": preferences.proactive_support,
+                "ordinary_notifications": {
+                    kind: "not-configured"
+                    for kind in ORDINARY_NOTIFICATION_KINDS
+                },
+            },
+            consent={
+                "enabled": True,
+                "data_scope": owner.data_boundary,
+                # Ticket 111 has one first-hop route fact rather than separate
+                # logical-route and recipient fields.  Preserve that fact in
+                # both Ticket 114 views instead of fabricating a second value.
+                "route_id": owner.first_hop_route,
+                "first_hop_recipient": owner.first_hop_route,
+                "configuration_generation": 1,
+                "consent_generation": 1,
+                "disclosure_version": (
+                    initialization.draft.skill_use.disclosure_version
+                ),
+                "disclosure_digest": (
+                    initialization.draft.skill_proof.disclosure_digest
+                ),
+            },
+            contact=contact,
+            completed_review_keys=(),
+        )
+        return self._project_current_owner_settings(seeded)
+
+    def _project_current_owner_settings(
+        self,
+        state: OwnerSettingsState,
+    ) -> OwnerSettingsState:
+        """Materialize time and core-owned route facts over persisted settings."""
+
+        try:
+            observed_at = self._owner_settings_clock()
+            if (
+                type(observed_at) is not datetime
+                or observed_at.tzinfo is None
+                or observed_at.utcoffset() is None
+            ):
+                raise ValueError("owner settings clock must be timezone-aware")
+            observed_at_utc = observed_at.astimezone(timezone.utc).isoformat()
+            projected = OwnerSettingsEngine.activate_due_timezone_transition(
+                state,
+                observed_at_utc=observed_at_utc,
+            ).state
+            provider = self._route_configuration_provider
+            if provider is None:
+                return projected
+            route_fact = provider()
+            if type(route_fact) is not RouteConfigurationUpdate:
+                raise ValueError("route configuration provider returned invalid fact")
+            return OwnerSettingsEngine.observe_route_configuration(
+                projected,
+                route_fact,
+            ).state
+        except (SettingsContractViolation, TypeError, ValueError) as exc:
+            raise AuthorityValidationError("owner-settings-projection-unavailable") from exc
+
+    def owner_settings_state(self) -> OwnerSettingsState:
+        """Return the current owner-scoped settings after integrity proof."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("owner-settings-unavailable")
+            try:
+                if self._probe_open().state is not ProbeState.HEALTHY:
+                    raise AuthorityValidationError("owner-settings-unavailable")
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    raise AuthorityValidationError("owner-settings-unavailable")
+                return self._current_owner_settings(authority)
+            except (KeyUnavailable, StoreUnavailable, SettingsContractViolation) as exc:
+                raise AuthorityValidationError("owner-settings-unavailable") from exc
+
+    def managed_owner_settings_read(self) -> dict[str, object]:
+        """Return the policy-bound health-settings projection for the owner."""
+
+        policy = self._admission_policy
+        if type(policy) is not AdmissionPolicy:
+            raise AuthorityValidationError("owner-settings-read-unavailable")
+        try:
+            return OwnerSettingsEngine.managed_view(
+                self.owner_settings_state(),
+                requester_owner_id=policy.owner_sender_id,
+            )
+        except (SettingsContractViolation, TypeError, ValueError) as exc:
+            raise AuthorityValidationError(
+                "owner-settings-read-unavailable"
+            ) from exc
+
+    def _production_status_inputs(
+        self,
+        *,
+        probe: ProbeReport,
+        valid_until_utc: str,
+    ) -> tuple[tuple[CapabilityRequirement, ...], tuple[object, ...]]:
+        """Convert current domain authorities into sealed, body-free facts.
+
+        The complete requirement manifest is always present.  Domains owned by
+        Ticket 115 or Ticket 116 deliberately have no envelope yet, so their
+        absence remains visible to ``StatusProjector`` as ``cannot-confirm``.
+        """
+
+        signer = self._status_fact_authority
+        if type(signer) is not CapabilityFactAuthority:
+            raise AuthorityValidationError("business-status-authority-unavailable")
+
+        expectations: dict[str, tuple[int, str, str]] = {}
+        facts: list[object] = []
+        for domain in CORE_STATUS_DOMAINS:
+            unavailable_digest = stable_digest(
+                {
+                    "domain": domain,
+                    "producer_id": PRODUCTION_STATUS_PRODUCER_IDS[domain],
+                    "producer_contract_version": (
+                        PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS[domain]
+                    ),
+                    "availability": "producer-not-integrated",
+                }
+            )
+            expectations[domain] = (
+                1,
+                unavailable_digest,
+                f"status-fact:{domain}:producer-not-integrated-v1",
+            )
+
+        def seal_current(
+            domain: str,
+            *,
+            state: str,
+            generation: int,
+            revision_digest: str,
+            transition_id: str,
+            evidence_refs: tuple[str, ...],
+        ) -> None:
+            expectations[domain] = (
+                generation,
+                revision_digest,
+                transition_id,
+            )
+            facts.append(
+                signer.seal(
+                    domain=domain,
+                    requiredness="core",
+                    state=state,
+                    generation=generation,
+                    revision_digest=revision_digest,
+                    transition_id=transition_id,
+                    producer_id=PRODUCTION_STATUS_PRODUCER_IDS[domain],
+                    producer_contract_version=(
+                        PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS[domain]
+                    ),
+                    evidence_refs=evidence_refs,
+                    valid_until_utc=valid_until_utc,
+                )
+            )
+
+        authority = self._store.finalized_authority()
+        if authority is not None:
+            head_revision = stable_digest(
+                {
+                    "authority": authority.to_storage(),
+                    "probe_state": probe.state.value,
+                    "probe_reason": probe.reason_code,
+                }
+            )
+            head_transition = (
+                f"status-fact:current-head:{authority.generation}:"
+                + head_revision.removeprefix("sha256:")
+            )
+            head_state = (
+                "confirmed-ok"
+                if probe.state is ProbeState.HEALTHY
+                else "confirmed-fault"
+                if probe.reason_code == "current-head-terminal"
+                else "unknown"
+            )
+            seal_current(
+                "current_head",
+                state=head_state,
+                generation=authority.generation,
+                revision_digest=head_revision,
+                transition_id=head_transition,
+                evidence_refs=(
+                    "current-head-authority:"
+                    + stable_digest(authority.to_storage()).removeprefix(
+                        "sha256:"
+                    ),
+                ),
+            )
+
+        # A non-healthy current-head proof cannot establish that any other
+        # producer snapshot is current.  Preserve those domains as missing
+        # rather than turning process or adapter liveness into business facts.
+        if probe.state is ProbeState.HEALTHY and authority is not None:
+            initialization = self._store.initialization()
+            initialization_current = (
+                initialization is not None
+                and initialization.phase == "enabled"
+                and self._initialization_configuration_matches(
+                    initialization.draft
+                )
+            )
+            if initialization_current and initialization is not None:
+                draft = initialization.draft
+                init_evidence = (f"initialization-record:{draft.record_id}",)
+                init_generation = max(1, draft.prepared_authority.generation)
+                seal_current(
+                    "entry",
+                    state="confirmed-ok",
+                    generation=init_generation,
+                    revision_digest=draft.revision_digest,
+                    transition_id=draft.transition_id,
+                    evidence_refs=init_evidence,
+                )
+                seal_current(
+                    "enablement",
+                    state="confirmed-ok",
+                    generation=init_generation,
+                    revision_digest=draft.revision_digest,
+                    transition_id=draft.transition_id,
+                    evidence_refs=init_evidence,
+                )
+
+                key_revision = stable_digest({"key_id": self._store.key_id})
+                seal_current(
+                    "keys_state",
+                    state="confirmed-ok",
+                    generation=1,
+                    revision_digest=key_revision,
+                    transition_id=(
+                        "status-fact:keys-state:"
+                        + key_revision.removeprefix("sha256:")
+                    ),
+                    evidence_refs=(
+                        "key-boundary:"
+                        + key_revision.removeprefix("sha256:"),
+                    ),
+                )
+
+                daily_state = self._store.daily_state()
+                daily_generation = max(
+                    1,
+                    len(daily_state.processed_source_causal_ids),
+                )
+                seal_current(
+                    "portrait_evidence",
+                    state="confirmed-ok",
+                    generation=daily_generation,
+                    revision_digest=daily_state.digest,
+                    transition_id=(
+                        f"status-fact:portrait-evidence:{daily_generation}:"
+                        + daily_state.digest.removeprefix("sha256:")
+                    ),
+                    evidence_refs=(
+                        "daily-health-state:"
+                        + daily_state.digest.removeprefix("sha256:"),
+                    ),
+                )
+
+                settings = self._current_owner_settings(authority)
+                settings_revision = stable_digest(settings.to_wire())
+                seal_current(
+                    "controls",
+                    state="confirmed-ok",
+                    generation=settings.version,
+                    revision_digest=settings_revision,
+                    transition_id=(
+                        f"status-fact:controls:{settings.version}:"
+                        + settings_revision.removeprefix("sha256:")
+                    ),
+                    evidence_refs=(
+                        "owner-settings:"
+                        + settings_revision.removeprefix("sha256:"),
+                    ),
+                )
+
+                if self._model_authority_digest is not None:
+                    route_state = (
+                        "confirmed-ok"
+                        if settings.consent_path_status == "active"
+                        else "confirmed-fault"
+                    )
+                    route_revision = stable_digest(
+                        {
+                            "model_authority_digest": (
+                                self._model_authority_digest
+                            ),
+                            "route_id": settings.current_route_id,
+                            "configuration_generation": (
+                                settings.current_configuration_generation
+                            ),
+                            "disclosure_version": (
+                                settings.current_disclosure_version
+                            ),
+                            "path_status": settings.consent_path_status,
+                        }
+                    )
+                    seal_current(
+                        "model_route",
+                        state=route_state,
+                        generation=(
+                            settings.current_configuration_generation
+                        ),
+                        revision_digest=route_revision,
+                        transition_id=(
+                            "status-fact:model-route:"
+                            + route_revision.removeprefix("sha256:")
+                        ),
+                        evidence_refs=(
+                            "model-route-authority:"
+                            + route_revision.removeprefix("sha256:"),
+                        ),
+                    )
+
+        requirements = tuple(
+            CapabilityRequirement(
+                domain=domain,
+                requiredness="core",
+                producer_id=PRODUCTION_STATUS_PRODUCER_IDS[domain],
+                producer_contract_version=(
+                    PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS[domain]
+                ),
+                expected_generation=expectations[domain][0],
+                expected_revision_digest=expectations[domain][1],
+                expected_transition_id=expectations[domain][2],
+            )
+            for domain in CORE_STATUS_DOMAINS
+        )
+        return requirements, tuple(facts)
+
+    def business_status(self) -> BusinessStatusResult:
+        """Return the business tri-state and one durable state-change fact."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("business-status-unavailable")
+            try:
+                evaluated_at = self._business_status_clock()
+                if (
+                    type(evaluated_at) is not datetime
+                    or evaluated_at.tzinfo is None
+                    or evaluated_at.utcoffset() != timedelta(0)
+                ):
+                    raise AuthorityValidationError(
+                        "invalid business status clock result"
+                    )
+                evaluated_at_utc = evaluated_at.isoformat()
+                valid_until_utc = (
+                    evaluated_at + timedelta(minutes=5)
+                ).isoformat()
+                probe = self._probe_open()
+                requirements, facts = self._production_status_inputs(
+                    probe=probe,
+                    valid_until_utc=valid_until_utc,
+                )
+                projector = StatusProjector(
+                    authority=self._status_fact_authority,  # type: ignore[arg-type]
+                    requirements=requirements,
+                )
+                projection = projector.project(
+                    facts,
+                    evaluated_at_utc=evaluated_at_utc,
+                )
+                previous = self._store.remember_business_status(projection)
+                transition = (
+                    None
+                    if previous is None
+                    else projector.transition(previous, projection)
+                )
+                return BusinessStatusResult(projection, transition)
+            except (
+                KeyUnavailable,
+                StoreUnavailable,
+                SettingsContractViolation,
+                StatusContractViolation,
+            ) as exc:
+                raise AuthorityValidationError(
+                    "business-status-unavailable"
+                ) from exc
+
+    def _managed_rights_projection(self) -> ManagedRightsProjection:
+        """Form the private core projection; never expose its raw objects."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                raise AuthorityValidationError("managed-rights-unavailable")
+            try:
+                state = self.daily_state()
+                authority = self._store.finalized_authority()
+                policy = self._admission_policy
+                if authority is None or type(policy) is not AdmissionPolicy:
+                    raise AuthorityValidationError("managed-rights-unavailable")
+                return self._managed_rights_projection_from_state(
+                    state,
+                    owner_id=policy.owner_sender_id,
+                    installation_id=authority.installation_id,
+                )
+            except (KeyUnavailable, StoreUnavailable, RightsContractViolation) as exc:
+                raise AuthorityValidationError("managed-rights-unavailable") from exc
+
+    def managed_rights_read_current(self) -> tuple[ManagedObject, ...]:
+        """Return current objects through the core-owned owner/read authority."""
+
+        projection = self._managed_rights_projection()
+        requested = tuple(
+            ManagedObjectReference(
+                object_ref=item.object_ref,
+                installation_id=item.installation_id,
+                version=item.version,
+            )
+            for item in projection.objects
+            if item.current
+            and item.object_ref in projection.permitted_object_refs
+            and item.object_ref not in projection.revoked_object_refs
+        )
+        if not requested:
+            return ()
+        return ManagedRightsService.managed_read(
+            projection,
+            requester_owner_id=projection.owner_id,
+            permission="health_data.read",
+            requested_refs=requested,
+        )
+
+    def managed_correction_draft(
+        self,
+        *,
+        target_ref: ManagedObjectReference,
+        correction_id: str,
+        reason: str,
+        corrected_at_utc: str,
+        replacement_claim: AtomicEvidenceClaim,
+        correction_source_refs: tuple[str, ...],
+        affected_object_refs: tuple[str, ...],
+        disposition_requests: tuple[str, ...],
+    ) -> PendingCorrectionDraft:
+        """Create a pending draft only from the private current projection."""
+
+        projection = self._managed_rights_projection()
+        pending = ManagedRightsService.correct(
+            projection,
+            requester_owner_id=projection.owner_id,
+            permission="health_data.correct",
+            target_ref=target_ref,
+            correction_id=correction_id,
+            reason=reason,
+            corrected_at_utc=corrected_at_utc,
+            replacement_claim=replacement_claim,
+            correction_source_refs=correction_source_refs,
+            affected_object_refs=affected_object_refs,
+            disposition_requests=disposition_requests,
+        )
+        source_refs = pending.revision.source_refs
+        if (
+            len(source_refs) == 1
+            and source_refs[0].startswith("source:")
+            and len(source_refs[0]) > len("source:")
+        ):
+            source_causal_id = source_refs[0].removeprefix("source:")
+            with self._lifecycle_lock:
+                if not self._closed:
+                    self._pending_correction_authorizations[
+                        source_causal_id
+                    ] = (
+                        pending.base_state_digest,
+                        stable_digest(
+                            pending.maintenance_request.to_storage()
+                        ),
+                    )
+        return pending
+
+    def managed_rights_export(
+        self,
+        *,
+        requested_refs: tuple[ManagedObjectReference, ...],
+        snapshot_id: str,
+        created_at_utc: str,
+    ) -> ManagedExport:
+        """Create one read-only export through the owner-bound core seam."""
+
+        projection = self._managed_rights_projection()
+        return ManagedRightsService.export(
+            projection,
+            requester_owner_id=projection.owner_id,
+            permission="health_data.export",
+            requested_refs=requested_refs,
+            snapshot_id=snapshot_id,
+            created_at_utc=created_at_utc,
+        )
+
+    @staticmethod
+    def _managed_rights_projection_from_state(
+        state: DailyHealthState,
+        *,
+        owner_id: str,
+        installation_id: str,
+    ) -> ManagedRightsProjection:
+        permitted = tuple(
+            card.evidence_id for card in state.evidence_cards
+        ) + tuple(
+            f"portrait-topic:{topic.topic_ref}"
+            for topic in state.portrait_topics
+        )
+        return ManagedRightsService._project_from_daily_state(
+            state,
+            owner_id=owner_id,
+            installation_id=installation_id,
+            permitted_object_refs=permitted,
+            revoked_object_refs=(),
+        )
+
+    def owner_mutation_status(
+        self,
+        command_id: str,
+    ) -> OwnerMutationStatus | None:
+        """Return body-free recovery state for one owner mutation command."""
+
+        validate_opaque_text(command_id, "owner mutation command identifier")
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            try:
+                self._store.verify_key()
+                authority = self._store.finalized_authority()
+                if authority is None or not self._store.verify_integrity(authority):
+                    return None
+                stored = self._store.owner_mutation(command_id)
+                if stored is None:
+                    return None
+                record = self._store.record(stored.record_id)
+                if record is None:
+                    raise KeyUnavailable("owner mutation transition missing")
+                phase_by_record = {
+                    "prepared": "prepared",
+                    "unknown": "unknown",
+                    "committed": "committed",
+                    "final": "finalized",
+                }
+                phase = phase_by_record.get(record.state)
+                if phase is None:
+                    raise KeyUnavailable("invalid owner mutation transition")
+                if (
+                    (stored.phase == "prepared" and phase == "finalized")
+                    or (stored.phase == "finalized" and phase != "finalized")
+                ):
+                    raise KeyUnavailable("owner mutation phase mismatch")
+                payload = record.payload
+                if isinstance(payload, PreparedTransition):
+                    prepared_authority = payload
+                    committed_authority = None
+                elif isinstance(payload, CommittedTransition):
+                    prepared_authority = payload.prepared
+                    committed_authority = payload.committed
+                else:
+                    raise KeyUnavailable("owner mutation authority missing")
+                if not prepared_authority.target.matches_commit(
+                    record_id=stored.record_id,
+                    revision_digest=record.revision_digest,
+                    transition_id=record.transition_id,
+                ):
+                    raise KeyUnavailable("owner mutation transition mismatch")
+                if type(stored.prepared) is OwnerPreparedCorrectionRecovery:
+                    binding = (
+                        stored.prepared.owner_authority_binding_digest
+                    )
+                    settings_version = stored.prepared.next_settings.version
+                    settings_result = stored.prepared.settings_result
+                elif type(stored.prepared) is OwnerPreparedMutation:
+                    binding = (
+                        stored.prepared.request.owner_authority_binding_digest
+                    )
+                    settings_version = stored.prepared.next_settings.version
+                    settings_result = stored.prepared.settings_result
+                elif stored.terminal is not None:
+                    binding = stored.terminal.owner_authority_binding_digest
+                    settings_version = stored.terminal.settings_version
+                    settings_result = stored.terminal.settings_result
+                else:  # pragma: no cover - StoredOwnerMutation invariant
+                    raise KeyUnavailable("owner mutation identity missing")
+                return OwnerMutationStatus(
+                    command_id=stored.command_id,
+                    phase=phase,
+                    record_id=stored.record_id,
+                    revision_digest=record.revision_digest,
+                    transition_id=record.transition_id,
+                    prepared_authority=prepared_authority.base,
+                    owner_authority_binding_digest=binding,
+                    settings_version=settings_version,
+                    settings_result=settings_result,
+                    committed_authority=committed_authority,
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return None
+
     def daily_state(self) -> DailyHealthState:
         """Return managed daily evidence/portrait state after full integrity proof."""
 
@@ -4546,6 +5973,152 @@ class HealthCore:
                 return self._store.daily_state()
             except (KeyUnavailable, StoreUnavailable) as exc:
                 raise AuthorityValidationError("daily-state-unavailable") from exc
+
+    def _recording_excluded_correction_authorization_matches(
+        self,
+        draft: DailyTurnDraft,
+    ) -> bool:
+        requests = draft.steward_plan.evidence_maintenance_requests
+        if len(requests) != 1 or requests[0].action != "correct":
+            return False
+        return self._pending_correction_authorizations.get(
+            draft.source_causal_id
+        ) == (
+            draft.base_state_digest,
+            stable_digest(requests[0].to_storage()),
+        )
+
+    def _recording_excluded_candidate_safe(
+        self,
+        draft: DailyTurnDraft,
+    ) -> bool:
+        if not draft.recording_excluded_persistence_safe():
+            return False
+        if not draft.steward_plan.evidence_maintenance_requests:
+            return True
+        return self._recording_excluded_correction_authorization_matches(
+            draft
+        )
+
+    def discard_recording_plaintext(self, source_causal_id: str) -> None:
+        """Unconditionally release one stopped source and its transient grant."""
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            self._recording_excluded_sources.pop(source_causal_id, None)
+            self._pending_correction_authorizations.pop(
+                source_causal_id,
+                None,
+            )
+
+    def recording_excluded_owner_correction_handoff_required(
+        self,
+        source_causal_id: str,
+        stage: DailyTurnDraft,
+    ) -> bool:
+        """Keep an exact stopped correction transient for owner prepare.
+
+        A correction completion cannot use the ordinary daily writer.  Once
+        the managed draft and exact redelivery restore the transient grant,
+        Plugin must hand the body to the existing owner prepare path instead
+        of attempting a second durable daily prepare.
+        """
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            if (
+                self._closed
+                or type(stage) is not DailyTurnDraft
+                or stage.turn_kind != "evidence-stage"
+                or stage.source_causal_id != source_causal_id
+            ):
+                return False
+            try:
+                daily = self._store.daily_turn(source_causal_id)
+                source_binding = self._daily_source_binding(
+                    source_causal_id
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                return False
+            return (
+                daily is not None
+                and daily.phase == "evidence-finalized"
+                and daily.draft == stage
+                and source_binding is not None
+                and source_binding[2]
+                and stage.recording_excluded_persistence_safe()
+                and self._recording_excluded_correction_authorization_matches(
+                    stage
+                )
+            )
+
+    def release_recording_plaintext_if_unowned(
+        self,
+        source_causal_id: str,
+    ) -> None:
+        """Drop transient stopped-recording text unless an unresolved turn owns retry."""
+
+        validate_opaque_text(source_causal_id, "source causal identifier")
+        with self._lifecycle_lock:
+            if source_causal_id not in self._recording_excluded_sources:
+                return
+            try:
+                durable_turn = self._store.daily_turn(source_causal_id)
+                owner_mutation = (
+                    None
+                    if durable_turn is None
+                    else self._store.owner_mutation_for_record(
+                        durable_turn.record_id
+                    )
+                )
+            except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+                self._recording_excluded_sources.pop(source_causal_id, None)
+                self._pending_correction_authorizations.pop(
+                    source_causal_id,
+                    None,
+                )
+                return
+            correction_stage_owns_retry = (
+                durable_turn is not None
+                and durable_turn.phase == "evidence-finalized"
+                and type(durable_turn.draft) is DailyTurnDraft
+                and self._recording_excluded_correction_authorization_matches(
+                    durable_turn.draft
+                )
+            )
+            owner_prepared = (
+                None
+                if owner_mutation is None
+                else owner_mutation.prepared
+            )
+            owner_correction_owns_retry = (
+                durable_turn is not None
+                and durable_turn.phase in {"prepared", "unknown", "committed"}
+                and type(durable_turn.draft) is DailyTurnDraft
+                and (
+                    (
+                        type(owner_prepared)
+                        is OwnerPreparedCorrectionRecovery
+                        and owner_prepared.matches_daily(
+                            durable_turn.draft
+                        )
+                    )
+                    or (
+                        type(owner_prepared) is OwnerPreparedMutation
+                        and owner_prepared.request.daily_turn_draft
+                        == durable_turn.draft
+                    )
+                )
+            )
+            if not (
+                correction_stage_owns_retry
+                or owner_correction_owns_retry
+            ):
+                self._recording_excluded_sources.pop(source_causal_id, None)
+                self._pending_correction_authorizations.pop(
+                    source_causal_id,
+                    None,
+                )
 
     @contextmanager
     def daily_turn_runtime_preparation(
@@ -5199,6 +6772,128 @@ class HealthCore:
             and self._initialization_configuration_matches(initialization.draft)
         ):
             return "initialization"
+        owner_mutation = (
+            self._store.owner_mutation_for_record(record_id)
+            if record_kind == "owner"
+            else None
+        )
+        if owner_mutation is not None:
+            if owner_mutation.phase == "finalized":
+                return "owner" if owner_mutation.terminal is not None else None
+            prepared_owner = owner_mutation.prepared
+            policy = self._admission_policy
+            record = self._store.record(record_id)
+            record_authority = (
+                None
+                if record is None
+                else record.payload
+                if isinstance(record.payload, PreparedTransition)
+                else record.payload.prepared
+                if isinstance(record.payload, CommittedTransition)
+                else None
+            )
+            if type(prepared_owner) is OwnerPreparedCorrectionRecovery:
+                prepared_owner_id = prepared_owner.owner_id
+                prepared_installation_id = prepared_owner.installation_id
+                prepared_generation = prepared_owner.current_head_generation
+                prepared_fence = prepared_owner.writer_fence
+                expected_settings_version = (
+                    prepared_owner.expected_settings_version
+                )
+                daily = self._store.daily_turn_for_record(record_id)
+                daily_draft = None if daily is None else daily.draft
+                if (
+                    daily_draft is None
+                    or not prepared_owner.matches_daily(daily_draft)
+                ):
+                    return None
+            elif type(prepared_owner) is OwnerPreparedMutation:
+                prepared_owner_id = prepared_owner.request.context.owner_id
+                prepared_installation_id = (
+                    prepared_owner.request.context.installation_id
+                )
+                prepared_generation = (
+                    prepared_owner.request.context.current_head_generation
+                )
+                prepared_fence = (
+                    prepared_owner.request.context.writer_fence
+                )
+                expected_settings_version = (
+                    prepared_owner.request.expected_settings_version
+                )
+                daily_draft = prepared_owner.request.daily_turn_draft
+                daily = (
+                    None
+                    if daily_draft is None
+                    else self._store.daily_turn_for_record(record_id)
+                )
+            else:
+                return None
+            if (
+                type(policy) is not AdmissionPolicy
+                or initialization is None
+                or initialization.phase != "enabled"
+                or not self._initialization_configuration_matches(
+                    initialization.draft
+                )
+                or type(record_authority) is not PreparedTransition
+                or not record_authority.target.matches_commit(
+                    record_id=prepared_owner.record_id,
+                    revision_digest=prepared_owner.revision_digest,
+                    transition_id=prepared_owner.transition_id,
+                )
+                or prepared_owner_id != policy.owner_sender_id
+                or prepared_installation_id
+                != record_authority.base.installation_id
+                or prepared_generation
+                != record_authority.base.generation
+                or prepared_fence
+                != record_authority.base.writer_fence
+            ):
+                return None
+            try:
+                current_settings = self._current_owner_settings(
+                    record_authority.base
+                )
+            except (AuthorityValidationError, SettingsContractViolation):
+                return None
+            if (
+                current_settings.version
+                != expected_settings_version
+            ):
+                return None
+            if daily_draft is not None:
+                verifier = self._daily_skill_verifier
+                bundle = self._daily_skill_bundle
+                if (
+                    daily is None
+                    or daily.draft != daily_draft
+                    or type(verifier) is not DailySkillAttestor
+                    or type(bundle) is not DailySkillBundle
+                ):
+                    return None
+                if type(prepared_owner) is OwnerPreparedCorrectionRecovery:
+                    if not self._daily_draft_recovery_is_authorized(
+                        daily_draft,
+                        bundle,
+                        verifier,
+                    ):
+                        return None
+                else:
+                    source_binding = self._daily_source_binding(
+                        daily_draft.source_causal_id
+                    )
+                    if (
+                        source_binding is None
+                        or not self._daily_draft_is_authorized(
+                            daily_draft,
+                            source_binding[0],
+                            bundle,
+                            verifier,
+                        )
+                    ):
+                        return None
+            return "owner"
         daily = (
             self._store.daily_turn_for_record(record_id)
             if record_kind == "daily"
@@ -5216,13 +6911,15 @@ class HealthCore:
             return "daily" if daily.terminal is not None else None
         if daily.draft is None:
             return None
-        source = self._store.source_envelope(daily.draft.source_causal_id)
-        if source is None:
+        source_binding = self._daily_source_binding(
+            daily.draft.source_causal_id
+        )
+        if source_binding is None:
             return None
         return (
             "daily" if self._daily_draft_is_authorized(
                 daily.draft,
-                source,
+                source_binding[0],
                 bundle,
                 verifier,
             ) else None
@@ -5255,6 +6952,72 @@ class HealthCore:
             committed_evidence_stage=evidence_stage,
         )
 
+    def _daily_draft_recovery_is_authorized(
+        self,
+        draft: DailyTurnDraft,
+        bundle: DailySkillBundle,
+        verifier: DailySkillAttestor,
+    ) -> bool:
+        """Revalidate a manifest-bound owner correction without source text."""
+
+        stage = draft.evidence_stage
+        if (
+            draft.turn_kind != "complete-turn"
+            or type(stage) is not DailyTurnDraft
+            or stage.turn_kind != "evidence-stage"
+            or stage.source_causal_id != draft.source_causal_id
+            or stage.source_digest != draft.source_digest
+        ):
+            return False
+        state = self._store.daily_state()
+        if stage.base_state_digest != state.digest:
+            return False
+        try:
+            post_stage_state = state.apply_evidence_stage(stage)
+        except AuthorityValidationError:
+            return False
+        if draft.base_state_digest != post_stage_state.digest:
+            return False
+        try:
+            for candidate in (stage, draft):
+                names = tuple(
+                    proof.skill_use.canonical_name
+                    for proof in candidate.skill_proofs
+                )
+                used_names = tuple(dict.fromkeys(names))
+                if (
+                    tuple(
+                        disclosure.canonical_name
+                        for disclosure in candidate.skill_disclosures
+                    )
+                    != used_names
+                    or any(
+                        not disclosure.matches(
+                            bundle.asset(disclosure.canonical_name)
+                        )
+                        for disclosure in candidate.skill_disclosures
+                    )
+                ):
+                    return False
+                parent: str | None = None
+                for index, proof in enumerate(candidate.skill_proofs):
+                    fact = proof.skill_use
+                    if (
+                        fact.source_causal_id != draft.source_causal_id
+                        or fact.purpose != candidate.purpose
+                        or fact.sequence_index != index
+                        or fact.parent_proof_digest != parent
+                        or not verifier.verify(
+                            proof,
+                            bundle.asset(fact.canonical_name),
+                        )
+                    ):
+                        return False
+                    parent = proof.digest
+        except AuthorityValidationError:
+            return False
+        return True
+
     def _business_transition_record_kind(self, record_id: str) -> str | None:
         """Identify the purpose-specific owner without accepting config drift."""
 
@@ -5264,6 +7027,8 @@ class HealthCore:
             and initialization.draft.record_id == record_id
         ):
             return "initialization"
+        if self._store.owner_mutation_for_record(record_id) is not None:
+            return "owner"
         return (
             "daily"
             if self._store.daily_turn_for_record(record_id) is not None

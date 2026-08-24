@@ -75,6 +75,19 @@ _HMAC_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 # atoms plus disclosures.  4096 UTF-8 bytes is the protocol payload budget for
 # that one reply intent; it is not an evidence or portrait retention limit.
 MAX_OWNER_REPLY_BYTES = 4096
+RECORDING_EXCLUDED_TEMPORARY_PURPOSE = "temporary-owner-answer"
+RECORDING_EXCLUDED_TEMPORARY_INQUIRY_GAP = (
+    "owner-requested temporary clarification"
+)
+RECORDING_EXCLUDED_TEMPORARY_DECISION_REASON = (
+    "required-context-unavailable"
+)
+RECORDING_EXCLUDED_TEMPORARY_REPLY_TEXT = (
+    "补问所需上下文不足，本轮没有猜测提问。"
+)
+RECORDING_EXCLUDED_CORRECTION_PORTRAIT_REASON = (
+    "owner correction requires portrait rejudgment"
+)
 
 
 def _mapping(value: object, fields: frozenset[str], name: str) -> Mapping[str, object]:
@@ -3127,6 +3140,122 @@ class EvidenceApplicabilityChange:
         )  # type: ignore[arg-type]
 
 
+@dataclass(frozen=True)
+class OwnerCorrectionRevision:
+    """Body-free owner correction metadata bound to the daily evidence ledger.
+
+    The prior value is deliberately absent.  ``evidence_refs`` identifies the
+    immutable predecessor EvidenceCard, while the normal applicability ledger
+    identifies its successor.
+    """
+
+    correction_id: str
+    object_ref: str
+    previous_version: int
+    revision_version: int
+    reason: str
+    corrected_at_utc: str
+    source_refs: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    affected_object_refs: tuple[str, ...]
+    disposition_requests: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        validate_opaque_text(self.correction_id, "owner correction identifier")
+        validate_opaque_text(self.object_ref, "owner corrected object reference")
+        if (
+            type(self.previous_version) is not int
+            or self.previous_version < 1
+            or type(self.revision_version) is not int
+            or self.revision_version != self.previous_version + 1
+        ):
+            raise AuthorityValidationError("invalid owner correction version link")
+        validate_opaque_text(self.reason, "owner correction reason")
+        corrected_at = _time(
+            self.corrected_at_utc,
+            "owner correction UTC timestamp",
+        )
+        if datetime.fromisoformat(corrected_at).utcoffset() != timezone.utc.utcoffset(
+            None
+        ):
+            raise AuthorityValidationError(
+                "owner correction timestamp must be UTC"
+            )
+        _texts(self.source_refs, "owner correction source references")
+        _texts(self.evidence_refs, "owner correction evidence references")
+        _texts(
+            self.affected_object_refs,
+            "owner correction affected object references",
+        )
+        dispositions = _texts(
+            self.disposition_requests,
+            "owner correction disposition requests",
+        )
+        if not set(dispositions) <= {"withdraw_current", "rejudge"}:
+            raise AuthorityValidationError(
+                "invalid owner correction disposition request"
+            )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "correction_id": self.correction_id,
+            "object_ref": self.object_ref,
+            "previous_version": self.previous_version,
+            "revision_version": self.revision_version,
+            "reason": self.reason,
+            "corrected_at_utc": self.corrected_at_utc,
+            "source_refs": list(self.source_refs),
+            "evidence_refs": list(self.evidence_refs),
+            "affected_object_refs": list(self.affected_object_refs),
+            "disposition_requests": list(self.disposition_requests),
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "OwnerCorrectionRevision":
+        fields = _mapping(
+            value,
+            frozenset(
+                {
+                    "correction_id",
+                    "object_ref",
+                    "previous_version",
+                    "revision_version",
+                    "reason",
+                    "corrected_at_utc",
+                    "source_refs",
+                    "evidence_refs",
+                    "affected_object_refs",
+                    "disposition_requests",
+                }
+            ),
+            "owner correction revision",
+        )
+        return cls(
+            correction_id=fields["correction_id"],
+            object_ref=fields["object_ref"],
+            previous_version=fields["previous_version"],
+            revision_version=fields["revision_version"],
+            reason=fields["reason"],
+            corrected_at_utc=fields["corrected_at_utc"],
+            source_refs=_stored_texts(
+                fields["source_refs"],
+                "owner correction source references",
+            ),
+            evidence_refs=_stored_texts(
+                fields["evidence_refs"],
+                "owner correction evidence references",
+            ),
+            affected_object_refs=_stored_texts(
+                fields["affected_object_refs"],
+                "owner correction affected object references",
+            ),
+            disposition_requests=_stored_texts(
+                fields["disposition_requests"],
+                "owner correction disposition requests",
+            ),
+        )  # type: ignore[arg-type]
+
+
 def _evidence_decision_artifacts(
     *,
     source_causal_id: str,
@@ -4013,6 +4142,8 @@ class DailyTurnDraft:
     portrait_withdrawals: tuple[str, ...] = ()
     evidence_applicability_changes: tuple[EvidenceApplicabilityChange, ...] = ()
     model_answer_resolution: ModelAnswerResolution | None = None
+    owner_authority_binding_digest: str | None = None
+    owner_correction_revision: OwnerCorrectionRevision | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
@@ -4045,6 +4176,23 @@ class DailyTurnDraft:
             self.model_answer_resolution
         ) is not ModelAnswerResolution:
             raise AuthorityValidationError("invalid model answer resolution")
+        if self.owner_authority_binding_digest is not None:
+            if self.turn_kind != "complete-turn":
+                raise AuthorityValidationError(
+                    "owner authority may bind only a complete daily turn"
+                )
+            _sha(
+                self.owner_authority_binding_digest,
+                "owner authority binding digest",
+            )
+        if self.owner_correction_revision is not None and (
+            type(self.owner_correction_revision) is not OwnerCorrectionRevision
+            or self.turn_kind != "complete-turn"
+            or self.owner_authority_binding_digest is None
+        ):
+            raise AuthorityValidationError(
+                "owner correction revision requires a bound complete daily turn"
+            )
         if len({c.evidence_id for c in self.evidence_cards}) != len(self.evidence_cards):
             raise AuthorityValidationError("duplicate evidence card")
         for topic_ref in _texts(
@@ -4107,6 +4255,18 @@ class DailyTurnDraft:
     @property
     def payload_digest(self) -> str: return self.digest
 
+    def recording_excluded_persistence_safe(self) -> bool:
+        """Allow only closed, body-free shapes while source recording is off."""
+
+        try:
+            return (
+                _is_recording_excluded_temporary_stage(self)
+                or _is_recording_excluded_temporary_completion(self)
+                or _is_recording_excluded_correction_stage(self)
+            )
+        except AuthorityValidationError:
+            return False
+
     def to_storage(self) -> dict[str, object]:
         stored: dict[str, object] = {"source_causal_id": self.source_causal_id, "source_digest": self.source_digest,
             "base_state_digest": self.base_state_digest, "purpose": self.purpose,
@@ -4143,6 +4303,14 @@ class DailyTurnDraft:
             stored["model_answer_resolution"] = (
                 self.model_answer_resolution.to_storage()
             )
+        if self.owner_authority_binding_digest is not None:
+            stored["owner_authority_binding_digest"] = (
+                self.owner_authority_binding_digest
+            )
+        if self.owner_correction_revision is not None:
+            stored["owner_correction_revision"] = (
+                self.owner_correction_revision.to_storage()
+            )
         return stored
 
     @classmethod
@@ -4153,9 +4321,17 @@ class DailyTurnDraft:
             "evidence_relations", "evidence_compactions", "skill_proofs",
             "skill_disclosures", "owner_reply", "turn_kind", "evidence_stage",
             "portrait_withdrawals", "evidence_applicability_changes"})
-        if type(value) is not dict or frozenset(value) not in (
-            legacy_fields,
-            legacy_fields | {"model_answer_resolution"},
+        optional_fields = frozenset(
+            {
+                "model_answer_resolution",
+                "owner_authority_binding_digest",
+                "owner_correction_revision",
+            }
+        )
+        if (
+            type(value) is not dict
+            or not legacy_fields <= frozenset(value)
+            or not frozenset(value) <= legacy_fields | optional_fields
         ):
             raise AuthorityValidationError("invalid daily turn draft")
         f = value
@@ -4182,6 +4358,9 @@ class DailyTurnDraft:
             raise AuthorityValidationError(
                 "invalid model answer resolution"
             ) from exc
+        raw_owner_revision = f.get("owner_correction_revision")
+        if raw_owner_revision is not None and type(raw_owner_revision) is not dict:
+            raise AuthorityValidationError("invalid owner correction revision")
         return cls(f["source_causal_id"], f["source_digest"], f["base_state_digest"], f["purpose"],
             f["created_at"], StewardPlan.from_storage(f["steward_plan"]),
             tuple(ResponsibilityResult.from_storage(x) for x in f["responsibility_results"]),
@@ -4205,6 +4384,12 @@ class DailyTurnDraft:
                 for item in f["evidence_applicability_changes"]
             ),
             model_resolution,
+            f.get("owner_authority_binding_digest"),
+            (
+                None
+                if raw_owner_revision is None
+                else OwnerCorrectionRevision.from_storage(raw_owner_revision)
+            ),
         )  # type: ignore[arg-type]
 
     def verify(
@@ -4668,6 +4853,199 @@ class DailyTurnDraft:
         )
 
 
+def _recording_excluded_skill_chain_matches(
+    draft: DailyTurnDraft,
+    expected: tuple[tuple[str, str], ...],
+) -> bool:
+    if len(draft.skill_proofs) != len(expected):
+        return False
+    parent: str | None = None
+    for index, (proof, (canonical_name, action)) in enumerate(
+        zip(draft.skill_proofs, expected)
+    ):
+        fact = proof.skill_use
+        if (
+            fact.canonical_name != canonical_name
+            or fact.action != action
+            or fact.source_causal_id != draft.source_causal_id
+            or fact.purpose != draft.purpose
+            or fact.sequence_index != index
+            or fact.parent_proof_digest != parent
+        ):
+            return False
+        parent = proof.digest
+    used_names = tuple(dict.fromkeys(name for name, _action in expected))
+    return tuple(
+        disclosure.canonical_name for disclosure in draft.skill_disclosures
+    ) == used_names
+
+
+def _recording_excluded_temporary_plan() -> StewardPlan:
+    return StewardPlan(
+        purpose=RECORDING_EXCLUDED_TEMPORARY_PURPOSE,
+        selected_skills=("health-owner-inquiry",),
+        atomic_claims=(),
+        inquiry_gap=RECORDING_EXCLUDED_TEMPORARY_INQUIRY_GAP,
+    )
+
+
+def _is_recording_excluded_temporary_stage(
+    draft: DailyTurnDraft,
+) -> bool:
+    return (
+        type(draft) is DailyTurnDraft
+        and draft.turn_kind == "evidence-stage"
+        and draft.purpose == RECORDING_EXCLUDED_TEMPORARY_PURPOSE
+        and draft.steward_plan == _recording_excluded_temporary_plan()
+        and not draft.responsibility_results
+        and not draft.reply_atoms
+        and draft.steward_resolution is None
+        and not draft.evidence_cards
+        and not draft.portrait_topics
+        and not draft.evidence_relations
+        and not draft.evidence_compactions
+        and draft.owner_reply == ""
+        and draft.evidence_stage is None
+        and not draft.portrait_withdrawals
+        and not draft.evidence_applicability_changes
+        and draft.model_answer_resolution is None
+        and draft.owner_authority_binding_digest is None
+        and draft.owner_correction_revision is None
+        and _recording_excluded_skill_chain_matches(
+            draft,
+            (("health-steward", "plan"),),
+        )
+    )
+
+
+def _is_recording_excluded_temporary_completion(
+    draft: DailyTurnDraft,
+) -> bool:
+    stage = draft.evidence_stage
+    if (
+        type(draft) is not DailyTurnDraft
+        or draft.turn_kind != "complete-turn"
+        or draft.purpose != RECORDING_EXCLUDED_TEMPORARY_PURPOSE
+        or draft.steward_plan != _recording_excluded_temporary_plan()
+        or type(stage) is not DailyTurnDraft
+        or not _is_recording_excluded_temporary_stage(stage)
+        or draft.source_causal_id != stage.source_causal_id
+        or draft.source_digest != stage.source_digest
+        or len(draft.responsibility_results) != 1
+    ):
+        return False
+    result = draft.responsibility_results[0]
+    expected_decision = OwnerInquiryDecision.gap(
+        RECORDING_EXCLUDED_TEMPORARY_DECISION_REASON
+    )
+    if (
+        result.canonical_name != "health-owner-inquiry"
+        or result.status != "gap"
+        or result.decision != expected_decision
+        or result.candidate_refs
+        or result.candidate_change_ids
+    ):
+        return False
+    expected_atom = OwnerReplyAtom.form(
+        kind="next-step",
+        text=RECORDING_EXCLUDED_TEMPORARY_REPLY_TEXT,
+        source_skill="health-owner-inquiry",
+        source_result_digest=result.result_digest,
+    )
+    expected_resolution = StewardResolution(
+        (),
+        (),
+        (expected_atom.atom_id,),
+        (),
+    )
+    return (
+        draft.reply_atoms == (expected_atom,)
+        and draft.steward_resolution == expected_resolution
+        and not draft.evidence_cards
+        and not draft.portrait_topics
+        and not draft.evidence_relations
+        and not draft.evidence_compactions
+        and not draft.portrait_withdrawals
+        and not draft.evidence_applicability_changes
+        and draft.model_answer_resolution is None
+        and draft.owner_authority_binding_digest is None
+        and draft.owner_correction_revision is None
+        and draft.skill_proofs[0] == stage.skill_proofs[0]
+        and _recording_excluded_skill_chain_matches(
+            draft,
+            (
+                ("health-steward", "plan"),
+                ("health-owner-inquiry", "form-owner-question"),
+                ("health-steward", "resolve"),
+            ),
+        )
+        and draft.owner_reply
+        == (
+            RECORDING_EXCLUDED_TEMPORARY_REPLY_TEXT
+            + _render_daily_skill_disclosure(draft.skill_disclosures)
+        )
+    )
+
+
+def _is_recording_excluded_correction_stage(
+    draft: DailyTurnDraft,
+) -> bool:
+    requests = draft.steward_plan.evidence_maintenance_requests
+    if (
+        type(draft) is not DailyTurnDraft
+        or draft.turn_kind != "evidence-stage"
+        or len(requests) != 1
+        or draft.steward_plan.atomic_claims
+    ):
+        return False
+    request = requests[0]
+    replacement = request.replacement_claim
+    if (
+        request.action != "correct"
+        or len(request.target_evidence_ids) != 1
+        or type(replacement) is not AtomicEvidenceClaim
+    ):
+        return False
+    expected_plan = StewardPlan(
+        purpose=request.purpose,
+        selected_skills=("health-evidence", "health-portrait"),
+        atomic_claims=(),
+        portrait_topic_refs=replacement.topic_refs,
+        evidence_maintenance_requests=(request,),
+    )
+    if draft.steward_plan != expected_plan or draft.purpose != request.purpose:
+        return False
+    (
+        expected_cards,
+        expected_compactions,
+        expected_relations,
+        expected_changes,
+    ) = _expected_stage_evidence_artifacts(draft)
+    return (
+        len(draft.responsibility_results) == 1
+        and draft.evidence_cards == expected_cards
+        and draft.evidence_compactions == expected_compactions
+        and draft.evidence_relations == expected_relations
+        and draft.evidence_applicability_changes == expected_changes
+        and not draft.reply_atoms
+        and draft.steward_resolution is None
+        and not draft.portrait_topics
+        and draft.owner_reply == ""
+        and draft.evidence_stage is None
+        and not draft.portrait_withdrawals
+        and draft.model_answer_resolution is None
+        and draft.owner_authority_binding_digest is None
+        and draft.owner_correction_revision is None
+        and _recording_excluded_skill_chain_matches(
+            draft,
+            (
+                ("health-steward", "plan"),
+                ("health-evidence", "evaluate-evidence"),
+            ),
+        )
+    )
+
+
 @dataclass(frozen=True)
 class DailyHealthState:
     evidence_cards: tuple[EvidenceCard, ...]
@@ -4678,6 +5056,7 @@ class DailyHealthState:
     portrait_schema_version: str = PORTRAIT_SCHEMA_VERSION
     portrait_schema_digest: str = FIRST_RELEASE_PORTRAIT_SCHEMA.digest
     portrait_revisions: tuple[PortraitRevision, ...] = ()
+    owner_correction_revisions: tuple[OwnerCorrectionRevision, ...] = ()
 
     def __post_init__(self) -> None:
         if self.portrait_schema_version != PORTRAIT_SCHEMA_VERSION:
@@ -4702,6 +5081,11 @@ class DailyHealthState:
             for revision in self.portrait_revisions
         ):
             raise AuthorityValidationError("invalid portrait revision ledger")
+        if type(self.owner_correction_revisions) is not tuple or any(
+            type(revision) is not OwnerCorrectionRevision
+            for revision in self.owner_correction_revisions
+        ):
+            raise AuthorityValidationError("invalid owner correction ledger")
         _texts(self.processed_source_causal_ids, "processed sources", empty=True)
         ids = {c.evidence_id for c in self.evidence_cards}
         topic_refs = tuple(topic.topic_ref for topic in self.portrait_topics)
@@ -4782,6 +5166,73 @@ class DailyHealthState:
                     break
                 cursor = successor_id
 
+        predecessor_by_successor = {
+            change.successor_evidence_id: change.target_evidence_id
+            for change in self.evidence_applicability_changes
+            if change.applicability == "corrected"
+            and change.successor_evidence_id is not None
+        }
+        if len(predecessor_by_successor) != sum(
+            1
+            for change in self.evidence_applicability_changes
+            if change.applicability == "corrected"
+        ):
+            raise AuthorityValidationError("forked evidence correction history")
+
+        def correction_lineage(evidence_id: str) -> tuple[str, int]:
+            version = 1
+            cursor = evidence_id
+            visited: set[str] = set()
+            while cursor in predecessor_by_successor:
+                if cursor in visited:
+                    raise AuthorityValidationError(
+                        "cyclic evidence correction history"
+                    )
+                visited.add(cursor)
+                cursor = predecessor_by_successor[cursor]
+                version += 1
+            return cursor, version
+
+        correction_ids: set[str] = set()
+        correction_links: set[tuple[str, int]] = set()
+        changes = {
+            change.target_evidence_id: change
+            for change in self.evidence_applicability_changes
+        }
+        for revision in self.owner_correction_revisions:
+            if revision.correction_id in correction_ids:
+                raise AuthorityValidationError("duplicate owner correction revision")
+            correction_ids.add(revision.correction_id)
+            if len(revision.evidence_refs) != 1:
+                raise AuthorityValidationError(
+                    "owner correction must reference one predecessor card"
+                )
+            predecessor_id = revision.evidence_refs[0]
+            predecessor = cards.get(predecessor_id)
+            change = changes.get(predecessor_id)
+            if (
+                predecessor is None
+                or change is None
+                or change.applicability != "corrected"
+                or change.successor_evidence_id is None
+                or cards.get(change.successor_evidence_id) is None
+                or revision.reason != change.reason
+            ):
+                raise AuthorityValidationError(
+                    "owner correction revision is not backed by evidence history"
+                )
+            root_ref, previous_version = correction_lineage(predecessor_id)
+            link = (revision.object_ref, revision.revision_version)
+            if (
+                revision.object_ref != root_ref
+                or revision.previous_version != previous_version
+                or link in correction_links
+            ):
+                raise AuthorityValidationError(
+                    "owner correction revision version history mismatch"
+                )
+            correction_links.add(link)
+
         current_topics = {
             topic.topic_ref: topic for topic in self.portrait_topics
         }
@@ -4807,7 +5258,7 @@ class DailyHealthState:
     @classmethod
     def empty(cls) -> "DailyHealthState": return cls((), (), (), (), ())
     def to_storage(self) -> dict[str, object]:
-        return {"evidence_cards": [c.to_storage() for c in self.evidence_cards],
+        stored: dict[str, object] = {"evidence_cards": [c.to_storage() for c in self.evidence_cards],
             "portrait_topics": [t.to_storage() for t in self.portrait_topics],
             "evidence_relations": [r.to_storage() for r in self.evidence_relations],
             "processed_source_causal_ids": list(self.processed_source_causal_ids),
@@ -4820,18 +5271,30 @@ class DailyHealthState:
                 change.to_storage()
                 for change in self.evidence_applicability_changes
             ]}
+        if self.owner_correction_revisions:
+            stored["owner_correction_revisions"] = [
+                revision.to_storage()
+                for revision in self.owner_correction_revisions
+            ]
+        return stored
     @classmethod
     def from_storage(cls, value: object) -> "DailyHealthState":
-        f = _mapping(value, frozenset({"evidence_cards", "portrait_topics",
+        legacy_fields = frozenset({"evidence_cards", "portrait_topics",
             "evidence_relations", "processed_source_causal_ids",
             "evidence_applicability_changes", "portrait_schema_version",
-            "portrait_schema_digest", "portrait_revisions"}),
-            "daily health state")
+            "portrait_schema_digest", "portrait_revisions"})
+        if type(value) is not dict or frozenset(value) not in (
+            legacy_fields,
+            legacy_fields | {"owner_correction_revisions"},
+        ):
+            raise AuthorityValidationError("invalid daily health state")
+        f = value
         if (type(f["evidence_cards"]) is not list
                 or type(f["portrait_topics"]) is not list
                 or type(f["evidence_relations"]) is not list
                 or type(f["evidence_applicability_changes"]) is not list
-                or type(f["portrait_revisions"]) is not list):
+                or type(f["portrait_revisions"]) is not list
+                or type(f.get("owner_correction_revisions", [])) is not list):
             raise AuthorityValidationError("invalid daily health state")
         return cls(tuple(EvidenceCard.from_storage(x) for x in f["evidence_cards"]),
             tuple(PortraitTopic.from_storage(x) for x in f["portrait_topics"]),
@@ -4846,6 +5309,10 @@ class DailyHealthState:
             tuple(
                 PortraitRevision.from_storage(item)
                 for item in f["portrait_revisions"]
+            ),
+            tuple(
+                OwnerCorrectionRevision.from_storage(item)
+                for item in f.get("owner_correction_revisions", [])
             ),
         )  # type: ignore[arg-type]
     @property
@@ -5249,6 +5716,7 @@ class DailyHealthState:
             self.portrait_schema_version,
             self.portrait_schema_digest,
             self.portrait_revisions,
+            self.owner_correction_revisions,
         )
 
     def apply(self, draft: DailyTurnDraft) -> tuple["DailyHealthState", DailyTurnResult]:
@@ -5260,6 +5728,27 @@ class DailyHealthState:
             raise AuthorityValidationError("daily state revision changed")
         if draft.source_causal_id in self.processed_source_causal_ids:
             raise AuthorityValidationError("daily source already committed")
+        owner_revision = draft.owner_correction_revision
+        if owner_revision is not None:
+            stage = draft.evidence_stage
+            corrected_changes = (
+                ()
+                if type(stage) is not DailyTurnDraft
+                else tuple(
+                    change
+                    for change in stage.evidence_applicability_changes
+                    if change.applicability == "corrected"
+                )
+            )
+            if (
+                len(corrected_changes) != 1
+                or owner_revision.evidence_refs
+                != (corrected_changes[0].target_evidence_id,)
+                or owner_revision.reason != corrected_changes[0].reason
+            ):
+                raise AuthorityValidationError(
+                    "owner correction revision changed its committed evidence stage"
+                )
         cards = {c.evidence_id: c for c in self.evidence_cards}
         for card in draft.evidence_cards:
             if card.evidence_id in cards: raise AuthorityValidationError("duplicate evidence card")
@@ -5509,7 +5998,12 @@ class DailyHealthState:
             self.evidence_applicability_changes,
             self.portrait_schema_version,
             self.portrait_schema_digest,
-            (*self.portrait_revisions, *new_revisions))
+            (*self.portrait_revisions, *new_revisions),
+            (
+                self.owner_correction_revisions
+                if owner_revision is None
+                else (*self.owner_correction_revisions, owner_revision)
+            ))
         stage = draft.evidence_stage
         if type(stage) is not DailyTurnDraft:
             raise AuthorityValidationError("complete turn evidence stage missing")

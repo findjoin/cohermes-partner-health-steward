@@ -37,6 +37,7 @@ from .contract import (
     CommandEnvelope,
     DailyTurnPreparePayload,
     EffectResultPayload,
+    OwnerPreparePayload,
     ProtocolViolation,
     Response,
     StateCommitPayload,
@@ -52,6 +53,9 @@ from .initialization import (
     InitializationDraft,
     stable_digest,
 )
+from .owner_authority import OwnerPreparedMutation
+from .settings import OwnerSettingsState
+from .status import StatusContractViolation, StatusProjection, StatusTransition
 
 
 class KeyUnavailable(RuntimeError):
@@ -64,6 +68,243 @@ class StoreUnavailable(RuntimeError):
 
 class CausalIdConflict(RuntimeError):
     """A causal ID was reused with a different command envelope."""
+
+
+def _owner_recovery_digest(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or not value.startswith("sha256:")
+        or len(value) != len("sha256:") + 64
+    ):
+        raise AuthorityValidationError(f"invalid {name}")
+    try:
+        int(value.removeprefix("sha256:"), 16)
+    except ValueError as exc:
+        raise AuthorityValidationError(f"invalid {name}") from exc
+    return value
+
+
+@dataclass(frozen=True)
+class OwnerPreparedCorrectionRecovery:
+    """Body-free recovery authority for one prepared owner correction.
+
+    Ticket 112's prepared daily aggregate is the sole durable copy of the
+    correction body.  This value binds that aggregate to the owner command and
+    retains only the business values needed to resume commit/finalize.
+    """
+
+    command_id: str
+    record_id: str
+    revision_digest: str
+    transition_id: str
+    payload_digest: str
+    owner_id: str
+    installation_id: str
+    current_head_generation: int
+    writer_fence: str
+    expected_settings_version: int
+    owner_authority_binding_digest: str
+    next_settings: OwnerSettingsState
+    settings_result: dict[str, object] | None
+    daily_source_causal_id: str
+    daily_result_digest: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.command_id, "owner mutation command identifier"),
+            (self.record_id, "owner mutation record identifier"),
+            (self.transition_id, "owner mutation transition identifier"),
+            (self.owner_id, "owner identifier"),
+            (self.installation_id, "installation identifier"),
+            (self.writer_fence, "owner mutation writer fence"),
+            (self.daily_source_causal_id, "daily source causal identifier"),
+        ):
+            validate_opaque_text(value, name)
+        _owner_recovery_digest(
+            self.revision_digest,
+            "owner mutation revision digest",
+        )
+        _owner_recovery_digest(
+            self.payload_digest,
+            "owner mutation payload digest",
+        )
+        _owner_recovery_digest(
+            self.owner_authority_binding_digest,
+            "owner authority binding digest",
+        )
+        _owner_recovery_digest(
+            self.daily_result_digest,
+            "owner mutation daily result digest",
+        )
+        if (
+            type(self.current_head_generation) is not int
+            or self.current_head_generation < 1
+            or type(self.expected_settings_version) is not int
+            or self.expected_settings_version < 1
+        ):
+            raise AuthorityValidationError("invalid owner recovery version")
+        if type(self.next_settings) is not OwnerSettingsState or (
+            self.next_settings.owner_id != self.owner_id
+            or self.next_settings.installation_id != self.installation_id
+            or self.next_settings.version
+            not in {
+                self.expected_settings_version,
+                self.expected_settings_version + 1,
+            }
+        ):
+            raise AuthorityValidationError(
+                "owner recovery settings authority mismatch"
+            )
+        if self.settings_result is not None:
+            if type(self.settings_result) is not dict:
+                raise AuthorityValidationError("invalid owner settings result")
+            try:
+                normalized = json.loads(
+                    json.dumps(
+                        self.settings_result,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise AuthorityValidationError(
+                    "invalid owner settings result"
+                ) from exc
+            object.__setattr__(self, "settings_result", normalized)
+
+    @classmethod
+    def for_preparation(
+        cls,
+        prepared: OwnerPreparedMutation,
+    ) -> "OwnerPreparedCorrectionRecovery":
+        if type(prepared) is not OwnerPreparedMutation:
+            raise AuthorityValidationError("prepared owner mutation required")
+        request = prepared.request
+        daily = request.daily_turn_draft
+        if (
+            request.pending_correction is None
+            or daily is None
+            or prepared.daily_result_digest is None
+        ):
+            raise AuthorityValidationError(
+                "prepared owner correction required"
+            )
+        return cls(
+            command_id=request.context.command_id,
+            record_id=prepared.record_id,
+            revision_digest=prepared.revision_digest,
+            transition_id=prepared.transition_id,
+            payload_digest=prepared.payload_digest,
+            owner_id=request.context.owner_id,
+            installation_id=request.context.installation_id,
+            current_head_generation=(
+                request.context.current_head_generation
+            ),
+            writer_fence=request.context.writer_fence,
+            expected_settings_version=request.expected_settings_version,
+            owner_authority_binding_digest=(
+                request.owner_authority_binding_digest
+            ),
+            next_settings=prepared.next_settings,
+            settings_result=prepared.settings_result,
+            daily_source_causal_id=daily.source_causal_id,
+            daily_result_digest=prepared.daily_result_digest,
+        )
+
+    def matches_prepared(self, prepared: OwnerPreparedMutation) -> bool:
+        try:
+            return self == type(self).for_preparation(prepared)
+        except AuthorityValidationError:
+            return False
+
+    def matches_daily(self, daily: DailyTurnDraft) -> bool:
+        return (
+            type(daily) is DailyTurnDraft
+            and daily.turn_kind == "complete-turn"
+            and daily.source_causal_id == self.daily_source_causal_id
+            and daily.record_id == self.record_id
+            and daily.revision_digest == self.revision_digest
+            and daily.transition_id == self.transition_id
+            and daily.payload_digest == self.payload_digest
+            and daily.owner_authority_binding_digest
+            == self.owner_authority_binding_digest
+            and daily.owner_correction_revision is not None
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "command_id": self.command_id,
+            "owner_id": self.owner_id,
+            "installation_id": self.installation_id,
+            "current_head_generation": self.current_head_generation,
+            "writer_fence": self.writer_fence,
+            "expected_settings_version": self.expected_settings_version,
+            "owner_authority_binding_digest": (
+                self.owner_authority_binding_digest
+            ),
+            "next_settings": self.next_settings.to_wire(),
+            "settings_result": self.settings_result,
+            "daily_turn_ref": {
+                "source_causal_id": self.daily_source_causal_id,
+                "record_id": self.record_id,
+                "revision_digest": self.revision_digest,
+                "transition_id": self.transition_id,
+                "payload_digest": self.payload_digest,
+                "result_digest": self.daily_result_digest,
+            },
+        }
+
+    @classmethod
+    def from_storage(
+        cls,
+        value: object,
+    ) -> "OwnerPreparedCorrectionRecovery":
+        fields = {
+            "command_id",
+            "owner_id",
+            "installation_id",
+            "current_head_generation",
+            "writer_fence",
+            "expected_settings_version",
+            "owner_authority_binding_digest",
+            "next_settings",
+            "settings_result",
+            "daily_turn_ref",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise AuthorityValidationError("invalid owner correction recovery")
+        daily_ref = value["daily_turn_ref"]
+        if not isinstance(daily_ref, Mapping) or set(daily_ref) != {
+            "source_causal_id",
+            "record_id",
+            "revision_digest",
+            "transition_id",
+            "payload_digest",
+            "result_digest",
+        }:
+            raise AuthorityValidationError("invalid owner daily-turn reference")
+        return cls(
+            command_id=value["command_id"],  # type: ignore[arg-type]
+            record_id=daily_ref["record_id"],  # type: ignore[arg-type]
+            revision_digest=daily_ref["revision_digest"],  # type: ignore[arg-type]
+            transition_id=daily_ref["transition_id"],  # type: ignore[arg-type]
+            payload_digest=daily_ref["payload_digest"],  # type: ignore[arg-type]
+            owner_id=value["owner_id"],  # type: ignore[arg-type]
+            installation_id=value["installation_id"],  # type: ignore[arg-type]
+            current_head_generation=value["current_head_generation"],  # type: ignore[arg-type]
+            writer_fence=value["writer_fence"],  # type: ignore[arg-type]
+            expected_settings_version=value["expected_settings_version"],  # type: ignore[arg-type]
+            owner_authority_binding_digest=value[  # type: ignore[arg-type]
+                "owner_authority_binding_digest"
+            ],
+            next_settings=OwnerSettingsState.from_wire(
+                value["next_settings"]
+            ),
+            settings_result=value["settings_result"],  # type: ignore[arg-type]
+            daily_source_causal_id=daily_ref["source_causal_id"],  # type: ignore[arg-type]
+            daily_result_digest=daily_ref["result_digest"],  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True)
@@ -84,6 +325,307 @@ class StoredInitialization:
 
     phase: str
     draft: InitializationDraft
+
+
+@dataclass(frozen=True)
+class OwnerMutationTerminalReceipt:
+    """Health-body-free terminal proof for one finalized owner mutation."""
+
+    command_id: str
+    record_id: str
+    revision_digest: str
+    transition_id: str
+    owner_authority_binding_digest: str
+    base_settings_version: int
+    settings_version: int
+    next_settings_digest: str
+    settings_result: dict[str, object] | None
+    daily_result_digest: str | None
+
+    def __post_init__(self) -> None:
+        validate_opaque_text(self.command_id, "owner mutation command identifier")
+        validate_opaque_text(self.record_id, "owner mutation record identifier")
+        self._validate_digest(
+            self.revision_digest,
+            "owner mutation revision digest",
+        )
+        validate_opaque_text(
+            self.transition_id,
+            "owner mutation transition identifier",
+        )
+        self._validate_digest(
+            self.owner_authority_binding_digest,
+            "owner authority binding digest",
+        )
+        if (
+            type(self.base_settings_version) is not int
+            or self.base_settings_version < 1
+        ):
+            raise AuthorityValidationError("invalid base owner settings version")
+        if type(self.settings_version) is not int or self.settings_version < 1:
+            raise AuthorityValidationError("invalid owner settings version")
+        if self.settings_version not in {
+            self.base_settings_version,
+            self.base_settings_version + 1,
+        }:
+            raise AuthorityValidationError("invalid owner settings version transition")
+        self._validate_digest(
+            self.next_settings_digest,
+            "next owner settings digest",
+        )
+        if self.settings_result is not None:
+            if type(self.settings_result) is not dict:
+                raise AuthorityValidationError("invalid owner settings result")
+            try:
+                normalized = json.loads(
+                    json.dumps(
+                        self.settings_result,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise AuthorityValidationError(
+                    "invalid owner settings result"
+                ) from exc
+            if type(normalized) is not dict:
+                raise AuthorityValidationError("invalid owner settings result")
+            object.__setattr__(self, "settings_result", normalized)
+        if self.daily_result_digest is not None:
+            self._validate_digest(
+                self.daily_result_digest,
+                "owner mutation daily result digest",
+            )
+
+    @staticmethod
+    def _validate_digest(value: object, name: str) -> str:
+        if (
+            type(value) is not str
+            or not value.startswith("sha256:")
+            or len(value) != len("sha256:") + 64
+        ):
+            raise AuthorityValidationError(f"invalid {name}")
+        try:
+            int(value.removeprefix("sha256:"), 16)
+        except ValueError as exc:
+            raise AuthorityValidationError(f"invalid {name}") from exc
+        return value
+
+    @classmethod
+    def for_finalization(
+        cls,
+        prepared: OwnerPreparedMutation | OwnerPreparedCorrectionRecovery,
+    ) -> "OwnerMutationTerminalReceipt":
+        if type(prepared) is OwnerPreparedCorrectionRecovery:
+            return cls(
+                command_id=prepared.command_id,
+                record_id=prepared.record_id,
+                revision_digest=prepared.revision_digest,
+                transition_id=prepared.transition_id,
+                owner_authority_binding_digest=(
+                    prepared.owner_authority_binding_digest
+                ),
+                base_settings_version=prepared.expected_settings_version,
+                settings_version=prepared.next_settings.version,
+                next_settings_digest=stable_digest(
+                    prepared.next_settings.to_wire()
+                ),
+                settings_result=prepared.settings_result,
+                daily_result_digest=prepared.daily_result_digest,
+            )
+        if type(prepared) is not OwnerPreparedMutation:
+            raise AuthorityValidationError("prepared owner mutation required")
+        if (
+            prepared.request.pending_correction is not None
+            and prepared.daily_result_digest is None
+        ):
+            raise AuthorityValidationError(
+                "owner correction daily result digest required"
+            )
+        return cls(
+            command_id=prepared.request.context.command_id,
+            record_id=prepared.record_id,
+            revision_digest=prepared.revision_digest,
+            transition_id=prepared.transition_id,
+            owner_authority_binding_digest=(
+                prepared.request.owner_authority_binding_digest
+            ),
+            base_settings_version=prepared.request.expected_settings_version,
+            settings_version=prepared.next_settings.version,
+            next_settings_digest=stable_digest(
+                prepared.next_settings.to_wire()
+            ),
+            settings_result=prepared.settings_result,
+            daily_result_digest=prepared.daily_result_digest,
+        )
+
+    def matches(
+        self,
+        prepared: OwnerPreparedMutation | OwnerPreparedCorrectionRecovery,
+    ) -> bool:
+        return (
+            type(prepared)
+            in {OwnerPreparedMutation, OwnerPreparedCorrectionRecovery}
+            and self == type(self).for_finalization(prepared)
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "command_id": self.command_id,
+            "record_id": self.record_id,
+            "revision_digest": self.revision_digest,
+            "transition_id": self.transition_id,
+            "owner_authority_binding_digest": (
+                self.owner_authority_binding_digest
+            ),
+            "base_settings_version": self.base_settings_version,
+            "settings_version": self.settings_version,
+            "next_settings_digest": self.next_settings_digest,
+            "settings_result": self.settings_result,
+            "daily_result_digest": self.daily_result_digest,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "OwnerMutationTerminalReceipt":
+        fields = {
+            "command_id",
+            "record_id",
+            "revision_digest",
+            "transition_id",
+            "owner_authority_binding_digest",
+            "base_settings_version",
+            "settings_version",
+            "next_settings_digest",
+            "settings_result",
+            "daily_result_digest",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise AuthorityValidationError("invalid owner mutation terminal receipt")
+        return cls(
+            command_id=value["command_id"],  # type: ignore[arg-type]
+            record_id=value["record_id"],  # type: ignore[arg-type]
+            revision_digest=value["revision_digest"],  # type: ignore[arg-type]
+            transition_id=value["transition_id"],  # type: ignore[arg-type]
+            owner_authority_binding_digest=value[  # type: ignore[arg-type]
+                "owner_authority_binding_digest"
+            ],
+            base_settings_version=value["base_settings_version"],  # type: ignore[arg-type]
+            settings_version=value["settings_version"],  # type: ignore[arg-type]
+            next_settings_digest=value["next_settings_digest"],  # type: ignore[arg-type]
+            settings_result=value["settings_result"],  # type: ignore[arg-type]
+            daily_result_digest=value["daily_result_digest"],  # type: ignore[arg-type]
+        )
+
+
+@dataclass(frozen=True)
+class StoredOwnerMutation:
+    """One encrypted prepared mutation or its body-free terminal receipt."""
+
+    phase: str
+    prepared: (
+        OwnerPreparedMutation | OwnerPreparedCorrectionRecovery | None
+    )
+    terminal: OwnerMutationTerminalReceipt | None
+
+    def __post_init__(self) -> None:
+        if self.phase == "prepared":
+            if (
+                type(self.prepared)
+                not in {
+                    OwnerPreparedMutation,
+                    OwnerPreparedCorrectionRecovery,
+                }
+                or self.terminal is not None
+            ):
+                raise AuthorityValidationError("invalid prepared owner mutation")
+        elif self.phase == "finalized":
+            if (
+                self.prepared is not None
+                or type(self.terminal) is not OwnerMutationTerminalReceipt
+            ):
+                raise AuthorityValidationError("invalid finalized owner mutation")
+        else:
+            raise AuthorityValidationError("invalid owner mutation phase")
+
+    @property
+    def command_id(self) -> str:
+        if type(self.prepared) is OwnerPreparedCorrectionRecovery:
+            return self.prepared.command_id
+        if type(self.prepared) is OwnerPreparedMutation:
+            return self.prepared.request.context.command_id
+        if self.terminal is None:  # pragma: no cover - dataclass invariant
+            raise AuthorityValidationError("owner mutation terminal required")
+        return self.terminal.command_id
+
+    @property
+    def record_id(self) -> str:
+        if type(self.prepared) in {
+            OwnerPreparedMutation,
+            OwnerPreparedCorrectionRecovery,
+        }:
+            return self.prepared.record_id
+        if self.terminal is None:  # pragma: no cover - dataclass invariant
+            raise AuthorityValidationError("owner mutation terminal required")
+        return self.terminal.record_id
+
+    def to_storage(self) -> dict[str, object]:
+        if type(self.prepared) is OwnerPreparedCorrectionRecovery:
+            prepared_wire: object = {
+                "kind": "correction-recovery-v1",
+                "recovery": self.prepared.to_storage(),
+            }
+        elif type(self.prepared) is OwnerPreparedMutation:
+            prepared_wire = self.prepared.to_storage()
+        else:
+            prepared_wire = None
+        return {
+            "phase": self.phase,
+            "prepared": prepared_wire,
+            "terminal": (
+                None if self.terminal is None else self.terminal.to_storage()
+            ),
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "StoredOwnerMutation":
+        if not isinstance(value, Mapping) or set(value) != {
+            "phase",
+            "prepared",
+            "terminal",
+        }:
+            raise AuthorityValidationError("invalid stored owner mutation")
+        phase = value["phase"]
+        if phase == "prepared":
+            if value["prepared"] is None or value["terminal"] is not None:
+                raise AuthorityValidationError("invalid prepared owner mutation")
+            raw_prepared = value["prepared"]
+            if (
+                isinstance(raw_prepared, Mapping)
+                and set(raw_prepared) == {"kind", "recovery"}
+                and raw_prepared["kind"] == "correction-recovery-v1"
+            ):
+                prepared = OwnerPreparedCorrectionRecovery.from_storage(
+                    raw_prepared["recovery"]
+                )
+            else:
+                prepared = OwnerPreparedMutation.from_storage(raw_prepared)
+            return cls(
+                phase=phase,
+                prepared=prepared,
+                terminal=None,
+            )
+        if phase == "finalized":
+            if value["prepared"] is not None or value["terminal"] is None:
+                raise AuthorityValidationError("invalid finalized owner mutation")
+            return cls(
+                phase=phase,
+                prepared=None,
+                terminal=OwnerMutationTerminalReceipt.from_storage(
+                    value["terminal"]
+                ),
+            )
+        raise AuthorityValidationError("invalid owner mutation phase")
 
 
 @dataclass(frozen=True)
@@ -840,6 +1382,35 @@ class EncryptedStateStore:
             )
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_settings_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS owner_mutations_v1 (
+                command_id TEXT PRIMARY KEY,
+                record_id TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL CHECK(phase IN ('prepared', 'finalized')),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_status_v1 (
+                slot INTEGER PRIMARY KEY CHECK(slot = 1),
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
         self._commit("health state initialization unavailable")
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
@@ -956,32 +1527,84 @@ class EncryptedStateStore:
                 "owner_initialization_v1",
             )
             ticket112_tables = ("daily_turns_v1", "daily_health_state_v1")
+            ticket114_status_tables = ("business_status_v1",)
+            ticket114_tables = (
+                "owner_settings_v1",
+                "owner_mutations_v1",
+                *ticket114_status_tables,
+            )
             migration_tables: tuple[str, ...] | None = None
+            migration_shape: dict[str, bool] | None = None
             if isinstance(fingerprint, str):
                 if (
                     fingerprint
-                    == self._integrity_fingerprint(include_ticket112=False)
+                    == self._integrity_fingerprint(
+                        include_ticket114_status=False,
+                    )
                     and all(
                         self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                         is None
-                        for table in ticket112_tables
+                        for table in ticket114_status_tables
                     )
                 ):
-                    migration_tables = ticket112_tables
+                    migration_tables = ticket114_status_tables
+                    migration_shape = {"include_ticket114_status": False}
+                elif (
+                    fingerprint
+                    == self._integrity_fingerprint(include_ticket114=False)
+                    and all(
+                        self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        is None
+                        for table in ticket114_tables
+                    )
+                ):
+                    migration_tables = ticket114_tables
+                    migration_shape = {"include_ticket114": False}
+                elif (
+                    fingerprint
+                    == self._integrity_fingerprint(
+                        include_ticket112=False,
+                        include_ticket114=False,
+                    )
+                    and all(
+                        self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        is None
+                        for table in (*ticket112_tables, *ticket114_tables)
+                    )
+                ):
+                    migration_tables = (*ticket112_tables, *ticket114_tables)
+                    migration_shape = {
+                        "include_ticket112": False,
+                        "include_ticket114": False,
+                    }
                 elif (
                     fingerprint
                     == self._integrity_fingerprint(
                         include_ticket111=False,
                         include_ticket112=False,
+                        include_ticket114=False,
                     )
                     and all(
                         self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
                         is None
-                        for table in (*ticket111_tables, *ticket112_tables)
+                        for table in (
+                            *ticket111_tables,
+                            *ticket112_tables,
+                            *ticket114_tables,
+                        )
                     )
                 ):
-                    migration_tables = (*ticket111_tables, *ticket112_tables)
-            if migration_tables is None:
+                    migration_tables = (
+                        *ticket111_tables,
+                        *ticket112_tables,
+                        *ticket114_tables,
+                    )
+                    migration_shape = {
+                        "include_ticket111": False,
+                        "include_ticket112": False,
+                        "include_ticket114": False,
+                    }
+            if migration_tables is None or migration_shape is None:
                 return
             with self.transaction() as connection:
                 current_row = connection.execute(
@@ -996,6 +1619,8 @@ class EncryptedStateStore:
                 )
                 if (
                     current_stored != stored
+                    or fingerprint
+                    != self._integrity_fingerprint(**migration_shape)
                     or any(
                         connection.execute(
                             f"SELECT 1 FROM {table} LIMIT 1"
@@ -1022,10 +1647,27 @@ class EncryptedStateStore:
             "owner_initialization_v1",
             "daily_turns_v1",
             "daily_health_state_v1",
+            "owner_settings_v1",
+            "owner_mutations_v1",
+            "business_status_v1",
         )
         if any(self._execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None for table in populated_tables):
             return
         with self.transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM integrity_manifest_v1 WHERE slot = 1"
+                ).fetchone()
+                is not None
+                or any(
+                    connection.execute(
+                        f"SELECT 1 FROM {table} LIMIT 1"
+                    ).fetchone()
+                    is not None
+                    for table in populated_tables
+                )
+            ):
+                return
             self._refresh_integrity_manifest(connection)
 
     def _integrity_fingerprint(
@@ -1033,6 +1675,8 @@ class EncryptedStateStore:
         *,
         include_ticket111: bool = True,
         include_ticket112: bool | None = None,
+        include_ticket114: bool | None = None,
+        include_ticket114_status: bool | None = None,
     ) -> str:
         """Hash every mutable domain row except the manifest itself."""
 
@@ -1041,6 +1685,10 @@ class EncryptedStateStore:
             # asking for the pre-Ticket-112 shape.  Explicit values are used by
             # the staged migration logic when only the newest tables are absent.
             include_ticket112 = include_ticket111
+        if include_ticket114 is None:
+            include_ticket114 = include_ticket112
+        if include_ticket114_status is None:
+            include_ticket114_status = include_ticket114
 
         tables = {
             "records": self._execute(
@@ -1107,6 +1755,24 @@ class EncryptedStateStore:
                     ).fetchall(),
                 }
             )
+        if include_ticket114:
+            tables.update(
+                {
+                    "owner_settings": self._execute(
+                        "SELECT slot, nonce, ciphertext "
+                        "FROM owner_settings_v1 ORDER BY slot"
+                    ).fetchall(),
+                    "owner_mutations": self._execute(
+                        "SELECT command_id, record_id, phase, nonce, ciphertext "
+                        "FROM owner_mutations_v1 ORDER BY command_id"
+                    ).fetchall(),
+                }
+            )
+        if include_ticket114_status:
+            tables["business_status"] = self._execute(
+                "SELECT slot, nonce, ciphertext "
+                "FROM business_status_v1 ORDER BY slot"
+            ).fetchall()
 
         def wire_value(value: object) -> object:
             if isinstance(value, bytes):
@@ -1663,7 +2329,10 @@ class EncryptedStateStore:
             if (
                 command.action == "turn.prepare"
                 and isinstance(command.payload, DailyTurnPreparePayload)
-                and command.payload.candidate is not None
+            )
+            or (
+                command.action == "owner.prepare"
+                and isinstance(command.payload, OwnerPreparePayload)
             )
             else {
                 "command": self._receipt_command_wire(command),
@@ -1814,6 +2483,7 @@ class EncryptedStateStore:
         envelope: SourceEnvelope,
         *,
         confirm_native_replay: bool = False,
+        retain_body: bool = True,
     ) -> SourceReceipt:
         """Persist one admitted source observation inside the caller transaction."""
 
@@ -1821,6 +2491,8 @@ class EncryptedStateStore:
             raise AuthorityValidationError("invalid source envelope")
         if type(confirm_native_replay) is not bool:
             raise AuthorityValidationError("invalid native replay policy")
+        if type(retain_body) is not bool:
+            raise AuthorityValidationError("invalid source body retention policy")
         native_event_digest = (
             None
             if envelope.message_id is None
@@ -1873,8 +2545,17 @@ class EncryptedStateStore:
                 )
             ):
                 business_source_causal_id = related_receipt.business_causal_id
+            if (
+                business_source_causal_id is not None
+                and related_receipt is not None
+                and related_receipt.managed_cursor_state == "recording-excluded"
+            ):
+                # Exclusion is a property of the proven native event, not of
+                # one delivery-local causal ID.  Never create a durable held
+                # plaintext alias after recording resumes.
+                retain_body = False
             receipt = SourceReceipt(
-                envelope=envelope,
+                envelope=(envelope if retain_body else envelope.without_body()),
                 relation=(
                     "replay-unknown"
                     if envelope.message_id is None
@@ -1883,7 +2564,9 @@ class EncryptedStateStore:
                     else "possible-replay"
                 ),
                 related_causal_id=related_causal_id,
-                managed_cursor_state="held",
+                managed_cursor_state=(
+                    "held" if retain_body else "recording-excluded"
+                ),
                 native_cursor_state="not-ready",
                 native_event_digest=native_event_digest,
                 business_source_causal_id=business_source_causal_id,
@@ -2015,6 +2698,14 @@ class EncryptedStateStore:
         return self._replace_source_receipt(
             receipt.with_native_replay_rejected()
         )
+
+    def reject_source_recording(self, causal_id: str) -> SourceReceipt:
+        """Remove a stopped-recording source body while keeping replay proof."""
+
+        receipt = self.source_receipt(causal_id)
+        if receipt is None:
+            raise AuthorityValidationError("recording source required")
+        return self._replace_source_receipt(receipt.with_recording_rejected())
 
     def mark_source_business_committed(self, causal_id: str) -> SourceReceipt:
         return self.mark_source_business_committed_many((causal_id,))[0]
@@ -2214,6 +2905,355 @@ class EncryptedStateStore:
         if draft.record_id != record_id:
             raise KeyUnavailable("initialization record identifier mismatch")
         return StoredInitialization(phase=phase, draft=draft)
+
+    def business_status_projection(self) -> StatusProjection | None:
+        """Return the last owner-visible business projection, if observed."""
+
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return StatusProjection.from_storage(
+                self._open("business-status", row[0], row[1])
+            )
+        except StatusContractViolation as exc:
+            raise KeyUnavailable("invalid business status projection") from exc
+
+    def remember_business_status(
+        self,
+        projection: StatusProjection,
+    ) -> StatusProjection | None:
+        """Atomically replace the projection and return its durable predecessor.
+
+        Returning the predecessor from the same transaction lets core decide
+        whether this exact read owns a state-change notification.  A concurrent
+        or restarted replay sees the newly stored projection and therefore
+        cannot emit that transition a second time.
+        """
+
+        if type(projection) is not StatusProjection:
+            raise AuthorityValidationError("invalid business status projection")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            row = connection.execute(
+                "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+            ).fetchone()
+            if row is None:
+                previous = None
+            else:
+                try:
+                    previous = StatusProjection.from_storage(
+                        self._open("business-status", row[0], row[1])
+                    )
+                except StatusContractViolation as exc:
+                    raise KeyUnavailable(
+                        "invalid business status projection"
+                    ) from exc
+            if previous == projection:
+                return previous
+            nonce, ciphertext = self._seal(
+                "business-status",
+                projection.to_storage(),
+            )
+            connection.execute(
+                """
+                INSERT INTO business_status_v1(slot, nonce, ciphertext)
+                VALUES (1, ?, ?)
+                ON CONFLICT(slot) DO UPDATE SET
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext
+                """,
+                (nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+            return previous
+
+    def owner_settings(self) -> OwnerSettingsState | None:
+        """Return the single encrypted current owner-settings aggregate."""
+
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM owner_settings_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return OwnerSettingsState.from_wire(
+                self._open("owner-settings:v1", row[0], row[1])
+            )
+        except (TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid owner settings aggregate") from exc
+
+    def write_owner_mutation(
+        self,
+        prepared: OwnerPreparedMutation,
+    ) -> StoredOwnerMutation:
+        """Persist one exact prepared owner mutation as the recovery authority."""
+
+        if type(prepared) is not OwnerPreparedMutation:
+            raise AuthorityValidationError("prepared owner mutation required")
+        stored_prepared: (
+            OwnerPreparedMutation | OwnerPreparedCorrectionRecovery
+        ) = prepared
+        if prepared.request.pending_correction is not None:
+            stored_prepared = OwnerPreparedCorrectionRecovery.for_preparation(
+                prepared
+            )
+        command_id = prepared.request.context.command_id
+        record_id = prepared.record_id
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            rows = connection.execute(
+                "SELECT command_id, record_id, phase, nonce, ciphertext "
+                "FROM owner_mutations_v1 "
+                "WHERE command_id = ? OR record_id = ?",
+                (command_id, record_id),
+            ).fetchall()
+            if rows:
+                if len(rows) == 1:
+                    existing = self._decode_owner_mutation(*rows[0])
+                    if (
+                        existing.command_id == command_id
+                        and existing.record_id == record_id
+                        and (
+                            (
+                                existing.phase == "prepared"
+                                and existing.prepared == stored_prepared
+                            )
+                            or (
+                                existing.phase == "finalized"
+                                and existing.terminal is not None
+                                and existing.terminal.matches(prepared)
+                            )
+                        )
+                    ):
+                        return existing
+                raise AuthorityValidationError("owner mutation identity conflict")
+            unresolved = connection.execute(
+                "SELECT command_id FROM owner_mutations_v1 "
+                "WHERE phase = 'prepared' LIMIT 2"
+            ).fetchall()
+            if unresolved:
+                raise AuthorityValidationError("owner mutation lease already owned")
+            stored = StoredOwnerMutation(
+                phase="prepared",
+                prepared=stored_prepared,
+                terminal=None,
+            )
+            nonce, ciphertext = self._seal(
+                f"owner-mutation:{command_id}:{record_id}:prepared",
+                stored.to_storage(),
+            )
+            connection.execute(
+                "INSERT INTO owner_mutations_v1("
+                "command_id, record_id, phase, nonce, ciphertext"
+                ") VALUES (?, ?, 'prepared', ?, ?)",
+                (command_id, record_id, nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+            return stored
+
+    def owner_mutation(self, command_id: str) -> StoredOwnerMutation | None:
+        validate_opaque_text(command_id, "owner mutation command identifier")
+        row = self._execute(
+            "SELECT command_id, record_id, phase, nonce, ciphertext "
+            "FROM owner_mutations_v1 WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        return None if row is None else self._decode_owner_mutation(*row)
+
+    def owner_mutation_for_record(
+        self,
+        record_id: str,
+    ) -> StoredOwnerMutation | None:
+        validate_opaque_text(record_id, "owner mutation record identifier")
+        row = self._execute(
+            "SELECT command_id, record_id, phase, nonce, ciphertext "
+            "FROM owner_mutations_v1 WHERE record_id = ?",
+            (record_id,),
+        ).fetchone()
+        return None if row is None else self._decode_owner_mutation(*row)
+
+    def finalize_owner_mutation(
+        self,
+        prepared: OwnerPreparedMutation | OwnerPreparedCorrectionRecovery,
+    ) -> StoredOwnerMutation:
+        """Atomically publish settings and redact the prepared recovery body."""
+
+        if type(prepared) not in {
+            OwnerPreparedMutation,
+            OwnerPreparedCorrectionRecovery,
+        }:
+            raise AuthorityValidationError("prepared owner mutation required")
+        durable_prepared = prepared
+        if (
+            type(prepared) is OwnerPreparedMutation
+            and prepared.request.pending_correction is not None
+        ):
+            durable_prepared = (
+                OwnerPreparedCorrectionRecovery.for_preparation(prepared)
+            )
+        if type(durable_prepared) is OwnerPreparedCorrectionRecovery:
+            command_id = durable_prepared.command_id
+            expected_settings_version = (
+                durable_prepared.expected_settings_version
+            )
+            next_settings = durable_prepared.next_settings
+        else:
+            command_id = durable_prepared.request.context.command_id
+            expected_settings_version = (
+                durable_prepared.request.expected_settings_version
+            )
+            next_settings = durable_prepared.next_settings
+        record_id = prepared.record_id
+        terminal = OwnerMutationTerminalReceipt.for_finalization(
+            durable_prepared
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            row = connection.execute(
+                "SELECT command_id, record_id, phase, nonce, ciphertext "
+                "FROM owner_mutations_v1 WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            if row is None:
+                raise AuthorityValidationError("prepared owner mutation required")
+            existing = self._decode_owner_mutation(*row)
+            if existing.record_id != record_id:
+                raise AuthorityValidationError("owner mutation identity conflict")
+            if existing.phase == "finalized":
+                if existing.terminal != terminal:
+                    raise AuthorityValidationError("finalized owner mutation mismatch")
+                current_settings = self.owner_settings()
+                if current_settings is None or (
+                    current_settings.owner_id != next_settings.owner_id
+                    or current_settings.installation_id
+                    != next_settings.installation_id
+                    or current_settings.version < terminal.settings_version
+                ):
+                    raise KeyUnavailable("owner settings aggregate mismatch")
+                return existing
+            if existing.prepared != durable_prepared:
+                raise AuthorityValidationError("prepared owner mutation mismatch")
+            current_settings = self.owner_settings()
+            if current_settings is not None and (
+                current_settings.owner_id != next_settings.owner_id
+                or current_settings.installation_id
+                != next_settings.installation_id
+                or current_settings.version
+                != expected_settings_version
+            ):
+                raise AuthorityValidationError("stale owner settings version")
+            if type(durable_prepared) is OwnerPreparedCorrectionRecovery:
+                daily_turn = self._daily_turn_row(
+                    durable_prepared.daily_source_causal_id
+                )
+                if (
+                    daily_turn is None
+                    or daily_turn.phase != "finalized"
+                    or daily_turn.terminal is None
+                    or daily_turn.terminal.source_causal_id
+                    != durable_prepared.daily_source_causal_id
+                    or daily_turn.terminal.record_id
+                    != durable_prepared.record_id
+                    or daily_turn.terminal.revision_digest
+                    != durable_prepared.revision_digest
+                    or daily_turn.terminal.transition_id
+                    != durable_prepared.transition_id
+                    or daily_turn.terminal.payload_digest
+                    != durable_prepared.payload_digest
+                    or daily_turn.terminal.result_digest
+                    != durable_prepared.daily_result_digest
+                ):
+                    raise AuthorityValidationError(
+                        "finalized owner correction result required"
+                    )
+            elif durable_prepared.request.daily_turn_draft is not None:
+                daily_draft = durable_prepared.request.daily_turn_draft
+                daily_turn = self._daily_turn_row(daily_draft.source_causal_id)
+                if (
+                    durable_prepared.daily_result_digest is None
+                    or daily_turn is None
+                    or daily_turn.phase != "finalized"
+                    or daily_turn.terminal is None
+                    or not daily_turn.terminal.matches_draft(daily_draft)
+                    or daily_turn.terminal.result_digest
+                    != durable_prepared.daily_result_digest
+                ):
+                    raise AuthorityValidationError(
+                        "finalized owner correction result required"
+                    )
+
+            settings_nonce, settings_ciphertext = self._seal(
+                "owner-settings:v1",
+                next_settings.to_wire(),
+            )
+            connection.execute(
+                "INSERT INTO owner_settings_v1(slot, nonce, ciphertext) "
+                "VALUES (1, ?, ?) "
+                "ON CONFLICT(slot) DO UPDATE SET "
+                "nonce=excluded.nonce, ciphertext=excluded.ciphertext",
+                (settings_nonce, settings_ciphertext),
+            )
+            stored = StoredOwnerMutation(
+                phase="finalized",
+                prepared=None,
+                terminal=terminal,
+            )
+            mutation_nonce, mutation_ciphertext = self._seal(
+                f"owner-mutation:{command_id}:{record_id}:finalized",
+                stored.to_storage(),
+            )
+            connection.execute(
+                "UPDATE owner_mutations_v1 SET "
+                "phase = 'finalized', nonce = ?, ciphertext = ? "
+                "WHERE command_id = ? AND record_id = ? AND phase = 'prepared'",
+                (
+                    mutation_nonce,
+                    mutation_ciphertext,
+                    command_id,
+                    record_id,
+                ),
+            )
+            self._redact_owner_prepare_receipts(
+                connection,
+                durable_prepared,
+            )
+            self._refresh_integrity_manifest(connection)
+            return stored
+
+    def _decode_owner_mutation(
+        self,
+        command_id: object,
+        record_id: object,
+        phase: object,
+        nonce: object,
+        ciphertext: object,
+    ) -> StoredOwnerMutation:
+        if type(command_id) is not str or not command_id:
+            raise KeyUnavailable("invalid owner mutation command identifier")
+        if type(record_id) is not str or not record_id:
+            raise KeyUnavailable("invalid owner mutation record identifier")
+        if phase not in {"prepared", "finalized"}:
+            raise KeyUnavailable("invalid owner mutation phase")
+        try:
+            stored = StoredOwnerMutation.from_storage(
+                self._open(
+                    f"owner-mutation:{command_id}:{record_id}:{phase}",
+                    nonce,  # type: ignore[arg-type]
+                    ciphertext,  # type: ignore[arg-type]
+                )
+            )
+        except (AuthorityValidationError, TypeError, ValueError) as exc:
+            raise KeyUnavailable("invalid owner mutation") from exc
+        if (
+            stored.command_id != command_id
+            or stored.record_id != record_id
+            or stored.phase != phase
+        ):
+            raise KeyUnavailable("owner mutation identifier mismatch")
+        return stored
 
     def write_daily_turn(
         self,
@@ -2830,6 +3870,63 @@ class EncryptedStateStore:
             ),
         )
 
+    def _redact_owner_prepare_receipts(
+        self,
+        connection: sqlite3.Connection,
+        prepared: OwnerPreparedMutation | OwnerPreparedCorrectionRecovery,
+    ) -> None:
+        """Replace a finalized owner prepare body with its exact command digest."""
+
+        if type(prepared) is OwnerPreparedCorrectionRecovery:
+            expected_binding = prepared.owner_authority_binding_digest
+            expected_command_id = prepared.command_id
+        elif type(prepared) is OwnerPreparedMutation:
+            expected_binding = (
+                prepared.request.owner_authority_binding_digest
+            )
+            expected_command_id = prepared.request.context.command_id
+        else:
+            raise AuthorityValidationError("prepared owner mutation required")
+
+        rows = connection.execute(
+            "SELECT causal_id, nonce, ciphertext FROM command_receipts_v2"
+        ).fetchall()
+        replacements: list[tuple[bytes, bytes, str]] = []
+        for causal_id, nonce, ciphertext in rows:
+            stored = self._decode_receipt(causal_id, nonce, ciphertext)
+            if not isinstance(stored, _ExactCommandReceipt):
+                continue
+            command = stored.command
+            if (
+                command.action == "owner.prepare"
+                and isinstance(command.payload, OwnerPreparePayload)
+                and command.payload.request.context.command_id
+                == expected_command_id
+                and command.payload.request.owner_authority_binding_digest
+                == expected_binding
+            ):
+                if stored.response.meta.to_wire() != {}:
+                    raise KeyUnavailable(
+                        "owner prepare receipt response is not body-free"
+                    )
+                redacted_nonce, redacted_ciphertext = self._seal(
+                    f"receipt:v2:{causal_id}",
+                    {
+                        "kind": "command-digest-v1",
+                        "command_digest": self._receipt_command_digest(command),
+                        "response": stored.response.to_wire(),
+                    },
+                )
+                replacements.append(
+                    (redacted_nonce, redacted_ciphertext, causal_id)
+                )
+        for redacted_nonce, redacted_ciphertext, causal_id in replacements:
+            connection.execute(
+                "UPDATE command_receipts_v2 SET nonce = ?, ciphertext = ? "
+                "WHERE causal_id = ?",
+                (redacted_nonce, redacted_ciphertext, causal_id),
+            )
+
     def _redact_daily_prepare_receipts(
         self,
         connection: sqlite3.Connection,
@@ -3316,6 +4413,166 @@ class EncryptedStateStore:
         if processed_sources and not daily_state_rows:
             raise KeyUnavailable("daily health aggregate missing")
 
+        owner_settings_rows = self._execute(
+            "SELECT nonce, ciphertext FROM owner_settings_v1 ORDER BY slot"
+        ).fetchall()
+        if len(owner_settings_rows) > 1:
+            raise KeyUnavailable("multiple owner settings aggregates")
+        current_owner_settings = self.owner_settings()
+        owner_mutation_rows = self._execute(
+            "SELECT command_id, record_id, phase, nonce, ciphertext "
+            "FROM owner_mutations_v1 ORDER BY command_id"
+        ).fetchall()
+        owner_mutations = tuple(
+            self._decode_owner_mutation(*row) for row in owner_mutation_rows
+        )
+        unresolved_owner_mutations = tuple(
+            mutation
+            for mutation in owner_mutations
+            if mutation.phase == "prepared"
+        )
+        if len(unresolved_owner_mutations) > 1:
+            raise KeyUnavailable("multiple unresolved owner mutations")
+        finalized_owner_chain: list[
+            tuple[int, OwnerMutationTerminalReceipt]
+        ] = []
+        for mutation in owner_mutations:
+            record = self.record(mutation.record_id)
+            if record is None:
+                raise KeyUnavailable("owner mutation transition missing")
+            record_authority = (
+                record.payload
+                if isinstance(record.payload, PreparedTransition)
+                else record.payload.prepared
+                if isinstance(record.payload, CommittedTransition)
+                else None
+            )
+            if (
+                type(record_authority) is not PreparedTransition
+                or not record_authority.target.matches_commit(
+                    record_id=mutation.record_id,
+                    revision_digest=record.revision_digest,
+                    transition_id=record.transition_id,
+                )
+            ):
+                raise KeyUnavailable("owner mutation transition mismatch")
+            if mutation.phase == "prepared":
+                prepared = mutation.prepared
+                if prepared is None:  # pragma: no cover - decoded invariant
+                    raise KeyUnavailable("prepared owner mutation body missing")
+                if (
+                    record.state not in {"prepared", "unknown", "committed"}
+                    or prepared.record_id != mutation.record_id
+                    or prepared.revision_digest != record.revision_digest
+                    or prepared.transition_id != record.transition_id
+                ):
+                    raise KeyUnavailable("prepared owner mutation target mismatch")
+                if type(prepared) is OwnerPreparedCorrectionRecovery:
+                    prepared_owner_id = prepared.owner_id
+                    prepared_installation_id = prepared.installation_id
+                    prepared_settings_version = (
+                        prepared.expected_settings_version
+                    )
+                    daily = daily_turns.get(
+                        prepared.daily_source_causal_id
+                    )
+                    if (
+                        daily is None
+                        or daily.draft is None
+                        or not prepared.matches_daily(daily.draft)
+                    ):
+                        raise KeyUnavailable(
+                            "prepared owner correction aggregate mismatch"
+                        )
+                elif type(prepared) is OwnerPreparedMutation:
+                    prepared_owner_id = prepared.request.context.owner_id
+                    prepared_installation_id = (
+                        prepared.request.context.installation_id
+                    )
+                    prepared_settings_version = (
+                        prepared.request.expected_settings_version
+                    )
+                else:  # pragma: no cover - StoredOwnerMutation invariant
+                    raise KeyUnavailable("prepared owner mutation body missing")
+                if current_owner_settings is not None and (
+                    prepared_owner_id != current_owner_settings.owner_id
+                    or prepared_installation_id
+                    != current_owner_settings.installation_id
+                    or prepared_settings_version
+                    != current_owner_settings.version
+                ):
+                    raise KeyUnavailable("prepared owner mutation base mismatch")
+                continue
+            terminal = mutation.terminal
+            if (
+                terminal is None
+                or current_owner_settings is None
+                or terminal.settings_version > current_owner_settings.version
+            ):
+                raise KeyUnavailable("finalized owner mutation aggregate mismatch")
+            if (
+                record.state != "final"
+                or terminal.record_id != mutation.record_id
+                or terminal.revision_digest != record.revision_digest
+                or terminal.transition_id != record.transition_id
+            ):
+                raise KeyUnavailable("finalized owner mutation target mismatch")
+            result_version = (
+                None
+                if terminal.settings_result is None
+                else terminal.settings_result.get("settings_version")
+            )
+            if (
+                terminal.settings_result is None
+                and terminal.settings_version != terminal.base_settings_version
+            ) or (
+                result_version is not None
+                and result_version != terminal.settings_version
+            ):
+                raise KeyUnavailable("finalized owner settings result mismatch")
+            finalized_owner_chain.append(
+                (record_authority.base.generation, terminal)
+            )
+            if terminal.daily_result_digest is not None:
+                daily_turn = self.daily_turn_for_record(terminal.record_id)
+                if (
+                    daily_turn is None
+                    or daily_turn.phase != "finalized"
+                    or daily_turn.terminal is None
+                    or daily_turn.terminal.result_digest
+                    != terminal.daily_result_digest
+                ):
+                    raise KeyUnavailable(
+                        "finalized owner correction aggregate mismatch"
+                    )
+        if current_owner_settings is not None and not finalized_owner_chain:
+            raise KeyUnavailable("owner settings aggregate has no terminal chain")
+        finalized_owner_chain.sort(key=lambda item: item[0])
+        if finalized_owner_chain:
+            generations = tuple(item[0] for item in finalized_owner_chain)
+            if len(set(generations)) != len(generations):
+                raise KeyUnavailable("owner mutation generation chain mismatch")
+            previous_settings_version = 1
+            for _, terminal in finalized_owner_chain:
+                if terminal.base_settings_version != previous_settings_version:
+                    raise KeyUnavailable("owner settings version chain mismatch")
+                previous_settings_version = terminal.settings_version
+            if (
+                current_owner_settings is None
+                or previous_settings_version != current_owner_settings.version
+                or finalized_owner_chain[-1][1].next_settings_digest
+                != stable_digest(current_owner_settings.to_wire())
+            ):
+                raise KeyUnavailable("owner settings terminal digest mismatch")
+
+        business_status_rows = self._execute(
+            "SELECT nonce, ciphertext FROM business_status_v1 ORDER BY slot"
+        ).fetchall()
+        if len(business_status_rows) > 1:
+            raise KeyUnavailable("multiple business status projections")
+        if business_status_rows:
+            self.business_status_projection()
+
         # A terminal latch must itself be authenticated; its row is also part
         # of the signed inventory above, so raw deletion cannot silently reopen
         # the state domain.
@@ -3364,6 +4621,16 @@ class EncryptedStateStore:
         daily_state_rows = self._execute(
             "SELECT slot, nonce, ciphertext FROM daily_health_state_v1"
         ).fetchall()
+        owner_settings_rows = self._execute(
+            "SELECT slot, nonce, ciphertext FROM owner_settings_v1"
+        ).fetchall()
+        owner_mutation_rows = self._execute(
+            "SELECT command_id, record_id, phase, nonce, ciphertext "
+            "FROM owner_mutations_v1"
+        ).fetchall()
+        business_status_rows = self._execute(
+            "SELECT slot, nonce, ciphertext FROM business_status_v1"
+        ).fetchall()
         return repr(
             (
                 record_rows,
@@ -3378,6 +4645,9 @@ class EncryptedStateStore:
                 initialization_rows,
                 daily_turn_rows,
                 daily_state_rows,
+                owner_settings_rows,
+                owner_mutation_rows,
+                business_status_rows,
             )
         ).encode("utf-8")
 

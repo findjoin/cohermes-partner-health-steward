@@ -364,6 +364,7 @@ class SourceReceipt:
             "held",
             "superseded",
             "rejected",
+            "recording-excluded",
             "committed",
         }:
             raise AuthorityValidationError("invalid source cursor state")
@@ -376,7 +377,8 @@ class SourceReceipt:
         }:
             raise AuthorityValidationError("invalid source cursor state")
         if (
-            self.managed_cursor_state in {"held", "superseded", "rejected"}
+            self.managed_cursor_state
+            in {"held", "superseded", "rejected", "recording-excluded"}
             and self.native_cursor_state != "not-ready"
         ):
             raise AuthorityValidationError("invalid source cursor state")
@@ -388,7 +390,7 @@ class SourceReceipt:
         ):
             raise AuthorityValidationError("held source body is missing")
         if (
-            self.managed_cursor_state == "rejected"
+            self.managed_cursor_state in {"rejected", "recording-excluded"}
             and self.envelope.body is not None
         ):
             raise AuthorityValidationError("rejected source body was retained")
@@ -522,6 +524,23 @@ class SourceReceipt:
             native_cursor_state="not-ready",
             native_event_digest=self.native_event_digest,
             business_source_causal_id=None,
+        )
+
+    def with_recording_rejected(self) -> "SourceReceipt":
+        """Retain only a body-free replay fact for a stopped-recording turn."""
+
+        if self.managed_cursor_state == "recording-excluded":
+            return self
+        if self.managed_cursor_state != "held":
+            raise AuthorityValidationError("source is not awaiting recording decision")
+        return SourceReceipt(
+            envelope=self.envelope.without_body(),
+            relation=self.relation,
+            related_causal_id=self.related_causal_id,
+            managed_cursor_state="recording-excluded",
+            native_cursor_state="not-ready",
+            native_event_digest=self.native_event_digest,
+            business_source_causal_id=self.business_source_causal_id,
         )
 
     def with_native_cursor_state(self, state: str) -> "SourceReceipt":
