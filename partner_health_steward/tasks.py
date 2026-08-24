@@ -1177,6 +1177,68 @@ class TaskUnknownFact:
 
 
 @dataclass(frozen=True)
+class TaskControlFact:
+    """Append-only owner-visible history for defer and task adjustment."""
+
+    fact_id: str
+    task_id: str
+    kind: str
+    basis_digest: str
+    recorded_at_utc: str
+    related_task_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.fact_id, "task control fact identifier")
+        _text(self.task_id, "task control task identifier")
+        if self.kind not in {"deferred", "adjusted", "scope-expanded"}:
+            raise TaskContractViolation("invalid task control fact kind")
+        _sha256(self.basis_digest, "task control basis digest")
+        _utc_time(self.recorded_at_utc, "task control fact time")
+        _optional_text(self.related_task_id, "task control related task")
+        if self.kind == "scope-expanded" and self.related_task_id is None:
+            raise TaskContractViolation("scope expansion requires a related task")
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "fact_id": self.fact_id,
+            "task_id": self.task_id,
+            "kind": self.kind,
+            "basis_digest": self.basis_digest,
+            "recorded_at_utc": self.recorded_at_utc,
+            "related_task_id": self.related_task_id,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "TaskControlFact":
+        stored = _mapping(
+            value,
+            frozenset(
+                {
+                    "fact_id",
+                    "task_id",
+                    "kind",
+                    "basis_digest",
+                    "recorded_at_utc",
+                    "related_task_id",
+                }
+            ),
+            "task control fact",
+        )
+        return cls(
+            fact_id=_text(stored["fact_id"], "task control fact identifier"),
+            task_id=_text(stored["task_id"], "task control task identifier"),
+            kind=_text(stored["kind"], "task control fact kind"),
+            basis_digest=_sha256(stored["basis_digest"], "task control basis digest"),
+            recorded_at_utc=_utc_time(
+                stored["recorded_at_utc"], "task control fact time"
+            ),
+            related_task_id=_optional_text(
+                stored["related_task_id"], "task control related task"
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TaskRuntimeState:
     owner_id: str
     installation_id: str
@@ -1185,6 +1247,7 @@ class TaskRuntimeState:
     candidate_receipts: tuple[tuple[str, str, str], ...]
     unknown_facts: tuple[TaskUnknownFact, ...] = ()
     active_claims: tuple[TaskLease, ...] = ()
+    control_facts: tuple[TaskControlFact, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.owner_id, "task owner")
@@ -1236,6 +1299,17 @@ class TaskRuntimeState:
             raise TaskContractViolation("task claim points outside state")
         if any(self.task(claim.task_id).primary_label != "active" for claim in self.active_claims):
             raise TaskContractViolation("terminal task cannot retain a claim")
+        if type(self.control_facts) is not tuple or any(
+            type(fact) is not TaskControlFact for fact in self.control_facts
+        ):
+            raise TaskContractViolation("invalid task control facts")
+        control_ids = tuple(fact.fact_id for fact in self.control_facts)
+        if control_ids != tuple(sorted(control_ids)) or len(control_ids) != len(
+            set(control_ids)
+        ):
+            raise TaskContractViolation("task control facts must be uniquely ordered")
+        if any(fact.task_id not in task_id_set for fact in self.control_facts):
+            raise TaskContractViolation("task control fact points outside state")
 
     @classmethod
     def empty(cls, owner_id: str, installation_id: str) -> "TaskRuntimeState":
@@ -1247,6 +1321,7 @@ class TaskRuntimeState:
             candidate_receipts=(),
             unknown_facts=(),
             active_claims=(),
+            control_facts=(),
         )
 
     def task(self, task_id: str) -> ManagedTask:
@@ -1273,30 +1348,37 @@ class TaskRuntimeState:
             "candidate_receipts": [list(receipt) for receipt in self.candidate_receipts],
             "unknown_facts": [fact.to_storage() for fact in self.unknown_facts],
             "active_claims": [claim.to_storage() for claim in self.active_claims],
+            "control_facts": [fact.to_storage() for fact in self.control_facts],
         }
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskRuntimeState":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
-                    "owner_id",
-                    "installation_id",
-                    "version",
-                    "tasks",
-                    "candidate_receipts",
-                    "unknown_facts",
-                    "active_claims",
-                }
-            ),
-            "task runtime state",
-        )
+        if type(value) is not dict:
+            raise TaskContractViolation("invalid task runtime state")
+        expected = {
+            "owner_id",
+            "installation_id",
+            "version",
+            "tasks",
+            "candidate_receipts",
+            "unknown_facts",
+            "active_claims",
+        }
+        if frozenset(value) not in {
+            frozenset(expected),
+            frozenset(expected | {"control_facts"}),
+        }:
+            raise TaskContractViolation("invalid task runtime state")
+        stored = value
         raw_tasks = stored["tasks"]
         raw_receipts = stored["candidate_receipts"]
         raw_unknowns = stored["unknown_facts"]
         raw_claims = stored["active_claims"]
-        if any(type(value) is not list for value in (raw_tasks, raw_receipts, raw_unknowns, raw_claims)):
+        raw_controls = stored.get("control_facts", [])
+        if any(
+            type(value) is not list
+            for value in (raw_tasks, raw_receipts, raw_unknowns, raw_claims, raw_controls)
+        ):
             raise TaskContractViolation("invalid task runtime collection")
         receipts: list[tuple[str, str, str]] = []
         for receipt in raw_receipts:
@@ -1321,6 +1403,9 @@ class TaskRuntimeState:
                 TaskUnknownFact.from_storage(item) for item in raw_unknowns
             ),
             active_claims=tuple(TaskLease.from_storage(item) for item in raw_claims),
+            control_facts=tuple(
+                TaskControlFact.from_storage(item) for item in raw_controls
+            ),
         )
 
 
@@ -1607,6 +1692,189 @@ class TaskEngine:
             ),
         )
         return TaskTransition(next_state, task.task_id, "released")
+
+    @staticmethod
+    def defer(
+        state: TaskRuntimeState,
+        task_id: str,
+        *,
+        deferred_at_utc: str,
+        reason_code: str = "owner-deferred",
+    ) -> TaskTransition:
+        """Record a defer fact without changing the task's primary label."""
+
+        task = state.task(task_id)
+        if task.primary_label != "active":
+            raise TaskContractViolation("terminal task cannot be deferred")
+        at = _utc_time(deferred_at_utc, "task defer time")
+        reason = _text(reason_code, "task defer reason")
+        fact_id = "task-control:" + stable_digest(
+            {
+                "task_id": task.task_id,
+                "kind": "deferred",
+                "reason_code": reason,
+                "recorded_at_utc": at,
+                "task_version": task.version,
+            }
+        ).removeprefix("sha256:")
+        fact = TaskControlFact(
+            fact_id=fact_id,
+            task_id=task.task_id,
+            kind="deferred",
+            basis_digest=stable_digest(
+                {"task_id": task.task_id, "reason_code": reason}
+            ),
+            recorded_at_utc=at,
+        )
+        if any(existing.fact_id == fact.fact_id for existing in state.control_facts):
+            return TaskTransition(state, task.task_id, "deferred", True)
+        next_task = replace(
+            task,
+            phase="waiting-owner",
+            version=task.version + 1,
+            updated_at_utc=at,
+        )
+        next_state = replace(
+            state,
+            version=state.version + 1,
+            tasks=_replace_task(state, next_task),
+            control_facts=tuple(
+                sorted(state.control_facts + (fact,), key=lambda item: item.fact_id)
+            ),
+        )
+        return TaskTransition(next_state, task.task_id, "deferred")
+
+    @staticmethod
+    def adjust(
+        state: TaskRuntimeState,
+        task_id: str,
+        candidate: TaskCandidate,
+        *,
+        adjusted_at_utc: str,
+        scope_expanded: bool = False,
+        cancelled_task_refs: tuple[str, ...] = (),
+    ) -> TaskTransition:
+        """Adjust a task, or create a linked task when scope expands."""
+
+        task = state.task(task_id)
+        if task.primary_label != "active":
+            raise TaskContractViolation("terminal task cannot be adjusted")
+        at = _utc_time(adjusted_at_utc, "task adjustment time")
+        if type(scope_expanded) is not bool:
+            raise TaskContractViolation("invalid task scope expansion flag")
+        if not scope_expanded and (
+            candidate.external_boundary != task.external_boundary
+            or candidate.approval != task.approval
+            or candidate.allowed_data_categories != task.allowed_data_categories
+            or candidate.allowed_data_refs != task.allowed_data_refs
+            or candidate.assignee != task.assignee
+        ):
+            raise TaskContractViolation(
+                "scope expansion requires a linked task and fresh approval"
+            )
+        if scope_expanded:
+            linked = TaskEngine.link_successor(
+                state,
+                task.task_id,
+                candidate,
+                committed_at_utc=at,
+                cancelled_task_refs=cancelled_task_refs,
+            )
+            successor = linked.state.task(linked.task_id)
+            fact = TaskControlFact(
+                fact_id="task-control:"
+                + stable_digest(
+                    {
+                        "task_id": task.task_id,
+                        "kind": "scope-expanded",
+                        "related_task_id": successor.task_id,
+                        "recorded_at_utc": at,
+                    }
+                ).removeprefix("sha256:"),
+                task_id=task.task_id,
+                kind="scope-expanded",
+                basis_digest=candidate.semantic_digest,
+                recorded_at_utc=at,
+                related_task_id=successor.task_id,
+            )
+            return TaskTransition(
+                replace(
+                    linked.state,
+                    version=linked.state.version + 1,
+                    control_facts=tuple(
+                        sorted(
+                            linked.state.control_facts + (fact,),
+                            key=lambda item: item.fact_id,
+                        )
+                    ),
+                ),
+                linked.task_id,
+                "scope-expanded",
+                linked.replayed,
+            )
+
+        source_bindings = {
+            ref: (kind, digest)
+            for kind, ref, digest in zip(
+                task.source_kinds,
+                task.source_refs,
+                task.source_revision_digests,
+            )
+        }
+        source_bindings[candidate.source_ref] = (
+            candidate.source_kind,
+            candidate.source_revision_digest,
+        )
+        ordered = tuple(sorted(source_bindings.items()))
+        adjusted = replace(
+            task,
+            version=task.version + 1,
+            purpose=candidate.purpose,
+            expected_result=candidate.expected_result,
+            assignee=candidate.assignee,
+            allowed_data_categories=candidate.allowed_data_categories,
+            allowed_data_refs=candidate.allowed_data_refs,
+            external_boundary=candidate.external_boundary,
+            approval=candidate.approval,
+            acceptance_criteria=candidate.acceptance_criteria,
+            source_kinds=tuple(item[1][0] for item in ordered),
+            source_refs=tuple(item[0] for item in ordered),
+            source_revision_digests=tuple(item[1][1] for item in ordered),
+            semantic_digest=candidate.semantic_digest,
+            phase=candidate.phase,
+            updated_at_utc=at,
+        )
+        fact = TaskControlFact(
+            fact_id="task-control:"
+            + stable_digest(
+                {
+                    "task_id": task.task_id,
+                    "kind": "adjusted",
+                    "semantic_digest": candidate.semantic_digest,
+                    "recorded_at_utc": at,
+                }
+            ).removeprefix("sha256:"),
+            task_id=task.task_id,
+            kind="adjusted",
+            basis_digest=candidate.semantic_digest,
+            recorded_at_utc=at,
+        )
+        next_state = replace(
+            state,
+            version=state.version + 1,
+            tasks=_replace_task(state, adjusted),
+            candidate_receipts=tuple(
+                sorted(
+                    state.candidate_receipts
+                    + ((_text(candidate.candidate_id, "task candidate identifier"),
+                        _candidate_receipt_digest(candidate), task.task_id),)
+                )
+            ),
+            control_facts=tuple(
+                sorted(state.control_facts + (fact,), key=lambda item: item.fact_id)
+            ),
+        )
+        return TaskTransition(next_state, task.task_id, "adjusted")
 
     @staticmethod
     def advance_phase(
@@ -2034,6 +2302,7 @@ __all__ = [
     "TaskAcceptanceCriterionProof",
     "TaskApprovalBinding",
     "TaskCandidate",
+    "TaskControlFact",
     "TaskContractViolation",
     "TaskEngine",
     "TaskExternalBoundary",

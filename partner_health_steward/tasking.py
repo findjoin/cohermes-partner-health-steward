@@ -12,6 +12,7 @@ from .tasks import (
     TaskAcceptanceCriterionProof,
     TaskApprovalBinding,
     TaskCandidate,
+    TaskControlFact,
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
@@ -20,6 +21,14 @@ from .tasks import (
     TaskTerminalFact,
     TaskTransition,
     TaskUnknownFact,
+)
+from .ticket115_contracts import (
+    DeliveryEvidence,
+    DeliveryEvidenceAuthority,
+    MandatoryDeliveryLedger,
+    MandatoryDeliveryRequest,
+    TaskClaimLease,
+    Ticket115ContractViolation,
 )
 
 HealthTask = ManagedTask
@@ -39,6 +48,8 @@ __all__ = [
     "TaskAcceptanceCriterionProof",
     "TaskApprovalBinding",
     "TaskCandidate",
+    "TaskControlFact",
+    "TaskClaimLease",
     "TaskContractViolation",
     "TaskEngine",
     "TaskExternalBoundary",
@@ -47,4 +58,9 @@ __all__ = [
     "TaskTerminalFact",
     "TaskTransition",
     "TaskUnknownFact",
+    "DeliveryEvidence",
+    "DeliveryEvidenceAuthority",
+    "MandatoryDeliveryLedger",
+    "MandatoryDeliveryRequest",
+    "Ticket115ContractViolation",
 ]
