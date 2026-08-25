@@ -44,7 +44,7 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 ## 实施协议
 
 1. 只有本票记录 frozen design content commit/tree 后，才把 Status 改为 ready-for-agent。
-2. 编码 Agent 从该门禁提交开始，严格执行设计 CP1 → CP5；每个 checkpoint 先红测、最小实现、定向与累积回归、独立 commit。
+2. 编码 Agent 从该门禁提交开始，严格执行设计 CP0 → CP5；每个 checkpoint 先红测、最小实现、定向与累积回归、独立 commit。
 3. salvage 只可按设计第 12 节人工选择；每项记录来源、采用条款和目标文件。禁止整体 cherry-pick。
 4. 若出现冻结设计未覆盖的新事实，只能在它可复现且足以使路线不可实现、不安全或破坏 d468e0a 兼容时停工；保存 checkpoint，退回设计 amendment。不得在编码中自行改路线。
 5. 实施 Agent 在本票追加 Implementation evidence (unreviewed)，记录 design identity、checkpoint commits、行为映射、测试与环境；不得自行把测试绿色解释为设计已通过。
