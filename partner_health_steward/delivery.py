@@ -576,13 +576,102 @@ class OwnerDeliveryWireAdapter(Protocol):
         """Attempt one serialized Weixin send and return its serialized result."""
 
 
+_LEGACY_DELIVERY_DECODE_TOKEN = object()
+
+
+class _LegacyDeliveryProof:
+    """Storage-only identity for facts written before producer attestations."""
+
+    __slots__ = (
+        "layer",
+        "evidence_ref",
+        "replay_identity",
+        "_decode_available",
+        "_effect_id",
+        "_generation",
+    )
+
+    def __init__(
+        self,
+        *,
+        layer: str,
+        evidence_ref: str,
+        replay_identity: str,
+        token: object,
+    ) -> None:
+        if token is not _LEGACY_DELIVERY_DECODE_TOKEN:
+            raise DeliveryContractViolation(
+                "legacy delivery evidence is storage-only"
+            )
+        self.layer = layer
+        self.evidence_ref = evidence_ref
+        self.replay_identity = replay_identity
+        self._decode_available = True
+        self._effect_id: str | None = None
+        self._generation: int | None = None
+
+    @property
+    def producer_contract(self) -> str:
+        return "legacy-storage.delivery-fact-v1"
+
+    @property
+    def effect_id(self) -> str:
+        if self._effect_id is None:
+            raise DeliveryContractViolation(
+                "legacy delivery evidence is not bound to its stored intent"
+            )
+        return self._effect_id
+
+    @property
+    def generation(self) -> int:
+        if self._generation is None:
+            raise DeliveryContractViolation(
+                "legacy delivery evidence is not bound to its stored intent"
+            )
+        return self._generation
+
+    def _consume_decode(self) -> None:
+        if not self._decode_available:
+            raise DeliveryContractViolation(
+                "legacy delivery evidence is storage-only"
+            )
+        self._decode_available = False
+
+    def _bind(self, *, effect_id: str, generation: int) -> None:
+        if self._effect_id is None and self._generation is None:
+            self._effect_id = effect_id
+            self._generation = generation
+            return
+        if self._effect_id != effect_id or self._generation != generation:
+            raise DeliveryContractViolation(
+                "legacy delivery evidence intent binding mismatch"
+            )
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not _LegacyDeliveryProof:
+            return NotImplemented
+        return (
+            self.layer,
+            self.evidence_ref,
+            self.replay_identity,
+            self._effect_id,
+            self._generation,
+        ) == (
+            other.layer,
+            other.evidence_ref,
+            other.replay_identity,
+            other._effect_id,
+            other._generation,
+        )
+
+
 @dataclass(frozen=True)
 class DeliveryFact:
     """One factual delivery layer; no layer implies another layer."""
 
     kind: str
     occurred_at_utc: str
-    proof: DeliveryEvidence
+    proof: DeliveryEvidence | _LegacyDeliveryProof
     result_ref: str | None = None
     attempt_ref: str | None = None
     lease_id: str | None = None
@@ -591,7 +680,9 @@ class DeliveryFact:
         if self.kind not in DELIVERY_FACT_KINDS:
             raise DeliveryContractViolation("invalid delivery fact kind")
         _utc(self.occurred_at_utc, "delivery fact time")
-        if type(self.proof) is not DeliveryEvidence:
+        if type(self.proof) is _LegacyDeliveryProof:
+            self.proof._consume_decode()
+        elif type(self.proof) is not DeliveryEvidence:
             raise DeliveryContractViolation("delivery fact requires signed evidence")
         if self.proof.layer != _EVIDENCE_LAYER_BY_FACT_KIND[self.kind]:
             raise DeliveryContractViolation("delivery fact evidence layer mismatch")
@@ -650,10 +741,30 @@ class DeliveryFact:
     def replay_identity(self) -> str:
         return self.proof.replay_identity
 
-    def evidence(self) -> DeliveryEvidence:
+    @property
+    def is_legacy_storage_fact(self) -> bool:
+        return type(self.proof) is _LegacyDeliveryProof
+
+    def evidence(self) -> DeliveryEvidence | _LegacyDeliveryProof:
         return self.proof
 
+    def _bind_legacy_storage(self, intent: OutboxIntent) -> None:
+        if type(self.proof) is _LegacyDeliveryProof:
+            self.proof._bind(
+                effect_id=intent.effect_id,
+                generation=intent.route_generation,
+            )
+
     def to_wire(self) -> dict[str, object]:
+        if type(self.proof) is _LegacyDeliveryProof:
+            return {
+                "kind": self.kind,
+                "occurred_at_utc": self.occurred_at_utc,
+                "evidence_ref": self.evidence_ref,
+                "result_ref": self.result_ref,
+                "attempt_ref": self.attempt_ref,
+                "lease_id": self.lease_id,
+            }
         return {
             "kind": self.kind,
             "occurred_at_utc": self.occurred_at_utc,
@@ -665,13 +776,40 @@ class DeliveryFact:
 
     @classmethod
     def from_wire(cls, value: object) -> "DeliveryFact":
-        fields = frozenset(
+        current_fields = frozenset(
             {"kind", "occurred_at_utc", "evidence", "result_ref", "attempt_ref", "lease_id"}
         )
-        if type(value) is not dict or frozenset(value) != fields:
+        legacy_fields = (current_fields - {"evidence"}) | {"evidence_ref"}
+        if type(value) is not dict or frozenset(value) not in {
+            current_fields,
+            legacy_fields,
+        }:
             raise DeliveryContractViolation("invalid delivery fact")
         fields = dict(value)
-        fields["proof"] = DeliveryEvidence.from_storage(fields.pop("evidence"))
+        if frozenset(value) == current_fields:
+            fields["proof"] = DeliveryEvidence.from_storage(fields.pop("evidence"))
+        else:
+            kind = _text(fields["kind"], "delivery fact kind")
+            evidence_ref = _text(
+                fields.pop("evidence_ref"),
+                "delivery fact evidence reference",
+            )
+            replay_identity = (
+                fields["attempt_ref"]
+                if kind == "attempted"
+                else evidence_ref
+                if kind in {"formed", "submitted"}
+                else fields["result_ref"]
+            )
+            fields["proof"] = _LegacyDeliveryProof(
+                layer=_EVIDENCE_LAYER_BY_FACT_KIND.get(kind, ""),
+                evidence_ref=evidence_ref,
+                replay_identity=_text(
+                    replay_identity,
+                    "delivery replay identity",
+                ),
+                token=_LEGACY_DELIVERY_DECODE_TOKEN,
+            )
         return cls(**fields)  # type: ignore[arg-type]
 
 
@@ -753,8 +891,10 @@ class OutboxRecord:
             type(fact) is not DeliveryFact for fact in self.facts
         ):
             raise DeliveryContractViolation("invalid delivery facts")
-        if any(fact.effect_id != self.intent.effect_id for fact in self.facts):
-            raise DeliveryContractViolation("delivery fact effect binding mismatch")
+        for fact in self.facts:
+            fact._bind_legacy_storage(self.intent)
+            if fact.effect_id != self.intent.effect_id:
+                raise DeliveryContractViolation("delivery fact effect binding mismatch")
         kinds = tuple(fact.kind for fact in self.facts)
         if len(kinds) != len(set(kinds)):
             raise DeliveryContractViolation("duplicate delivery fact kind")

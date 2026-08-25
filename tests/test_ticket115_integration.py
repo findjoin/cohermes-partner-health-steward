@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from partner_health_steward.delivery import (
     OwnerDeliveryTransportResult,
     OwnerWeixinDestination,
 )
+from partner_health_steward.health_commands import HealthCommandAuthority
 from partner_health_steward.review import (
     DailyReviewDecision,
     DailyReviewLedger,
@@ -38,6 +40,7 @@ from partner_health_steward.tasks import (
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
+    TaskFailureProof,
     TaskRuntimeState,
 )
 from partner_health_steward.ticket115_contracts import (
@@ -136,6 +139,15 @@ class Ticket115IntegrationTests(unittest.TestCase):
             entrypoint=self.base.policy.entrypoint,
         )
         self._health_command_index = 0
+        self.health_command_authorities = {
+            source: HealthCommandAuthority(source)
+            for source in (
+                "daily_skill_runtime",
+                "health_tasks",
+                "owner_delivery_adapter",
+                "owner_event_admission",
+            )
+        }
         self._restart_core()
 
     def tearDown(self) -> None:
@@ -195,6 +207,9 @@ class Ticket115IntegrationTests(unittest.TestCase):
                     "owner-delivery-adapter.interface",
                     "owner-delivery-adapter.unknown",
                 )
+            ),
+            health_command_authorities=tuple(
+                self.health_command_authorities.values()
             ),
         )
         self.base.core = core
@@ -323,10 +338,24 @@ class Ticket115IntegrationTests(unittest.TestCase):
         *,
         context: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        command_context = self._health_context(action) if context is None else context
+        authority_source = (
+            "daily_skill_runtime"
+            if action == "task.admit"
+            else "owner_delivery_adapter"
+            if action == "delivery.observe"
+            else "owner_event_admission"
+            if action in {
+                "delivery.observe-owner-action",
+                "delivery.authorize-retry",
+            }
+            else "health_tasks"
+        )
         return self.plugin.health_operation(
             action,
             payload,
-            context=self._health_context(action) if context is None else context,
+            context=command_context,
+            authority=self.health_command_authorities[authority_source],
             peer_id=_PEER,
         )
 
@@ -553,6 +582,36 @@ class Ticket115IntegrationTests(unittest.TestCase):
             suffix=":ticket115-review-summary-notification",
         )
 
+    def _revoke_approval(self, approval_id: str, *, suffix: str) -> None:
+        snapshot = self.base.head.read().head
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        command = settings.OwnerControlCommand(
+            context=settings.OwnerCommandContext(
+                command_id="settings-command:ticket115-revoke" + suffix,
+                causal_id="settings-source:ticket115-revoke" + suffix,
+                actor_kind="current_owner",
+                owner_id="owner-A",
+                installation_id="partner-installation",
+                permission="health_settings.write",
+                context_ref="managed-context:ticket115-revoke",
+                generation=snapshot.generation,
+                writer_fence=snapshot.writer_fence,
+            ),
+            control_update=settings.ControlUpdate(
+                control_name="execution_scope_approval",
+                operation="revoke",
+                target_ref=approval_id,
+                generation=snapshot.generation,
+                effective_at_utc="2026-08-24T03:04:00+00:00",
+            ),
+            execution_scope_approval=None,
+        )
+        self._apply_owner_setting(
+            command,
+            expected_version=current.version,
+            suffix=":ticket115-revoke" + suffix,
+        )
+
     def _disable_review_summary(self) -> None:
         snapshot = self.base.head.read().head
         current = self.plugin.owner_settings_state(peer_id=_PEER)
@@ -674,10 +733,15 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(len(outbox.records), 1)
         return outbox.records[0].intent.intent_id
 
-    def _claimed_delivery(self, intent_id: str) -> object:
+    def _claimed_delivery(
+        self,
+        intent_id: str,
+        *,
+        attempted_at_utc: str = _ATTEMPTED_AT,
+    ) -> object:
         prepared = self._effect(
             "owner-delivery.prepare",
-            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+            {"intent_id": intent_id, "attempted_at_utc": attempted_at_utc},
         )
         self.assertEqual(
             prepared["send_intent"]["destination"]["owner_sender_id"],
@@ -763,6 +827,40 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertTrue(resumed.replayed)
         self.assertEqual(resumed.ledger, prepared.ledger)
 
+    def test_same_day_concurrent_review_commands_commit_one_pending_review(self) -> None:
+        generation = self.base.head.read().head.generation
+        contexts = tuple(
+            self._health_context(
+                "review.prepare",
+                causal_id=f"ticket115-concurrent-review:{index}",
+                generation=generation,
+            )
+            for index in range(2)
+        )
+
+        def invoke(context: dict[str, object]) -> object:
+            try:
+                return self._decision(
+                    self._health("review.prepare", {}, context=context)
+                )
+            except Exception as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = tuple(pool.map(invoke, contexts))
+
+        decisions = tuple(
+            result for result in results if type(result) is DailyReviewDecision
+        )
+        failures = tuple(result for result in results if isinstance(result, Exception))
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ProtocolViolation)
+        self.assertIn("generation mismatch", str(failures[0]))
+        ledger = self._review_ledger()
+        self.assertIsNotNone(ledger.pending)
+        self.assertEqual(ledger.version, 1)
+
     def test_restart_rejects_old_holder_phase_solve_and_fail(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
         claim_id, holder_role = self._claim_task(
@@ -808,8 +906,15 @@ class Ticket115IntegrationTests(unittest.TestCase):
             (
                 "task.fail",
                 {
-                    "task_id": task_id,
-                    "failed_at_utc": "2026-08-24T03:02:00+00:00",
+                    "failure_proof": TaskFailureProof.prove(
+                        task,
+                        reason_code="no-reasonable-path",
+                        goal_assessment="goal remains unmet",
+                        acceptance_assessment="acceptance cannot be proved",
+                        authority_assessment="current authority was evaluated",
+                        capability_assessment="no supported capability path remains",
+                        assessed_at_utc="2026-08-24T03:02:00+00:00",
+                    ).to_storage(),
                     "claim_id": claim_id,
                     "holder_role": holder_role,
                 },
@@ -825,7 +930,13 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(self._task_state().task(task_id).primary_label, "active")
 
     def test_task_mutation_advances_current_head_before_local_visibility(self) -> None:
-        candidate, task_id, _ = self._candidate()
+        candidate, task_id, effect_request_id = self._candidate()
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            command_suffix=":mutation-visibility",
+        )
         before = self.base.head.read().head
         self.base.head.set_failure(
             FailureMode.UNKNOWN_AFTER_ADVANCE,
@@ -868,6 +979,86 @@ class Ticket115IntegrationTests(unittest.TestCase):
             self.base.store.finalized_authority(),
             self.base.head.read().head.as_authority(),
         )
+
+    def test_ticket115_prepare_crash_leaves_no_visible_or_pending_business_state(
+        self,
+    ) -> None:
+        candidate, task_id, effect_request_id = self._candidate(
+            suffix="prepare-crash"
+        )
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            approval_id="approval:ticket115-review-summary:prepare-crash",
+            command_suffix=":prepare-crash",
+            purpose=candidate.purpose,
+        )
+        before = self.base.head.read().head
+
+        with patch.object(
+            self.base.store,
+            "prepare_ticket115_mutation",
+            side_effect=RuntimeError("synthetic prepare crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "prepare crash"):
+                self._health(
+                    "task.admit",
+                    {
+                        "candidate": candidate.to_storage(),
+                        "committed_at_utc": _PREPARED_AT,
+                    },
+                )
+
+        self.assertEqual(self.base.head.read().head, before)
+        self.assertIsNone(self.base.store.pending_ticket115_mutation())
+        self.assertEqual(self._task_state().tasks, ())
+
+    def test_ticket115_finalize_crash_recovers_exact_prepared_business_state(
+        self,
+    ) -> None:
+        candidate, task_id, effect_request_id = self._candidate(
+            suffix="finalize-crash"
+        )
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            approval_id="approval:ticket115-review-summary:finalize-crash",
+            command_suffix=":finalize-crash",
+            purpose=candidate.purpose,
+        )
+
+        with patch.object(
+            self.base.store,
+            "finalize_ticket115_mutation",
+            side_effect=StoreUnavailable("synthetic finalize crash"),
+        ):
+            with self.assertRaisesRegex(
+                AuthorityValidationError,
+                "health-state-unavailable",
+            ):
+                self._health(
+                    "task.admit",
+                    {
+                        "candidate": candidate.to_storage(),
+                        "committed_at_utc": _PREPARED_AT,
+                    },
+                )
+
+        pending = self.base.store.pending_ticket115_mutation()
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(
+            self.base.store.record(pending.prepared.target.record_id).state,
+            "committed",
+        )
+        self.assertIsNone(self.base.store.task_runtime())
+
+        self._restart_core()
+
+        self.assertEqual(self._task_state().task(task_id).task_id, task_id)
+        self.assertIsNone(self.base.store.pending_ticket115_mutation())
 
     def test_review_and_outbox_business_commits_each_advance_current_head(
         self,
@@ -1001,6 +1192,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
             self.plugin.health_operation(
                 "review.prepare",
                 {},
+                authority=self.health_command_authorities["health_tasks"],
                 peer_id=_PEER,
             )
 
@@ -1023,6 +1215,160 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.base.head.read().head, before)
         self.assertIsNone(self.base.store.pending_ticket115_mutation())
+
+    def test_adapter_capability_cannot_impersonate_task_command_source(self) -> None:
+        context = self._health_context(
+            "task.claim",
+            source="health_tasks",
+            scope=("task:claim",),
+        )
+
+        with self.assertRaises(ProtocolViolation):
+            self.plugin.health_operation(
+                "task.claim",
+                {
+                    "task_id": "task:forged-adapter-command",
+                    "holder_id": "owner-delivery-adapter",
+                    "lease_id": "claim:forged-adapter-command",
+                    "acquired_at_utc": _PREPARED_AT,
+                },
+                context=context,
+                authority=self.health_command_authorities[
+                    "owner_delivery_adapter"
+                ],
+                peer_id=_PEER,
+            )
+
+    def test_initial_bound_task_requires_current_ticket114_approval(self) -> None:
+        candidate, _, _ = self._candidate(suffix="missing-current-approval")
+
+        with self.assertRaisesRegex(
+            TaskContractViolation,
+            "task approval is not current and exact",
+        ):
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+
+        self.assertEqual(self._task_state().tasks, ())
+
+    def test_initial_bound_task_accepts_exact_current_ticket114_approval(self) -> None:
+        candidate, task_id, effect_request_id = self._candidate(
+            suffix="exact-current-approval"
+        )
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            approval_id="approval:ticket115-review-summary:exact-current-approval",
+            command_suffix=":exact-current-approval",
+            purpose=candidate.purpose,
+        )
+
+        transition = self._transition(
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+        )
+
+        self.assertEqual(transition.task_id, task_id)
+        self.assertEqual(self._task_state().task(task_id).approval.status, "bound")
+
+    def test_initial_bound_task_rejects_old_approval_version(self) -> None:
+        candidate, task_id, effect_request_id = self._candidate(
+            suffix="old-current-approval",
+        )
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=current.version,
+            approval_id="approval:ticket115-review-summary:old-current-approval",
+            command_suffix=":old-current-approval",
+            purpose=(
+                "send one owner-approved daily review summary for "
+                "old-current-approval"
+            ),
+        )
+        candidate = replace(
+            candidate,
+            approval=TaskApprovalBinding.bound(
+                "approval:ticket115-review-summary:old-current-approval",
+                2,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            TaskContractViolation,
+            "task approval is not current and exact",
+        ):
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+
+        self.assertEqual(self._task_state().tasks, ())
+
+    def test_initial_bound_task_rejects_revoked_current_approval(self) -> None:
+        candidate, task_id, effect_request_id = self._candidate(
+            suffix="revoked-current-approval"
+        )
+        approval_id = "approval:ticket115-review-summary:revoked-current-approval"
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            approval_id=approval_id,
+            command_suffix=":revoked-current-approval",
+            purpose=candidate.purpose,
+        )
+        self._revoke_approval(approval_id, suffix=":initial")
+
+        with self.assertRaisesRegex(
+            TaskContractViolation,
+            "task approval is not current and exact",
+        ):
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+
+        self.assertEqual(self._task_state().tasks, ())
+
+    def test_task_adjust_rejects_scope_expansion_flag_bypass(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        expanded, _, _ = self._candidate(suffix="scope-flag-bypass")
+
+        with self.assertRaisesRegex(
+            TaskContractViolation,
+            "scope expansion flag does not match semantic change",
+        ):
+            self._health(
+                "task.adjust",
+                {
+                    "task_id": task_id,
+                    "candidate": expanded.to_storage(),
+                    "adjusted_at_utc": "2026-08-24T03:01:00+00:00",
+                    "scope_expanded": False,
+                    "requested_approval": None,
+                },
+            )
+
+        self.assertEqual(self._task_state().task(task_id).version, 1)
 
     def test_health_command_source_scope_and_generation_are_exact(self) -> None:
         before = self.base.head.read().head
@@ -1211,6 +1557,12 @@ class Ticket115IntegrationTests(unittest.TestCase):
                     candidate, _, _ = self._candidate(
                         suffix="interleaved-generation-change"
                     )
+                    candidate = replace(
+                        candidate,
+                        expected_result_kind="internal-result",
+                        external_boundary=TaskExternalBoundary.internal_only(),
+                        approval=TaskApprovalBinding.not_required(),
+                    )
                     self._health(
                         "task.admit",
                         {
@@ -1242,7 +1594,13 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(len(task_state.tasks), 2)
 
     def test_health_command_unknown_cas_recovers_exact_causal_owner(self) -> None:
-        candidate, task_id, _ = self._candidate()
+        candidate, task_id, effect_request_id = self._candidate()
+        self._configure_approval(
+            task_id,
+            effect_request_id,
+            expected_version=self.plugin.owner_settings_state(peer_id=_PEER).version,
+            command_suffix=":unknown-cas",
+        )
         before = self.base.head.read().head
         context = self._health_context(
             "task.admit",
@@ -1821,7 +2179,23 @@ class Ticket115IntegrationTests(unittest.TestCase):
         )
         record = self._outbox().record(intent_id)
         attempted = record.fact("attempted")
-        result_ref = "owner-event:admitted:actual-action"
+        source_causal_id = "owner-event:admitted:actual-action"
+        self.base.route_classification = "health"
+        owner_event = self.plugin.receive_weixin(
+            self.base._message(
+                ticket114_integration.CountingBody("我已按提醒完成行动"),
+                causal_id=source_causal_id,
+                generation=self.base.head.read().head.generation,
+                requested_capability="health-steward",
+                message_id="wx:ticket115:actual-action",
+                protocol_timestamp="2026-08-24T11:07:59+08:00",
+                received_at="2026-08-24T11:08:00+08:00",
+                native_cursor="cursor:ticket115:actual-action",
+            ),
+            peer_id=_PEER,
+        )
+        self.assertEqual(owner_event.status, "accepted", owner_event)
+        result_ref = source_causal_id
         evidence_ref = "owner-event:evidence:actual-action"
         valid_evidence = self._delivery_evidence(
             intent_id,
@@ -1831,6 +2205,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
         )
         payload = {
             "intent_id": intent_id,
+            "source_causal_id": source_causal_id,
             "attempt_ref": attempted.attempt_ref,
             "result_ref": result_ref,
             "evidence_ref": evidence_ref,
@@ -1888,6 +2263,11 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(fact.producer_contract, "owner.admitted-event")
         self.assertEqual(fact.result_ref, result_ref)
         self.assertEqual(self._task_state().task(task_id).primary_label, "active")
+        with self.assertRaisesRegex(
+            DeliveryContractViolation,
+            "fresh admitted owner event",
+        ):
+            self._health("delivery.observe-owner-action", payload)
 
     def test_adapter_exception_freezes_unknown_until_independent_delivery(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
@@ -1946,6 +2326,109 @@ class Ticket115IntegrationTests(unittest.TestCase):
             .result_ref,
             transport_result.result_ref,
         )
+
+    def test_owner_event_authorizes_one_new_attempt_after_unknown(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": intent_id,
+                "attempted_at_utc": _ATTEMPTED_AT,
+                "observed_at_utc": "2026-08-24T03:05:01+00:00",
+            },
+            grant=grant,
+            transport=_RaisingAdapter(),
+        )
+        source_causal_id = "owner-event:authorize-ticket115-retry"
+        owner_event = self.base._message(
+            ticket114_integration.CountingBody("我知情接受重复风险，请再尝试一次"),
+            causal_id=source_causal_id,
+            generation=self.base.head.read().head.generation,
+            requested_capability="health-steward",
+            message_id="wx:ticket115:authorize-retry",
+            protocol_timestamp="2026-08-24T11:09:59+08:00",
+            received_at="2026-08-24T11:10:00+08:00",
+            native_cursor="cursor:ticket115:authorize-retry",
+        )
+        authorized = self.plugin.owner_authorized_delivery_retry(
+            owner_event,
+            intent_id,
+            authority=self.health_command_authorities["owner_event_admission"],
+            peer_id=_PEER,
+        )
+        receipt = self.base.store.source_receipt(source_causal_id)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.managed_cursor_state, "recording-excluded")
+
+        retry_intent_id = authorized["intent_id"]
+        self.assertNotEqual(retry_intent_id, intent_id)
+        old_record = self._outbox().record(intent_id)
+        retry_record = self._outbox().record(retry_intent_id)
+        self.assertEqual(old_record.current_layer, "unknown")
+        self.assertNotEqual(
+            retry_record.intent.effect_id,
+            old_record.intent.effect_id,
+        )
+        self.assertNotEqual(
+            retry_record.intent.idempotency_key,
+            old_record.intent.idempotency_key,
+        )
+        resolved = next(
+            fact
+            for fact in self._task_state().unknown_facts
+            if fact.effect_ref == intent_id
+        )
+        self.assertEqual(resolved.resolution, "owner-authorized-new-attempt")
+        self.assertEqual(resolved.resolution_ref, source_causal_id)
+
+        self.base.owner_clock_value = datetime.fromisoformat(
+            "2026-08-24T03:11:00+00:00"
+        )
+        retry_grant = self._claimed_delivery(
+            retry_intent_id,
+            attempted_at_utc="2026-08-24T03:11:00+00:00",
+        )
+        adapter = _RecordingAdapter(self.base.store)
+        completed = self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": retry_intent_id,
+                "attempted_at_utc": "2026-08-24T03:11:00+00:00",
+                "observed_at_utc": "2026-08-24T03:11:01+00:00",
+            },
+            grant=retry_grant,
+            transport=adapter,
+        )
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(
+            OwnerDeliveryTransportResult.from_wire(
+                completed["transport_result"]
+            ).status,
+            "accepted",
+        )
+        with self.assertRaisesRegex(
+            DeliveryContractViolation,
+            "fresh admitted owner decision",
+        ):
+            self.plugin.owner_authorized_delivery_retry(
+                self.base._message(
+                    ticket114_integration.CountingBody("请再试一次"),
+                    causal_id="owner-event:second-ticket115-retry",
+                    generation=self.base.head.read().head.generation,
+                    requested_capability="health-steward",
+                    message_id="wx:ticket115:second-authorize-retry",
+                    protocol_timestamp="2026-08-24T11:11:59+08:00",
+                    received_at="2026-08-24T11:12:00+08:00",
+                    native_cursor="cursor:ticket115:second-authorize-retry",
+                ),
+                intent_id,
+                authority=self.health_command_authorities[
+                    "owner_event_admission"
+                ],
+                peer_id=_PEER,
+            )
 
     def test_restart_recovers_orphan_attempt_without_replaying_transport(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
@@ -2311,10 +2794,11 @@ class Ticket115IntegrationTests(unittest.TestCase):
     def test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault(self) -> None:
         initial = self.plugin.business_status(peer_id=_PEER).projection
         self.assertTrue(
-            {"tasks", "daily_review", "delivery"}.isdisjoint(
+            {"tasks", "delivery"}.isdisjoint(
                 initial.affected_core_domains
             )
         )
+        self.assertIn("daily_review", initial.affected_core_domains)
         task_id, effect_request_id = self._admit_review_task()
         intent_id = self._commit_review_outbox(task_id, effect_request_id)
         grant = self._claimed_delivery(intent_id)
@@ -2333,6 +2817,39 @@ class Ticket115IntegrationTests(unittest.TestCase):
             )
         )
         self.assertIn("delivery", unknown.isolated_noncore_domains)
+
+    def test_business_status_marks_missing_current_local_day_review_unknown(self) -> None:
+        self.base.status_clock_value = datetime.fromisoformat(_PREPARED_AT)
+
+        projection = self.plugin.business_status(peer_id=_PEER).projection
+
+        self.assertEqual(projection.state, "cannot-confirm")
+        self.assertIn("daily_review", projection.affected_core_domains)
+        self.assertIn(
+            "daily_review:health-core.status.daily_review:unknown",
+            projection.reason_codes,
+        )
+
+    def test_business_status_recovers_after_current_local_day_review(self) -> None:
+        self.base.status_clock_value = datetime.fromisoformat(_PREPARED_AT)
+        missing = self.plugin.business_status(peer_id=_PEER).projection
+        self.assertIn("daily_review", missing.affected_core_domains)
+        prepared = self._wake_review(_PREPARED_AT)
+        completed_at = "2026-08-24T03:01:00+00:00"
+        self.base.owner_clock_value = datetime.fromisoformat(completed_at)
+        self._health(
+            "review.commit",
+            {"decision": self._decision_wire(prepared)},
+        )
+        self.base.status_clock_value = datetime.fromisoformat(completed_at)
+
+        projection = self.plugin.business_status(peer_id=_PEER).projection
+
+        self.assertEqual(projection.state, "cannot-confirm")
+        self.assertNotIn("daily_review", projection.affected_core_domains)
+        self.assertFalse(
+            any(reason.startswith("daily_review:") for reason in projection.reason_codes)
+        )
 
     def test_delivery_gap_remains_ancillary_to_the_four_task_labels(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
@@ -2528,12 +3045,35 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self._health(
             "task.fail",
             {
-                "task_id": capability_task_id,
-                "failed_at_utc": "2026-08-24T03:02:00+00:00",
+                "failure_proof": TaskFailureProof.prove(
+                    self._task_state().task(capability_task_id),
+                    reason_code="capability-gap",
+                    goal_assessment="goal remains unmet",
+                    acceptance_assessment="acceptance cannot be proved",
+                    authority_assessment="current authority permits assessment only",
+                    capability_assessment="required capability is unavailable",
+                    assessed_at_utc="2026-08-24T03:02:00+00:00",
+                ).to_storage(),
                 "claim_id": claim_id,
                 "holder_role": holder_role,
             },
         )
+
+        request_kinds_before_status = {
+            request.kind
+            for request in self.store.mandatory_delivery_ledger().requests
+        }
+        intent_kinds_before_status = {
+            record.intent.mandatory_request_kind
+            for record in self._outbox().records
+            if record.intent.mandatory_request_kind is not None
+        }
+        self.assertTrue(
+            {"authorization-request", "capability-gap"}.issubset(
+                request_kinds_before_status
+            )
+        )
+        self.assertEqual(intent_kinds_before_status, request_kinds_before_status)
 
         business = self.plugin.business_status(peer_id=_PEER)
 
@@ -2552,6 +3092,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
             )
         )
         self.assertEqual(intent_kinds, request_kinds)
+        self.assertEqual(request_kinds, request_kinds_before_status)
         self.assertEqual(business.projection.state, "abnormal")
         self.assertIn("tasks", business.projection.affected_core_domains)
 
@@ -2667,7 +3208,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
             with self.subTest(action=action):
                 with self.assertRaisesRegex(
                     ProtocolViolation,
-                    "health-command-authority-denied",
+                    "invalid trusted health command",
                 ):
                     self._health(
                         action,
@@ -2736,9 +3277,15 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self._health(
             "task.fail",
             {
-                "task_id": task_id,
-                "failed_at_utc": "2026-08-24T03:02:00+00:00",
-                "reason_code": "owner-cancellation-test-terminal",
+                "failure_proof": TaskFailureProof.prove(
+                    self._task_state().task(task_id),
+                    reason_code="owner-cancellation-test-terminal",
+                    goal_assessment="goal remains unmet",
+                    acceptance_assessment="acceptance cannot be proved",
+                    authority_assessment="current authority was evaluated",
+                    capability_assessment="no supported completion path remains",
+                    assessed_at_utc="2026-08-24T03:02:00+00:00",
+                ).to_storage(),
                 "claim_id": claim_id,
                 "holder_role": holder_role,
             },

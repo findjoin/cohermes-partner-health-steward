@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 from .initialization import stable_digest
@@ -320,6 +320,29 @@ def _semantic_digest(
     )
 
 
+def _legacy_semantic_digest(
+    *,
+    purpose: str,
+    expected_result: str,
+    assignee: str,
+    allowed_data_categories: tuple[str, ...],
+    allowed_data_refs: tuple[str, ...],
+    external_boundary: TaskExternalBoundary,
+    acceptance_criteria: tuple[str, ...],
+) -> str:
+    return stable_digest(
+        {
+            "purpose": purpose,
+            "expected_result": expected_result,
+            "assignee": assignee,
+            "allowed_data_categories": list(allowed_data_categories),
+            "allowed_data_refs": list(allowed_data_refs),
+            "external_boundary": external_boundary.to_storage(),
+            "acceptance_criteria": list(acceptance_criteria),
+        }
+    )
+
+
 @dataclass(frozen=True)
 class TaskCandidate:
     """A non-authoritative task proposal from an allowed product source."""
@@ -338,6 +361,7 @@ class TaskCandidate:
     phase: str
     approval: TaskApprovalBinding
     acceptance_criteria: tuple[str, ...]
+    _legacy_result_kind: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         _text(self.candidate_id, "task candidate identifier")
@@ -362,6 +386,16 @@ class TaskCandidate:
 
     @property
     def semantic_digest(self) -> str:
+        if self._legacy_result_kind:
+            return _legacy_semantic_digest(
+                purpose=self.purpose,
+                expected_result=self.expected_result,
+                assignee=self.assignee,
+                allowed_data_categories=self.allowed_data_categories,
+                allowed_data_refs=self.allowed_data_refs,
+                external_boundary=self.external_boundary,
+                acceptance_criteria=self.acceptance_criteria,
+            )
         return _semantic_digest(
             purpose=self.purpose,
             expected_result=self.expected_result,
@@ -374,7 +408,7 @@ class TaskCandidate:
         )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "candidate_id": self.candidate_id,
             "source_kind": self.source_kind,
             "source_ref": self.source_ref,
@@ -390,13 +424,14 @@ class TaskCandidate:
             "approval": self.approval.to_storage(),
             "acceptance_criteria": list(self.acceptance_criteria),
         }
+        if self._legacy_result_kind:
+            stored.pop("expected_result_kind")
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskCandidate":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
+        fields = frozenset(
+            {
                     "candidate_id",
                     "source_kind",
                     "source_ref",
@@ -411,10 +446,15 @@ class TaskCandidate:
                     "phase",
                     "approval",
                     "acceptance_criteria",
-                }
-            ),
-            "task candidate",
+            }
         )
+        if type(value) is not dict or frozenset(value) not in {
+            fields,
+            fields - {"expected_result_kind"},
+        }:
+            raise TaskContractViolation("invalid task candidate")
+        stored = value
+        legacy_result_kind = "expected_result_kind" not in stored
         return cls(
             candidate_id=_text(stored["candidate_id"], "task candidate identifier"),
             source_kind=_text(stored["source_kind"], "task candidate source"),
@@ -426,8 +466,12 @@ class TaskCandidate:
             expected_result=_text(
                 stored["expected_result"], "task expected result"
             ),
-            expected_result_kind=_text(
-                stored["expected_result_kind"], "task expected result kind"
+            expected_result_kind=(
+                "internal-result"
+                if legacy_result_kind
+                else _text(
+                    stored["expected_result_kind"], "task expected result kind"
+                )
             ),
             assignee=_text(stored["assignee"], "task assignee"),
             allowed_data_categories=_wire_texts(
@@ -444,6 +488,198 @@ class TaskCandidate:
             acceptance_criteria=_wire_texts(
                 stored["acceptance_criteria"], "task acceptance criteria"
             ),
+            _legacy_result_kind=legacy_result_kind,
+        )
+
+
+@dataclass(frozen=True)
+class TaskFailureProof:
+    """Typed assessment proving why the current task has no valid completion path."""
+
+    task_id: str
+    task_version: int
+    task_semantic_digest: str
+    reason_code: str
+    goal_assessment: str
+    acceptance_assessment: str
+    authority_assessment: str
+    capability_assessment: str
+    evidence_refs: tuple[str, ...]
+    evidence_revision_digests: tuple[str, ...]
+    assessed_at_utc: str
+    result_digest: str
+
+    def __post_init__(self) -> None:
+        _text(self.task_id, "task failure task identifier")
+        _positive_integer(self.task_version, "task failure task version")
+        _sha256(self.task_semantic_digest, "task failure semantic digest")
+        for value, name in (
+            (self.reason_code, "task failure reason"),
+            (self.goal_assessment, "task failure goal assessment"),
+            (self.acceptance_assessment, "task failure acceptance assessment"),
+            (self.authority_assessment, "task failure authority assessment"),
+            (self.capability_assessment, "task failure capability assessment"),
+        ):
+            _text(value, name)
+        refs = _tuple_texts(
+            self.evidence_refs,
+            "task failure evidence reference",
+            allow_empty=True,
+            ordered=True,
+        )
+        if type(self.evidence_revision_digests) is not tuple:
+            raise TaskContractViolation("invalid task failure evidence revisions")
+        revisions = tuple(
+            _sha256(value, "task failure evidence revision")
+            for value in self.evidence_revision_digests
+        )
+        if len(refs) != len(revisions):
+            raise TaskContractViolation(
+                "task failure evidence and revisions must align"
+            )
+        assessed_at = _utc_time(self.assessed_at_utc, "task failure assessment time")
+        expected = stable_digest(
+            {
+                "contract": "task-failure-proof-v1",
+                "task_id": self.task_id,
+                "task_version": self.task_version,
+                "task_semantic_digest": self.task_semantic_digest,
+                "reason_code": self.reason_code,
+                "goal_assessment": self.goal_assessment,
+                "acceptance_assessment": self.acceptance_assessment,
+                "authority_assessment": self.authority_assessment,
+                "capability_assessment": self.capability_assessment,
+                "evidence_refs": list(refs),
+                "evidence_revision_digests": list(revisions),
+                "assessed_at_utc": assessed_at,
+            }
+        )
+        if _sha256(self.result_digest, "task failure result digest") != expected:
+            raise TaskContractViolation("task failure result digest mismatch")
+
+    @classmethod
+    def prove(
+        cls,
+        task: "ManagedTask",
+        *,
+        reason_code: str,
+        goal_assessment: str,
+        acceptance_assessment: str,
+        authority_assessment: str,
+        capability_assessment: str,
+        assessed_at_utc: str,
+        evidence_refs: tuple[str, ...] = (),
+        evidence_revision_digests: tuple[str, ...] = (),
+    ) -> "TaskFailureProof":
+        if type(task) is not ManagedTask:
+            raise TaskContractViolation("invalid task failure target")
+        material = {
+            "contract": "task-failure-proof-v1",
+            "task_id": task.task_id,
+            "task_version": task.version,
+            "task_semantic_digest": task.semantic_digest,
+            "reason_code": reason_code,
+            "goal_assessment": goal_assessment,
+            "acceptance_assessment": acceptance_assessment,
+            "authority_assessment": authority_assessment,
+            "capability_assessment": capability_assessment,
+            "evidence_refs": list(evidence_refs),
+            "evidence_revision_digests": list(evidence_revision_digests),
+            "assessed_at_utc": assessed_at_utc,
+        }
+        return cls(
+            task_id=task.task_id,
+            task_version=task.version,
+            task_semantic_digest=task.semantic_digest,
+            reason_code=reason_code,
+            goal_assessment=goal_assessment,
+            acceptance_assessment=acceptance_assessment,
+            authority_assessment=authority_assessment,
+            capability_assessment=capability_assessment,
+            evidence_refs=evidence_refs,
+            evidence_revision_digests=evidence_revision_digests,
+            assessed_at_utc=assessed_at_utc,
+            result_digest=stable_digest(material),
+        )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "task_version": self.task_version,
+            "task_semantic_digest": self.task_semantic_digest,
+            "reason_code": self.reason_code,
+            "goal_assessment": self.goal_assessment,
+            "acceptance_assessment": self.acceptance_assessment,
+            "authority_assessment": self.authority_assessment,
+            "capability_assessment": self.capability_assessment,
+            "evidence_refs": list(self.evidence_refs),
+            "evidence_revision_digests": list(self.evidence_revision_digests),
+            "assessed_at_utc": self.assessed_at_utc,
+            "result_digest": self.result_digest,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "TaskFailureProof":
+        fields = frozenset(
+            {
+                "task_id",
+                "task_version",
+                "task_semantic_digest",
+                "reason_code",
+                "goal_assessment",
+                "acceptance_assessment",
+                "authority_assessment",
+                "capability_assessment",
+                "evidence_refs",
+                "evidence_revision_digests",
+                "assessed_at_utc",
+                "result_digest",
+            }
+        )
+        stored = _mapping(value, fields, "task failure proof")
+        revisions = stored["evidence_revision_digests"]
+        if type(revisions) is not list:
+            raise TaskContractViolation("invalid task failure evidence revisions")
+        return cls(
+            task_id=_text(stored["task_id"], "task failure task identifier"),
+            task_version=_positive_integer(
+                stored["task_version"], "task failure task version"
+            ),
+            task_semantic_digest=_sha256(
+                stored["task_semantic_digest"], "task failure semantic digest"
+            ),
+            reason_code=_text(stored["reason_code"], "task failure reason"),
+            goal_assessment=_text(
+                stored["goal_assessment"], "task failure goal assessment"
+            ),
+            acceptance_assessment=_text(
+                stored["acceptance_assessment"],
+                "task failure acceptance assessment",
+            ),
+            authority_assessment=_text(
+                stored["authority_assessment"],
+                "task failure authority assessment",
+            ),
+            capability_assessment=_text(
+                stored["capability_assessment"],
+                "task failure capability assessment",
+            ),
+            evidence_refs=_wire_texts(
+                stored["evidence_refs"],
+                "task failure evidence reference",
+                allow_empty=True,
+                ordered=True,
+            ),
+            evidence_revision_digests=tuple(
+                _sha256(value, "task failure evidence revision")
+                for value in revisions
+            ),
+            assessed_at_utc=_utc_time(
+                stored["assessed_at_utc"], "task failure assessment time"
+            ),
+            result_digest=_sha256(
+                stored["result_digest"], "task failure result digest"
+            ),
         )
 
 
@@ -455,6 +691,8 @@ class TaskTerminalFact:
     result_digest: str | None
     recorded_at_utc: str
     acceptance: TaskAcceptance | None = None
+    failure_proof: TaskFailureProof | None = None
+    _legacy_failure_proof: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.primary_label) is not str or self.primary_label not in {
@@ -486,6 +724,24 @@ class TaskTerminalFact:
                 raise TaskContractViolation(
                     "task terminal acceptance proof mismatch"
                 )
+            if self.failure_proof is not None:
+                raise TaskContractViolation("solved task cannot carry a failure proof")
+        elif self.primary_label == "failed":
+            if self.acceptance is not None:
+                raise TaskContractViolation(
+                    "failed task cannot carry an acceptance proof"
+                )
+            if self.failure_proof is None:
+                if not self._legacy_failure_proof:
+                    raise TaskContractViolation("failed task requires a failure proof")
+            elif (
+                type(self.failure_proof) is not TaskFailureProof
+                or self.failure_proof.reason_code != self.reason_code
+                or self.failure_proof.evidence_refs != self.evidence_refs
+                or self.failure_proof.result_digest != self.result_digest
+                or self.failure_proof.assessed_at_utc != self.recorded_at_utc
+            ):
+                raise TaskContractViolation("task terminal failure proof mismatch")
         else:
             if self.result_digest is not None:
                 _sha256(self.result_digest, "task terminal result digest")
@@ -493,10 +749,14 @@ class TaskTerminalFact:
                 raise TaskContractViolation(
                     "non-solved task cannot carry an acceptance proof"
                 )
+            if self.failure_proof is not None:
+                raise TaskContractViolation(
+                    "cancelled task cannot carry a failure proof"
+                )
         _utc_time(self.recorded_at_utc, "task terminal time")
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "primary_label": self.primary_label,
             "reason_code": self.reason_code,
             "evidence_refs": list(self.evidence_refs),
@@ -505,23 +765,37 @@ class TaskTerminalFact:
             "acceptance": (
                 None if self.acceptance is None else self.acceptance.to_storage()
             ),
+            "failure_proof": (
+                None
+                if self.failure_proof is None
+                else self.failure_proof.to_storage()
+            ),
         }
+        if self._legacy_failure_proof:
+            stored.pop("failure_proof")
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskTerminalFact":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
+        fields = frozenset(
+            {
                     "primary_label",
                     "reason_code",
                     "evidence_refs",
                     "result_digest",
                     "recorded_at_utc",
                     "acceptance",
-                }
-            ),
-            "task terminal fact",
+                    "failure_proof",
+            }
+        )
+        if type(value) is not dict or frozenset(value) not in {
+            fields,
+            fields - {"failure_proof"},
+        }:
+            raise TaskContractViolation("invalid task terminal fact")
+        stored = value
+        legacy_failure = (
+            stored["primary_label"] == "failed" and "failure_proof" not in stored
         )
         result_digest = stored["result_digest"]
         if result_digest is not None:
@@ -544,6 +818,12 @@ class TaskTerminalFact:
                 if stored["acceptance"] is None
                 else TaskAcceptance.from_storage(stored["acceptance"])
             ),
+            failure_proof=(
+                None
+                if stored.get("failure_proof") is None
+                else TaskFailureProof.from_storage(stored["failure_proof"])
+            ),
+            _legacy_failure_proof=legacy_failure,
         )
 
 
@@ -571,6 +851,7 @@ class ManagedTask:
     terminal_fact: TaskTerminalFact | None
     created_at_utc: str
     updated_at_utc: str
+    _legacy_result_kind: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         _text(self.task_id, "task identifier")
@@ -656,6 +937,16 @@ class ManagedTask:
                     raise TaskContractViolation(
                         "task terminal acceptance does not bind solved task"
                     )
+            elif self.primary_label == "failed":
+                failure = self.terminal_fact.failure_proof
+                if failure is not None and (
+                    failure.task_id != self.task_id
+                    or failure.task_version >= self.version
+                    or failure.task_semantic_digest != self.semantic_digest
+                ):
+                    raise TaskContractViolation(
+                        "task terminal failure does not bind failed task"
+                    )
         created = datetime.fromisoformat(_utc_time(self.created_at_utc, "task creation time"))
         updated = datetime.fromisoformat(_utc_time(self.updated_at_utc, "task update time"))
         if updated < created:
@@ -664,21 +955,32 @@ class ManagedTask:
             self.terminal_fact.recorded_at_utc
         ) > updated:
             raise TaskContractViolation("task terminal time exceeds task update time")
-        expected_digest = _semantic_digest(
-            purpose=self.purpose,
-            expected_result=self.expected_result,
-            expected_result_kind=self.expected_result_kind,
-            assignee=self.assignee,
-            allowed_data_categories=self.allowed_data_categories,
-            allowed_data_refs=self.allowed_data_refs,
-            external_boundary=self.external_boundary,
-            acceptance_criteria=self.acceptance_criteria,
-        )
+        if self._legacy_result_kind:
+            expected_digest = _legacy_semantic_digest(
+                purpose=self.purpose,
+                expected_result=self.expected_result,
+                assignee=self.assignee,
+                allowed_data_categories=self.allowed_data_categories,
+                allowed_data_refs=self.allowed_data_refs,
+                external_boundary=self.external_boundary,
+                acceptance_criteria=self.acceptance_criteria,
+            )
+        else:
+            expected_digest = _semantic_digest(
+                purpose=self.purpose,
+                expected_result=self.expected_result,
+                expected_result_kind=self.expected_result_kind,
+                assignee=self.assignee,
+                allowed_data_categories=self.allowed_data_categories,
+                allowed_data_refs=self.allowed_data_refs,
+                external_boundary=self.external_boundary,
+                acceptance_criteria=self.acceptance_criteria,
+            )
         if self.semantic_digest != expected_digest:
             raise TaskContractViolation("task semantic digest mismatch")
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "task_id": self.task_id,
             "version": self.version,
             "purpose": self.purpose,
@@ -704,13 +1006,14 @@ class ManagedTask:
             "created_at_utc": self.created_at_utc,
             "updated_at_utc": self.updated_at_utc,
         }
+        if self._legacy_result_kind:
+            stored.pop("expected_result_kind")
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "ManagedTask":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
+        fields = frozenset(
+            {
                     "task_id",
                     "version",
                     "purpose",
@@ -733,10 +1036,15 @@ class ManagedTask:
                     "terminal_fact",
                     "created_at_utc",
                     "updated_at_utc",
-                }
-            ),
-            "managed task",
+            }
         )
+        if type(value) is not dict or frozenset(value) not in {
+            fields,
+            fields - {"expected_result_kind"},
+        }:
+            raise TaskContractViolation("invalid managed task")
+        stored = value
+        legacy_result_kind = "expected_result_kind" not in stored
         revisions = stored["source_revision_digests"]
         if type(revisions) is not list or not revisions:
             raise TaskContractViolation("invalid task source revisions")
@@ -751,8 +1059,12 @@ class ManagedTask:
             expected_result=_text(
                 stored["expected_result"], "task expected result"
             ),
-            expected_result_kind=_text(
-                stored["expected_result_kind"], "task expected result kind"
+            expected_result_kind=(
+                "internal-result"
+                if legacy_result_kind
+                else _text(
+                    stored["expected_result_kind"], "task expected result kind"
+                )
             ),
             assignee=_text(stored["assignee"], "task assignee"),
             allowed_data_categories=_wire_texts(
@@ -799,6 +1111,7 @@ class ManagedTask:
             ),
             created_at_utc=_utc_time(stored["created_at_utc"], "task creation time"),
             updated_at_utc=_utc_time(stored["updated_at_utc"], "task update time"),
+            _legacy_result_kind=legacy_result_kind,
         )
 
 
@@ -827,6 +1140,7 @@ class TaskAcceptanceCriterionProof:
     result_status: str
     evidence_refs: tuple[str, ...]
     evidence_revision_digests: tuple[str, ...]
+    _legacy_result_type: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         _text(self.criterion, "task acceptance criterion")
@@ -857,7 +1171,7 @@ class TaskAcceptanceCriterionProof:
             )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "criterion": self.criterion,
             "result_kind": self.result_kind,
             "result_status": self.result_status,
@@ -866,22 +1180,30 @@ class TaskAcceptanceCriterionProof:
                 self.evidence_revision_digests
             ),
         }
+        if self._legacy_result_type:
+            stored.pop("result_kind")
+            stored.pop("result_status")
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskAcceptanceCriterionProof":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
+        fields = frozenset(
+            {
                     "criterion",
                     "result_kind",
                     "result_status",
                     "evidence_refs",
                     "evidence_revision_digests",
-                }
-            ),
-            "task acceptance criterion proof",
+            }
         )
+        legacy_fields = fields - {"result_kind", "result_status"}
+        if type(value) is not dict or frozenset(value) not in {
+            fields,
+            legacy_fields,
+        }:
+            raise TaskContractViolation("invalid task acceptance criterion proof")
+        stored = value
+        legacy_result_type = frozenset(stored) == legacy_fields
         revisions = stored["evidence_revision_digests"]
         if type(revisions) is not list:
             raise TaskContractViolation(
@@ -891,11 +1213,17 @@ class TaskAcceptanceCriterionProof:
             criterion=_text(
                 stored["criterion"], "task acceptance criterion"
             ),
-            result_kind=_text(
-                stored["result_kind"], "task acceptance result kind"
+            result_kind=(
+                "internal-result"
+                if legacy_result_type
+                else _text(stored["result_kind"], "task acceptance result kind")
             ),
-            result_status=_text(
-                stored["result_status"], "task acceptance result status"
+            result_status=(
+                "completed"
+                if legacy_result_type
+                else _text(
+                    stored["result_status"], "task acceptance result status"
+                )
             ),
             evidence_refs=_wire_texts(
                 stored["evidence_refs"],
@@ -905,6 +1233,7 @@ class TaskAcceptanceCriterionProof:
                 _sha256(digest, "task acceptance evidence revision")
                 for digest in revisions
             ),
+            _legacy_result_type=legacy_result_type,
         )
 
 
@@ -1171,6 +1500,7 @@ class TaskUnknownFact:
     possibly_external: bool
     resolution: str | None = None
     resolved_at_utc: str | None = None
+    resolution_ref: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.unknown_id, "task unknown identifier")
@@ -1180,7 +1510,7 @@ class TaskUnknownFact:
         _utc_time(self.observed_at_utc, "task unknown observation time")
         _boolean(self.possibly_external, "task unknown external-effect flag")
         if self.resolution is None:
-            if self.resolved_at_utc is not None:
+            if self.resolved_at_utc is not None or self.resolution_ref is not None:
                 raise TaskContractViolation("unresolved task unknown cannot have a resolution time")
         else:
             if self.resolution not in TASK_UNKNOWN_RESOLUTIONS:
@@ -1188,13 +1518,19 @@ class TaskUnknownFact:
             if self.resolved_at_utc is None:
                 raise TaskContractViolation("resolved task unknown requires a resolution time")
             _utc_time(self.resolved_at_utc, "task unknown resolution time")
+            if self.resolution == "owner-authorized-new-attempt":
+                _text(self.resolution_ref, "task unknown owner resolution reference")
+            elif self.resolution_ref is not None:
+                raise TaskContractViolation(
+                    "non-owner task unknown resolution cannot carry an authority reference"
+                )
 
     @property
     def unresolved(self) -> bool:
         return self.resolution is None
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "unknown_id": self.unknown_id,
             "task_id": self.task_id,
             "effect_ref": self.effect_ref,
@@ -1204,13 +1540,14 @@ class TaskUnknownFact:
             "resolution": self.resolution,
             "resolved_at_utc": self.resolved_at_utc,
         }
+        if self.resolution_ref is not None:
+            stored["resolution_ref"] = self.resolution_ref
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskUnknownFact":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
+        fields = frozenset(
+            {
                     "unknown_id",
                     "task_id",
                     "effect_ref",
@@ -1219,10 +1556,14 @@ class TaskUnknownFact:
                     "possibly_external",
                     "resolution",
                     "resolved_at_utc",
-                }
-            ),
-            "task unknown fact",
+            }
         )
+        if type(value) is not dict or frozenset(value) not in {
+            fields,
+            fields | {"resolution_ref"},
+        }:
+            raise TaskContractViolation("invalid task unknown fact")
+        stored = value
         return cls(
             unknown_id=_text(stored["unknown_id"], "task unknown identifier"),
             task_id=_text(stored["task_id"], "task unknown task identifier"),
@@ -1243,6 +1584,10 @@ class TaskUnknownFact:
                 else _utc_time(
                     stored["resolved_at_utc"], "task unknown resolution time"
                 )
+            ),
+            resolution_ref=_optional_text(
+                stored.get("resolution_ref"),
+                "task unknown owner resolution reference",
             ),
         )
 
@@ -1320,8 +1665,17 @@ class TaskRuntimeState:
     active_claims: tuple[TaskLease, ...] = ()
     control_facts: tuple[TaskControlFact, ...] = ()
     task_claim_leases: tuple[TaskClaimLease, ...] = ()
+    _legacy_omitted_fields: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
+        if not self._legacy_omitted_fields.issubset(
+            {"control_facts", "task_claim_leases"}
+        ):
+            raise TaskContractViolation("invalid task runtime legacy fields")
         _text(self.owner_id, "task owner")
         _text(self.installation_id, "task installation")
         _nonnegative_integer(self.version, "task runtime version")
@@ -1440,7 +1794,7 @@ class TaskRuntimeState:
         )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        stored = {
             "owner_id": self.owner_id,
             "installation_id": self.installation_id,
             "version": self.version,
@@ -1453,6 +1807,9 @@ class TaskRuntimeState:
                 claim.to_storage() for claim in self.task_claim_leases
             ],
         }
+        for omitted in self._legacy_omitted_fields:
+            stored.pop(omitted)
+        return stored
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskRuntimeState":
@@ -1521,6 +1878,11 @@ class TaskRuntimeState:
             ),
             task_claim_leases=tuple(
                 TaskClaimLease.from_storage(item) for item in raw_runtime_claims
+            ),
+            _legacy_omitted_fields=frozenset(
+                field_name
+                for field_name in ("control_facts", "task_claim_leases")
+                if field_name not in stored
             ),
         )
 
@@ -2404,23 +2766,32 @@ class TaskEngine:
     @staticmethod
     def fail(
         state: TaskRuntimeState,
-        task_id: str,
-        *,
-        failed_at_utc: str,
-        reason_code: str = "no-reasonable-path",
+        proof: TaskFailureProof,
     ) -> TaskTransition:
-        task = state.task(task_id)
+        if type(proof) is not TaskFailureProof:
+            raise TaskContractViolation("typed task failure proof required")
+        task = state.task(proof.task_id)
         if task.primary_label != "active":
             raise TaskContractViolation("terminal task cannot be failed again")
         if _unresolved_unknowns(state, task.task_id):
             raise TaskContractViolation("delivery unknown cannot be rewritten as failed")
-        at = _utc_time(failed_at_utc, "task failure time")
+        if (
+            proof.task_version != task.version
+            or proof.task_semantic_digest != task.semantic_digest
+        ):
+            raise TaskContractViolation(
+                "task failure proof does not bind the current task"
+            )
+        at = proof.assessed_at_utc
+        if datetime.fromisoformat(at) < datetime.fromisoformat(task.updated_at_utc):
+            raise TaskContractViolation("task failure proof predates current task")
         terminal = TaskTerminalFact(
             primary_label="failed",
-            reason_code=_text(reason_code, "task failure reason"),
-            evidence_refs=(),
-            result_digest=None,
+            reason_code=proof.reason_code,
+            evidence_refs=proof.evidence_refs,
+            result_digest=proof.result_digest,
             recorded_at_utc=at,
+            failure_proof=proof,
         )
         next_task = replace(
             task,
@@ -2517,6 +2888,7 @@ class TaskEngine:
         *,
         resolution: str,
         resolved_at_utc: str,
+        resolution_ref: str | None = None,
     ) -> TaskTransition:
         effect = _text(effect_ref, "task delivery effect reference")
         if type(resolution) is not str or resolution not in TASK_UNKNOWN_RESOLUTIONS:
@@ -2529,7 +2901,21 @@ class TaskEngine:
             if fact.resolution == resolution and fact.resolved_at_utc == at:
                 return TaskTransition(state, fact.task_id, "delivery-unknown-resolved", True)
             raise TaskContractViolation("task delivery unknown was already resolved")
-        resolved = replace(fact, resolution=resolution, resolved_at_utc=at)
+        if resolution == "owner-authorized-new-attempt":
+            resolution_ref = _text(
+                resolution_ref,
+                "task unknown owner resolution reference",
+            )
+        elif resolution_ref is not None:
+            raise TaskContractViolation(
+                "task unknown resolution reference requires owner authorization"
+            )
+        resolved = replace(
+            fact,
+            resolution=resolution,
+            resolved_at_utc=at,
+            resolution_ref=resolution_ref,
+        )
         task = state.task(fact.task_id)
         next_task = task
         still_unresolved = any(
@@ -2650,6 +3036,7 @@ __all__ = [
     "TaskContractViolation",
     "TaskEngine",
     "TaskExternalBoundary",
+    "TaskFailureProof",
     "TaskLease",
     "TaskRuntimeState",
     "TaskTerminalFact",

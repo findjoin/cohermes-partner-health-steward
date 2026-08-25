@@ -13,8 +13,55 @@ from .authority import MAX_OPAQUE_TEXT_BYTES
 MAX_HEALTH_COMMAND_JSON_BYTES = 64 * 1024
 
 
+HEALTH_COMMAND_AUTHORITY = {
+    "task.admit": ("daily_skill_runtime", ("task:admit",)),
+    "task.claim": ("health_tasks", ("task:claim",)),
+    "task.release": ("health_tasks", ("task:release",)),
+    "task.defer": ("health_tasks", ("task:defer",)),
+    "task.adjust": ("health_tasks", ("task:adjust",)),
+    "task.advance": ("health_tasks", ("task:advance",)),
+    "task.solve": ("health_tasks", ("task:solve",)),
+    "task.cancel": ("health_tasks", ("task:cancel",)),
+    "task.fail": ("health_tasks", ("task:fail",)),
+    "task.link-successor": ("health_tasks", ("task:link-successor",)),
+    "review.prepare": ("health_tasks", ("review:prepare",)),
+    "review.commit": ("health_tasks", ("review:commit",)),
+    "delivery.observe": ("owner_delivery_adapter", ("delivery:observe",)),
+    "delivery.observe-owner-action": (
+        "owner_event_admission",
+        ("delivery:actual-action",),
+    ),
+    "delivery.authorize-retry": (
+        "owner_event_admission",
+        ("delivery:authorize-retry",),
+    ),
+}
+
+
 class HealthCommandContractViolation(ValueError):
     """A health command or receipt cannot be treated as trusted authority."""
+
+
+class HealthCommandAuthority:
+    """A process-local source capability configured into one Plugin instance."""
+
+    __slots__ = ("source",)
+
+    def __init__(self, source: str) -> None:
+        parsed = _bounded_text(source, "health command authority source")
+        if parsed not in {value[0] for value in HEALTH_COMMAND_AUTHORITY.values()}:
+            raise HealthCommandContractViolation(
+                "unknown health command authority source"
+            )
+        self.source = parsed
+
+    def binding_for(self, action: str) -> tuple[str, tuple[str, ...]]:
+        binding = HEALTH_COMMAND_AUTHORITY.get(action)
+        if binding is None or binding[0] != self.source:
+            raise HealthCommandContractViolation(
+                "health command authority does not permit action"
+            )
+        return binding
 
 
 def _bounded_text(value: object, name: str) -> str:

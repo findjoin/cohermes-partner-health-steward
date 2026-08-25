@@ -6,6 +6,7 @@ import unittest
 
 from partner_health_steward.delivery import (
     DeliveryContractViolation,
+    DeliveryFact,
     DeliveryOutboxState,
     OwnerDeliveryCompletion,
     OwnerDeliveryEngine,
@@ -84,6 +85,30 @@ def _attempted_state():
 
 
 class Ticket115DeliveryTests(unittest.TestCase):
+    def test_legacy_scalar_delivery_evidence_round_trips_without_becoming_forgeable(
+        self,
+    ) -> None:
+        state, _ = _attempted_state()
+        legacy = state.to_wire()
+        for fact in legacy["records"][0]["facts"]:
+            fact["evidence_ref"] = fact.pop("evidence")["evidence_ref"]
+
+        restored = DeliveryOutboxState.from_wire(legacy)
+        restored_fact = restored.records[0].facts[0]
+
+        self.assertTrue(restored_fact.is_legacy_storage_fact)
+        self.assertEqual(restored.to_wire(), legacy)
+        self.assertEqual(DeliveryOutboxState.from_wire(legacy), restored)
+        with self.assertRaisesRegex(
+            DeliveryContractViolation,
+            "legacy delivery evidence is storage-only",
+        ):
+            DeliveryFact(
+                kind=restored_fact.kind,
+                occurred_at_utc=restored_fact.occurred_at_utc,
+                proof=restored_fact.proof,
+            )
+
     def test_plugin_transport_contract_exposes_only_owner_weixin_send_fields(self) -> None:
         destination = OwnerWeixinDestination(
             partner_id="partner-A",

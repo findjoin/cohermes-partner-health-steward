@@ -138,9 +138,13 @@ class Ticket115PreparedMutation:
         if any(value is not None for value in business_values):
             if (
                 self.base_business_status_digest is None
-                or type(self.business_status_projection) is not StatusProjection
                 or type(self.mandatory_delivery_ledger)
                 is not MandatoryDeliveryLedger
+                or (
+                    self.business_status_projection is not None
+                    and type(self.business_status_projection)
+                    is not StatusProjection
+                )
             ):
                 raise AuthorityValidationError(
                     "incomplete ticket115 business status payload"
@@ -178,20 +182,27 @@ class Ticket115PreparedMutation:
             "review_state": review_state.to_storage(),
             "delivery_state": delivery_state.to_wire(),
         }
-        if business_status_projection is not None:
+        if mandatory_delivery_ledger is not None:
             if type(mandatory_delivery_ledger) is not MandatoryDeliveryLedger:
-                raise AuthorityValidationError(
-                    "ticket115 business status ledger required"
-                )
+                raise AuthorityValidationError("invalid ticket115 mandatory ledger")
+            if (
+                business_status_projection is not None
+                and type(business_status_projection) is not StatusProjection
+            ):
+                raise AuthorityValidationError("invalid ticket115 business status")
             value["business_status"] = {
-                "projection": business_status_projection.to_storage(),
+                "projection": (
+                    None
+                    if business_status_projection is None
+                    else business_status_projection.to_storage()
+                ),
                 "mandatory_delivery_ledger": (
                     mandatory_delivery_ledger.to_storage()
                 ),
             }
-        elif mandatory_delivery_ledger is not None:
+        elif business_status_projection is not None:
             raise AuthorityValidationError(
-                "ticket115 business status projection required"
+                "ticket115 business status ledger required"
             )
         return stable_digest(value)
 
@@ -283,10 +294,8 @@ class Ticket115PreparedMutation:
             stable_digest(current_review_state.to_storage()),
             stable_digest(current_delivery_state.to_wire()),
         )
-        include_business_status = business_status_projection is not None
-        if include_business_status != (
-            type(mandatory_delivery_ledger) is MandatoryDeliveryLedger
-        ):
+        include_business_status = mandatory_delivery_ledger is not None
+        if business_status_projection is not None and not include_business_status:
             raise AuthorityValidationError(
                 "incomplete ticket115 business status payload"
             )
@@ -375,14 +384,16 @@ class Ticket115PreparedMutation:
                 else self.health_command_receipt.to_storage()
             ),
         }
-        if self.business_status_projection is not None:
+        if self.mandatory_delivery_ledger is not None:
             value.update(
                 {
                     "base_business_status_digest": (
                         self.base_business_status_digest
                     ),
                     "business_status_projection": (
-                        self.business_status_projection.to_storage()
+                        None
+                        if self.business_status_projection is None
+                        else self.business_status_projection.to_storage()
                     ),
                     "mandatory_delivery_ledger": (
                         self.mandatory_delivery_ledger.to_storage()  # type: ignore[union-attr]
@@ -3709,12 +3720,14 @@ class EncryptedStateStore:
     @staticmethod
     def _decode_business_status_value(
         value: object,
-    ) -> tuple[StatusProjection, MandatoryDeliveryLedger]:
+    ) -> tuple[StatusProjection | None, MandatoryDeliveryLedger]:
         if type(value) is not dict:
             raise StatusContractViolation("invalid stored business status")
         if frozenset(value) == {"projection", "mandatory_delivery_ledger"}:
             return (
-                StatusProjection.from_storage(value["projection"]),
+                None
+                if value["projection"] is None
+                else StatusProjection.from_storage(value["projection"]),
                 MandatoryDeliveryLedger.from_storage(
                     value["mandatory_delivery_ledger"]
                 ),
@@ -3723,11 +3736,11 @@ class EncryptedStateStore:
 
     @staticmethod
     def _business_status_value(
-        projection: StatusProjection,
+        projection: StatusProjection | None,
         ledger: MandatoryDeliveryLedger,
     ) -> dict[str, object]:
         return {
-            "projection": projection.to_storage(),
+            "projection": None if projection is None else projection.to_storage(),
             "mandatory_delivery_ledger": ledger.to_storage(),
         }
 
@@ -3767,13 +3780,13 @@ class EncryptedStateStore:
     def _write_business_status_state(
         self,
         connection: sqlite3.Connection,
-        projection: StatusProjection,
+        projection: StatusProjection | None,
         ledger: MandatoryDeliveryLedger,
     ) -> None:
         if (
-            type(projection) is not StatusProjection
-            or type(ledger) is not MandatoryDeliveryLedger
-        ):
+            projection is not None
+            and type(projection) is not StatusProjection
+        ) or type(ledger) is not MandatoryDeliveryLedger:
             raise AuthorityValidationError("invalid business status state")
         previous, current_ledger = self.business_status_state()
         del previous
@@ -4549,10 +4562,8 @@ class EncryptedStateStore:
                         "notifying daily review requires its exact new "
                         "owner-delivery intent"
                     )
-        has_business_status = business_status_projection is not None
-        if has_business_status != (
-            type(mandatory_delivery_ledger) is MandatoryDeliveryLedger
-        ):
+        has_mandatory_state = mandatory_delivery_ledger is not None
+        if business_status_projection is not None and not has_mandatory_state:
             raise AuthorityValidationError(
                 "incomplete ticket115 business status state"
             )
@@ -4576,13 +4587,13 @@ class EncryptedStateStore:
             for record in new_records
             if record.intent.mandatory_request_kind is not None
         )
-        if new_mandatory_records and not has_business_status:
+        if new_mandatory_records and not has_mandatory_state:
             raise AuthorityValidationError(
-                "mandatory outbox intent requires atomic business status"
+                "mandatory outbox intent requires atomic mandatory ledger"
             )
-        if has_business_status:
+        if has_mandatory_state:
             assert mandatory_delivery_ledger is not None
-            _, current_ledger = self.business_status_state()
+            current_projection, current_ledger = self.business_status_state()
             if (
                 mandatory_delivery_ledger.requests[
                     : len(current_ledger.requests)
@@ -4629,10 +4640,14 @@ class EncryptedStateStore:
             self._write_daily_review_ledger(connection, review_state)
         if delivery_state is not None:
             self._write_delivery_outbox(connection, delivery_state)
-        if has_business_status:
+        if has_mandatory_state:
             self._write_business_status_state(
                 connection,
-                business_status_projection,  # type: ignore[arg-type]
+                (
+                    current_projection
+                    if business_status_projection is None
+                    else business_status_projection
+                ),
                 mandatory_delivery_ledger,  # type: ignore[arg-type]
             )
 

@@ -69,6 +69,7 @@ from .initialization import (
     stable_digest,
 )
 from .health_commands import (
+    HealthCommandAuthority,
     HealthCommandContractViolation,
     TrustedHealthCommand,
 )
@@ -150,12 +151,23 @@ class HealthPlugin:
         coarse_router: CoarseMessageRouter | None = None,
         daily_skill_runtime: DailySkillRuntime | None = None,
         delivery_evidence_issuers: tuple[DeliveryEvidenceIssuer, ...] = (),
+        health_command_authorities: tuple[HealthCommandAuthority, ...] = (),
     ) -> None:
         self._core = core
         self._admission_policy = admission_policy
         self._health_init_runtime = health_init_runtime
         self._coarse_router = coarse_router
         self._daily_skill_runtime = daily_skill_runtime
+        if type(health_command_authorities) is not tuple or any(
+            type(authority) is not HealthCommandAuthority
+            for authority in health_command_authorities
+        ):
+            raise AuthorityValidationError("invalid health command authorities")
+        self._health_command_authorities = {
+            authority.source: authority for authority in health_command_authorities
+        }
+        if len(self._health_command_authorities) != len(health_command_authorities):
+            raise AuthorityValidationError("duplicate health command authority")
         if type(delivery_evidence_issuers) is not tuple or any(
             type(issuer) is not DeliveryEvidenceIssuer
             for issuer in delivery_evidence_issuers
@@ -850,6 +862,7 @@ class HealthPlugin:
         payload: Mapping[str, object],
         *,
         context: Mapping[str, object] | None = None,
+        authority: HealthCommandAuthority | None = None,
         peer_id: str,
     ) -> dict[str, object]:
         """Forward one explicitly authorized semantic command to health-core."""
@@ -866,16 +879,91 @@ class HealthPlugin:
         if type(scope) is not list:
             raise ProtocolViolation("invalid health command scope")
         try:
+            if (
+                type(authority) is not HealthCommandAuthority
+                or self._health_command_authorities.get(authority.source)
+                is not authority
+            ):
+                raise HealthCommandContractViolation(
+                    "health command source capability required"
+                )
+            source, expected_scope = authority.binding_for(action)
+            if fields["source"] != source or tuple(scope) != expected_scope:
+                raise HealthCommandContractViolation(
+                    "health command context does not match source capability"
+                )
             command = TrustedHealthCommand(
                 action=action,
-                source=fields["source"],  # type: ignore[arg-type]
+                source=source,
                 causal_id=fields["causal_id"],  # type: ignore[arg-type]
                 generation=fields["generation"],  # type: ignore[arg-type]
-                scope=tuple(scope),
+                scope=expected_scope,
                 payload=payload,
             )
         except HealthCommandContractViolation as exc:
             raise ProtocolViolation("invalid trusted health command") from exc
+        return self._core.execute_trusted_health_command(command)
+
+    def owner_authorized_delivery_retry(
+        self,
+        message: RawWeixinMessage,
+        intent_id: str,
+        *,
+        authority: HealthCommandAuthority,
+        peer_id: str,
+    ) -> dict[str, object]:
+        """Admit one owner event and authorize one new attempt after unknown."""
+
+        self._require_ticket115_peer(peer_id)
+        policy = self._admission_policy
+        if type(policy) is not AdmissionPolicy:
+            raise AuthorityValidationError("admission-policy-unavailable")
+        if policy.rejection_reason(
+            message,
+            allowed_capabilities=DAILY_HEALTH_SKILL_NAMES,
+        ) is not None:
+            raise ProtocolViolation("owner retry source denied")
+        try:
+            if (
+                type(authority) is not HealthCommandAuthority
+                or self._health_command_authorities.get(authority.source)
+                is not authority
+            ):
+                raise HealthCommandContractViolation(
+                    "health command source capability required"
+                )
+            source, scope = authority.binding_for("delivery.authorize-retry")
+            envelope = materialize_source(message)
+            receipt = self._core.admit_owner_delivery_event(envelope)
+            causal_digest = stable_digest(
+                {
+                    "contract": "owner-authorized-delivery-retry-command-v1",
+                    "source_causal_id": receipt.business_causal_id,
+                    "intent_id": validate_opaque_text(
+                        intent_id,
+                        "owner delivery intent identifier",
+                    ),
+                }
+            ).removeprefix("sha256:")
+            command = TrustedHealthCommand(
+                action="delivery.authorize-retry",
+                source=source,
+                causal_id="owner-delivery-retry:" + causal_digest,
+                generation=envelope.generation,
+                scope=scope,
+                payload={
+                    "intent_id": intent_id,
+                    "source_causal_id": receipt.business_causal_id,
+                    "authorized_at_utc": envelope.received_at,
+                },
+            )
+        except (
+            AuthorityValidationError,
+            HealthCommandContractViolation,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ProtocolViolation("invalid owner-authorized retry") from exc
         return self._core.execute_trusted_health_command(command)
 
     def controlled_effect(

@@ -14,6 +14,7 @@ from partner_health_steward.review import (
     local_day_key,
 )
 from partner_health_steward.tasks import (
+    ManagedTask,
     TaskAcceptance,
     TaskAcceptanceCriterionProof,
     TaskApprovalBinding,
@@ -21,6 +22,7 @@ from partner_health_steward.tasks import (
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
+    TaskFailureProof,
     TaskResultEvidence,
     TaskRuntimeState,
 )
@@ -89,6 +91,68 @@ def acceptance_for(
 
 
 class Ticket115TaskValueTests(unittest.TestCase):
+    def test_legacy_candidate_without_result_kind_round_trips_exactly(self) -> None:
+        legacy = candidate().to_storage()
+        legacy.pop("expected_result_kind")
+
+        restored = TaskCandidate.from_storage(legacy)
+
+        self.assertEqual(restored.expected_result_kind, "internal-result")
+        self.assertEqual(restored.to_storage(), legacy)
+
+    def test_legacy_managed_task_without_result_kind_round_trips_exactly(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        legacy = created.state.task(created.task_id).to_storage()
+        legacy.pop("expected_result_kind")
+        legacy["semantic_digest"] = stable_digest(
+            {
+                "purpose": legacy["purpose"],
+                "expected_result": legacy["expected_result"],
+                "assignee": legacy["assignee"],
+                "allowed_data_categories": legacy["allowed_data_categories"],
+                "allowed_data_refs": legacy["allowed_data_refs"],
+                "external_boundary": legacy["external_boundary"],
+                "acceptance_criteria": legacy["acceptance_criteria"],
+            }
+        )
+
+        restored = ManagedTask.from_storage(legacy)
+
+        self.assertEqual(restored.expected_result_kind, "internal-result")
+        self.assertEqual(restored.to_storage(), legacy)
+
+    def test_legacy_acceptance_proof_without_result_type_round_trips_exactly(
+        self,
+    ) -> None:
+        legacy = {
+            "criterion": "owner-visible result exists",
+            "evidence_refs": ["evidence:sleep:accepted"],
+            "evidence_revision_digests": [SHA_TWO],
+        }
+
+        restored = TaskAcceptanceCriterionProof.from_storage(legacy)
+
+        self.assertEqual(restored.result_kind, "internal-result")
+        self.assertEqual(restored.result_status, "completed")
+        self.assertEqual(restored.to_storage(), legacy)
+
+    def test_legacy_runtime_without_new_control_collections_round_trips_exactly(
+        self,
+    ) -> None:
+        legacy = TaskRuntimeState.empty(OWNER, INSTALLATION).to_storage()
+        legacy.pop("control_facts")
+        legacy.pop("task_claim_leases")
+
+        restored = TaskRuntimeState.from_storage(legacy)
+
+        self.assertEqual(restored.control_facts, ())
+        self.assertEqual(restored.task_claim_leases, ())
+        self.assertEqual(restored.to_storage(), legacy)
+
     def test_owner_cancellation_closes_active_task_and_releases_its_claim(self) -> None:
         created = TaskEngine.admit_candidate(
             TaskRuntimeState.empty(OWNER, INSTALLATION),
@@ -574,9 +638,15 @@ class Ticket115TaskEngineTests(unittest.TestCase):
         with self.assertRaises(TaskContractViolation):
             TaskEngine.fail(
                 unknown.state,
-                created.task_id,
-                failed_at_utc="2026-08-24T02:03:00+00:00",
-                reason_code="delivery-failed",
+                TaskFailureProof.prove(
+                    task,
+                    reason_code="delivery-failed",
+                    goal_assessment="goal remains unmet",
+                    acceptance_assessment="acceptance cannot be proved",
+                    authority_assessment="current authority was evaluated",
+                    capability_assessment="delivery result remains unknown",
+                    assessed_at_utc="2026-08-24T02:03:00+00:00",
+                ),
             )
 
         cancelled = TaskEngine.cancel(
@@ -587,6 +657,46 @@ class Ticket115TaskEngineTests(unittest.TestCase):
         )
         self.assertEqual(cancelled.state.task(created.task_id).primary_label, "cancelled")
         self.assertEqual(len(cancelled.state.unknown_facts), 1)
+
+    def test_failed_task_requires_typed_current_business_assessment(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        task = created.state.task(created.task_id)
+        proof = TaskFailureProof.prove(
+            task,
+            reason_code="capability-gap",
+            goal_assessment="declared owner goal remains unmet",
+            acceptance_assessment="declared acceptance cannot be proved",
+            authority_assessment="current authority permits no external effect",
+            capability_assessment="required supported capability is unavailable",
+            assessed_at_utc="2026-08-24T03:00:00+00:00",
+        )
+
+        failed = TaskEngine.fail(created.state, proof)
+        terminal = failed.state.task(created.task_id).terminal_fact
+
+        self.assertEqual(failed.state.task(created.task_id).primary_label, "failed")
+        self.assertEqual(terminal.failure_proof, proof)  # type: ignore[union-attr]
+        self.assertEqual(
+            TaskRuntimeState.from_storage(failed.state.to_storage()),
+            failed.state,
+        )
+        with self.assertRaisesRegex(
+            TaskContractViolation,
+            "current task",
+        ):
+            TaskEngine.fail(
+                TaskEngine.advance_phase(
+                    created.state,
+                    created.task_id,
+                    phase="in-progress",
+                    advanced_at_utc="2026-08-24T02:30:00+00:00",
+                ).state,
+                proof,
+            )
 
     def test_resolving_one_delivery_unknown_keeps_other_unknowns_frozen(self) -> None:
         created = TaskEngine.admit_candidate(
