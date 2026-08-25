@@ -53,3 +53,7 @@
 ### Domain docs
 
 使用单上下文布局：根目录 `CONTEXT.md` 与 `docs/adr/`。见 `docs/agents/domain.md`。
+
+### Architecture governance
+
+实施 Ticket 选择架构或审查要求重开架构时，使用 `docs/agents/architecture-governance.md` 的风险分类、复杂度举证与停止规则；Ticket 只保留经证据说明且经用户确认的本票增量门禁。
