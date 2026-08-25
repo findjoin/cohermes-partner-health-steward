@@ -141,6 +141,11 @@ from .delivery import (
     OwnerDeliveryTransportResult,
     OwnerWeixinDestination,
 )
+from .ticket115_contracts import (
+    DeliveryEvidence,
+    DeliveryEvidenceAuthority,
+    DeliveryEvidenceIssuer,
+)
 from .probe import ProbeReport, ProbeState
 from .owner_authority import (
     OwnerAuthorityContractViolation,
@@ -237,13 +242,20 @@ _TICKET115_HEALTH_COMMAND_AUTHORITY = {
     "task.admit": ("daily_skill_runtime", ("task:admit",)),
     "task.claim": ("health_tasks", ("task:claim",)),
     "task.release": ("health_tasks", ("task:release",)),
+    "task.defer": ("health_tasks", ("task:defer",)),
+    "task.adjust": ("health_tasks", ("task:adjust",)),
     "task.advance": ("health_tasks", ("task:advance",)),
     "task.solve": ("health_tasks", ("task:solve",)),
+    "task.cancel": ("health_tasks", ("task:cancel",)),
     "task.fail": ("health_tasks", ("task:fail",)),
     "task.link-successor": ("health_tasks", ("task:link-successor",)),
     "review.prepare": ("health_tasks", ("review:prepare",)),
     "review.commit": ("health_tasks", ("review:commit",)),
     "delivery.observe": ("owner_delivery_adapter", ("delivery:observe",)),
+    "delivery.observe-owner-action": (
+        "owner_event_admission",
+        ("delivery:actual-action",),
+    ),
 }
 
 # A process-local marker only protects the short hand-off between authorization
@@ -948,6 +960,8 @@ class HealthCore:
             Callable[[], RouteConfigurationUpdate] | None
         ) = None,
         status_fact_authority: CapabilityFactAuthority | None = None,
+        delivery_evidence_authority: DeliveryEvidenceAuthority | None = None,
+        delivery_evidence_issuers: tuple[DeliveryEvidenceIssuer, ...] = (),
         business_status_clock: Callable[[], datetime] | None = None,
         model_authority_digest: str | None = None,
         knowledge_releases: tuple[KnowledgeRelease, ...] = (),
@@ -1002,6 +1016,39 @@ class HealthCore:
         ):
             raise AuthorityValidationError("invalid business status clock")
         self._status_fact_authority = status_fact_authority
+        if delivery_evidence_authority is not None and (
+            type(delivery_evidence_authority) is not DeliveryEvidenceAuthority
+        ):
+            raise AuthorityValidationError("invalid delivery evidence authority")
+        if type(delivery_evidence_issuers) is not tuple or any(
+            type(issuer) is not DeliveryEvidenceIssuer
+            for issuer in delivery_evidence_issuers
+        ):
+            raise AuthorityValidationError("invalid delivery evidence issuers")
+        issuers = {
+            issuer.producer_contract: issuer
+            for issuer in delivery_evidence_issuers
+        }
+        if len(issuers) != len(delivery_evidence_issuers):
+            raise AuthorityValidationError("duplicate delivery evidence issuer")
+        if issuers and delivery_evidence_authority is None:
+            raise AuthorityValidationError("delivery evidence authority required")
+        if delivery_evidence_authority is not None:
+            for issuer in issuers.values():
+                for layer in issuer.allowed_layers:
+                    probe = issuer.issue(
+                        layer=layer,
+                        generation=1,
+                        replay_identity="delivery-issuer-probe",
+                        effect_id="effect:delivery-issuer-probe",
+                        evidence_ref="delivery-evidence:issuer-probe",
+                    )
+                    if not delivery_evidence_authority.verify(probe):
+                        raise AuthorityValidationError(
+                            "delivery evidence issuer is not registered"
+                        )
+        self._delivery_evidence_authority = delivery_evidence_authority
+        self._delivery_evidence_issuers = issuers
         self._business_status_clock = (
             business_status_clock
             if business_status_clock is not None
@@ -6219,7 +6266,41 @@ class HealthCore:
         )
         if type(state) is not DeliveryOutboxState:
             raise AuthorityValidationError("owner-delivery-authority-mismatch")
+        self._require_delivery_state_evidence_open(state)
         return state
+
+    def _delivery_evidence_issuer_open(
+        self,
+        producer_contract: str,
+    ) -> DeliveryEvidenceIssuer:
+        issuer = self._delivery_evidence_issuers.get(producer_contract)
+        if type(issuer) is not DeliveryEvidenceIssuer:
+            raise AuthorityValidationError("delivery-evidence-issuer-unavailable")
+        return issuer
+
+    def _require_delivery_state_evidence_open(
+        self,
+        state: DeliveryOutboxState,
+    ) -> None:
+        authority = self._delivery_evidence_authority
+        if state.records and type(authority) is not DeliveryEvidenceAuthority:
+            raise AuthorityValidationError("delivery-evidence-authority-unavailable")
+        if authority is None:
+            return
+        try:
+            for record in state.records:
+                for fact in record.facts:
+                    authority.require(
+                        fact.evidence(),
+                        expected_layer=fact.evidence().layer,
+                        expected_generation=record.intent.route_generation,
+                        expected_effect_id=record.intent.effect_id,
+                        expected_replay_identity=fact.replay_identity,
+                    )
+        except ValueError as exc:
+            raise AuthorityValidationError(
+                "owner-delivery-evidence-invalid"
+            ) from exc
 
     def execute_trusted_health_command(
         self,
@@ -6305,25 +6386,88 @@ class HealthCore:
                     _health_command=command,
                 )
                 return _ticket115_task_transition_wire(transition)
+            if action == "task.defer":
+                fields = _ticket115_wire_fields(
+                    payload,
+                    frozenset({"task_id", "deferred_at_utc"}),
+                    frozenset({"reason_code"}),
+                )
+                transition = self.defer_task(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    deferred_at_utc=fields["deferred_at_utc"],  # type: ignore[arg-type]
+                    reason_code=fields.get("reason_code", "owner-deferred"),  # type: ignore[arg-type]
+                    _health_command=command,
+                )
+                return _ticket115_task_transition_wire(transition)
+            if action == "task.adjust":
+                fields = _ticket115_wire_fields(
+                    payload,
+                    frozenset(
+                        {
+                            "task_id",
+                            "candidate",
+                            "adjusted_at_utc",
+                            "scope_expanded",
+                            "requested_approval",
+                        }
+                    ),
+                )
+                approval_wire = fields["requested_approval"]
+                transition = self.adjust_task(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    TaskCandidate.from_storage(fields["candidate"]),
+                    adjusted_at_utc=fields["adjusted_at_utc"],  # type: ignore[arg-type]
+                    scope_expanded=fields["scope_expanded"],  # type: ignore[arg-type]
+                    requested_approval=(
+                        None
+                        if approval_wire is None
+                        else ExecutionScopeApproval.from_wire(approval_wire)
+                    ),
+                    _health_command=command,
+                )
+                return _ticket115_task_transition_wire(transition)
             if action == "task.advance":
                 fields = _ticket115_wire_fields(
                     payload,
-                    frozenset({"task_id", "phase", "advanced_at_utc"}),
+                    frozenset(
+                        {
+                            "task_id",
+                            "phase",
+                            "advanced_at_utc",
+                            "claim_id",
+                            "holder_role",
+                        }
+                    ),
                 )
                 transition = self.advance_task_phase(
                     fields["task_id"],  # type: ignore[arg-type]
                     phase=fields["phase"],  # type: ignore[arg-type]
                     advanced_at_utc=fields["advanced_at_utc"],  # type: ignore[arg-type]
+                    claim_id=fields["claim_id"],  # type: ignore[arg-type]
+                    holder_role=fields["holder_role"],  # type: ignore[arg-type]
                     _health_command=command,
                 )
                 return _ticket115_task_transition_wire(transition)
             if action == "task.solve":
                 fields = _ticket115_wire_fields(
                     payload,
-                    frozenset({"acceptance"}),
+                    frozenset({"acceptance", "claim_id", "holder_role"}),
                 )
                 transition = self.solve_task(
                     TaskAcceptance.from_storage(fields["acceptance"]),
+                    claim_id=fields["claim_id"],  # type: ignore[arg-type]
+                    holder_role=fields["holder_role"],  # type: ignore[arg-type]
+                    _health_command=command,
+                )
+                return _ticket115_task_transition_wire(transition)
+            if action == "task.cancel":
+                fields = _ticket115_wire_fields(
+                    payload,
+                    frozenset({"task_id", "cancelled_at_utc"}),
+                )
+                transition = self.cancel_task(
+                    fields["task_id"],  # type: ignore[arg-type]
+                    cancelled_at_utc=fields["cancelled_at_utc"],  # type: ignore[arg-type]
                     _health_command=command,
                 )
                 return _ticket115_task_transition_wire(transition)
@@ -6397,10 +6541,10 @@ class HealthCore:
                             "attempt_ref",
                             "result_ref",
                             "evidence_ref",
+                            "evidence",
                             "observed_at_utc",
                         }
                     ),
-                    frozenset({"producer_contract"}),
                 )
                 transition = self.record_owner_delivery_observation(
                     fields["intent_id"],  # type: ignore[arg-type]
@@ -6408,8 +6552,33 @@ class HealthCore:
                     attempt_ref=fields["attempt_ref"],  # type: ignore[arg-type]
                     result_ref=fields["result_ref"],  # type: ignore[arg-type]
                     evidence_ref=fields["evidence_ref"],  # type: ignore[arg-type]
+                    evidence=DeliveryEvidence.from_storage(fields["evidence"]),
                     observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
-                    producer_contract=fields.get("producer_contract"),
+                    _health_command=command,
+                )
+                return _ticket115_delivery_transition_wire(transition)
+            if action == "delivery.observe-owner-action":
+                fields = _ticket115_wire_fields(
+                    payload,
+                    frozenset(
+                        {
+                            "intent_id",
+                            "attempt_ref",
+                            "result_ref",
+                            "evidence_ref",
+                            "evidence",
+                            "observed_at_utc",
+                        }
+                    ),
+                )
+                transition = self.record_owner_delivery_observation(
+                    fields["intent_id"],  # type: ignore[arg-type]
+                    kind="actual-action",
+                    attempt_ref=fields["attempt_ref"],  # type: ignore[arg-type]
+                    result_ref=fields["result_ref"],  # type: ignore[arg-type]
+                    evidence_ref=fields["evidence_ref"],  # type: ignore[arg-type]
+                    evidence=DeliveryEvidence.from_storage(fields["evidence"]),
+                    observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
                     _health_command=command,
                 )
                 return _ticket115_delivery_transition_wire(transition)
@@ -6449,9 +6618,11 @@ class HealthCore:
         operation_with_settings: Callable[
             [TaskRuntimeState, OwnerSettingsState], TaskTransition
         ] | None = None,
-        health_command: TrustedHealthCommand | None = None,
+        health_command: TrustedHealthCommand,
         health_command_action: str,
     ) -> TaskTransition:
+        if type(health_command) is not TrustedHealthCommand:
+            raise ProtocolViolation("trusted health command required")
         with self._lifecycle_lock:
             with self._ticket115_write_authority() as (head, settings):
                 self._recheck_trusted_health_command_open(
@@ -6467,14 +6638,10 @@ class HealthCore:
                 )
                 if type(transition) is not TaskTransition:
                     raise AuthorityValidationError("invalid task transition")
-                receipt = (
-                    None
-                    if health_command is None
-                    else HealthCommandReceipt(
-                        causal_id=health_command.causal_id,
-                        command_digest=health_command.command_digest,
-                        result=_ticket115_task_transition_wire(transition),
-                    )
+                receipt = HealthCommandReceipt(
+                    causal_id=health_command.causal_id,
+                    command_digest=health_command.command_digest,
+                    result=_ticket115_task_transition_wire(transition),
                 )
                 mutation = self._prepare_ticket115_facts_open(
                     head,
@@ -6497,7 +6664,7 @@ class HealthCore:
         candidate: TaskCandidate,
         *,
         committed_at_utc: str,
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
             lambda state: TaskEngine.admit_candidate(
@@ -6523,13 +6690,13 @@ class HealthCore:
         lease_id: str,
         acquired_at_utc: str,
         lease_seconds: int = 300,
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
-        def claim_with_runtime(state: TaskRuntimeState) -> TaskTransition:
+        def claim_with_runtime(
+            state: TaskRuntimeState,
+            settings: OwnerSettingsState,
+        ) -> TaskTransition:
             acquired_monotonic = time.monotonic()
-            authority = self._store.finalized_authority()
-            if authority is None:
-                raise AuthorityValidationError("task-claim-authority-unavailable")
             return TaskEngine.claim(
                 state,
                 task_id,
@@ -6540,12 +6707,15 @@ class HealthCore:
                 runtime_epoch=self._task_runtime_epoch,
                 acquired_at_monotonic_seconds=acquired_monotonic,
                 expires_at_monotonic_seconds=acquired_monotonic + lease_seconds,
-                generation=max(1, authority.generation),
+                generation=settings.version,
                 task_cas_identity=stable_digest(state.task(task_id).to_storage()),
             )
 
         return self._mutate_ticket115_task(
-            claim_with_runtime,
+            lambda state: (_ for _ in ()).throw(
+                AuthorityValidationError("task-claim-settings-required")
+            ),
+            operation_with_settings=claim_with_runtime,
             health_command=_health_command,
             health_command_action="task.claim",
         )
@@ -6556,7 +6726,7 @@ class HealthCore:
         *,
         holder_id: str,
         observed_at_utc: str,
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         def release_with_runtime(state: TaskRuntimeState) -> TaskTransition:
             return TaskEngine.release_claim(
@@ -6574,17 +6744,144 @@ class HealthCore:
             health_command_action="task.release",
         )
 
+    def defer_task(
+        self,
+        task_id: str,
+        *,
+        deferred_at_utc: str,
+        reason_code: str = "owner-deferred",
+        _health_command: TrustedHealthCommand,
+    ) -> TaskTransition:
+        return self._mutate_ticket115_task(
+            lambda state: TaskEngine.defer(
+                state,
+                task_id,
+                deferred_at_utc=deferred_at_utc,
+                reason_code=reason_code,
+            ),
+            health_command=_health_command,
+            health_command_action="task.defer",
+        )
+
+    def adjust_task(
+        self,
+        task_id: str,
+        candidate: TaskCandidate,
+        *,
+        adjusted_at_utc: str,
+        scope_expanded: bool,
+        requested_approval: ExecutionScopeApproval | None,
+        _health_command: TrustedHealthCommand,
+    ) -> TaskTransition:
+        def adjust_with_current_settings(
+            state: TaskRuntimeState,
+            settings: OwnerSettingsState,
+        ) -> TaskTransition:
+            current_approval = (
+                None
+                if requested_approval is None
+                else next(
+                    (
+                        approval
+                        for approval in settings.approvals
+                        if approval.approval_id == requested_approval.approval_id
+                    ),
+                    None,
+                )
+            )
+            return TaskEngine.adjust(
+                state,
+                task_id,
+                candidate,
+                adjusted_at_utc=adjusted_at_utc,
+                scope_expanded=scope_expanded,
+                cancelled_task_refs=settings.cancelled_task_refs,
+                requested_approval=requested_approval,
+                current_approval=current_approval,
+            )
+
+        return self._mutate_ticket115_task(
+            lambda state: TaskEngine.adjust(
+                state,
+                task_id,
+                candidate,
+                adjusted_at_utc=adjusted_at_utc,
+                scope_expanded=scope_expanded,
+                requested_approval=requested_approval,
+            ),
+            operation_with_settings=adjust_with_current_settings,
+            health_command=_health_command,
+            health_command_action="task.adjust",
+        )
+
+    def _consume_task_claim_open(
+        self,
+        state: TaskRuntimeState,
+        task_id: str,
+        *,
+        claim_id: str,
+        holder_role: str,
+        generation: int,
+    ) -> TaskRuntimeState:
+        task = state.task(task_id)
+        claim = next(
+            (item for item in state.task_claim_leases if item.claim_id == claim_id),
+            None,
+        )
+        legacy = next(
+            (item for item in state.active_claims if item.lease_id == claim_id),
+            None,
+        )
+        if (
+            claim is None
+            or legacy is None
+            or claim.task_id != task.task_id
+            or legacy.task_id != task.task_id
+            or legacy.holder_id != holder_role
+            or not claim.can_commit(
+                runtime_epoch=self._task_runtime_epoch,
+                monotonic_seconds=time.monotonic(),
+                generation=generation,
+                holder_role=holder_role,
+                task_revision=task.version,
+                task_cas_identity=stable_digest(task.to_storage()),
+            )
+        ):
+            raise TaskContractViolation("runtime task claim is stale")
+        return replace(
+            state,
+            active_claims=tuple(
+                item for item in state.active_claims if item.lease_id != claim_id
+            ),
+            task_claim_leases=tuple(
+                item
+                for item in state.task_claim_leases
+                if item.claim_id != claim_id
+            ),
+        )
+
     def advance_task_phase(
         self,
         task_id: str,
         *,
         phase: str,
         advanced_at_utc: str,
-        _health_command: TrustedHealthCommand | None = None,
+        claim_id: str,
+        holder_role: str,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
-            lambda state: TaskEngine.advance_phase(
-                state,
+            lambda state: (_ for _ in ()).throw(
+                AuthorityValidationError("task-claim-settings-required")
+            ),
+            operation_with_settings=lambda state, settings: TaskEngine.advance_phase(
+                self._consume_task_claim_open(
+                    state,
+                    task_id,
+                    claim_id=claim_id,
+                    holder_role=holder_role,
+                    generation=settings.version,
+                ),
                 task_id,
                 phase=phase,
                 advanced_at_utc=advanced_at_utc,
@@ -6597,10 +6894,13 @@ class HealthCore:
         self,
         acceptance: TaskAcceptance,
         *,
-        _health_command: TrustedHealthCommand | None = None,
+        claim_id: str,
+        holder_role: str,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         def solve_with_current_evidence(
             state: TaskRuntimeState,
+            settings: OwnerSettingsState,
         ) -> TaskTransition:
             # Acceptance must bind to the evidence revisions that are current
             # in the same serialized authority lane as the task transition.
@@ -6610,13 +6910,22 @@ class HealthCore:
                 for card in daily_state.current_evidence_cards
             }
             return TaskEngine.solve(
-                state,
+                self._consume_task_claim_open(
+                    state,
+                    acceptance.task_id,
+                    claim_id=claim_id,
+                    holder_role=holder_role,
+                    generation=settings.version,
+                ),
                 acceptance,
                 current_evidence_revisions=current_evidence_revisions,
             )
 
         return self._mutate_ticket115_task(
-            solve_with_current_evidence,
+            lambda state: (_ for _ in ()).throw(
+                AuthorityValidationError("task-claim-settings-required")
+            ),
+            operation_with_settings=solve_with_current_evidence,
             health_command=_health_command,
             health_command_action="task.solve",
         )
@@ -6626,15 +6935,23 @@ class HealthCore:
         task_id: str,
         *,
         cancelled_at_utc: str,
-        reason_code: str = "task-cancelled",
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
-            lambda state: TaskEngine.cancel(
-                state,
-                task_id,
-                cancelled_at_utc=cancelled_at_utc,
-                reason_code=reason_code,
+            lambda state: (_ for _ in ()).throw(
+                TaskContractViolation("owner task cancellation is not committed")
+            ),
+            operation_with_settings=lambda state, settings: (
+                TaskEngine.apply_owner_cancellation(
+                    state,
+                    task_id,
+                    control_ref=_health_command.causal_id,
+                    effective_at_utc=cancelled_at_utc,
+                )
+                if task_id in settings.cancelled_task_refs
+                else (_ for _ in ()).throw(
+                    TaskContractViolation("owner task cancellation is not committed")
+                )
             ),
             health_command=_health_command,
             health_command_action="task.cancel",
@@ -6646,7 +6963,7 @@ class HealthCore:
         *,
         failed_at_utc: str,
         reason_code: str = "no-reasonable-path",
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
             lambda state: TaskEngine.fail(
@@ -6665,7 +6982,7 @@ class HealthCore:
         successor_candidate: TaskCandidate,
         *,
         committed_at_utc: str,
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
             lambda state: TaskEngine.link_successor(
@@ -7150,6 +7467,12 @@ class HealthCore:
                             self._ticket115_outbox_state_open(settings),
                             intent,
                             submitted_at_utc=delivery.submitted_at_utc,
+                            formed_issuer=self._delivery_evidence_issuer_open(
+                                "health-core.delivery.formed"
+                            ),
+                            committed_issuer=self._delivery_evidence_issuer_open(
+                                "health-core.delivery.committed"
+                            ),
                         )
                         mutation = self._prepare_ticket115_facts_open(
                             head,
@@ -7633,6 +7956,10 @@ class HealthCore:
                 attempt_ref=completion.attempt_ref,
                 result=transport,
                 observed_at_utc=completion.observed_at_utc,
+                issuer=self._delivery_evidence_issuer_open(
+                    "owner-delivery-adapter.unknown"
+                ),
+                authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
             )
             task_state = self._ticket115_task_state_open(settings)
             task_transition = (
@@ -7873,6 +8200,9 @@ class HealthCore:
                     lease_id=lease_id,
                     attempt_ref=attempt_ref,
                     attempted_at_utc=attempted_at_utc,
+                    issuer=self._delivery_evidence_issuer_open(
+                        "owner-delivery-adapter.attempted"
+                    ),
                 )
                 attempted_state = replace(
                     attempted.state,
@@ -8090,6 +8420,12 @@ class HealthCore:
                     attempt_ref=completion.attempt_ref,
                     result=transport,
                     observed_at_utc=completion.observed_at_utc,
+                    issuer=self._delivery_evidence_issuer_open(
+                        "owner-delivery-adapter.unknown"
+                        if transport.status == "unknown"
+                        else "owner-delivery-adapter.interface"
+                    ),
+                    authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
@@ -8126,19 +8462,34 @@ class HealthCore:
         attempt_ref: str,
         result_ref: str,
         evidence_ref: str,
+        evidence: DeliveryEvidence,
         observed_at_utc: str,
-        producer_contract: str | None = None,
-        _health_command: TrustedHealthCommand | None = None,
+        _health_command: TrustedHealthCommand,
     ) -> DeliveryTransition:
         """Append independent channel evidence without rewriting transport facts."""
 
         validate_opaque_text(intent_id, "owner delivery intent identifier")
+        if type(_health_command) is not TrustedHealthCommand:
+            raise ProtocolViolation("trusted health command required")
+        expected_action = (
+            "delivery.observe-owner-action"
+            if kind == "actual-action"
+            else "delivery.observe"
+        )
+        if (
+            (expected_action == "delivery.observe" and kind not in {"delivered", "read", "unknown"})
+            or (
+                expected_action == "delivery.observe-owner-action"
+                and kind != "actual-action"
+            )
+        ):
+            raise ProtocolViolation("delivery-observation-authority-denied")
         with self._lifecycle_lock:
             with self._ticket115_write_authority() as (head, settings):
                 self._recheck_trusted_health_command_open(
                     head,
                     _health_command,
-                    expected_action="delivery.observe",
+                    expected_action=expected_action,
                 )
                 outbox = self._ticket115_outbox_state_open(settings)
                 intent = outbox.record(intent_id).intent
@@ -8150,7 +8501,8 @@ class HealthCore:
                     result_ref=result_ref,
                     evidence_ref=evidence_ref,
                     observed_at_utc=observed_at_utc,
-                    producer_contract=producer_contract,
+                    evidence=evidence,
+                    authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
@@ -8162,25 +8514,21 @@ class HealthCore:
                         effect_ref=intent.intent_id,
                         observed_at_utc=observed_at_utc,
                     )
-                elif unresolved and kind in {"delivered", "read", "rejected"}:
+                elif unresolved and kind in {"delivered", "read", "actual-action"}:
                     task_transition = TaskEngine.resolve_delivery_unknown(
                         task_state,
                         intent.intent_id,
                         resolution=(
                             "delivered"
-                            if kind in {"delivered", "read"}
+                            if kind in {"delivered", "read", "actual-action"}
                             else "not-delivered"
                         ),
                         resolved_at_utc=observed_at_utc,
                     )
-                receipt = (
-                    None
-                    if _health_command is None
-                    else HealthCommandReceipt(
-                        causal_id=_health_command.causal_id,
-                        command_digest=_health_command.command_digest,
-                        result=_ticket115_delivery_transition_wire(transition),
-                    )
+                receipt = HealthCommandReceipt(
+                    causal_id=_health_command.causal_id,
+                    command_digest=_health_command.command_digest,
+                    result=_ticket115_delivery_transition_wire(transition),
                 )
                 mutation = self._prepare_ticket115_facts_open(
                     head,
@@ -8537,18 +8885,14 @@ class HealthCore:
                     facts,
                     evaluated_at_utc=evaluated_at_utc,
                 )
-                previous = self._store.remember_business_status(projection)
-                transition = (
-                    None
-                    if previous is None
-                    else projector.transition(previous, projection)
-                )
-                mandatory_request = StatusProjector.mandatory_delivery_request(
-                    transition,
-                    generation=max(
-                        requirement.expected_generation
-                        for requirement in requirements
-                    ),
+                _, transition, mandatory_request = (
+                    self._store.remember_business_status_transition(
+                        projection,
+                        generation=max(
+                            requirement.expected_generation
+                            for requirement in requirements
+                        ),
+                    )
                 )
                 return BusinessStatusResult(
                     projection,

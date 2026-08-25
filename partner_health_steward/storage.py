@@ -62,7 +62,17 @@ from .initialization import (
 from .owner_authority import OwnerPreparedMutation
 from .review import DailyReviewLedger
 from .settings import OwnerSettingsState
-from .status import StatusContractViolation, StatusProjection, StatusTransition
+from .status import (
+    StatusContractViolation,
+    StatusProjection,
+    StatusProjector,
+    StatusTransition,
+)
+from .ticket115_contracts import (
+    MandatoryDeliveryLedger,
+    MandatoryDeliveryRequest,
+    Ticket115ContractViolation,
+)
 from .tasks import TaskRuntimeState
 
 
@@ -1737,6 +1747,7 @@ class EncryptedStateStore:
                         'rejected',
                         'delivered',
                         'read',
+                        'actual-action',
                         'unknown'
                     )
                 ),
@@ -1754,8 +1765,67 @@ class EncryptedStateStore:
             """
         )
         self._commit("health state initialization unavailable")
+        self._upgrade_owner_delivery_observation_layers()
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
+
+    def _upgrade_owner_delivery_observation_layers(self) -> None:
+        """Extend the Ticket 115 observation constraint without losing facts."""
+
+        row = self._execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'owner_delivery_observations_v1'"
+        ).fetchone()
+        if row is None or type(row[0]) is not str:
+            raise StoreUnavailable("owner delivery observation schema unavailable")
+        if "'actual-action'" in row[0]:
+            return
+        with self.transaction() as connection:
+            connection.execute(
+                "ALTER TABLE owner_delivery_observations_v1 "
+                "RENAME TO owner_delivery_observations_legacy_v1"
+            )
+            connection.execute(
+                """
+                CREATE TABLE owner_delivery_observations_v1 (
+                    observation_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL,
+                    layer TEXT NOT NULL CHECK(
+                        layer IN (
+                            'formed',
+                            'submitted',
+                            'attempted',
+                            'accepted',
+                            'rejected',
+                            'delivered',
+                            'read',
+                            'actual-action',
+                            'unknown'
+                        )
+                    ),
+                    nonce BLOB NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    FOREIGN KEY(intent_id) REFERENCES owner_outbox_v1(intent_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO owner_delivery_observations_v1(
+                    observation_id, intent_id, layer, nonce, ciphertext
+                )
+                SELECT observation_id, intent_id, layer, nonce, ciphertext
+                FROM owner_delivery_observations_legacy_v1
+                """
+            )
+            connection.execute("DROP TABLE owner_delivery_observations_legacy_v1")
+            connection.execute(
+                """
+                CREATE INDEX owner_delivery_observations_intent_v1
+                ON owner_delivery_observations_v1(intent_id, observation_id)
+                """
+            )
 
     @property
     def key_id(self) -> str:
@@ -3487,11 +3557,53 @@ class EncryptedStateStore:
         if row is None:
             return None
         try:
-            return StatusProjection.from_storage(
+            projection, _ = self._decode_business_status_value(
                 self._open("business-status", row[0], row[1])
             )
-        except StatusContractViolation as exc:
+            return projection
+        except (StatusContractViolation, Ticket115ContractViolation) as exc:
             raise KeyUnavailable("invalid business status projection") from exc
+
+    @staticmethod
+    def _decode_business_status_value(
+        value: object,
+    ) -> tuple[StatusProjection, MandatoryDeliveryLedger]:
+        if type(value) is not dict:
+            raise StatusContractViolation("invalid stored business status")
+        if frozenset(value) == {"projection", "mandatory_delivery_ledger"}:
+            return (
+                StatusProjection.from_storage(value["projection"]),
+                MandatoryDeliveryLedger.from_storage(
+                    value["mandatory_delivery_ledger"]
+                ),
+            )
+        return StatusProjection.from_storage(value), MandatoryDeliveryLedger()
+
+    @staticmethod
+    def _business_status_value(
+        projection: StatusProjection,
+        ledger: MandatoryDeliveryLedger,
+    ) -> dict[str, object]:
+        return {
+            "projection": projection.to_storage(),
+            "mandatory_delivery_ledger": ledger.to_storage(),
+        }
+
+    def mandatory_delivery_ledger(self) -> MandatoryDeliveryLedger:
+        """Return durable required-owner requests, including after restart."""
+
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return MandatoryDeliveryLedger()
+        try:
+            _, ledger = self._decode_business_status_value(
+                self._open("business-status", row[0], row[1])
+            )
+            return ledger
+        except (StatusContractViolation, Ticket115ContractViolation) as exc:
+            raise KeyUnavailable("invalid mandatory delivery ledger") from exc
 
     def remember_business_status(
         self,
@@ -3516,18 +3628,20 @@ class EncryptedStateStore:
                 previous = None
             else:
                 try:
-                    previous = StatusProjection.from_storage(
+                    previous, ledger = self._decode_business_status_value(
                         self._open("business-status", row[0], row[1])
                     )
-                except StatusContractViolation as exc:
+                except (StatusContractViolation, Ticket115ContractViolation) as exc:
                     raise KeyUnavailable(
                         "invalid business status projection"
                     ) from exc
+            if row is None:
+                ledger = MandatoryDeliveryLedger()
             if previous == projection:
                 return previous
             nonce, ciphertext = self._seal(
                 "business-status",
-                projection.to_storage(),
+                self._business_status_value(projection, ledger),
             )
             connection.execute(
                 """
@@ -3541,6 +3655,68 @@ class EncryptedStateStore:
             )
             self._refresh_integrity_manifest(connection)
             return previous
+
+    def remember_business_status_transition(
+        self,
+        projection: StatusProjection,
+        *,
+        generation: int,
+    ) -> tuple[
+        StatusProjection | None,
+        StatusTransition | None,
+        MandatoryDeliveryRequest | None,
+    ]:
+        """Persist projection and mandatory request in one SQLite transaction."""
+
+        if type(projection) is not StatusProjection:
+            raise AuthorityValidationError("invalid business status projection")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            row = connection.execute(
+                "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+            ).fetchone()
+            if row is None:
+                previous = None
+                ledger = MandatoryDeliveryLedger()
+            else:
+                try:
+                    previous, ledger = self._decode_business_status_value(
+                        self._open("business-status", row[0], row[1])
+                    )
+                except (StatusContractViolation, Ticket115ContractViolation) as exc:
+                    raise KeyUnavailable("invalid business status projection") from exc
+            if previous == projection:
+                return previous, None, None
+            transition = (
+                None
+                if previous is None
+                else StatusTransition.between(previous, projection)
+            )
+            request = StatusProjector.mandatory_delivery_request(
+                transition,
+                generation=generation,
+            )
+            issued_request = None
+            if request is not None:
+                ledger, issued = ledger.issue(request)
+                if issued:
+                    issued_request = request
+            nonce, ciphertext = self._seal(
+                "business-status",
+                self._business_status_value(projection, ledger),
+            )
+            connection.execute(
+                """
+                INSERT INTO business_status_v1(slot, nonce, ciphertext)
+                VALUES (1, ?, ?)
+                ON CONFLICT(slot) DO UPDATE SET
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext
+                """,
+                (nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+            return previous, transition, issued_request
 
     @staticmethod
     def _task_runtime_wire(state: object) -> dict[str, object]:

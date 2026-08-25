@@ -24,6 +24,7 @@ from partner_health_steward.tasks import (
     TaskExternalBoundary,
     TaskRuntimeState,
 )
+from tests.ticket115_delivery_fixtures import AUTHORITY, ISSUERS
 
 
 SHA = "sha256:" + "a" * 64
@@ -122,6 +123,13 @@ class Ticket115GapContractTests(unittest.TestCase):
         self.assertEqual(deferred.state.task(created.task_id).primary_label, "active")
         self.assertEqual(deferred.state.task(created.task_id).phase, "waiting-owner")
         self.assertEqual(deferred.state.control_facts[0].kind, "deferred")
+        replay = TaskEngine.defer(
+            deferred.state,
+            created.task_id,
+            deferred_at_utc="2026-08-24T03:00:00+00:00",
+        )
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.state, deferred.state)
 
     def test_115_a1_c02_scope_expansion_creates_linked_waiting_task(self) -> None:
         created = TaskEngine.admit_candidate(
@@ -191,18 +199,30 @@ class Ticket115GapContractTests(unittest.TestCase):
             bound,
             adjusted_at_utc="2026-08-24T03:00:00+00:00",
             scope_expanded=True,
+            requested_approval=approval,
             current_approval=approval,
         )
         self.assertEqual(expanded.state.task(expanded.task_id).approval.status, "bound")
-        with self.assertRaisesRegex(TaskContractViolation, "current and exact"):
-            TaskEngine.adjust(
-                created.state,
-                created.task_id,
-                bound,
-                adjusted_at_utc="2026-08-24T03:00:00+00:00",
-                scope_expanded=True,
-                current_approval=replace(approval, approval_version=2),
-            )
+        drifts = (
+            {"effect_request_id": "effect:drift"},
+            {"max_attempts": 2},
+            {"min_contact_interval_seconds": 60},
+            {"route_id": "route:drift"},
+            {"configuration_generation": 2},
+            {"disclosure_version": "disclosure:drift"},
+        )
+        for drift in drifts:
+            with self.subTest(drift=drift):
+                with self.assertRaisesRegex(TaskContractViolation, "current and exact"):
+                    TaskEngine.adjust(
+                        created.state,
+                        created.task_id,
+                        bound,
+                        adjusted_at_utc="2026-08-24T03:00:00+00:00",
+                        scope_expanded=True,
+                        requested_approval=replace(approval, **drift),
+                        current_approval=approval,
+                    )
 
     def test_115_a1_c06_scope_expansion_requires_a_current_approval(self) -> None:
         created = TaskEngine.admit_candidate(
@@ -211,7 +231,7 @@ class Ticket115GapContractTests(unittest.TestCase):
             committed_at_utc=NOW,
         )
         bound, _ = _bound_scope_candidate(suffix="missing-approval")
-        with self.assertRaisesRegex(TaskContractViolation, "exact current approval"):
+        with self.assertRaisesRegex(TaskContractViolation, "current and exact"):
             TaskEngine.adjust(
                 created.state,
                 created.task_id,
@@ -234,6 +254,7 @@ class Ticket115GapContractTests(unittest.TestCase):
                 bound,
                 adjusted_at_utc="2026-08-24T03:00:00+00:00",
                 scope_expanded=True,
+                requested_approval=revoked,
                 current_approval=revoked,
             )
 
@@ -287,6 +308,26 @@ class Ticket115GapContractTests(unittest.TestCase):
         self.assertEqual(adjusted.state.control_facts[0].kind, "adjusted")
         self.assertEqual(adjusted.state.task(created.task_id).version, 2)
 
+    def test_115_a2_c02_quiet_review_does_not_change_task_outcome(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            _candidate(suffix="quiet-review"),
+            committed_at_utc=NOW,
+        )
+        review = DailyReviewEngine.prepare(
+            DailyReviewLedger.empty(OWNER, INSTALLATION),
+            owner_id=OWNER,
+            installation_id=INSTALLATION,
+            timezone_name="Asia/Shanghai",
+            observed_at_utc=NOW,
+            current_state_digest=SHA,
+            changed=False,
+            action_refs=(),
+        )
+
+        self.assertFalse(review.notification_required)
+        self.assertEqual(created.state.task(created.task_id).primary_label, "active")
+
     def test_115_a6_c01_task_claim_lease_rejects_cross_epoch_and_stale_cas(self) -> None:
         lease = TaskClaimLease(
             claim_id="claim:1",
@@ -303,6 +344,8 @@ class Ticket115GapContractTests(unittest.TestCase):
             lease.can_commit(
                 runtime_epoch="epoch:1",
                 monotonic_seconds=15.0,
+                generation=3,
+                holder_role="health-tasks",
                 task_revision=4,
                 task_cas_identity="cas:4",
             )
@@ -311,6 +354,8 @@ class Ticket115GapContractTests(unittest.TestCase):
             lease.can_commit(
                 runtime_epoch="epoch:2",
                 monotonic_seconds=15.0,
+                generation=3,
+                holder_role="health-tasks",
                 task_revision=4,
                 task_cas_identity="cas:4",
             )
@@ -399,39 +444,43 @@ class Ticket115GapContractTests(unittest.TestCase):
             lease.can_commit(
                 runtime_epoch="epoch:1",
                 monotonic_seconds=15.0,
+                generation=1,
+                holder_role="worker:old",
                 task_revision=5,
                 task_cas_identity="cas:4",
             )
         )
 
     def test_115_a5_c01_delivery_evidence_accepts_only_layer_authority(self) -> None:
-        evidence = DeliveryEvidence(
+        evidence = ISSUERS["weixin.channel.receipt"].issue(
             layer="delivered",
-            producer_contract="weixin.channel.receipt",
             generation=2,
-            attestation=SHA,
             replay_identity="replay:1",
-            effect_id="outbox:1",
+            effect_id="effect:1",
             evidence_ref="weixin:receipt:1",
         )
-        self.assertIs(DeliveryEvidenceAuthority.require(evidence), evidence)
-        forged = DeliveryEvidence(
-            **{
-                **evidence.to_storage(),
-                "producer_contract": "owner-delivery-adapter.interface",
-            }
+        self.assertIs(AUTHORITY.require(evidence), evidence)
+        forged = ISSUERS["owner-delivery-adapter.interface"].issue(
+            layer="interface-accepted",
+            generation=2,
+            replay_identity="replay:1",
+            effect_id="effect:1",
+            evidence_ref="weixin:receipt:1",
         )
         with self.assertRaises(Ticket115ContractViolation):
-            DeliveryEvidenceAuthority.require(forged)
+            AUTHORITY.require(forged, expected_layer="delivered")
+        with self.assertRaises(Ticket115ContractViolation):
+            AUTHORITY.require(
+                replace(evidence, effect_id="effect:rebound"),
+                expected_effect_id="effect:rebound",
+            )
 
     def test_115_a5_c02_delivery_evidence_round_trip_preserves_replay_identity(self) -> None:
-        evidence = DeliveryEvidence(
+        evidence = ISSUERS["owner-delivery-adapter.interface"].issue(
             layer="interface-accepted",
-            producer_contract="owner-delivery-adapter.interface",
             generation=1,
-            attestation=SHA,
             replay_identity="attempt:1",
-            effect_id="outbox:1",
+            effect_id="effect:1",
             evidence_ref="adapter:accepted:1",
         )
         self.assertEqual(
@@ -440,34 +489,29 @@ class Ticket115GapContractTests(unittest.TestCase):
         )
 
     def test_115_a5_c08_actual_action_requires_the_admitted_event_producer(self) -> None:
-        evidence = DeliveryEvidence(
+        evidence = ISSUERS["owner.admitted-event"].issue(
             layer="actual-action",
-            producer_contract="owner.admitted-event",
             generation=1,
-            attestation=SHA,
             replay_identity="owner-event:1",
-            effect_id="outbox:1",
+            effect_id="effect:1",
             evidence_ref="owner-event:evidence:1",
         )
-        self.assertIs(DeliveryEvidenceAuthority.require(evidence), evidence)
+        self.assertIs(AUTHORITY.require(evidence), evidence)
         with self.assertRaises(Ticket115ContractViolation):
-            DeliveryEvidenceAuthority.require(
-                replace(evidence, producer_contract="owner-delivery-adapter.interface")
+            AUTHORITY.require(
+                ISSUERS["owner-delivery-adapter.interface"].issue(
+                    layer="interface-accepted",
+                    generation=1,
+                    replay_identity="owner-event:1",
+                    effect_id="effect:1",
+                    evidence_ref="owner-event:evidence:1",
+                ),
+                expected_layer="actual-action",
             )
 
     def test_115_a5_c09_out_of_order_delivery_facts_are_rejected(self) -> None:
         from partner_health_steward.delivery import DeliveryFact, DeliveryContractViolation
 
-        formed = DeliveryFact(
-            kind="formed",
-            occurred_at_utc=NOW,
-            evidence_ref="outbox:1:formed",
-        )
-        submitted = DeliveryFact(
-            kind="submitted",
-            occurred_at_utc="2026-08-24T02:00:01+00:00",
-            evidence_ref="business:1",
-        )
         from partner_health_steward.delivery import OutboxRecord, OwnerDeliveryEngine
 
         intent = OwnerDeliveryEngine.form_intent(
@@ -484,6 +528,28 @@ class Ticket115GapContractTests(unittest.TestCase):
             payload_ref="payload:1",
             payload_digest=SHA,
             formed_at_utc=NOW,
+        )
+        formed = DeliveryFact(
+            kind="formed",
+            occurred_at_utc=NOW,
+            proof=ISSUERS["health-core.delivery.formed"].issue(
+                layer="formed",
+                generation=1,
+                replay_identity=f"{intent.intent_id}:formed",
+                effect_id=intent.effect_id,
+                evidence_ref=f"{intent.intent_id}:formed",
+            ),
+        )
+        submitted = DeliveryFact(
+            kind="submitted",
+            occurred_at_utc="2026-08-24T02:00:01+00:00",
+            proof=ISSUERS["health-core.delivery.committed"].issue(
+                layer="business-committed",
+                generation=1,
+                replay_identity="business:1",
+                effect_id=intent.effect_id,
+                evidence_ref="business:1",
+            ),
         )
         with self.assertRaises(DeliveryContractViolation):
             OutboxRecord(intent=intent, facts=(submitted, formed))
@@ -535,20 +601,25 @@ class Ticket115GapContractTests(unittest.TestCase):
         fact = DeliveryFact(
             kind="delivered",
             occurred_at_utc=NOW,
-            evidence_ref="weixin:receipt:gap",
+            proof=ISSUERS["weixin.channel.receipt"].issue(
+                layer="delivered",
+                generation=1,
+                replay_identity="weixin:result:gap",
+                effect_id="effect:gap",
+                evidence_ref="weixin:receipt:gap",
+            ),
             result_ref="weixin:result:gap",
             attempt_ref="attempt:gap",
         )
-        evidence = fact.evidence("outbox:gap")
+        evidence = fact.evidence()
         self.assertEqual(evidence.producer_contract, "weixin.channel.receipt")
         with self.assertRaises(DeliveryContractViolation):
             DeliveryFact(
                 kind="delivered",
                 occurred_at_utc=NOW,
-                evidence_ref="weixin:receipt:forged",
+                proof=replace(evidence, effect_id="effect:rebound"),
                 result_ref="weixin:result:forged",
                 attempt_ref="attempt:forged",
-                producer_contract="owner-delivery-adapter.interface",
             )
 
     def test_115_a8_c04_status_transition_emits_one_content_free_request(self) -> None:
@@ -569,13 +640,23 @@ class Ticket115GapContractTests(unittest.TestCase):
         self.assertEqual(request.causal_state_id, transition.transition_id)
 
     def test_115_registry_self_validates_every_observable_target(self) -> None:
-        from tests.ticket115_case_registry import (
-            CASE_REGISTRY,
-            validate_case_registry,
-        )
+        from unittest.mock import patch
 
-        validate_case_registry(resolve_tests=True)
-        self.assertGreaterEqual(len(CASE_REGISTRY), 50)
+        from tests import ticket115_case_registry as registry
+
+        registry.validate_case_registry(resolve_tests=True)
+        self.assertGreaterEqual(len(registry.CASE_REGISTRY), 50)
+        duplicate_target = (
+            registry.CASE_REGISTRY[0],
+            (
+                "115-A1-C99",
+                registry.CASE_REGISTRY[0][1],
+                "synthetic duplicate target",
+            ),
+        )
+        with patch.object(registry, "CASE_REGISTRY", duplicate_target):
+            with self.assertRaisesRegex(AssertionError, "test targets must be unique"):
+                registry.validate_case_registry()
 
 
 if __name__ == "__main__":

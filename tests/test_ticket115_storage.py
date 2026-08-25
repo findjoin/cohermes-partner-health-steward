@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -21,6 +22,11 @@ from partner_health_steward.tasks import (
     TaskEngine,
     TaskExternalBoundary,
     TaskRuntimeState,
+)
+from tests.ticket115_delivery_fixtures import (
+    mark_attempted,
+    record_observation,
+    submit,
 )
 
 
@@ -110,7 +116,7 @@ def _delivery_state(
         payload_digest=SHA_TWO,
         formed_at_utc="2026-08-24T00:01:30+00:00",
     )
-    return OwnerDeliveryEngine.submit(
+    return submit(
         DeliveryOutboxState.empty(OWNER, INSTALLATION),
         intent,
         submitted_at_utc="2026-08-24T00:02:00+00:00",
@@ -222,6 +228,75 @@ class Ticket115StorageMigrationTests(unittest.TestCase):
                 )
             finally:
                 reopened.close()
+
+    def test_existing_delivery_schema_adds_actual_action_without_losing_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "pre-actual-action.sqlite")
+            expected = _delivery_state()
+            store = EncryptedStateStore(database, self.key_provider)
+            store.commit_ticket115_facts(delivery_state=expected)
+            store.close()
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "ALTER TABLE owner_delivery_observations_v1 "
+                    "RENAME TO owner_delivery_observations_legacy_v1"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE owner_delivery_observations_v1 (
+                        observation_id TEXT PRIMARY KEY,
+                        intent_id TEXT NOT NULL,
+                        layer TEXT NOT NULL CHECK(
+                            layer IN (
+                                'formed', 'submitted', 'attempted', 'accepted',
+                                'rejected', 'delivered', 'read', 'unknown'
+                            )
+                        ),
+                        nonce BLOB NOT NULL,
+                        ciphertext BLOB NOT NULL,
+                        FOREIGN KEY(intent_id) REFERENCES owner_outbox_v1(intent_id)
+                            ON DELETE CASCADE
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO owner_delivery_observations_v1(
+                        observation_id, intent_id, layer, nonce, ciphertext
+                    )
+                    SELECT observation_id, intent_id, layer, nonce, ciphertext
+                    FROM owner_delivery_observations_legacy_v1
+                    """
+                )
+                connection.execute(
+                    "DROP TABLE owner_delivery_observations_legacy_v1"
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX owner_delivery_observations_intent_v1
+                    ON owner_delivery_observations_v1(intent_id, observation_id)
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated = EncryptedStateStore(database, self.key_provider)
+            try:
+                schema = migrated._execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' "
+                    "AND name = 'owner_delivery_observations_v1'"
+                ).fetchone()[0]
+                self.assertIn("'actual-action'", schema)
+                self.assertEqual(
+                    migrated.delivery_outbox_state(OWNER, INSTALLATION),
+                    expected,
+                )
+            finally:
+                migrated.close()
 
 
 class Ticket115TypedStorageTests(unittest.TestCase):
@@ -399,7 +474,7 @@ class Ticket115TypedStorageTests(unittest.TestCase):
             lease_seconds=30,
         )
         self.store.remember_delivery_outbox(claimed.state)
-        attempted = OwnerDeliveryEngine.mark_attempted(
+        attempted = mark_attempted(
             claimed.state,
             intent_id,
             lease_id="lease:storage:1",
@@ -407,7 +482,7 @@ class Ticket115TypedStorageTests(unittest.TestCase):
             attempted_at_utc="2026-08-24T00:03:01+00:00",
         )
         self.store.remember_delivery_outbox(attempted.state)
-        accepted = OwnerDeliveryEngine.record_observation(
+        accepted = record_observation(
             attempted.state,
             intent_id,
             kind="accepted",
@@ -437,7 +512,7 @@ class Ticket115TypedStorageTests(unittest.TestCase):
 
         changed_accepted = replace(
             record.fact("accepted"),
-            result_ref="result:storage:accepted:changed",
+            occurred_at_utc="2026-08-24T00:03:03+00:00",
         )
         modified_record = replace(
             record,
@@ -509,14 +584,14 @@ class Ticket115TypedStorageTests(unittest.TestCase):
             acquired_at_utc="2026-08-24T00:03:00+00:00",
             lease_seconds=30,
         )
-        attempted = OwnerDeliveryEngine.mark_attempted(
+        attempted = mark_attempted(
             claimed.state,
             intent_id,
             lease_id="lease:storage:3",
             attempt_ref="attempt:storage:3",
             attempted_at_utc="2026-08-24T00:03:01+00:00",
         )
-        accepted = OwnerDeliveryEngine.record_observation(
+        accepted = record_observation(
             attempted.state,
             intent_id,
             kind="accepted",
@@ -530,7 +605,7 @@ class Ticket115TypedStorageTests(unittest.TestCase):
         self.store.remember_delivery_outbox(attempted.state)
         self.store.remember_delivery_outbox(accepted)
 
-        delivered = OwnerDeliveryEngine.record_observation(
+        delivered = record_observation(
             accepted,
             intent_id,
             kind="delivered",

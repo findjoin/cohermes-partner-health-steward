@@ -20,11 +20,11 @@ CASE_REGISTRY = (
     ("115-A1-C10", "test_ticket115_tasks.Ticket115TaskEngineTests.test_terminal_task_cannot_reopen_but_can_link_an_explicit_successor", "a terminal task cannot reopen and can only link an explicit successor"),
     ("115-A1-C11", "test_ticket115_integration.Ticket115IntegrationTests.test_review_plugin_inputs_are_wake_only", "the plugin wake surface cannot write a candidate task directly"),
     # A2: task outcomes remain separate from ancillary facts.
-    ("115-A2-C01", "test_ticket115_tasks.Ticket115TaskEngineTests.test_engine_owns_initial_task_state_and_merges_duplicate_basis", "candidate evidence and owner goals remain task source facts"),
-    ("115-A2-C02", "test_ticket115_tasks.Ticket115DailyReviewTests.test_quiet_review_has_no_notification_and_commit_cannot_change_pending", "a reminder can be quiet without changing task outcome semantics"),
+    ("115-A2-C01", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c01_adjustment_is_append_only_and_changes_current_revision", "task adjustment remains an ancillary control fact rather than a task outcome"),
+    ("115-A2-C02", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c02_quiet_review_does_not_change_task_outcome", "a reminder can be quiet without changing task outcome semantics"),
     ("115-A2-C03", "test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_current_evidence_card_revision", "acceptance uses current evidence rather than a stale data lookup"),
     ("115-A2-C04", "test_ticket115_integration.Ticket115IntegrationTests.test_owner_task_cancellation_atomically_closes_active_task_and_claim", "owner cancellation is a task control, not a solved result"),
-    ("115-A2-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault", "a capability or delivery gap does not become a fifth task label"),
+    ("115-A2-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_delivery_gap_remains_ancillary_to_the_four_task_labels", "a capability or delivery gap does not become a fifth task label"),
     ("115-A2-C06", "test_ticket115_tasks.Ticket115TaskEngineTests.test_delivery_unknown_is_an_active_ancillary_fact_not_a_fifth_label", "unknown delivery remains an ancillary active fact"),
     ("115-A2-C07", "test_ticket115_tasks.Ticket115TaskEngineTests.test_solve_requires_acceptance_evidence_to_match_current_revisions", "solved requires acceptance evidence bound to current revisions"),
     # A3: owner-local-day review.
@@ -47,9 +47,9 @@ CASE_REGISTRY = (
     ("115-A5-C05", "test_ticket115_delivery.Ticket115DeliveryTests.test_unknown_freezes_automatic_retry_without_erasing_later_proof", "unknown freezes retry without erasing later proof"),
     ("115-A5-C06", "test_ticket115_storage.Ticket115TypedStorageTests.test_outbox_history_rejects_fact_deletion_and_modification", "delivery fact history is append-only"),
     ("115-A5-C07", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c07_production_delivery_fact_exposes_bound_authoritative_evidence", "production delivery facts expose bound authoritative evidence"),
-    ("115-A5-C08", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c08_actual_action_requires_the_admitted_event_producer", "actual action requires an admitted-event producer"),
+    ("115-A5-C08", "test_ticket115_integration.Ticket115IntegrationTests.test_actual_action_uses_only_the_admitted_owner_event_command", "actual action requires an admitted-event producer"),
     ("115-A5-C09", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c09_out_of_order_delivery_facts_are_rejected", "out-of-order layer facts are rejected"),
-    ("115-A5-C10", "test_ticket115_delivery.Ticket115DeliveryTests.test_unknown_freezes_automatic_retry_without_erasing_later_proof", "duplicate observation replay does not overwrite a prior fact"),
+    ("115-A5-C10", "test_ticket115_delivery.Ticket115DeliveryTests.test_duplicate_observation_replay_preserves_the_prior_fact", "duplicate observation replay does not overwrite a prior fact"),
     # A6: currentness, task runtime claim, and unknown freeze.
     ("115-A6-C01", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a6_c01_task_claim_lease_rejects_cross_epoch_and_stale_cas", "runtime claim rejects cross-epoch and stale CAS commits"),
     ("115-A6-C02", "test_ticket115_tasks.Ticket115TaskEngineTests.test_expired_task_lease_can_be_taken_over_but_live_lease_cannot", "live claims are exclusive and expired claims can be taken over"),
@@ -69,7 +69,7 @@ CASE_REGISTRY = (
     ("115-A8-C02", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c02_mandatory_request_dedupes_replay_and_keeps_new_cause", "mandatory ledger deduplicates one causal state"),
     ("115-A8-C03", "test_ticket114_authority_integration.Ticket114AuthorityIntegrationTests.test_114_a5_c21_status_transition_is_deduplicated_across_restart", "status transition replay remains one causal request"),
     ("115-A8-C04", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c04_status_transition_emits_one_content_free_request", "status transition forms one content-free request"),
-    ("115-A8-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_business_status_replay_emits_one_mandatory_request", "business-status replay emits one mandatory request for one state transition"),
+    ("115-A8-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_mandatory_request_survives_response_loss_and_restart", "business-status replay emits one mandatory request for one state transition"),
     ("115-A8-C06", "test_ticket115_integration.Ticket115IntegrationTests.test_not_configured_notification_never_reaches_adapter", "ordinary notification suppression does not create a hidden delivery"),
 )
 
@@ -85,6 +85,9 @@ def validate_case_registry(*, resolve_tests: bool = False) -> None:
     ids = [case_id for case_id, _, _ in CASE_REGISTRY]
     if len(ids) != len(set(ids)):
         raise AssertionError("Ticket 115 case IDs must be unique")
+    test_paths = [test_path for _, test_path, _ in CASE_REGISTRY]
+    if len(test_paths) != len(set(test_paths)):
+        raise AssertionError("Ticket 115 Case test targets must be unique")
     for case_id, test_path, observable in CASE_REGISTRY:
         if not _CASE_ID.fullmatch(case_id):
             raise AssertionError(f"invalid Ticket 115 case ID: {case_id}")

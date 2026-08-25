@@ -1874,6 +1874,8 @@ class TaskEngine:
             if not runtime_claim.can_commit(
                 runtime_epoch=runtime_epoch,
                 monotonic_seconds=monotonic_seconds,
+                generation=runtime_claim.generation,
+                holder_role=holder,
                 task_revision=task.version,
                 task_cas_identity=stable_digest(task.to_storage()),
             ):
@@ -1920,7 +1922,6 @@ class TaskEngine:
                 "kind": "deferred",
                 "reason_code": reason,
                 "recorded_at_utc": at,
-                "task_version": task.version,
             }
         ).removeprefix("sha256:")
         fact = TaskControlFact(
@@ -1959,6 +1960,7 @@ class TaskEngine:
         adjusted_at_utc: str,
         scope_expanded: bool = False,
         cancelled_task_refs: tuple[str, ...] = (),
+        requested_approval: ExecutionScopeApproval | None = None,
         current_approval: ExecutionScopeApproval | None = None,
     ) -> TaskTransition:
         """Adjust a task, or create a linked task when scope expands."""
@@ -1993,10 +1995,15 @@ class TaskEngine:
                     "scope-expanded task must await or hold a current approval"
                 )
             if candidate.approval.status == "bound":
+                requested = requested_approval
                 approval = current_approval
-                if type(approval) is not ExecutionScopeApproval:
+                if (
+                    type(requested) is not ExecutionScopeApproval
+                    or type(approval) is not ExecutionScopeApproval
+                    or requested != approval
+                ):
                     raise TaskContractViolation(
-                        "scope-expanded task requires the exact current approval"
+                        "scope-expanded task approval is not current and exact"
                     )
                 if (
                     approval.revoked

@@ -17,6 +17,7 @@ from partner_health_steward.core import (
 )
 from partner_health_steward.current_head import ExecutionLeaseIdentity, FailureMode
 from partner_health_steward.delivery import (
+    DeliveryContractViolation,
     DeliveryOutboxState,
     OwnerDeliveryTransportResult,
     OwnerWeixinDestination,
@@ -39,12 +40,25 @@ from partner_health_steward.tasks import (
     TaskExternalBoundary,
     TaskRuntimeState,
 )
+from partner_health_steward.ticket115_contracts import (
+    DeliveryEvidenceAuthority,
+    DeliveryEvidenceIssuer,
+)
 from tests import test_ticket114_authority_integration as ticket114_integration
 
 
 _PEER = "plugin"
 _PREPARED_AT = "2026-08-24T03:00:00+00:00"
 _ATTEMPTED_AT = "2026-08-24T03:05:00+00:00"
+_DELIVERY_KEYS = {
+    "health-core.delivery.formed": b"ticket115-core-formed-key",
+    "health-core.delivery.committed": b"ticket115-core-committed-key",
+    "owner-delivery-adapter.attempted": b"ticket115-adapter-attempt-key",
+    "owner-delivery-adapter.interface": b"ticket115-adapter-interface-key",
+    "owner-delivery-adapter.unknown": b"ticket115-adapter-unknown-key",
+    "weixin.channel.receipt": b"ticket115-weixin-receipt-key",
+    "owner.admitted-event": b"ticket115-owner-event-key",
+}
 
 
 class _RecordingAdapter:
@@ -93,6 +107,19 @@ class Ticket115IntegrationTests(unittest.TestCase):
             signing_key=b"ticket115-production-status-key",
             producer_contracts=dict(status.PRODUCTION_STATUS_PRODUCER_CONTRACTS),
         )
+        self.delivery_authority = DeliveryEvidenceAuthority(_DELIVERY_KEYS)
+        self.delivery_issuers = {
+            producer: DeliveryEvidenceIssuer(
+                producer_contract=producer,
+                allowed_layers=tuple(
+                    layer
+                    for layer, expected in DeliveryEvidenceAuthority.PRODUCER_BY_LAYER.items()
+                    if expected == producer
+                ),
+                signing_key=key,
+            )
+            for producer, key in _DELIVERY_KEYS.items()
+        }
         self.route_fact = settings.RouteConfigurationUpdate(
             route_id="jojo-responses-v1",
             first_hop_recipient="jojo-responses-v1",
@@ -144,6 +171,17 @@ class Ticket115IntegrationTests(unittest.TestCase):
             owner_settings_clock=lambda: self.base.owner_clock_value,
             route_configuration_provider=lambda: self.route_fact,
             status_fact_authority=self.status_authority,
+            delivery_evidence_authority=self.delivery_authority,
+            delivery_evidence_issuers=tuple(
+                self.delivery_issuers[producer]
+                for producer in (
+                    "health-core.delivery.formed",
+                    "health-core.delivery.committed",
+                    "owner-delivery-adapter.attempted",
+                    "owner-delivery-adapter.interface",
+                    "owner-delivery-adapter.unknown",
+                )
+            ),
             business_status_clock=lambda: self.base.status_clock_value,
         )
         plugin = HealthPlugin(
@@ -250,6 +288,8 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 if action == "task.admit"
                 else "owner_delivery_adapter"
                 if action == "delivery.observe"
+                else "owner_event_admission"
+                if action == "delivery.observe-owner-action"
                 else "health_tasks"
             ),
             "causal_id": causal_id
@@ -260,7 +300,13 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 else generation
             ),
             "scope": list(
-                (action.replace(".", ":"),) if scope is None else scope
+                (
+                    ("delivery:actual-action",)
+                    if action == "delivery.observe-owner-action"
+                    else (action.replace(".", ":"),)
+                )
+                if scope is None
+                else scope
             ),
         }
 
@@ -278,6 +324,25 @@ class Ticket115IntegrationTests(unittest.TestCase):
             peer_id=_PEER,
         )
 
+    def _claim_task(
+        self,
+        task_id: str,
+        *,
+        suffix: str,
+    ) -> tuple[str, str]:
+        claim_id = f"task-claim:{suffix}"
+        holder_role = f"health-task-worker:{suffix}"
+        self._health(
+            "task.claim",
+            {
+                "task_id": task_id,
+                "holder_id": holder_role,
+                "lease_id": claim_id,
+                "acquired_at_utc": _PREPARED_AT,
+            },
+        )
+        return claim_id, holder_role
+
     def _effect(
         self,
         action: str,
@@ -293,6 +358,29 @@ class Ticket115IntegrationTests(unittest.TestCase):
             transport=transport,
             peer_id=_PEER,
         )
+
+    def _delivery_evidence(
+        self,
+        intent_id: str,
+        *,
+        kind: str,
+        result_ref: str,
+        evidence_ref: str,
+    ) -> dict[str, object]:
+        record = self._outbox().record(intent_id)
+        producer = (
+            "owner.admitted-event"
+            if kind == "actual-action"
+            else "weixin.channel.receipt"
+        )
+        layer = "actual-action" if kind == "actual-action" else kind
+        return self.delivery_issuers[producer].issue(
+            layer=layer,
+            generation=record.intent.route_generation,
+            replay_identity=result_ref,
+            effect_id=record.intent.effect_id,
+            evidence_ref=evidence_ref,
+        ).to_storage()
 
     def _apply_owner_setting(
         self,
@@ -609,9 +697,12 @@ class Ticket115IntegrationTests(unittest.TestCase):
             AuthorityValidationError,
             "current-head-unknown",
         ):
-            self.core.admit_task_candidate(
-                candidate,
-                committed_at_utc=_PREPARED_AT,
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
             )
 
         advanced = self.base.head.read().head
@@ -699,13 +790,20 @@ class Ticket115IntegrationTests(unittest.TestCase):
         first = self._wake_review()
         self.assertEqual(first.outcome, "prepared")
 
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="refresh-current-day",
+        )
+
         self._transition(
             self._health(
                 "task.advance",
                 {
                     "task_id": task_id,
-                    "phase": "in-progress",
+                    "phase": "awaiting-result",
                     "advanced_at_utc": "2026-08-24T03:00:30+00:00",
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
                 },
             )
         )
@@ -824,7 +922,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 self.assertEqual(self.base.head.read().head, before)
                 self.assertIsNone(self.base.store.pending_ticket115_mutation())
 
-        with self.assertRaises(ProtocolViolation):
+        with self.assertRaisesRegex(TaskContractViolation, "not committed"):
             self._health(
                 "task.cancel",
                 {
@@ -971,10 +1069,15 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 injecting = True
                 injected = True
                 try:
-                    self.core.advance_task_phase(
-                        task_id,
-                        phase="awaiting-result",
-                        advanced_at_utc="2026-08-24T03:00:01+00:00",
+                    candidate, _, _ = self._candidate(
+                        suffix="interleaved-generation-change"
+                    )
+                    self._health(
+                        "task.admit",
+                        {
+                            "candidate": candidate.to_storage(),
+                            "committed_at_utc": "2026-08-24T03:00:01+00:00",
+                        },
                     )
                 finally:
                     injecting = False
@@ -995,8 +1098,9 @@ class Ticket115IntegrationTests(unittest.TestCase):
             generation + 1,
         )
         task_state = self._task_state()
-        self.assertEqual(task_state.task(task_id).phase, "awaiting-result")
+        self.assertEqual(task_state.task(task_id).phase, "planned")
         self.assertEqual(task_state.active_claims, ())
+        self.assertEqual(len(task_state.tasks), 2)
 
     def test_health_command_unknown_cas_recovers_exact_causal_owner(self) -> None:
         candidate, task_id, _ = self._candidate()
@@ -1132,6 +1236,10 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
     def test_core_solve_task_requires_current_evidence_card_revision(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="solve-current-evidence",
+        )
         task = self._task_state().task(task_id)
         card = self.base.baseline_card
         revision_digest = card.revision_digest
@@ -1148,7 +1256,14 @@ class Ticket115IntegrationTests(unittest.TestCase):
         )
 
         solved = self._transition(
-            self._health("task.solve", {"acceptance": acceptance.to_storage()})
+            self._health(
+                "task.solve",
+                {
+                    "acceptance": acceptance.to_storage(),
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
+                },
+            )
         )
 
         self.assertEqual(solved.outcome, "solved")
@@ -1169,12 +1284,18 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 {"decision": self._decision_wire(prepared)},
             )
 
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="review-fresh-state-change",
+        )
         self._health(
             "task.advance",
             {
                 "task_id": task_id,
-                "phase": "in-progress",
+                "phase": "awaiting-result",
                 "advanced_at_utc": "2026-08-24T03:40:00+00:00",
+                "claim_id": claim_id,
+                "holder_role": holder_role,
             },
         )
         self.base.owner_clock_value = datetime.fromisoformat(
@@ -1495,6 +1616,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(transport_result.status, "accepted")
         self.assertEqual(effect_response.status, "accepted")
         self.assertEqual(adapter.calls, 1)
+
         self.assertFalse(adapter.saw_sqlite_transaction)
         self.assertEqual(
             self._task_state().task(task_id).primary_label,
@@ -1506,14 +1628,22 @@ class Ticket115IntegrationTests(unittest.TestCase):
             ("delivered", "2026-08-24T03:06:00+00:00"),
             ("read", "2026-08-24T03:07:00+00:00"),
         ):
+            result_ref = f"owner-delivery-result:{kind}"
+            evidence_ref = f"owner-delivery-evidence:{kind}"
             self._health(
                 "delivery.observe",
                 {
                     "intent_id": intent_id,
                     "kind": kind,
                     "attempt_ref": attempted.attempt_ref,
-                    "result_ref": f"owner-delivery-result:{kind}",
-                    "evidence_ref": f"owner-delivery-evidence:{kind}",
+                    "result_ref": result_ref,
+                    "evidence_ref": evidence_ref,
+                    "evidence": self._delivery_evidence(
+                        intent_id,
+                        kind=kind,
+                        result_ref=result_ref,
+                        evidence_ref=evidence_ref,
+                    ),
                     "observed_at_utc": observed_at,
                 },
             )
@@ -1530,6 +1660,90 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 transport=adapter,
             )
         self.assertEqual(adapter.calls, 1)
+
+    def test_actual_action_uses_only_the_admitted_owner_event_command(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": intent_id,
+                "attempted_at_utc": _ATTEMPTED_AT,
+                "observed_at_utc": "2026-08-24T03:05:01+00:00",
+            },
+            grant=grant,
+            transport=_RecordingAdapter(self.base.store),
+        )
+        record = self._outbox().record(intent_id)
+        attempted = record.fact("attempted")
+        result_ref = "owner-event:admitted:actual-action"
+        evidence_ref = "owner-event:evidence:actual-action"
+        valid_evidence = self._delivery_evidence(
+            intent_id,
+            kind="actual-action",
+            result_ref=result_ref,
+            evidence_ref=evidence_ref,
+        )
+        payload = {
+            "intent_id": intent_id,
+            "attempt_ref": attempted.attempt_ref,
+            "result_ref": result_ref,
+            "evidence_ref": evidence_ref,
+            "evidence": valid_evidence,
+            "observed_at_utc": "2026-08-24T03:08:00+00:00",
+        }
+
+        bad_contexts = (
+            self._health_context(
+                "delivery.observe-owner-action",
+                source="owner_delivery_adapter",
+            ),
+            self._health_context(
+                "delivery.observe-owner-action",
+                scope=("delivery:observe",),
+            ),
+        )
+        for context in bad_contexts:
+            with self.subTest(context=context):
+                with self.assertRaises(ProtocolViolation):
+                    self._health(
+                        "delivery.observe-owner-action",
+                        payload,
+                        context=context,
+                    )
+
+        producer_forgeries = (
+            self.delivery_issuers["owner-delivery-adapter.interface"].issue(
+                layer="interface-accepted",
+                generation=record.intent.route_generation,
+                replay_identity=result_ref,
+                effect_id=record.intent.effect_id,
+                evidence_ref=evidence_ref,
+            ).to_storage(),
+            self.delivery_issuers["weixin.channel.receipt"].issue(
+                layer="delivered",
+                generation=record.intent.route_generation,
+                replay_identity=result_ref,
+                effect_id=record.intent.effect_id,
+                evidence_ref=evidence_ref,
+            ).to_storage(),
+        )
+        for evidence in producer_forgeries:
+            with self.subTest(producer=evidence["producer_contract"]):
+                with self.assertRaises(DeliveryContractViolation):
+                    self._health(
+                        "delivery.observe-owner-action",
+                        {**payload, "evidence": evidence},
+                    )
+        self.assertFalse(self._outbox().record(intent_id).has_fact("actual-action"))
+
+        transition = self._health("delivery.observe-owner-action", payload)
+        fact = self._outbox().record(intent_id).fact("actual-action")
+        self.assertEqual(transition["current_layer"], "actual-action")
+        self.assertEqual(fact.producer_contract, "owner.admitted-event")
+        self.assertEqual(fact.result_ref, result_ref)
+        self.assertEqual(self._task_state().task(task_id).primary_label, "active")
 
     def test_adapter_exception_freezes_unknown_until_independent_delivery(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
@@ -1559,14 +1773,22 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(state.task(task_id).primary_label, "active")
 
         attempted = self._outbox().record(intent_id).fact("attempted")
+        delivered_result_ref = "owner-delivery-result:later-delivered"
+        delivered_evidence_ref = "owner-delivery-evidence:later-delivered"
         self._health(
             "delivery.observe",
             {
                 "intent_id": intent_id,
                 "kind": "delivered",
                 "attempt_ref": attempted.attempt_ref,
-                "result_ref": "owner-delivery-result:later-delivered",
-                "evidence_ref": "owner-delivery-evidence:later-delivered",
+                "result_ref": delivered_result_ref,
+                "evidence_ref": delivered_evidence_ref,
+                "evidence": self._delivery_evidence(
+                    intent_id,
+                    kind="delivered",
+                    result_ref=delivered_result_ref,
+                    evidence_ref=delivered_evidence_ref,
+                ),
                 "observed_at_utc": "2026-08-24T03:10:00+00:00",
             },
         )
@@ -1704,6 +1926,10 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
     def test_pending_ticket115_recovery_releases_orphan_execution_lease_first(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="pending-recovery",
+        )
         intent_id = self._commit_review_outbox(task_id, effect_request_id)
         self._claimed_delivery(intent_id)
 
@@ -1711,17 +1937,22 @@ class Ticket115IntegrationTests(unittest.TestCase):
             AuthorityValidationError,
             "current-head-conflict",
         ):
-            self.core.advance_task_phase(
-                task_id,
-                phase="in-progress",
-                advanced_at_utc="2026-08-24T03:06:00+00:00",
+            self._health(
+                "task.advance",
+                {
+                    "task_id": task_id,
+                    "phase": "awaiting-result",
+                    "advanced_at_utc": "2026-08-24T03:06:00+00:00",
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
+                },
             )
         pending = self.base.store.pending_ticket115_mutation()
         self.assertIsNotNone(pending)
 
         self._restart_core(preserve_execution_vault=False)
         restored = self._task_state().task(task_id)
-        self.assertEqual(restored.phase, "in-progress")
+        self.assertEqual(restored.phase, "awaiting-result")
         self.assertIsNone(self.base.store.pending_ticket115_mutation())
         effect = self.base.store.effect(self.core._effect_id(effect_request_id))
         self.assertIsNotNone(effect)
@@ -1952,7 +2183,23 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(unknown.state, "cannot-confirm")
         self.assertNotIn("confirmed-fault", unknown.reason_codes)
 
-    def test_115_a8_c05_business_status_replay_emits_one_mandatory_request(self) -> None:
+    def test_delivery_gap_remains_ancillary_to_the_four_task_labels(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+            grant=grant,
+            transport=_RaisingAdapter(),
+        )
+
+        state = self._task_state()
+        self.assertIn(intent_id, state.delivery_unknown_refs)
+        self.assertEqual(state.task(task_id).primary_label, "active")
+        self.assertNotIn("unknown", {task.primary_label for task in state.tasks})
+
+    def test_115_a8_c05_mandatory_request_survives_response_loss_and_restart(self) -> None:
         prior = status.StatusProjection(
             state="active",
             evaluated_at_utc="2026-08-24T11:59:00+00:00",
@@ -1972,18 +2219,24 @@ class Ticket115IntegrationTests(unittest.TestCase):
             transport=_RaisingAdapter(),
         )
 
-        first = self.plugin.business_status(peer_id=_PEER)
+        with patch(
+            "partner_health_steward.core.BusinessStatusResult",
+            side_effect=RuntimeError("synthetic response loss after durable commit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "response loss"):
+                self.plugin.business_status(peer_id=_PEER)
+
+        durable = self.store.mandatory_delivery_ledger()
+        self.assertEqual(len(durable.requests), 1)
+        request = durable.requests[0]
+        self.assertTrue(request.body_free)
+
+        self._restart_core()
+        recovered = self.store.mandatory_delivery_ledger()
+        self.assertEqual(recovered, durable)
         replay = self.plugin.business_status(peer_id=_PEER)
-        self.assertIsNotNone(first.mandatory_request)
-        assert first.mandatory_request is not None
-        self.assertTrue(first.mandatory_request.body_free)
-        self.assertIsNotNone(first.transition)
-        assert first.transition is not None
-        self.assertEqual(
-            first.mandatory_request.causal_state_id,
-            first.transition.transition_id,
-        )
         self.assertIsNone(replay.mandatory_request)
+        self.assertEqual(self.store.mandatory_delivery_ledger(), recovered)
 
     def test_owner_task_cancellation_atomically_closes_active_task_and_claim(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
@@ -2040,6 +2293,10 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
     def test_owner_task_cancellation_preserves_solved_terminal(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="solve-before-owner-cancel",
+        )
         task = self._task_state().task(task_id)
         card = self.base.baseline_card
         acceptance = TaskAcceptance.prove(
@@ -2053,7 +2310,14 @@ class Ticket115IntegrationTests(unittest.TestCase):
             ),
             accepted_at_utc="2026-08-24T03:02:00+00:00",
         )
-        self._health("task.solve", {"acceptance": acceptance.to_storage()})
+        self._health(
+            "task.solve",
+            {
+                "acceptance": acceptance.to_storage(),
+                "claim_id": claim_id,
+                "holder_role": holder_role,
+            },
+        )
         before = self._task_state().task(task_id)
         request = self._owner_task_cancellation_request(
             task_id,

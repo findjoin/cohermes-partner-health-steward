@@ -14,6 +14,12 @@ from partner_health_steward.delivery import (
     OwnerDeliveryWireAdapter,
     OwnerWeixinDestination,
 )
+from tests.ticket115_delivery_fixtures import (
+    mark_attempted,
+    record_observation,
+    record_transport_result,
+    submit,
+)
 
 
 OWNER = "owner-A"
@@ -49,7 +55,7 @@ def _intent(
 
 
 def _submitted_state():
-    transition = OwnerDeliveryEngine.submit(
+    transition = submit(
         DeliveryOutboxState.empty(OWNER, INSTALLATION),
         _intent(),
         submitted_at_utc=SUBMITTED_AT,
@@ -67,7 +73,7 @@ def _attempted_state():
         acquired_at_utc=CLAIMED_AT,
         lease_seconds=30,
     )
-    attempted = OwnerDeliveryEngine.mark_attempted(
+    attempted = mark_attempted(
         claimed.state,
         intent_id,
         lease_id="lease:delivery:1",
@@ -161,7 +167,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
         initial = DeliveryOutboxState.empty(OWNER, INSTALLATION)
         intent = _intent()
 
-        submitted = OwnerDeliveryEngine.submit(
+        submitted = submit(
             initial,
             intent,
             submitted_at_utc=SUBMITTED_AT,
@@ -175,7 +181,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
         self.assertEqual(record.current_layer, "submitted")
         self.assertTrue(record.automatic_retry_allowed)
 
-        replay = OwnerDeliveryEngine.submit(
+        replay = submit(
             submitted.state,
             _intent(formed_at_utc="2026-08-24T02:10:00+00:00"),
             submitted_at_utc="2026-08-24T02:10:01+00:00",
@@ -184,7 +190,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
         self.assertEqual(replay.state, submitted.state)
 
     def test_effect_request_identifier_cannot_be_reused_for_new_payload(self) -> None:
-        submitted = OwnerDeliveryEngine.submit(
+        submitted = submit(
             DeliveryOutboxState.empty(OWNER, INSTALLATION),
             _intent(),
             submitted_at_utc=SUBMITTED_AT,
@@ -194,7 +200,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
             DeliveryContractViolation,
             "effect request identifier was already submitted",
         ):
-            OwnerDeliveryEngine.submit(
+            submit(
                 submitted.state,
                 _intent(payload_digest="sha256:" + "4" * 64),
                 submitted_at_utc="2026-08-24T02:00:04+00:00",
@@ -248,7 +254,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
             ("formed", "submitted", "attempted"),
         )
 
-        accepted = OwnerDeliveryEngine.record_observation(
+        accepted = record_observation(
             state,
             intent_id,
             kind="accepted",
@@ -262,7 +268,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
         self.assertFalse(accepted_record.has_fact("delivered"))
         self.assertFalse(accepted_record.has_fact("read"))
 
-        delivered = OwnerDeliveryEngine.record_observation(
+        delivered = record_observation(
             accepted.state,
             intent_id,
             kind="delivered",
@@ -271,7 +277,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
             evidence_ref="weixin-receipt:delivered:1",
             observed_at_utc="2026-08-24T02:00:05+00:00",
         )
-        read = OwnerDeliveryEngine.record_observation(
+        read = record_observation(
             delivered.state,
             intent_id,
             kind="read",
@@ -297,7 +303,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
             evidence_ref="weixin-response:rejected:1",
         )
 
-        rejected = OwnerDeliveryEngine.record_transport_result(
+        rejected = record_transport_result(
             state,
             intent_id,
             attempt_ref="weixin-attempt:1",
@@ -318,9 +324,9 @@ class Ticket115DeliveryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             DeliveryContractViolation,
-            "rejected delivery cannot be delivered or read",
+            "rejected delivery cannot prove an owner result",
         ):
-            OwnerDeliveryEngine.record_observation(
+            record_observation(
                 rejected.state,
                 intent_id,
                 kind="delivered",
@@ -372,7 +378,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
 
     def test_unknown_freezes_automatic_retry_without_erasing_later_proof(self) -> None:
         state, intent_id = _attempted_state()
-        unknown = OwnerDeliveryEngine.record_observation(
+        unknown = record_observation(
             state,
             intent_id,
             kind="unknown",
@@ -398,7 +404,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
                 acquired_at_utc="2026-08-24T02:01:00+00:00",
             )
 
-        duplicate = OwnerDeliveryEngine.record_observation(
+        duplicate = record_observation(
             unknown.state,
             intent_id,
             kind="unknown",
@@ -409,7 +415,7 @@ class Ticket115DeliveryTests(unittest.TestCase):
         )
         self.assertTrue(duplicate.replayed)
 
-        clarified = OwnerDeliveryEngine.record_observation(
+        clarified = record_observation(
             duplicate.state,
             intent_id,
             kind="delivered",
@@ -424,6 +430,47 @@ class Ticket115DeliveryTests(unittest.TestCase):
         self.assertEqual(clarified_record.current_layer, "delivered")
         self.assertFalse(clarified_record.unknown_frozen)
         self.assertFalse(clarified_record.automatic_retry_allowed)
+
+    def test_duplicate_observation_replay_preserves_the_prior_fact(self) -> None:
+        state, intent_id = _attempted_state()
+        first = record_observation(
+            state,
+            intent_id,
+            kind="unknown",
+            attempt_ref="weixin-attempt:1",
+            result_ref="weixin-result:unknown:dedupe",
+            evidence_ref="weixin-timeout:dedupe",
+            observed_at_utc="2026-08-24T02:00:04+00:00",
+        )
+        prior_fact = first.state.record(intent_id).fact("unknown")
+
+        replay = record_observation(
+            first.state,
+            intent_id,
+            kind="unknown",
+            attempt_ref="weixin-attempt:1",
+            result_ref="weixin-result:unknown:dedupe",
+            evidence_ref="weixin-timeout:dedupe",
+            observed_at_utc="2026-08-24T02:00:04+00:00",
+        )
+
+        self.assertTrue(replay.replayed)
+        self.assertIs(replay.state, first.state)
+        self.assertEqual(replay.state.record(intent_id).fact("unknown"), prior_fact)
+        with self.assertRaisesRegex(
+            DeliveryContractViolation,
+            "unknown delivery fact already recorded",
+        ):
+            record_observation(
+                first.state,
+                intent_id,
+                kind="unknown",
+                attempt_ref="weixin-attempt:1",
+                result_ref="weixin-result:unknown:changed",
+                evidence_ref="weixin-timeout:changed",
+                observed_at_utc="2026-08-24T02:00:05+00:00",
+            )
+        self.assertEqual(first.state.record(intent_id).fact("unknown"), prior_fact)
 
     def test_state_round_trip_preserves_public_value_contract(self) -> None:
         state, intent_id = _attempted_state()

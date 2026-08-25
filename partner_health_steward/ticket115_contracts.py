@@ -7,6 +7,8 @@ Plugin, Skill, or a transport adapter write authority.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import timedelta
 from datetime import datetime
@@ -111,13 +113,20 @@ class TaskClaimLease:
         *,
         runtime_epoch: str,
         monotonic_seconds: float,
+        generation: int,
+        holder_role: str,
         task_revision: int,
         task_cas_identity: str,
     ) -> bool:
         return self.is_active(
             runtime_epoch=runtime_epoch,
             monotonic_seconds=monotonic_seconds,
-        ) and task_revision == self.task_revision and task_cas_identity == self.task_cas_identity
+        ) and (
+            generation == self.generation
+            and holder_role == self.holder_role
+            and task_revision == self.task_revision
+            and task_cas_identity == self.task_cas_identity
+        )
 
     def to_storage(self) -> dict[str, object]:
         return {
@@ -214,6 +223,17 @@ class DeliveryEvidence:
             }
         )
 
+    @property
+    def signing_material(self) -> dict[str, object]:
+        return {
+            "layer": self.layer,
+            "producer_contract": self.producer_contract,
+            "generation": self.generation,
+            "replay_identity": self.replay_identity,
+            "effect_id": self.effect_id,
+            "evidence_ref": self.evidence_ref,
+        }
+
     def to_storage(self) -> dict[str, object]:
         return {
             "layer": self.layer,
@@ -227,13 +247,92 @@ class DeliveryEvidence:
 
     @classmethod
     def from_storage(cls, value: object) -> "DeliveryEvidence":
-        if type(value) is not dict:
+        fields = frozenset(
+            {
+                "layer",
+                "producer_contract",
+                "generation",
+                "attestation",
+                "replay_identity",
+                "effect_id",
+                "evidence_ref",
+            }
+        )
+        if type(value) is not dict or frozenset(value) != fields:
             raise Ticket115ContractViolation("invalid delivery evidence")
         return cls(**value)  # type: ignore[arg-type]
 
 
+def _delivery_attestation(
+    signing_key: bytes,
+    material: Mapping[str, object],
+) -> str:
+    digest = stable_digest(dict(material)).encode("ascii")
+    return "sha256:" + hmac.new(signing_key, digest, hashlib.sha256).hexdigest()
+
+
+class DeliveryEvidenceIssuer:
+    """A producer-bound signing capability for only its declared layers."""
+
+    __slots__ = ("producer_contract", "allowed_layers", "_signing_key")
+
+    def __init__(
+        self,
+        *,
+        producer_contract: str,
+        allowed_layers: tuple[str, ...],
+        signing_key: bytes,
+    ) -> None:
+        self.producer_contract = _text(
+            producer_contract,
+            "delivery producer contract",
+        )
+        if (
+            type(allowed_layers) is not tuple
+            or not allowed_layers
+            or len(allowed_layers) != len(set(allowed_layers))
+            or any(
+                DeliveryEvidenceAuthority.PRODUCER_BY_LAYER.get(layer)
+                != self.producer_contract
+                for layer in allowed_layers
+            )
+        ):
+            raise Ticket115ContractViolation("invalid delivery issuer layers")
+        if type(signing_key) is not bytes or len(signing_key) < 16:
+            raise Ticket115ContractViolation("invalid delivery signing key")
+        self.allowed_layers = allowed_layers
+        self._signing_key = bytes(signing_key)
+
+    def issue(
+        self,
+        *,
+        layer: str,
+        generation: int,
+        replay_identity: str,
+        effect_id: str,
+        evidence_ref: str,
+    ) -> DeliveryEvidence:
+        if layer not in self.allowed_layers:
+            raise Ticket115ContractViolation("delivery issuer cannot prove layer")
+        material = {
+            "layer": layer,
+            "producer_contract": self.producer_contract,
+            "generation": _positive(generation, "delivery evidence generation"),
+            "replay_identity": _text(
+                replay_identity,
+                "delivery replay identity",
+            ),
+            "effect_id": _text(effect_id, "delivery effect identifier"),
+            "evidence_ref": _text(evidence_ref, "delivery evidence reference"),
+        }
+        return DeliveryEvidence(
+            **material,
+            attestation=_delivery_attestation(self._signing_key, material),
+        )
+
+
 class DeliveryEvidenceAuthority:
-    """Restrict which producer may prove each delivery layer."""
+    """Verify producer possession plus exact layer/effect/replay bindings."""
 
     PRODUCER_BY_LAYER = MappingProxyType({
         "formed": "health-core.delivery.formed",
@@ -247,18 +346,76 @@ class DeliveryEvidenceAuthority:
         "actual-action": "owner.admitted-event",
     })
 
-    @classmethod
-    def verify(cls, evidence: DeliveryEvidence) -> bool:
-        return (
-            type(evidence) is DeliveryEvidence
-            and cls.PRODUCER_BY_LAYER.get(evidence.layer)
-            == evidence.producer_contract
-        )
+    def __init__(self, producer_keys: Mapping[str, bytes]) -> None:
+        if not isinstance(producer_keys, Mapping):
+            raise Ticket115ContractViolation("invalid delivery producer manifest")
+        keys: dict[str, bytes] = {}
+        for producer, key in producer_keys.items():
+            parsed = _text(producer, "delivery producer contract")
+            if parsed not in self.PRODUCER_BY_LAYER.values():
+                raise Ticket115ContractViolation("unknown delivery producer contract")
+            if type(key) is not bytes or len(key) < 16:
+                raise Ticket115ContractViolation("invalid delivery verification key")
+            keys[parsed] = bytes(key)
+        self._producer_keys = MappingProxyType(keys)
 
-    @classmethod
-    def require(cls, evidence: DeliveryEvidence) -> DeliveryEvidence:
-        if not cls.verify(evidence):
-            raise Ticket115ContractViolation("delivery evidence producer is not authoritative")
+    @property
+    def producer_contracts(self) -> frozenset[str]:
+        return frozenset(self._producer_keys)
+
+    def verify(
+        self,
+        evidence: DeliveryEvidence,
+        *,
+        expected_layer: str | None = None,
+        expected_generation: int | None = None,
+        expected_effect_id: str | None = None,
+        expected_replay_identity: str | None = None,
+    ) -> bool:
+        if type(evidence) is not DeliveryEvidence:
+            return False
+        key = self._producer_keys.get(evidence.producer_contract)
+        if (
+            key is None
+            or self.PRODUCER_BY_LAYER.get(evidence.layer)
+            != evidence.producer_contract
+            or (expected_layer is not None and evidence.layer != expected_layer)
+            or (
+                expected_generation is not None
+                and evidence.generation != expected_generation
+            )
+            or (
+                expected_effect_id is not None
+                and evidence.effect_id != expected_effect_id
+            )
+            or (
+                expected_replay_identity is not None
+                and evidence.replay_identity != expected_replay_identity
+            )
+        ):
+            return False
+        expected = _delivery_attestation(key, evidence.signing_material)
+        return hmac.compare_digest(evidence.attestation, expected)
+
+    def require(
+        self,
+        evidence: DeliveryEvidence,
+        *,
+        expected_layer: str | None = None,
+        expected_generation: int | None = None,
+        expected_effect_id: str | None = None,
+        expected_replay_identity: str | None = None,
+    ) -> DeliveryEvidence:
+        if not self.verify(
+            evidence,
+            expected_layer=expected_layer,
+            expected_generation=expected_generation,
+            expected_effect_id=expected_effect_id,
+            expected_replay_identity=expected_replay_identity,
+        ):
+            raise Ticket115ContractViolation(
+                "delivery evidence is not authoritative"
+            )
         return evidence
 
 
@@ -304,6 +461,32 @@ class MandatoryDeliveryRequest:
             }
         )
 
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "request_id": self.request_id,
+            "kind": self.kind,
+            "causal_state_id": self.causal_state_id,
+            "generation": self.generation,
+            "reason_code": self.reason_code,
+            "body_free": self.body_free,
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "MandatoryDeliveryRequest":
+        fields = frozenset(
+            {
+                "request_id",
+                "kind",
+                "causal_state_id",
+                "generation",
+                "reason_code",
+                "body_free",
+            }
+        )
+        if type(value) is not dict or frozenset(value) != fields:
+            raise Ticket115ContractViolation("invalid mandatory delivery request")
+        return cls(**value)  # type: ignore[arg-type]
+
 
 @dataclass(frozen=True)
 class MandatoryDeliveryLedger:
@@ -326,10 +509,27 @@ class MandatoryDeliveryLedger:
             True,
         )
 
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "requests": [request.to_storage() for request in self.requests],
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "MandatoryDeliveryLedger":
+        if type(value) is not dict or frozenset(value) != {"requests"}:
+            raise Ticket115ContractViolation("invalid mandatory delivery ledger")
+        requests = value["requests"]
+        if type(requests) is not list:
+            raise Ticket115ContractViolation("invalid mandatory delivery ledger")
+        return cls(
+            tuple(MandatoryDeliveryRequest.from_storage(item) for item in requests)
+        )
+
 
 __all__ = [
     "DeliveryEvidence",
     "DeliveryEvidenceAuthority",
+    "DeliveryEvidenceIssuer",
     "MANDATORY_DELIVERY_KINDS",
     "MandatoryDeliveryLedger",
     "MandatoryDeliveryRequest",

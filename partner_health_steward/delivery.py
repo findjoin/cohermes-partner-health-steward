@@ -11,13 +11,18 @@ separate approved authority chain before ``contact-delivery`` can be formed.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from .initialization import stable_digest
-from .ticket115_contracts import DeliveryEvidence, DeliveryEvidenceAuthority
+from .ticket115_contracts import (
+    DeliveryEvidence,
+    DeliveryEvidenceAuthority,
+    DeliveryEvidenceIssuer,
+)
 
 
 class DeliveryContractViolation(ValueError):
@@ -34,6 +39,7 @@ DELIVERY_FACT_KINDS = (
     "rejected",
     "delivered",
     "read",
+    "actual-action",
     "unknown",
 )
 DELIVERY_OBSERVATION_KINDS = (
@@ -41,6 +47,7 @@ DELIVERY_OBSERVATION_KINDS = (
     "rejected",
     "delivered",
     "read",
+    "actual-action",
     "unknown",
 )
 OWNER_DELIVERY_TRANSPORT_STATUSES = ("accepted", "rejected", "unknown")
@@ -54,6 +61,7 @@ _EVIDENCE_LAYER_BY_FACT_KIND = {
     "rejected": "interface-rejected",
     "delivered": "delivered",
     "read": "read",
+    "actual-action": "actual-action",
     "unknown": "unknown",
 }
 _MAX_TEXT_BYTES = 4_096
@@ -273,6 +281,12 @@ class OutboxIntent:
             payload_ref=self.payload_ref,
             payload_digest=self.payload_digest,
         )
+
+    @property
+    def effect_id(self) -> str:
+        return "effect:" + hashlib.sha256(
+            self.effect_request_id.encode("utf-8")
+        ).hexdigest()
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -542,37 +556,19 @@ class DeliveryFact:
 
     kind: str
     occurred_at_utc: str
-    evidence_ref: str
+    proof: DeliveryEvidence
     result_ref: str | None = None
     attempt_ref: str | None = None
     lease_id: str | None = None
-    producer_contract: str | None = None
-    generation: int = 1
-    attestation: str | None = None
-    replay_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in DELIVERY_FACT_KINDS:
             raise DeliveryContractViolation("invalid delivery fact kind")
         _utc(self.occurred_at_utc, "delivery fact time")
-        _text(self.evidence_ref, "delivery fact evidence reference")
-        expected_producer = {
-            "formed": "health-core.delivery.formed",
-            "submitted": "health-core.delivery.committed",
-            "attempted": "owner-delivery-adapter.attempted",
-            "accepted": "owner-delivery-adapter.interface",
-            "rejected": "owner-delivery-adapter.interface",
-            "unknown": "owner-delivery-adapter.unknown",
-            "delivered": "weixin.channel.receipt",
-            "read": "weixin.channel.receipt",
-        }[self.kind]
-        producer = expected_producer if self.producer_contract is None else _text(
-            self.producer_contract, "delivery producer contract"
-        )
-        if producer != expected_producer:
-            raise DeliveryContractViolation("delivery producer is not authoritative")
-        object.__setattr__(self, "producer_contract", producer)
-        _positive_int(self.generation, "delivery fact generation")
+        if type(self.proof) is not DeliveryEvidence:
+            raise DeliveryContractViolation("delivery fact requires signed evidence")
+        if self.proof.layer != _EVIDENCE_LAYER_BY_FACT_KIND[self.kind]:
+            raise DeliveryContractViolation("delivery fact evidence layer mismatch")
         result_ref = _optional_text(
             self.result_ref, "delivery fact result reference"
         )
@@ -598,71 +594,58 @@ class DeliveryFact:
             raise DeliveryContractViolation(
                 "delivery observation requires result and attempt references"
             )
-        replay_identity = self.replay_identity
-        if replay_identity is None:
-            replay_identity = self.attempt_ref or self.result_ref or self.evidence_ref
-        object.__setattr__(self, "replay_identity", _text(replay_identity, "delivery replay identity"))
-        attestation = self.attestation
-        if attestation is None:
-            attestation = stable_digest(
-                {
-                    "contract": "delivery-fact-attestation-v1",
-                    "kind": self.kind,
-                    "occurred_at_utc": self.occurred_at_utc,
-                    "evidence_ref": self.evidence_ref,
-                    "result_ref": self.result_ref,
-                    "attempt_ref": self.attempt_ref,
-                    "lease_id": self.lease_id,
-                    "producer_contract": producer,
-                    "generation": self.generation,
-                    "replay_identity": replay_identity,
-                }
-            )
-        object.__setattr__(self, "attestation", _sha256(attestation, "delivery attestation"))
-
-    def evidence(self, effect_id: str) -> DeliveryEvidence:
-        return DeliveryEvidence(
-            layer=_EVIDENCE_LAYER_BY_FACT_KIND[self.kind],
-            producer_contract=self.producer_contract,  # type: ignore[arg-type]
-            generation=self.generation,
-            attestation=self.attestation,  # type: ignore[arg-type]
-            replay_identity=self.replay_identity,  # type: ignore[arg-type]
-            effect_id=_text(effect_id, "delivery effect identifier"),
-            evidence_ref=self.evidence_ref,
+        expected_replay = (
+            self.attempt_ref
+            if self.kind == "attempted"
+            else self.evidence_ref
+            if self.kind in {"formed", "submitted"}
+            else self.result_ref
         )
+        if self.proof.replay_identity != expected_replay:
+            raise DeliveryContractViolation("delivery replay identity mismatch")
+
+    @property
+    def evidence_ref(self) -> str:
+        return self.proof.evidence_ref
+
+    @property
+    def producer_contract(self) -> str:
+        return self.proof.producer_contract
+
+    @property
+    def generation(self) -> int:
+        return self.proof.generation
+
+    @property
+    def effect_id(self) -> str:
+        return self.proof.effect_id
+
+    @property
+    def replay_identity(self) -> str:
+        return self.proof.replay_identity
+
+    def evidence(self) -> DeliveryEvidence:
+        return self.proof
 
     def to_wire(self) -> dict[str, object]:
         return {
             "kind": self.kind,
             "occurred_at_utc": self.occurred_at_utc,
-            "evidence_ref": self.evidence_ref,
+            "evidence": self.proof.to_storage(),
             "result_ref": self.result_ref,
             "attempt_ref": self.attempt_ref,
             "lease_id": self.lease_id,
-            "producer_contract": self.producer_contract,
-            "generation": self.generation,
-            "attestation": self.attestation,
-            "replay_identity": self.replay_identity,
         }
 
     @classmethod
     def from_wire(cls, value: object) -> "DeliveryFact":
-        legacy = frozenset(
-            {
-                "kind",
-                "occurred_at_utc",
-                "evidence_ref",
-                "result_ref",
-                "attempt_ref",
-                "lease_id",
-            }
+        fields = frozenset(
+            {"kind", "occurred_at_utc", "evidence", "result_ref", "attempt_ref", "lease_id"}
         )
-        extended = legacy | frozenset(
-            {"producer_contract", "generation", "attestation", "replay_identity"}
-        )
-        if type(value) is not dict or frozenset(value) not in {legacy, extended}:
+        if type(value) is not dict or frozenset(value) != fields:
             raise DeliveryContractViolation("invalid delivery fact")
         fields = dict(value)
+        fields["proof"] = DeliveryEvidence.from_storage(fields.pop("evidence"))
         return cls(**fields)  # type: ignore[arg-type]
 
 
@@ -744,8 +727,8 @@ class OutboxRecord:
             type(fact) is not DeliveryFact for fact in self.facts
         ):
             raise DeliveryContractViolation("invalid delivery facts")
-        for fact in self.facts:
-            DeliveryEvidenceAuthority.require(fact.evidence(self.intent.intent_id))
+        if any(fact.effect_id != self.intent.effect_id for fact in self.facts):
+            raise DeliveryContractViolation("delivery fact effect binding mismatch")
         kinds = tuple(fact.kind for fact in self.facts)
         if len(kinds) != len(set(kinds)):
             raise DeliveryContractViolation("duplicate delivery fact kind")
@@ -850,10 +833,10 @@ class OutboxRecord:
                 )
             if rejected is not None and any(
                 self.optional_fact(kind) is not None
-                for kind in ("delivered", "read")
+                for kind in ("delivered", "read", "actual-action")
             ):
                 raise DeliveryContractViolation(
-                    "rejected delivery cannot be delivered or read"
+                    "rejected delivery cannot prove an owner result"
                 )
             self._validate_known_layer_times()
             unknown = self.optional_fact("unknown")
@@ -861,7 +844,7 @@ class OutboxRecord:
                 unknown_at = _utc_datetime(
                     unknown.occurred_at_utc, "delivery unknown time"
                 )
-                for kind in ("rejected", "delivered", "read"):
+                for kind in ("rejected", "delivered", "read", "actual-action"):
                     known = self.optional_fact(kind)
                     if known is not None and _utc_datetime(
                         known.occurred_at_utc, "delivery observation time"
@@ -872,7 +855,7 @@ class OutboxRecord:
 
     def _validate_known_layer_times(self) -> None:
         previous: DeliveryFact | None = None
-        for kind in ("accepted", "delivered", "read"):
+        for kind in ("accepted", "delivered", "read", "actual-action"):
             current = self.optional_fact(kind)
             if current is None:
                 continue
@@ -912,7 +895,13 @@ class OutboxRecord:
         resolution = next(
             (
                 fact
-                for kind in ("read", "delivered", "rejected", "accepted")
+                for kind in (
+                    "actual-action",
+                    "read",
+                    "delivered",
+                    "rejected",
+                    "accepted",
+                )
                 if (fact := self.optional_fact(kind)) is not None
             ),
             None,
@@ -1131,6 +1120,8 @@ class OwnerDeliveryEngine:
         intent: OutboxIntent,
         *,
         submitted_at_utc: str,
+        formed_issuer: DeliveryEvidenceIssuer,
+        committed_issuer: DeliveryEvidenceIssuer,
     ) -> DeliveryTransition:
         if type(state) is not DeliveryOutboxState:
             raise DeliveryContractViolation("invalid delivery outbox state")
@@ -1171,14 +1162,24 @@ class OwnerDeliveryEngine:
                 DeliveryFact(
                     kind="formed",
                     occurred_at_utc=intent.formed_at_utc,
-                    evidence_ref=f"{intent.intent_id}:formed",
-                    generation=intent.route_generation,
+                    proof=formed_issuer.issue(
+                        layer="formed",
+                        generation=intent.route_generation,
+                        replay_identity=f"{intent.intent_id}:formed",
+                        effect_id=intent.effect_id,
+                        evidence_ref=f"{intent.intent_id}:formed",
+                    ),
                 ),
                 DeliveryFact(
                     kind="submitted",
                     occurred_at_utc=submitted_at,
-                    evidence_ref=intent.business_fact_ref,
-                    generation=intent.route_generation,
+                    proof=committed_issuer.issue(
+                        layer="business-committed",
+                        generation=intent.route_generation,
+                        replay_identity=intent.business_fact_ref,
+                        effect_id=intent.effect_id,
+                        evidence_ref=intent.business_fact_ref,
+                    ),
                 ),
             ),
         )
@@ -1252,6 +1253,7 @@ class OwnerDeliveryEngine:
         lease_id: str,
         attempt_ref: str,
         attempted_at_utc: str,
+        issuer: DeliveryEvidenceIssuer,
     ) -> DeliveryTransition:
         if type(state) is not DeliveryOutboxState:
             raise DeliveryContractViolation("invalid delivery outbox state")
@@ -1262,10 +1264,15 @@ class OwnerDeliveryEngine:
         fact = DeliveryFact(
             kind="attempted",
             occurred_at_utc=attempted_at,
-            evidence_ref=attempt,
+            proof=issuer.issue(
+                layer="attempted",
+                generation=record.intent.route_generation,
+                replay_identity=attempt,
+                effect_id=record.intent.effect_id,
+                evidence_ref=attempt,
+            ),
             attempt_ref=attempt,
             lease_id=lease_identifier,
-            generation=record.intent.route_generation,
         )
         existing = record.optional_fact("attempted")
         if existing is not None:
@@ -1299,7 +1306,8 @@ class OwnerDeliveryEngine:
         result_ref: str,
         evidence_ref: str,
         observed_at_utc: str,
-        producer_contract: str | None = None,
+        evidence: DeliveryEvidence,
+        authority: DeliveryEvidenceAuthority,
     ) -> DeliveryTransition:
         if type(state) is not DeliveryOutboxState:
             raise DeliveryContractViolation("invalid delivery outbox state")
@@ -1312,20 +1320,33 @@ class OwnerDeliveryEngine:
             raise DeliveryContractViolation(
                 "delivery observation requires the exact attempted effect"
             )
+        result = _text(result_ref, "delivery observation result reference")
+        evidence_reference = _text(
+            evidence_ref, "delivery observation evidence reference"
+        )
+        expected_layer = _EVIDENCE_LAYER_BY_FACT_KIND[kind]
+        try:
+            authority.require(
+                evidence,
+                expected_layer=expected_layer,
+                expected_generation=record.intent.route_generation,
+                expected_effect_id=record.intent.effect_id,
+                expected_replay_identity=result,
+            )
+        except ValueError as exc:
+            raise DeliveryContractViolation(
+                "delivery observation evidence is not authoritative"
+            ) from exc
+        if evidence.evidence_ref != evidence_reference:
+            raise DeliveryContractViolation("delivery evidence reference mismatch")
         fact = DeliveryFact(
             kind=kind,
             occurred_at_utc=_utc(
                 observed_at_utc, "delivery observation time"
             ),
-            result_ref=_text(
-                result_ref, "delivery observation result reference"
-            ),
-            evidence_ref=_text(
-                evidence_ref, "delivery observation evidence reference"
-            ),
+            result_ref=result,
+            proof=evidence,
             attempt_ref=attempt,
-            generation=record.intent.route_generation,
-            producer_contract=producer_contract,
         )
         existing = record.optional_fact(kind)
         if existing is not None:
@@ -1351,6 +1372,8 @@ class OwnerDeliveryEngine:
         attempt_ref: str,
         result: OwnerDeliveryTransportResult,
         observed_at_utc: str,
+        issuer: DeliveryEvidenceIssuer,
+        authority: DeliveryEvidenceAuthority,
     ) -> DeliveryTransition:
         """Record one narrow adapter response without implying owner receipt."""
 
@@ -1366,6 +1389,14 @@ class OwnerDeliveryEngine:
             result_ref=result.result_ref,
             evidence_ref=result.evidence_ref,
             observed_at_utc=observed_at_utc,
+            evidence=issuer.issue(
+                layer=_EVIDENCE_LAYER_BY_FACT_KIND[result.status],
+                generation=state.record(intent_id).intent.route_generation,
+                replay_identity=result.result_ref,
+                effect_id=state.record(intent_id).intent.effect_id,
+                evidence_ref=result.evidence_ref,
+            ),
+            authority=authority,
         )
 
     @staticmethod
