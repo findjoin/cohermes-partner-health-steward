@@ -19,6 +19,8 @@ from partner_health_steward.tasks import (
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
+    TaskAdjustment,
+    TaskOwnerMutation,
     TaskRuntimeState,
 )
 
@@ -247,6 +249,161 @@ class Ticket115TaskValueTests(unittest.TestCase):
 
 
 class Ticket115TaskEngineTests(unittest.TestCase):
+    def test_owner_defer_keeps_active_and_invalidates_claim_until_due(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        claimed = TaskEngine.claim(
+            created.state,
+            created.task_id,
+            holder_id="worker:A",
+            lease_id="lease:A",
+            acquired_at_utc="2026-08-24T02:01:00+00:00",
+        )
+
+        deferred = TaskEngine.apply_owner_mutation(
+            claimed.state,
+            TaskOwnerMutation.defer(
+                created.task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            control_ref="owner-control:defer-sleep",
+            effective_at_utc="2026-08-24T02:02:00+00:00",
+        )
+
+        task = deferred.state.task(created.task_id)
+        self.assertEqual(deferred.outcome, "owner-deferred")
+        self.assertEqual(task.primary_label, "active")
+        self.assertEqual(task.deferred_until_utc, "2026-08-24T04:00:00+00:00")
+        self.assertEqual(deferred.state.active_claims, ())
+        with self.assertRaisesRegex(TaskContractViolation, "deferred"):
+            TaskEngine.claim(
+                deferred.state,
+                created.task_id,
+                holder_id="worker:B",
+                lease_id="lease:B",
+                acquired_at_utc="2026-08-24T03:00:00+00:00",
+            )
+        with self.assertRaisesRegex(TaskContractViolation, "deferred"):
+            TaskEngine.advance_phase(
+                deferred.state,
+                created.task_id,
+                phase="awaiting-result",
+                advanced_at_utc="2026-08-24T03:00:00+00:00",
+            )
+        with self.assertRaisesRegex(TaskContractViolation, "lease does not exist"):
+            TaskEngine.release_claim(
+                deferred.state,
+                "lease:A",
+                holder_id="worker:A",
+                observed_at_utc="2026-08-24T03:00:00+00:00",
+            )
+
+    def test_owner_defer_expires_without_replaying_old_work(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        deferred = TaskEngine.apply_owner_mutation(
+            created.state,
+            TaskOwnerMutation.defer(
+                created.task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            control_ref="owner-control:defer-sleep-expiry",
+            effective_at_utc="2026-08-24T02:02:00+00:00",
+        )
+
+        resumed = TaskEngine.claim(
+            deferred.state,
+            created.task_id,
+            holder_id="worker:A",
+            lease_id="lease:A",
+            acquired_at_utc="2026-08-24T04:00:00+00:00",
+        )
+
+        task = resumed.state.task(created.task_id)
+        self.assertEqual(resumed.outcome, "claimed")
+        self.assertIsNone(task.deferred_until_utc)
+        self.assertEqual(task.phase, "in-progress")
+
+    def test_owner_in_scope_adjustment_updates_task_in_place_and_invalidates_claim(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        claimed = TaskEngine.claim(
+            created.state,
+            created.task_id,
+            holder_id="worker:A",
+            lease_id="lease:A",
+            acquired_at_utc="2026-08-24T02:01:00+00:00",
+        )
+        before = claimed.state.task(created.task_id)
+        adjusted = TaskEngine.apply_owner_mutation(
+            claimed.state,
+            TaskOwnerMutation.adjust(
+                created.task_id,
+                TaskAdjustment(allowed_data_categories=("portrait",)),
+            ),
+            control_ref="owner-control:adjust-sleep",
+            effective_at_utc="2026-08-24T02:03:00+00:00",
+        )
+
+        after = adjusted.state.task(created.task_id)
+        self.assertEqual(adjusted.outcome, "owner-adjusted")
+        self.assertEqual(after.task_id, before.task_id)
+        self.assertEqual(after.primary_label, "active")
+        self.assertEqual(after.allowed_data_categories, ("portrait",))
+        self.assertEqual(after.version, before.version + 1)
+        self.assertNotEqual(after.semantic_digest, before.semantic_digest)
+        self.assertEqual(adjusted.state.active_claims, ())
+
+    def test_owner_scope_expansion_creates_authorization_waiting_successor(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        adjusted = TaskEngine.apply_owner_mutation(
+            created.state,
+            TaskOwnerMutation.adjust(
+                created.task_id,
+                TaskAdjustment(purpose="Contact an external sleep coach about the schedule."),
+            ),
+            control_ref="owner-control:expand-sleep",
+            effective_at_utc="2026-08-24T02:03:00+00:00",
+        )
+
+        predecessor = adjusted.state.task(created.task_id)
+        successor = adjusted.state.task(adjusted.task_id)
+        self.assertEqual(adjusted.outcome, "owner-successor-created")
+        self.assertEqual(predecessor.successor_task_ids, (successor.task_id,))
+        self.assertEqual(successor.predecessor_task_ids, (predecessor.task_id,))
+        self.assertEqual(successor.primary_label, "active")
+        self.assertEqual(successor.phase, "waiting-owner")
+
+    def test_old_persisted_task_without_owner_deferral_round_trips(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(),
+            committed_at_utc=NOW,
+        )
+        old_task = created.state.task(created.task_id).to_storage()
+        old_task.pop("deferred_until_utc", None)
+        old_state = {
+            **created.state.to_storage(),
+            "tasks": [old_task],
+        }
+
+        restored = TaskRuntimeState.from_storage(old_state)
+
+        self.assertIsNone(restored.task(created.task_id).deferred_until_utc)
+
     def test_engine_owns_initial_task_state_and_merges_duplicate_basis(self) -> None:
         first = TaskEngine.admit_candidate(
             TaskRuntimeState.empty(OWNER, INSTALLATION),

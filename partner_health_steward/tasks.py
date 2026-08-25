@@ -426,6 +426,197 @@ class TaskCandidate:
 
 
 @dataclass(frozen=True)
+class TaskAdjustment:
+    """A bounded owner proposal for changing one task's current scope."""
+
+    purpose: str | None = None
+    expected_result: str | None = None
+    assignee: str | None = None
+    allowed_data_categories: tuple[str, ...] | None = None
+    allowed_data_refs: tuple[str, ...] | None = None
+    external_boundary: TaskExternalBoundary | None = None
+    acceptance_criteria: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if all(
+            value is None
+            for value in (
+                self.purpose,
+                self.expected_result,
+                self.assignee,
+                self.allowed_data_categories,
+                self.allowed_data_refs,
+                self.external_boundary,
+                self.acceptance_criteria,
+            )
+        ):
+            raise TaskContractViolation("task adjustment must change a field")
+        if self.purpose is not None:
+            _text(self.purpose, "task adjustment purpose")
+        if self.expected_result is not None:
+            _text(self.expected_result, "task adjustment expected result")
+        if self.assignee is not None:
+            _text(self.assignee, "task adjustment assignee")
+        if self.allowed_data_categories is not None:
+            _tuple_texts(
+                self.allowed_data_categories,
+                "task adjustment data categories",
+            )
+        if self.allowed_data_refs is not None:
+            _tuple_texts(self.allowed_data_refs, "task adjustment data references")
+        if self.external_boundary is not None and type(
+            self.external_boundary
+        ) is not TaskExternalBoundary:
+            raise TaskContractViolation("invalid task adjustment external boundary")
+        if self.acceptance_criteria is not None:
+            _tuple_texts(
+                self.acceptance_criteria,
+                "task adjustment acceptance criteria",
+            )
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "purpose": self.purpose,
+            "expected_result": self.expected_result,
+            "assignee": self.assignee,
+            "allowed_data_categories": (
+                None
+                if self.allowed_data_categories is None
+                else list(self.allowed_data_categories)
+            ),
+            "allowed_data_refs": (
+                None if self.allowed_data_refs is None else list(self.allowed_data_refs)
+            ),
+            "external_boundary": (
+                None
+                if self.external_boundary is None
+                else self.external_boundary.to_storage()
+            ),
+            "acceptance_criteria": (
+                None
+                if self.acceptance_criteria is None
+                else list(self.acceptance_criteria)
+            ),
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "TaskAdjustment":
+        stored = _mapping(
+            value,
+            frozenset(
+                {
+                    "purpose",
+                    "expected_result",
+                    "assignee",
+                    "allowed_data_categories",
+                    "allowed_data_refs",
+                    "external_boundary",
+                    "acceptance_criteria",
+                }
+            ),
+            "task adjustment",
+        )
+        raw_categories = stored["allowed_data_categories"]
+        raw_refs = stored["allowed_data_refs"]
+        raw_criteria = stored["acceptance_criteria"]
+        return cls(
+            purpose=_optional_text(stored["purpose"], "task adjustment purpose"),
+            expected_result=_optional_text(
+                stored["expected_result"],
+                "task adjustment expected result",
+            ),
+            assignee=_optional_text(stored["assignee"], "task adjustment assignee"),
+            allowed_data_categories=(
+                None
+                if raw_categories is None
+                else _wire_texts(raw_categories, "task adjustment data categories")
+            ),
+            allowed_data_refs=(
+                None
+                if raw_refs is None
+                else _wire_texts(raw_refs, "task adjustment data references")
+            ),
+            external_boundary=(
+                None
+                if stored["external_boundary"] is None
+                else TaskExternalBoundary.from_storage(stored["external_boundary"])
+            ),
+            acceptance_criteria=(
+                None
+                if raw_criteria is None
+                else _wire_texts(raw_criteria, "task adjustment acceptance criteria")
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class TaskOwnerMutation:
+    """A current-owner intent; TaskEngine alone turns it into task facts."""
+
+    operation: str
+    task_id: str
+    deferred_until_utc: str | None = None
+    adjustment: TaskAdjustment | None = None
+
+    def __post_init__(self) -> None:
+        if self.operation not in {"defer", "adjust"}:
+            raise TaskContractViolation("invalid owner task mutation")
+        _text(self.task_id, "owner task mutation task identifier")
+        if self.operation == "defer":
+            if self.deferred_until_utc is None or self.adjustment is not None:
+                raise TaskContractViolation("defer mutation requires only a deadline")
+            _utc_time(self.deferred_until_utc, "task deferral deadline")
+        elif self.deferred_until_utc is not None or type(
+            self.adjustment
+        ) is not TaskAdjustment:
+            raise TaskContractViolation("adjust mutation requires one adjustment")
+
+    @classmethod
+    def defer(cls, task_id: str, *, deferred_until_utc: str) -> "TaskOwnerMutation":
+        return cls(
+            operation="defer",
+            task_id=task_id,
+            deferred_until_utc=deferred_until_utc,
+        )
+
+    @classmethod
+    def adjust(cls, task_id: str, adjustment: TaskAdjustment) -> "TaskOwnerMutation":
+        return cls(operation="adjust", task_id=task_id, adjustment=adjustment)
+
+    def to_storage(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "task_id": self.task_id,
+            "deferred_until_utc": self.deferred_until_utc,
+            "adjustment": (
+                None if self.adjustment is None else self.adjustment.to_storage()
+            ),
+        }
+
+    @classmethod
+    def from_storage(cls, value: object) -> "TaskOwnerMutation":
+        stored = _mapping(
+            value,
+            frozenset({"operation", "task_id", "deferred_until_utc", "adjustment"}),
+            "owner task mutation",
+        )
+        raw_adjustment = stored["adjustment"]
+        return cls(
+            operation=_text(stored["operation"], "owner task mutation operation"),
+            task_id=_text(stored["task_id"], "owner task mutation task identifier"),
+            deferred_until_utc=_optional_text(
+                stored["deferred_until_utc"],
+                "task deferral deadline",
+            ),
+            adjustment=(
+                None
+                if raw_adjustment is None
+                else TaskAdjustment.from_storage(raw_adjustment)
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TaskTerminalFact:
     primary_label: str
     reason_code: str
@@ -548,6 +739,7 @@ class ManagedTask:
     terminal_fact: TaskTerminalFact | None
     created_at_utc: str
     updated_at_utc: str
+    deferred_until_utc: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.task_id, "task identifier")
@@ -635,6 +827,10 @@ class ManagedTask:
             self.terminal_fact.recorded_at_utc
         ) > updated:
             raise TaskContractViolation("task terminal time exceeds task update time")
+        if self.deferred_until_utc is not None:
+            _utc_time(self.deferred_until_utc, "task deferral deadline")
+            if self.primary_label != "active":
+                raise TaskContractViolation("terminal task cannot be deferred")
         expected_digest = _semantic_digest(
             purpose=self.purpose,
             expected_result=self.expected_result,
@@ -672,39 +868,40 @@ class ManagedTask:
             ),
             "created_at_utc": self.created_at_utc,
             "updated_at_utc": self.updated_at_utc,
+            "deferred_until_utc": self.deferred_until_utc,
         }
 
     @classmethod
     def from_storage(cls, value: object) -> "ManagedTask":
-        stored = _mapping(
-            value,
-            frozenset(
-                {
-                    "task_id",
-                    "version",
-                    "purpose",
-                    "expected_result",
-                    "assignee",
-                    "allowed_data_categories",
-                    "allowed_data_refs",
-                    "external_boundary",
-                    "approval",
-                    "acceptance_criteria",
-                    "source_kinds",
-                    "source_refs",
-                    "source_revision_digests",
-                    "semantic_digest",
-                    "primary_label",
-                    "phase",
-                    "predecessor_task_ids",
-                    "successor_task_ids",
-                    "terminal_fact",
-                    "created_at_utc",
-                    "updated_at_utc",
-                }
-            ),
-            "managed task",
+        old_fields = frozenset(
+            {
+                "task_id",
+                "version",
+                "purpose",
+                "expected_result",
+                "assignee",
+                "allowed_data_categories",
+                "allowed_data_refs",
+                "external_boundary",
+                "approval",
+                "acceptance_criteria",
+                "source_kinds",
+                "source_refs",
+                "source_revision_digests",
+                "semantic_digest",
+                "primary_label",
+                "phase",
+                "predecessor_task_ids",
+                "successor_task_ids",
+                "terminal_fact",
+                "created_at_utc",
+                "updated_at_utc",
+            }
         )
+        new_fields = old_fields | {"deferred_until_utc"}
+        if type(value) is not dict or frozenset(value) not in {old_fields, new_fields}:
+            raise TaskContractViolation("invalid managed task")
+        stored = value
         revisions = stored["source_revision_digests"]
         if type(revisions) is not list or not revisions:
             raise TaskContractViolation("invalid task source revisions")
@@ -764,6 +961,14 @@ class ManagedTask:
             ),
             created_at_utc=_utc_time(stored["created_at_utc"], "task creation time"),
             updated_at_utc=_utc_time(stored["updated_at_utc"], "task update time"),
+            deferred_until_utc=(
+                None
+                if "deferred_until_utc" not in stored
+                else _optional_text(
+                    stored["deferred_until_utc"],
+                    "task deferral deadline",
+                )
+            ),
         )
 
 
@@ -1360,8 +1565,106 @@ def _unresolved_unknowns(state: TaskRuntimeState, task_id: str) -> tuple[TaskUnk
     )
 
 
+def _task_is_deferred(task: ManagedTask, observed_at_utc: str) -> bool:
+    if task.deferred_until_utc is None:
+        return False
+    return datetime.fromisoformat(observed_at_utc) < datetime.fromisoformat(
+        task.deferred_until_utc
+    )
+
+
+def _task_available_for_action(task: ManagedTask, observed_at_utc: str) -> ManagedTask:
+    observed = _utc_time(observed_at_utc, "task action time")
+    if _task_is_deferred(task, observed):
+        raise TaskContractViolation("task is deferred")
+    if task.deferred_until_utc is None:
+        return task
+    return replace(task, deferred_until_utc=None)
+
+
+def _task_semantics(
+    task: ManagedTask,
+    adjustment: TaskAdjustment,
+) -> tuple[
+    str,
+    str,
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    TaskExternalBoundary,
+    tuple[str, ...],
+]:
+    return (
+        task.purpose if adjustment.purpose is None else adjustment.purpose,
+        (
+            task.expected_result
+            if adjustment.expected_result is None
+            else adjustment.expected_result
+        ),
+        task.assignee if adjustment.assignee is None else adjustment.assignee,
+        (
+            task.allowed_data_categories
+            if adjustment.allowed_data_categories is None
+            else adjustment.allowed_data_categories
+        ),
+        (
+            task.allowed_data_refs
+            if adjustment.allowed_data_refs is None
+            else adjustment.allowed_data_refs
+        ),
+        (
+            task.external_boundary
+            if adjustment.external_boundary is None
+            else adjustment.external_boundary
+        ),
+        (
+            task.acceptance_criteria
+            if adjustment.acceptance_criteria is None
+            else adjustment.acceptance_criteria
+        ),
+    )
+
+
+def _scope_expanded(
+    task: ManagedTask,
+    adjustment: TaskAdjustment,
+    proposed: tuple[
+        str,
+        str,
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        TaskExternalBoundary,
+        tuple[str, ...],
+    ],
+) -> bool:
+    purpose, expected_result, assignee, categories, refs, boundary, criteria = proposed
+    if purpose != task.purpose or expected_result != task.expected_result:
+        return True
+    if assignee != task.assignee:
+        return True
+    if not set(categories).issubset(task.allowed_data_categories):
+        return True
+    if not set(refs).issubset(task.allowed_data_refs):
+        return True
+    if not set(criteria).issubset(task.acceptance_criteria):
+        return True
+    if not set(boundary.recipient_refs).issubset(task.external_boundary.recipient_refs):
+        return True
+    if not set(boundary.effect_kinds).issubset(task.external_boundary.effect_kinds):
+        return True
+    return False
+
+
 class TaskEngine:
     """The sole authority that turns proposals into managed task facts."""
+
+    @staticmethod
+    def is_deferred(task: ManagedTask, observed_at_utc: str) -> bool:
+        if type(task) is not ManagedTask:
+            raise TaskContractViolation("invalid managed task")
+        observed = _utc_time(observed_at_utc, "task observation time")
+        return _task_is_deferred(task, observed)
 
     @staticmethod
     def admit_candidate(
@@ -1513,12 +1816,13 @@ class TaskEngine:
         task = state.task(task_id)
         if task.primary_label != "active":
             raise TaskContractViolation("only active tasks can be claimed")
+        acquired_text = _utc_time(acquired_at_utc, "task lease acquisition time")
+        task = _task_available_for_action(task, acquired_text)
         if task.phase not in {"planned", "in-progress"}:
             raise TaskContractViolation("task is not ready for a work claim")
         holder = _text(holder_id, "task lease holder")
         lease_identifier = _text(lease_id, "task lease identifier")
         duration = _positive_integer(lease_seconds, "task lease duration")
-        acquired_text = _utc_time(acquired_at_utc, "task lease acquisition time")
         acquired = datetime.fromisoformat(acquired_text)
         expiry = (acquired + timedelta(seconds=duration)).isoformat()
         for existing in state.active_claims:
@@ -1625,6 +1929,7 @@ class TaskEngine:
         }:
             raise TaskContractViolation("invalid active task phase")
         at = _utc_time(advanced_at_utc, "task phase time")
+        task = _task_available_for_action(task, at)
         if phase == task.phase:
             return TaskTransition(state, task.task_id, "phase-unchanged", True)
         next_task = replace(
@@ -1664,6 +1969,7 @@ class TaskEngine:
         task = state.task(acceptance.task_id)
         if task.primary_label != "active":
             raise TaskContractViolation("terminal task cannot be solved again")
+        task = _task_available_for_action(task, acceptance.accepted_at_utc)
         if acceptance.task_version != task.version:
             raise TaskContractViolation(
                 "task acceptance does not bind the current task version"
@@ -1766,6 +2072,230 @@ class TaskEngine:
         )
 
     @staticmethod
+    def apply_owner_mutation(
+        state: TaskRuntimeState,
+        mutation: TaskOwnerMutation,
+        *,
+        control_ref: str,
+        effective_at_utc: str,
+        cancelled_task_refs: tuple[str, ...] = (),
+    ) -> TaskTransition:
+        if type(state) is not TaskRuntimeState:
+            raise TaskContractViolation("invalid task runtime state")
+        if type(mutation) is not TaskOwnerMutation:
+            raise TaskContractViolation("invalid owner task mutation")
+        _text(control_ref, "owner task mutation control reference")
+        effective = _utc_time(effective_at_utc, "owner task mutation time")
+        if mutation.operation == "defer":
+            return TaskEngine._apply_owner_defer(
+                state,
+                mutation,
+                effective_at_utc=effective,
+            )
+        return TaskEngine._apply_owner_adjustment(
+            state,
+            mutation,
+            control_ref=control_ref,
+            effective_at_utc=effective,
+            cancelled_task_refs=cancelled_task_refs,
+        )
+
+    @staticmethod
+    def _apply_owner_defer(
+        state: TaskRuntimeState,
+        mutation: TaskOwnerMutation,
+        *,
+        effective_at_utc: str,
+    ) -> TaskTransition:
+        task = state.task(mutation.task_id)
+        deadline = _utc_time(
+            mutation.deferred_until_utc,
+            "task deferral deadline",
+        )
+        if task.primary_label != "active":
+            return TaskTransition(
+                state,
+                task.task_id,
+                "owner-defer-terminal-preserved",
+            )
+        if datetime.fromisoformat(deadline) <= datetime.fromisoformat(
+            effective_at_utc
+        ):
+            raise TaskContractViolation("task deferral deadline must be in the future")
+        if task.deferred_until_utc == deadline:
+            return TaskTransition(state, task.task_id, "owner-deferred", True)
+        next_task = replace(
+            task,
+            phase="planned" if task.phase == "in-progress" else task.phase,
+            version=task.version + 1,
+            updated_at_utc=effective_at_utc,
+            deferred_until_utc=deadline,
+        )
+        return TaskTransition(
+            replace(
+                state,
+                version=state.version + 1,
+                tasks=_replace_task(state, next_task),
+                active_claims=tuple(
+                    claim
+                    for claim in state.active_claims
+                    if claim.task_id != task.task_id
+                ),
+            ),
+            task.task_id,
+            "owner-deferred",
+        )
+
+    @staticmethod
+    def _apply_owner_adjustment(
+        state: TaskRuntimeState,
+        mutation: TaskOwnerMutation,
+        *,
+        control_ref: str,
+        effective_at_utc: str,
+        cancelled_task_refs: tuple[str, ...],
+    ) -> TaskTransition:
+        task = state.task(mutation.task_id)
+        adjustment = mutation.adjustment
+        if type(adjustment) is not TaskAdjustment:  # pragma: no cover - value invariant
+            raise TaskContractViolation("owner adjustment is missing")
+        if task.primary_label != "active":
+            return TaskTransition(
+                state,
+                task.task_id,
+                "owner-adjust-terminal-preserved",
+            )
+        proposed = _task_semantics(task, adjustment)
+        if proposed == (
+            task.purpose,
+            task.expected_result,
+            task.assignee,
+            task.allowed_data_categories,
+            task.allowed_data_refs,
+            task.external_boundary,
+            task.acceptance_criteria,
+        ):
+            return TaskTransition(state, task.task_id, "owner-adjusted", True)
+
+        if _scope_expanded(task, adjustment, proposed):
+            purpose, expected_result, assignee, categories, refs, boundary, criteria = (
+                proposed
+            )
+            candidate = TaskCandidate(
+                candidate_id=(
+                    "candidate:owner-adjustment:"
+                    + stable_digest(
+                        {
+                            "control_ref": control_ref,
+                            "task_id": task.task_id,
+                            "adjustment": adjustment.to_storage(),
+                        }
+                    ).removeprefix("sha256:")[:32]
+                ),
+                source_kind="owner-goal",
+                source_ref="owner-adjustment:" + control_ref,
+                source_revision_digest=stable_digest(adjustment.to_storage()),
+                purpose=purpose,
+                expected_result=expected_result,
+                assignee=assignee,
+                allowed_data_categories=categories,
+                allowed_data_refs=refs,
+                external_boundary=boundary,
+                phase=("waiting-approval" if boundary.permits_external_effect else "waiting-owner"),
+                approval=(
+                    TaskApprovalBinding.waiting()
+                    if boundary.permits_external_effect
+                    else TaskApprovalBinding.not_required()
+                ),
+                acceptance_criteria=criteria,
+            )
+            predecessor = task
+            if predecessor.phase == "in-progress":
+                predecessor = replace(predecessor, phase="planned")
+            state_for_link = replace(
+                state,
+                tasks=_replace_task(state, predecessor),
+                active_claims=tuple(
+                    claim
+                    for claim in state.active_claims
+                    if claim.task_id != task.task_id
+                ),
+            )
+            linked = TaskEngine.link_successor(
+                state_for_link,
+                task.task_id,
+                candidate,
+                committed_at_utc=effective_at_utc,
+                cancelled_task_refs=cancelled_task_refs,
+            )
+            return TaskTransition(
+                linked.state,
+                linked.task_id,
+                "owner-successor-created"
+                if linked.outcome == "successor-created"
+                else "owner-successor-linked",
+                linked.replayed,
+            )
+
+        (
+            purpose,
+            expected_result,
+            assignee,
+            categories,
+            refs,
+            boundary,
+            criteria,
+        ) = proposed
+        approval = (
+            task.approval
+            if boundary.permits_external_effect
+            else TaskApprovalBinding.not_required()
+        )
+        phase = task.phase
+        if phase == "in-progress":
+            phase = "planned"
+        if phase == "waiting-approval" and not boundary.permits_external_effect:
+            phase = "waiting-owner"
+        _validate_task_scope(boundary, approval, phase, initial=False)
+        next_task = replace(
+            task,
+            version=task.version + 1,
+            purpose=purpose,
+            expected_result=expected_result,
+            assignee=assignee,
+            allowed_data_categories=categories,
+            allowed_data_refs=refs,
+            external_boundary=boundary,
+            approval=approval,
+            acceptance_criteria=criteria,
+            semantic_digest=_semantic_digest(
+                purpose=purpose,
+                expected_result=expected_result,
+                assignee=assignee,
+                allowed_data_categories=categories,
+                allowed_data_refs=refs,
+                external_boundary=boundary,
+                acceptance_criteria=criteria,
+            ),
+            phase=phase,
+            updated_at_utc=effective_at_utc,
+        )
+        return TaskTransition(
+            replace(
+                state,
+                version=state.version + 1,
+                tasks=_replace_task(state, next_task),
+                active_claims=tuple(
+                    claim
+                    for claim in state.active_claims
+                    if claim.task_id != task.task_id
+                ),
+            ),
+            task.task_id,
+            "owner-adjusted",
+        )
+
+    @staticmethod
     def apply_owner_cancellation(
         state: TaskRuntimeState,
         task_id: str,
@@ -1813,6 +2343,7 @@ class TaskEngine:
         if _unresolved_unknowns(state, task.task_id):
             raise TaskContractViolation("delivery unknown cannot be rewritten as failed")
         at = _utc_time(failed_at_utc, "task failure time")
+        task = _task_available_for_action(task, at)
         terminal = TaskTerminalFact(
             primary_label="failed",
             reason_code=_text(reason_code, "task failure reason"),
@@ -1857,6 +2388,7 @@ class TaskEngine:
         effect = _text(effect_ref, "task delivery effect reference")
         reason = _text(reason_code, "task delivery unknown reason")
         observed = _utc_time(observed_at_utc, "task delivery unknown time")
+        task = _task_available_for_action(task, observed)
         _boolean(possibly_external, "task delivery unknown external flag")
         for fact in state.unknown_facts:
             if fact.effect_ref != effect:
@@ -2032,12 +2564,14 @@ __all__ = [
     "ManagedTask",
     "TaskAcceptance",
     "TaskAcceptanceCriterionProof",
+    "TaskAdjustment",
     "TaskApprovalBinding",
     "TaskCandidate",
     "TaskContractViolation",
     "TaskEngine",
     "TaskExternalBoundary",
     "TaskLease",
+    "TaskOwnerMutation",
     "TaskRuntimeState",
     "TaskTerminalFact",
     "TaskTransition",

@@ -160,6 +160,7 @@ from .settings import (
     ExecutionScopeApproval,
     ExecutionScopeConsumptionRequest,
     ORDINARY_NOTIFICATION_KINDS,
+    OwnerControlCommand,
     OwnerSettingsEngine,
     OwnerSettingsState,
     RouteConfigurationUpdate,
@@ -3327,6 +3328,25 @@ class HealthCore:
                 raise ProtocolViolation("invalid owner settings mutation") from exc
             next_settings = transition.state
             settings_result = transition.result
+            task_mutation = (
+                request.settings_command.task_mutation
+                if type(request.settings_command) is OwnerControlCommand
+                else None
+            )
+            if task_mutation is not None:
+                effective_at_utc = settings_result.get("effective_at_utc")
+                if type(effective_at_utc) is not str:
+                    raise ProtocolViolation("owner task control effective time missing")
+                try:
+                    TaskEngine.apply_owner_mutation(
+                        self._ticket115_task_state_open(current_settings),
+                        task_mutation,
+                        control_ref=request.context.command_id,
+                        effective_at_utc=effective_at_utc,
+                        cancelled_task_refs=current_settings.cancelled_task_refs,
+                    )
+                except (TaskContractViolation, TypeError, ValueError) as exc:
+                    raise ProtocolViolation("invalid owner task mutation") from exc
 
         daily = request.daily_turn_draft
         daily_result_digest: str | None = None
@@ -4845,7 +4865,38 @@ class HealthCore:
                         )
                     )
                 )
-                if matching_task_refs:
+                task_mutation = (
+                    prepared_owner.request.settings_command.task_mutation
+                    if type(prepared_owner) is OwnerPreparedMutation
+                    and type(prepared_owner.request.settings_command)
+                    is OwnerControlCommand
+                    else None
+                )
+                if task_mutation is not None:
+                    if type(task_state) is not TaskRuntimeState:
+                        raise KeyUnavailable("owner task aggregate missing")
+                    settings_result = prepared_owner.settings_result
+                    effective_at_utc = (
+                        None
+                        if type(settings_result) is not dict
+                        else settings_result.get("effective_at_utc")
+                    )
+                    if type(effective_at_utc) is not str:
+                        raise KeyUnavailable("owner task control effective time missing")
+                    control_ref = (
+                        prepared_owner.command_id
+                        if type(prepared_owner)
+                        is OwnerPreparedCorrectionRecovery
+                        else prepared_owner.request.context.command_id
+                    )
+                    next_task_state = TaskEngine.apply_owner_mutation(
+                        task_state,
+                        task_mutation,
+                        control_ref=control_ref,
+                        effective_at_utc=effective_at_utc,
+                        cancelled_task_refs=prepared_owner.next_settings.cancelled_task_refs,
+                    ).state
+                elif matching_task_refs:
                     settings_result = prepared_owner.settings_result
                     effective_at_utc = (
                         None
@@ -6869,6 +6920,8 @@ class HealthCore:
         outbox = self._ticket115_outbox_state_open(settings)
         refs: list[str] = []
         for task in task_state.tasks:
+            if TaskEngine.is_deferred(task, observed_at_utc):
+                continue
             approval_binding = task.approval
             approval = (
                 None
@@ -7324,6 +7377,8 @@ class HealthCore:
             return None
         outbox, outbox_record, task_state, review = binding
         task = task_state.task(intent.source_ref)
+        if TaskEngine.is_deferred(task, observed_at_utc):
+            return None
         try:
             current_review_key = local_day_key(
                 settings.owner_id,

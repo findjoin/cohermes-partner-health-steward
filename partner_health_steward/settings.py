@@ -22,6 +22,8 @@ from types import MappingProxyType
 from typing import Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .tasks import TaskOwnerMutation
+
 
 class SettingsContractViolation(ValueError):
     """A value cannot cross the owner-settings contract seam."""
@@ -717,6 +719,7 @@ class OwnerControlCommand:
     context: OwnerCommandContext
     control_update: ControlUpdate
     execution_scope_approval: ExecutionScopeApproval | None
+    task_mutation: TaskOwnerMutation | None = None
 
     def __post_init__(self) -> None:
         if type(self.context) is not OwnerCommandContext:
@@ -728,6 +731,11 @@ class OwnerControlCommand:
             and type(self.execution_scope_approval) is not ExecutionScopeApproval
         ):
             raise SettingsContractViolation("invalid execution-scope approval")
+        if (
+            self.task_mutation is not None
+            and type(self.task_mutation) is not TaskOwnerMutation
+        ):
+            raise SettingsContractViolation("invalid owner task mutation")
         if self.context.permission != "health_settings.write":
             raise SettingsContractViolation("invalid owner settings permission")
         if self.context.generation != self.control_update.generation:
@@ -735,6 +743,22 @@ class OwnerControlCommand:
 
         approval = self.execution_scope_approval
         update = self.control_update
+        mutation = self.task_mutation
+        if mutation is not None:
+            if (
+                update.control_name != "task"
+                or update.operation != mutation.operation
+                or update.target_ref != mutation.task_id
+                or self.execution_scope_approval is not None
+            ):
+                raise SettingsContractViolation("owner task mutation target mismatch")
+        elif update.control_name == "task" and update.operation in {
+            "defer",
+            "adjust",
+        }:
+            raise SettingsContractViolation(
+                "task defer or adjust requires owner task mutation"
+            )
         if approval is not None:
             if update.control_name != "execution_scope_approval":
                 raise SettingsContractViolation(
@@ -760,7 +784,7 @@ class OwnerControlCommand:
             raise SettingsContractViolation("approval control requires target reference")
 
     def to_wire(self) -> dict[str, object]:
-        return {
+        wire = {
             "context": self.context.to_wire(),
             "control_update": self.control_update.to_wire(),
             "execution_scope_approval": (
@@ -769,29 +793,34 @@ class OwnerControlCommand:
                 else self.execution_scope_approval.to_wire()
             ),
         }
+        if self.task_mutation is not None:
+            wire["task_mutation"] = self.task_mutation.to_storage()
+        return wire
 
     @classmethod
     def from_wire(cls, value: object) -> "OwnerControlCommand":
-        fields = _mapping(
-            value,
-            frozenset(
-                {
-                    "context",
-                    "control_update",
-                    "execution_scope_approval",
-                }
-            ),
-            "owner control command",
+        old_fields = frozenset(
+            {"context", "control_update", "execution_scope_approval"}
         )
+        new_fields = old_fields | {"task_mutation"}
+        if type(value) is not dict or frozenset(value) not in {old_fields, new_fields}:
+            raise SettingsContractViolation("invalid owner control command")
+        fields = value
         approval_wire = fields["execution_scope_approval"]
         if approval_wire is None:
             approval = None
         else:
             approval = ExecutionScopeApproval.from_wire(approval_wire)
+        raw_mutation = fields.get("task_mutation")
         return cls(
             context=OwnerCommandContext.from_wire(fields["context"]),
             control_update=ControlUpdate.from_wire(fields["control_update"]),
             execution_scope_approval=approval,
+            task_mutation=(
+                None
+                if raw_mutation is None
+                else TaskOwnerMutation.from_storage(raw_mutation)
+            ),
         )
 
 
@@ -2689,6 +2718,14 @@ class OwnerSettingsEngine:
     ) -> tuple[OwnerSettingsState, dict[str, object]]:
         _validate_owner_context(state, command.context)
         update = command.control_update
+        if command.task_mutation is not None:
+            return state, {
+                "kind": "task_control",
+                "operation": command.task_mutation.operation,
+                "task_id": command.task_mutation.task_id,
+                "settings_version": state.version + 1,
+                "effective_at_utc": committed_at,
+            }
         if update.control_name != "execution_scope_approval":
             return cls._apply_control(
                 state, update, committed_at

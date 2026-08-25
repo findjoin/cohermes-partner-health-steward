@@ -33,10 +33,12 @@ from partner_health_steward.tasks import (
     TaskApprovalBinding,
     TaskAcceptance,
     TaskAcceptanceCriterionProof,
+    TaskAdjustment,
     TaskCandidate,
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
+    TaskOwnerMutation,
     TaskRuntimeState,
 )
 from tests import test_ticket114_authority_integration as ticket114_integration
@@ -334,6 +336,47 @@ class Ticket115IntegrationTests(unittest.TestCase):
             command_suffix=suffix,
         )
 
+    def _owner_task_mutation_request(
+        self,
+        task_id: str,
+        mutation: TaskOwnerMutation,
+        *,
+        suffix: str,
+    ) -> object:
+        snapshot = self.base.head.read().head
+        current = self.store.owner_settings()
+        self.assertIsNotNone(current)
+        assert current is not None
+        nested_context = settings.OwnerCommandContext(
+            command_id=f"owner-task-command:{self._testMethodName}{suffix}",
+            causal_id=f"owner-task-source:{self._testMethodName}{suffix}",
+            actor_kind="current_owner",
+            owner_id="owner-A",
+            installation_id="partner-installation",
+            permission="health_settings.write",
+            context_ref=f"managed-context:owner-task:{self._testMethodName}",
+            generation=snapshot.generation,
+            writer_fence=snapshot.writer_fence,
+        )
+        command = settings.OwnerControlCommand(
+            context=nested_context,
+            control_update=settings.ControlUpdate(
+                control_name="task",
+                operation=mutation.operation,
+                target_ref=task_id,
+                generation=snapshot.generation,
+                effective_at_utc=_ATTEMPTED_AT,
+            ),
+            execution_scope_approval=None,
+            task_mutation=mutation,
+        )
+        return self.base._owner_request(
+            correction=False,
+            settings_command=command,
+            expected_settings_version=current.version,
+            command_suffix=suffix,
+        )
+
     def _candidate(
         self,
         *,
@@ -568,6 +611,194 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertIsNotNone(grant)
         assert grant is not None
         return grant
+
+    def test_owner_defer_uses_owner_mutation_chain_and_suppresses_review_action(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        claimed = self._transition(
+            self._health(
+                "task.claim",
+                {
+                    "task_id": task_id,
+                    "holder_id": "task-worker:owner-defer",
+                    "lease_id": "task-lease:owner-defer",
+                    "acquired_at_utc": "2026-08-24T03:01:00+00:00",
+                },
+            )
+        )
+        self.assertEqual(claimed.outcome, "claimed")
+        request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-owner-task-defer",
+        )
+
+        self.assertEqual(self.base._prepare(request).status, "accepted")
+        self.assertEqual(self.base._commit(request).status, "accepted")
+        self.assertEqual(self.base._finalize(request).status, "accepted")
+
+        task = self._task_state().task(task_id)
+        self.assertEqual(task.primary_label, "active")
+        self.assertEqual(task.deferred_until_utc, "2026-08-24T04:00:00+00:00")
+        self.assertEqual(self._task_state().active_claims, ())
+        visible_task = next(
+            item
+            for item in self._ticket115_read()["tasks"]
+            if item["task_id"] == task_id
+        )
+        self.assertEqual(
+            visible_task["deferred_until_utc"],
+            "2026-08-24T04:00:00+00:00",
+        )
+        self.assertNotIn(
+            "deferred_until_utc",
+            self.store.owner_settings().to_wire()["controls"],
+        )
+
+        pending = self._wake_review("2026-08-24T03:30:00+00:00").ledger.pending
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending.action_refs, ())
+
+    def test_owner_in_scope_adjustment_is_atomic_and_invalidates_old_version(self) -> None:
+        candidate, _, effect_request_id = self._candidate()
+        candidate = replace(
+            candidate,
+            allowed_data_categories=("health-evidence", "owner-action"),
+        )
+        task_id = (
+            "task:"
+            + candidate.semantic_digest.removeprefix("sha256:")[:32]
+            + ":1"
+        )
+        next_version = self.plugin.owner_settings_state(peer_id=_PEER).version
+        self._configure_approval(task_id, effect_request_id, expected_version=next_version)
+        self._transition(
+            self._health(
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+        )
+        claimed = self._transition(
+            self._health(
+                "task.claim",
+                {
+                    "task_id": task_id,
+                    "holder_id": "task-worker:owner-adjust",
+                    "lease_id": "task-lease:owner-adjust",
+                    "acquired_at_utc": "2026-08-24T03:01:00+00:00",
+                },
+            )
+        )
+        before = self._task_state().task(task_id)
+        self.assertEqual(claimed.task_id, task_id)
+        request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.adjust(
+                task_id,
+                TaskAdjustment(allowed_data_categories=("health-evidence",)),
+            ),
+            suffix=":ticket115-owner-task-adjust",
+        )
+
+        self.assertEqual(self.base._prepare(request).status, "accepted")
+        self.assertEqual(self.base._commit(request).status, "accepted")
+        self.assertEqual(self.base._finalize(request).status, "accepted")
+
+        after = self._task_state().task(task_id)
+        self.assertEqual(after.task_id, before.task_id)
+        self.assertEqual(after.version, before.version + 1)
+        self.assertEqual(after.allowed_data_categories, ("health-evidence",))
+        self.assertEqual(self._task_state().active_claims, ())
+
+    def test_owner_scope_expansion_creates_successor_without_trusting_caller_scope_flag(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.adjust(
+                task_id,
+                TaskAdjustment(
+                    assignee="external-sleep-coach",
+                    allowed_data_refs=(
+                        "portrait-topic:sleep",
+                        "owner-provided:sleep-diary",
+                    ),
+                ),
+            ),
+            suffix=":ticket115-owner-task-expand",
+        )
+
+        self.assertEqual(self.base._prepare(request).status, "accepted")
+        self.assertEqual(self.base._commit(request).status, "accepted")
+        self.assertEqual(self.base._finalize(request).status, "accepted")
+
+        state = self._task_state()
+        predecessor = state.task(task_id)
+        self.assertEqual(len(state.tasks), 2)
+        successor = state.task(predecessor.successor_task_ids[0])
+        self.assertEqual(successor.predecessor_task_ids, (task_id,))
+        self.assertEqual(successor.phase, "waiting-approval")
+        self.assertEqual(successor.approval.status, "waiting")
+        self.assertEqual(successor.primary_label, "active")
+
+    def test_owner_defer_replay_is_idempotent_and_finalize_rollback_keeps_prepared_state(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-owner-task-defer-replay",
+        )
+        self.assertEqual(self.base._prepare(request).status, "accepted")
+        self.assertEqual(self.base._commit(request).status, "accepted")
+        stored = self.store.owner_mutation(request.context.command_id)
+        self.assertIsNotNone(stored)
+        assert stored is not None and stored.prepared is not None
+        before_settings = self.store.owner_settings()
+        before_tasks = self.store.task_runtime()
+        self.assertIsInstance(before_tasks, TaskRuntimeState)
+        assert isinstance(before_tasks, TaskRuntimeState)
+        deferred = TaskEngine.apply_owner_mutation(
+            before_tasks,
+            request.settings_command.task_mutation,  # type: ignore[union-attr]
+            control_ref=request.context.command_id,
+            effective_at_utc=_ATTEMPTED_AT,
+        )
+        original = self.store._write_task_runtime
+
+        def fail_task_write(this: object, connection: object, state: object) -> None:
+            del this, connection, state
+            raise StoreUnavailable("synthetic owner task defer failure")
+
+        self.store._write_task_runtime = MethodType(fail_task_write, self.store)
+        try:
+            with self.assertRaisesRegex(StoreUnavailable, "synthetic owner task defer failure"):
+                self.store.finalize_owner_mutation(
+                    stored.prepared,
+                    task_state=deferred.state,
+                )
+        finally:
+            self.store._write_task_runtime = original
+
+        self.assertEqual(self.store.owner_settings(), before_settings)
+        self.assertEqual(self.store.task_runtime(), before_tasks)
+        self.assertEqual(
+            self.store.owner_mutation(request.context.command_id).phase,
+            "prepared",
+        )
+
+        self.assertEqual(self.base._finalize(request).status, "accepted")
+        first = self._task_state()
+        replayed = self.base._finalize(request)
+        self.assertIn(replayed.status, {"accepted", "replayed"})
+        self.assertEqual(self._task_state(), first)
 
     def test_task_claim_and_review_prepare_resume_across_restart(self) -> None:
         task_id, _ = self._admit_review_task()
@@ -846,6 +1077,18 @@ class Ticket115IntegrationTests(unittest.TestCase):
                             action,
                             source="health-records",
                             causal_id=f"ticket115-b-skill-denied:{action}",
+                        ),
+                    )
+
+        for action in ("task.defer", "task.adjust"):
+            with self.subTest(action=action):
+                with self.assertRaises(ProtocolViolation):
+                    self._health(
+                        action,
+                        {},
+                        context=self._health_context(
+                            action,
+                            causal_id=f"ticket115-direct-health-forbidden:{action}",
                         ),
                     )
         self.assertEqual(self.base.head.read().head, before)
