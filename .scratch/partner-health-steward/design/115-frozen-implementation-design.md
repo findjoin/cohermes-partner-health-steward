@@ -1,6 +1,6 @@
 # Ticket 115 冻结实施设计
 
-> 设计状态：第三版候选，尚未 frozen。本文只有在同一内容 commit/tree 通过规定复审、写入 Ticket 115 并由主人确认后才成为实施路线。此前禁止修改产品代码。冻结后，编码 Agent 只实现本文，不再选择状态机、事务、权限、兼容或模块路线。
+> 设计状态：第四版候选，尚未 frozen。本文只有在同一内容 commit/tree 通过规定复审、写入 Ticket 115 并由主人确认后才成为实施路线。此前禁止修改产品代码。冻结后，编码 Agent 只实现本文，不再选择状态机、事务、权限、兼容或模块路线。
 
 ## 1. 设计身份与依据
 
@@ -8,6 +8,7 @@
 - 只读 salvage：23d4827557b532f4eee4fe5511c458ed2b5d8e15，tree c179a9ba297f10d42aa1f534679c7d935836e213。
 - 第一版候选：8721b1b34f9ee311600531c82d97ac174e41b9f5，tree 44cbb9cd623c35bf315c7bd101cfeeabccc3c0d6；六轴 verdict 为 FAIL，只保留为审查输入。
 - 第二版候选：eccb4c11d96c88ea8993f8e96a9c1c8b1440ec56，tree 79c3267cc9676f915dc1cc56a52f22918ee8e920；三路分组复审 verdict 为 FAIL，只保留为审查输入。
+- 第三版候选：796488ff640caf90b919d6e51aef448317ae35c2，tree b6150039175b6c82a5fec0665152045959bdccac；三路分组复审 verdict 为 FAIL，只保留为审查输入。
 - salvage 不是实施基线、合并目标或既定路线。禁止整体 cherry-pick。第 15 节只允许按冻结条款人工提取单个测试或纯算法思想。
 - 产品权威依次为：当前 Spec、CONTEXT.md、ADR 0022、已 resolved 的 Ticket 110—114、本文、Ticket 115 的 A1—A8。测试证明合同，不能创造新的产品目标或替代设计。
 
@@ -54,7 +55,7 @@ I8. dispatch-armed 是外部效果不可逆边界。它只表示“可能已经�
 
 I9. attempted 只由绑定本次 execution 的严格 Adapter completion，或注册渠道对该 execution 的权威 readback 证明。interface-accepted、delivered、read、actual-action 分别需要各自证明。
 
-I10. dispatch-armed 后若无精确 completion/readback，效果进入 may-have-left + unknown，自动重试冻结。主人接受重复风险只建立新效果 E1，不能解冻 E0。
+I10. dispatch-armed 后若无精确 completion/readback，效果进入 may-have-left + unknown，自动重试冻结。unknown/may-have-left 历史永不删除；后续权威 readback 只能追加 current outcome 与 typed disposition。主人接受重复风险只建立后继效果 E1，不能改写 E0 历史。
 
 I11. business_status 保留 Ticket 114 行为：计算当前投影，并原子记住上一投影，使同一状态变化在并发和重启后只返回一次。它不依赖 delivery route 或 mandatory 是否可投影。
 
@@ -100,7 +101,7 @@ TaskClaimLease 持久字段固定为：
 - holder_role；
 - holder_binding_digest；
 - allowed_task_actions；
-- acquired_at_monotonic_seconds、expires_at_monotonic_seconds；
+- acquired_at_monotonic_ns、expires_at_monotonic_ns（同 runtime_epoch 内的非负整数纳秒 tick，expires > acquired）；
 - task_revision、task_cas_identity、head_generation。
 
 claim 成功时 core 返回不可序列化 TaskClaimCapability，绑定同一 claim_id、holder_binding_digest、runtime_epoch、owner/install/task 和 allowed_task_actions。所有 worker transition 必须同时提交 claim_id 与精确 capability；仅有 holder_role 或 holder_id 不构成证明。
@@ -109,21 +110,31 @@ claim 成功时 core 返回不可序列化 TaskClaimCapability，绑定同一 cl
 
 ### 4.3 候选的三个准入源
 
-Ticket 115 给 DailyTurnResult 增加可选、严格有序的 task_candidate_drafts；DailyTurnTerminalReceipt 增加相同顺序的 task_candidate_digests。两者进入既有 result_digest、payload_digest 和 terminal chain。d468 result 没有该字段时按空集合读取，不能从 owner_reply 或历史正文补猜。
+TaskCandidateDraftSource 是 closed union，discriminator 为 source_kind：
+
+- owner-goal：精确字段只有 source_kind、source_causal_id；goal ordinal 不在 wire 中，由 core 按 finalized DailyTurnResult.task_candidate_drafts 的 0-based 顺序重算；
+- portrait-evidence：精确字段为 source_kind、object_kind = portrait/evidence、object_id、expected_revision_digest、authority_transition_id、skill_proof_digest；
+- task-event：精确字段为 source_kind、source_task_id、source_task_version、source_transition_id；它只允许出现在下述 TaskEventCandidateFact，不允许出现在 DailyTurnResult。
+
+Ticket 115 给 DailyTurnResult 增加可选、严格有序且只含 owner-goal/portrait-evidence source 的 task_candidate_drafts；DailyTurnTerminalReceipt 增加相同顺序的 task_candidate_bindings，每项精确为 draft_digest + producer_skill_proof_digest。两者进入既有 result_digest、payload_digest 和 terminal chain。d468 result 没有该字段时按空集合读取，不能从 owner_reply 或历史正文补猜。
+
+task-event 候选走独立 core-internal 路径：持有 live TaskClaimCapability 的 worker 可在 typed TaskWorkResult 中返回 followup_candidate_drafts；core 在同一次 task transition 中只把候选写成 TaskEventCandidateFact，字段固定为 candidate_fact_id、source_task_id/version、source_transition_id、source_transition_digest、inherited_goal_anchor_ref、draft、draft_digest、worker_result_digest、fact_digest。该 fact 随 containing Ticket115 mutation 完成 current-head finalize 后，下一次独立 admission 才能消费；Skill/worker 仍只提出候选，不能直接建立 task。candidate_fact_id = H(task-event-candidate-fact-v1, source_transition_id, draft_digest, worker_result_digest)。
+
+TaskEventCandidateFact.fact_digest = H(task-event-candidate-fact-wire-v1, 除 fact_digest 外的完整 canonical wire)。source_transition_id/digest 必须来自同一 mutation 中已构造的 TaskTransitionFact；draft_digest 与 worker_result_digest 必须按各自 typed wire 重算，不能由 worker 自报。
 
 TaskCandidate 只从下表 resolver 进入 core：
 
 | source kind | resolver 必须精确读取并满足 | goal_anchor_ref |
 |---|---|---|
-| owner-goal | committed SourceReceipt；business causal id = receipt.business_source_causal_id 或 envelope.causal_id；同 causal id 的 finalized DailyTurnTerminalReceipt；record/transition/result digest 全匹配的 DailyTurnResult；其中精确 draft digest 已列入 terminal；terminal 的 health-steward Skill use/proof 验证成功 | owner-goal:{business_causal_id}:{goal_ordinal} |
-| portrait-evidence | finalized terminal/result；draft 指向的 portrait/evidence object 当前 revision 与 Ticket112 authority transition 精确匹配；对应职责 Skill use/proof digest 在 terminal 中 | portrait-evidence:{object_kind}:{object_id}:{authority_transition_id} |
-| task-event | 已 finalized 的 v2 TaskTransition，owner/install、task version、transition id 与 draft locator 全匹配 | task-event:{task_id}:{transition_id} |
+| owner-goal | committed SourceReceipt；business causal id = receipt.business_causal_id；同 causal id 的 finalized DailyTurnTerminalReceipt；record/transition/result digest 全匹配的 DailyTurnResult；同 ordinal 的 draft/binding 与 health-steward proof 精确匹配 | 若 verified_related_task_id 精确 current，则继承该 task 的根 anchor；否则 owner-goal:{business_causal_id}:{core-recomputed-ordinal} |
+| portrait-evidence | finalized terminal/result/binding；current portrait/evidence object 的 object kind/id、revision、Ticket112 authority transition 与职责 Skill proof 全匹配 | 若 verified_related_task_id 精确 current，则继承；否则 portrait-evidence:{object_kind}:{object_id}:{goal_signature}，revision 不进入 anchor；同一对象可有不同稳定目标 |
+| task-event | current TaskRuntimeState 中 finalized TaskTransitionFact + TaskEventCandidateFact；owner/install、source task/version/transition/digest 全匹配，source task 不是 compatibility-limited | 必须继承 source task 的根 anchor，不允许新建或自报 anchor |
 
-任何 resolver 缺对象、digest/currentness 不符、draft 未列入 terminal 或 source 属 d468 且没有 typed draft时，结果固定为 not-established，不尝试自然语言推断。
+verified_related_task_id 只作为 locator；core 必须读取同 owner/install 的 current v2 task，并验证 source binding 或 predecessor relation。任何 resolver 缺对象、digest/currentness 不符、draft 未绑定 proof、task-event 未 finalized、related task 不匹配，或 source 属 d468 且没有 typed draft/fact时，结果固定为 not-established，不尝试自然语言推断，也不创建第五类 MandatoryRequest。主人当前轮可由 health-steward 在唯一回复中提出一个最小补问；自动来源保持安静。
 
-draft_digest = H(task-candidate-draft-v2, canonical draft)。candidate_id = H(task-candidate-id-v2, source_kind, goal_anchor_ref, authority_transition_id, draft_digest)。candidate_digest = H(task-candidate-v2, owner_id, installation_id, goal_anchor_ref, contract_digest, ordered source bindings, verified_related_task_id-or-null)。CandidateReceipt replay 只使用 candidate_id + candidate_digest。
+resolver 同时产生 resolved_source_authority_id：owner-goal = finalized DailyTurnTerminalReceipt.transition_id；portrait-evidence = 已验证对象的 authority_transition_id；task-event = source_transition_id。draft_digest = H(task-candidate-draft-v2, canonical draft)。candidate_id = H(task-candidate-id-v2, source_kind, resolved goal_anchor_ref, resolved_source_authority_id, draft_digest)。candidate_digest = H(task-candidate-v2, owner_id, installation_id, goal_anchor_ref, contract_digest, ordered source bindings, verified_related_task_id-or-null)。CandidateReceipt replay 只使用 candidate_id + candidate_digest。
 
-Plugin 只运输 UnsignedHealthRequest。模型/Skill 只能贡献已进入 finalized DailyTurnResult 的 TaskCandidateDraft；core 重新解析表中对象后构造 AdmittedTaskCandidate。
+Plugin 只运输 UnsignedHealthRequest。模型/Skill 只能贡献 finalized DailyTurnResult 中的 turn draft，或 live claimed work 的 TaskWorkResult draft；core 按上述受管对象重建后才构造 AdmittedTaskCandidate。
 
 ### 4.4 渠道回执权限
 
@@ -141,12 +152,13 @@ ChannelReceiptObservation 固定字段：
 - effect_id、intent_id、execution_id、attempt_ref、idempotency_key；
 - kind：interface-accepted、interface-rejected、interface-unknown、delivered、read；
 - provider_receipt_id；
+- supersedes_replay_identity 可选；
 - observation_digest；
 - replay_identity；
 - observed_at_utc；
 - manifest_digest、key_id、signature。
 
-signature 覆盖 H(channel-receipt-envelope-v1, manifest_digest, observation 除 signature 外的 canonical wire)。replay_identity = H(producer_id, provider_receipt_id, kind, execution_id, observation_digest)。core 注册 manifest 时 module-private mint ChannelReceiptCapability；入口 ingest_channel_receipt(envelope, capability) 先做 registry identity、epoch、manifest、signature、allowed kind/route 和 replay 校验，再核对 owner/install/effect/intent/execution/attempt。该入口不是普通 Plugin controlled-effect 操作。
+observation_digest = H(channel-receipt-observation-v1, observation 中除 observation_digest、replay_identity、signature 外的完整 canonical causal/result fields)。replay_identity = H(channel-receipt-replay-v1, producer_id, provider_receipt_id, kind, execution_id, observation_digest)。signature 覆盖 H(channel-receipt-envelope-v1, manifest_digest, observation 除 signature 外的 canonical wire)。supersedes_replay_identity 只允许同 producer/channel/execution 的 conclusive interface-accepted/rejected/delivered/read 指向一条已验证的 interface-unknown 或较低层 observation；不能用来覆盖另一条相反的 conclusive interface result。core 注册 manifest 时 module-private mint ChannelReceiptCapability；入口 ingest_channel_receipt(envelope, capability) 先重算 observation_digest/replay_identity，再做 registry identity、epoch、manifest、signature、allowed kind/route 和 replay 校验，最后核对 owner/install/effect/intent/execution/attempt/supersedes chain。该入口不是普通 Plugin controlled-effect 操作。
 
 Adapter completion 最多证明 attempted 与 interface result；只有注册渠道 authority 可证明 delivered/read。actual-action 不由渠道回执证明。
 
@@ -154,9 +166,21 @@ Adapter completion 最多证明 attempted 与 interface result；只有注册渠
 
 ### 4.5 主人决定与主人行动
 
-DailyTurnResult 另增加可选、严格有序的 OwnerInteractionResult；terminal 保存相同顺序的 ordered digests。OwnerInteractionResult 公共字段固定为 interaction_result_id、kind、in_reply_to_request_id 可选、task_id 可选、expected_task_revision 可选、disposition 可选、control_kind 可选、control_payload 可选、action_kind 可选、result_ref 可选、result_revision_digest 可选、result_digest。result_digest = H(owner-interaction-result-v1, 除 result_digest 外的完整 canonical wire)，interaction_result_id 由 result_digest 派生。
+DailyTurnResult 另增加可选、严格有序的 OwnerInteractionResult；DailyTurnTerminalReceipt 保存相同顺序的 owner_interaction_bindings，每项精确绑定 result_digest + producer_skill_proof_digest。OwnerInteractionResult 公共字段固定为 interaction_result_id、kind、source_business_causal_id、result_ordinal、payload、interaction_payload_digest、producer_skill_proof_digest、result_digest。
 
-它是 closed union：mandatory-decision 必须且只能有 in_reply_to_request_id 与 disposition = affirmative/decline；task-control 必须且只能有 task_id、expected_task_revision、control_kind/control_payload；task-action 必须且只能有 task_id、expected_task_revision、action_kind、result_ref/result_revision_digest，并可额外携带 in_reply_to_request_id 以建立投递归因。每项必须由本轮实际使用的 health-settings 或 health-steward Skill proof 覆盖；未知字段、字段组合或任意 owner_reply 文本拒绝。
+identity 计算无环：interaction_payload_digest = H(owner-interaction-payload-v1, kind, canonical payload)；interaction_result_id = H(owner-interaction-id-v1, source_business_causal_id, core-recomputed result_ordinal, interaction_payload_digest)；result_digest = H(owner-interaction-result-v1, interaction_result_id, source_business_causal_id, result_ordinal, interaction_payload_digest, producer_skill_proof_digest)。core 必须按 finalized result 顺序重算 ordinal 和全部 digest。
+
+payload 是 closed union：
+
+| kind | 精确 payload | 必需 producer Skill proof |
+|---|---|---|
+| mandatory-decision | in_reply_to_request_id、disposition = affirmative/decline | health-settings |
+| task-control | task_id、expected_task_revision、control_kind、control_payload | health-settings |
+| task-action | task_id、expected_task_revision、action_kind、result_ref、result_revision_digest、in_reply_to_request_id 可选 | health-steward |
+| owner-answer | task_id、expected_task_revision、in_reply_to_request_id、answer_ref、answer_revision_digest | health-owner-inquiry + health-steward terminal chain |
+| status-acknowledgement | in_reply_to_request_id、acknowledged_status_transition_id | health-settings |
+
+未知 kind/字段组合拒绝；任意 owner_reply 文本不能替代 typed result。每个 proof 必须是本轮 terminal 中实际使用且顺序/父链有效的 proof。
 
 OwnerDecisionFact 只能由 core 从 committed SourceReceipt + finalized terminal/result 中精确匹配的 mandatory-decision result 形成，字段固定为：
 
@@ -173,6 +197,10 @@ OwnerDecisionFact 只能由 core 从 committed SourceReceipt + finalized termina
 OwnerActionFact 是另一对象，固定字段为 action_id = H(admitted_event_digest, interaction_result_digest, task_id, task_revision)、owner/install、admitted event、interaction_result_digest、task_id、task_revision、expected_result_kind、action_kind、result_ref/result_revision_digest、recorded_transition_id，以及 causal_request_id/effect_id/intent_id 可选的全有或全无三元组。
 
 只有三元组存在且与 current outbox/task 精确匹配时，OwnerActionFact 才能追加对应 delivery actual-action；否则它最多是 task 的 owner-action result。OwnerDecisionFact、read 回执、owner_reply 字符串或模型解释都不能代替。
+
+OwnerAnswerFact 固定字段为 answer_fact_id = H(admitted_event_digest, interaction_result_digest, task_id, task_revision, in_reply_to_request_id)、owner/install、admitted event、interaction result/proof digest、task_id/revision、in_reply_to_request_id、answer_ref/revision_digest、recorded_transition_id。只有 current owner-inquiry task/request 精确匹配时才能形成 owner-answer-admitted TaskResultBinding；SourceReceipt 单独不能证明答案。
+
+StatusAcknowledgementFact 固定字段为 acknowledgement_id = H(admitted_event_digest, interaction_result_digest, request_id, status_transition_id)、owner/install、request_id、status_transition_id、interaction result/proof digest、recorded_transition_id。它只关闭精确 status-change request，不证明 channel delivered/read，也不能关闭其他 mandatory kind。
 
 ## 5. 模块与依赖
 
@@ -195,12 +223,13 @@ OwnerActionFact 是另一对象，固定字段为 action_id = H(admitted_event_d
 
 在任何行为实现前，以下形状和严格 codec 必须同时存在：
 
-1. tasks.py：TaskContract、TaskCandidate、AdmittedTaskCandidate、TaskSourceBinding、TaskControlFact 及 payload、TaskClaimLease、legacy task history；
-2. review.py：EffectiveTimezoneBinding、ReviewCompletionTombstone；
-3. delivery.py：OutboxIntentV2、OutboxAttempt、DeliveryFactV2、DeliveryOutboxStateV2；
-4. status.py：MandatoryRequest、MandatoryProjection、MandatoryRequestRecord、空 MandatoryRequestState；
+1. tasks.py：TaskContract、TaskCandidateDraftSource、TaskCandidate、AdmittedTaskCandidate、TaskSourceBinding、TaskTransitionFact、TaskEventCandidateFact、TaskWorkResult、TaskControlFact 及 payload、TaskClaimLease、TaskUnknownDispositionFact、legacy task history；
+2. review.py：EffectiveTimezoneBinding、ReviewCompletionTombstone、LegacyReviewRecordV1；
+3. delivery.py：OutboxIntentV2、OutboxAttempt、DeliveryFactV2、ChannelReceiptObservation、DeliveryEvidenceConflictFact、DeliveryOutboxStateV2；
+4. status.py：MandatoryRequest、MandatoryProjection、MandatoryResolutionFact、MandatoryRequestRecord、StatusAcknowledgementFact、空 MandatoryRequestState；
 5. storage.py：Ticket115PreparedMutationV2、CompatibilityFact、LegacyDecoderResult、OwnerDeliveryExecutionJournal；
-6. health_commands.py：UnsignedHealthRequest、CoreCommandCapability、TaskClaimCapability、ChannelReceiptCapability 的本地构造边界。
+6. health_commands.py：UnsignedHealthRequest、CoreCommandCapability、TaskClaimCapability、ChannelReceiptCapability 的本地构造边界；
+7. coordination.py / terminal codec：TaskCandidateDraft、OwnerInteractionResult、task/interaction ordered proof bindings、OwnerDecisionFact、OwnerAnswerFact、OwnerActionFact。
 
 CP0 只落定值、严格序列化、升级门和空状态，不实现完整 task/review/delivery/status 行为。之后 CP1—CP4 只能消费这些形状，不能再改字段；若字段必须改，立即回到 design amendment。
 
@@ -208,12 +237,12 @@ Ticket115PreparedMutationV2 的四个 base digest、四个 next aggregate 和总
 
 ### 6.1 四聚合 canonical wire
 
-四聚合公共 header 固定为 schema、owner_id、installation_id、version、state_digest。schema 分别为 task-runtime-v2、daily-review-ledger-v2、delivery-outbox-v2、mandatory-request-state-v1。version 为非负整数；内容变化时必须恰好 +1，纯 replay 保持原 version/digest。所有集合按其 stable ID 升序、ID 唯一。canonical wire 复用仓库现有 stable_digest 的 UTF-8 canonical JSON 规则：对象 key 排序、紧凑分隔、tuple 写为 list、禁止 float/NaN/未知类型。decoder 只接受精确字段集，未知/缺失字段拒绝。
+四聚合公共 header 固定为 schema、owner_id、installation_id、version、state_digest。schema 分别为 task-runtime-v2、daily-review-ledger-v2、delivery-outbox-v2、mandatory-request-state-v1。version 为非负整数；内容变化时必须恰好 +1，纯 replay 保持原 version/digest。所有集合按其 stable ID 升序、ID 唯一。canonical wire 复用仓库现有 stable_digest 的 UTF-8 canonical JSON 规则：对象 key 排序、紧凑分隔、tuple 写为 list；Ticket115 新建字段禁止 float/NaN/未知类型。decoder 只接受精确字段集，未知/缺失字段拒绝。compat archive 中的 exact legacy wire 不按 v2 类型重新编码：保存认证时的 original canonical bytes/digest；若旧 schema 合法包含 JSON number，也只能作为不透明历史 bytes 读取和校验，不能进入 v2 业务字段或授权计算。
 
 state_digest = H(schema, owner_id, installation_id, version, 除 state_digest 外的完整 canonical aggregate wire)。
 
-- TaskRuntimeState body：tasks、candidate_receipts、control_facts、current_claims、unknown_facts、legacy_task_history、legacy_candidate_receipts、legacy_dispositions；分别以 task_id、candidate_id、control_id、task_id、unknown_id、legacy task_id、legacy candidate_id、disposition_id 排序和唯一。
-- DailyReviewLedger body：pending 可选、records、completion_tombstones。DailyReviewRecord 精确字段为 record_id、local_day_key、timezone_binding_digest、review_state_digest、outcome、action_refs、business_transition_id、committed_at_utc、record_digest；outcome 只有 quiet、action。pending 必须是 §8.2 的 DailyReviewPending；records/tombstones 分别以 record_id/legacy_key_value 排序和唯一。
+- TaskRuntimeState body：tasks、candidate_receipts、transition_facts、task_event_candidate_facts、control_facts、current_claims、unknown_facts、unknown_dispositions、legacy_task_history、legacy_candidate_receipts、legacy_dispositions；分别以 task_id、candidate_id、transition_id、candidate_fact_id、control_id、task_id、unknown_id、disposition_id、legacy task_id、legacy candidate_id、legacy disposition_id 排序和唯一。
+- DailyReviewLedger body：pending 可选、records、completion_tombstones、legacy_review_history。DailyReviewRecord 精确字段为 record_id、local_day_key、timezone_binding_digest、review_state_digest、outcome、action_refs、business_transition_id、committed_at_utc、record_digest；outcome 只有 quiet、action。pending 必须是 §8.2 的 DailyReviewPending；records/tombstones/legacy history 分别以 record_id/legacy_key_value/legacy_record_id 排序和唯一。LegacyReviewRecordV1 以 §8.2 为准，不能塞入 v2 records。
 - DeliveryOutboxStateV2 body：records、legacy_delivery_history、legacy_intent_dispositions。OutboxRecordV2 精确字段为 record_id = intent.intent_id、intent、attempts、facts、lifecycle、record_digest；lifecycle 只有 open、retired、frozen、completed，attempts/facts 按 attempt_ordinal/因果层级与 fact_id 稳定排序。records 与两个 legacy 集合分别按 record_id/legacy intent id/disposition id 排序和唯一。
 - MandatoryRequestState body：records。records 以 request_id 排序和唯一；MandatoryRequestRecord 的精确字段、variant 和 lifecycle 以 §11.3 为准。
 
@@ -238,6 +267,8 @@ TaskContract 固定字段：
 
 contract_digest 覆盖以上全部字段。requested_scope_digest 等于 contract_digest，由 core 计算，调用者不得输入。
 
+required_owner_actions 是有序 OwnerActionRequirement closed union：answer-owner-inquiry 只含 request_template_id；perform-owner-action 只含 action_kind。owner-inquiry result 必须恰有一个 answer-owner-inquiry；owner-action result 必须恰有一个 perform-owner-action；其他 result kind 必须为空。任意自由文本动作要求拒绝。
+
 首发外部范围只有两种：internal-only 时 recipient_ref/effect_kind 同为 null、max_attempts = 0；owner delivery 时 recipient_ref 必须等于 Ticket114 current_first_hop_recipient、effect_kind = owner-delivery、max_attempts >= 1。禁止一个 task 同时包含多个 recipient/effect；支持联系人由 Ticket116 另建 task/effect。
 
 AcceptanceCriterion 是 closed union，公共字段为 criterion_id、predicate_kind、parameters、criterion_digest：
@@ -261,15 +292,16 @@ TaskCandidate 草案字段固定为：
 - max_attempts、minimum_contact_interval_seconds；
 - required_owner_actions；
 - acceptance_criteria；
-- source_locator；
-- goal_ordinal，仅 owner-goal 使用；
+- source：§4.3 TaskCandidateDraftSource；
 - related_task_hint 可选。
 
-草案不含 task_id、owner/install、source authority、goal_key、approval、phase、label、result 或 dedupe verdict。
+related_task_hint 只能是一个 opaque v2 task_id locator，不携带 relation、anchor、scope 或 currentness 结论。草案不含新 task_id、owner/install、source authority、goal_key、approval、phase、label、result 或 dedupe verdict。
 
-AdmittedTaskCandidate 由 core 构造并增加 owner/install、verified goal_anchor_ref、goal_key、TaskContract/contract_digest、current TaskSourceBinding、verified_related_task_id 可选和 admission_transition_id。
+AdmittedTaskCandidate 由 core 构造并增加 owner/install、verified goal_anchor_ref、goal_key、goal_signature、TaskContract/contract_digest、current TaskSourceBinding、verified_related_task_id 可选和 admission_transition_id。
 
 goal_key = H(task-goal-v1, owner_id, installation_id, goal_anchor_ref)。
+
+goal_signature = H(task-goal-signature-v1, purpose, expected_result_kind, expected_result_description, assignee_role)。它只用于保守防重，不自动断言语义相同：无 verified_related_task_id 时，只要存在同 signature 的 active v2 task，candidate 就以 related-task-required 拒绝；必须由后续 typed related locator 明确继承或区分，core/模型不能选“最像”的 task。
 
 TaskSourceBinding 固定字段：
 
@@ -280,7 +312,9 @@ TaskSourceBinding 固定字段：
 - authority_transition_id；
 - skill_use_proof_ref 可选，仅 portrait-evidence 必需。
 
-CandidateReceipt 字段固定为 candidate_id、candidate_digest、disposition、task_id 可选、goal_key、contract_digest、recorded_transition_id。disposition 只有 created、merged、not-established、linked-narrowed、linked-substituted、linked-expanded、legacy-replayed。
+三种 source 的规范化映射固定为：owner-goal 使用 source_ref = business_causal_id、source_revision_digest = finalized DailyTurnResult.result_digest、authority_transition_id = terminal.transition_id；portrait-evidence 使用 source_ref = H(object_kind, object_id)、source_revision_digest = current object revision digest、authority_transition_id = verified Ticket112 authority transition，且必须有对应 skill_use_proof_ref；task-event 使用 source_ref = source_task_id、source_revision_digest = TaskEventCandidateFact.source_transition_digest、authority_transition_id = source_transition_id，skill_use_proof_ref 为 null。映射外字段组合拒绝。
+
+CandidateReceipt 字段固定为 candidate_id、candidate_digest、disposition、task_id 可选、goal_key 可选、contract_digest、not_established_reason 可选、recorded_transition_id。disposition 只有 created、merged、not-established、linked-narrowed、linked-substituted、linked-expanded、legacy-replayed；not-established 必须且只能有 reason = source-unproved/related-task-required/related-task-mismatch，且 task_id/goal_key 为 null。
 
 ### 7.2 合同关系与查重
 
@@ -294,10 +328,10 @@ CandidateReceipt 字段固定为 candidate_id、candidate_digest、disposition�
 core 的固定准入顺序：
 
 1. candidate_id 已有 receipt：digest 相同返回原 receipt；不同拒绝。
-2. 重新读取全部 source 当前 revision、owner/install、goal anchor 和 proof；不一致拒绝。
+2. 重新读取全部 source 当前 revision、owner/install、goal anchor 和 proof；不一致拒绝。若未带 verified related 且有同 goal_signature active task，写 related-task-required receipt并停止。
 3. 在同一 goal_key 的 active v2 tasks 中查找 exact contract_digest。
 4. 恰有一个 equal：合并新的 current source binding，disposition = merged。
-5. 没有 equal 但存在 same-goal active task：必须有 current verified_related_task_id；缺失或不匹配则 not-established 并形成一次 clarification request。
+5. 没有 equal 但存在 same-goal active task：必须有 current verified_related_task_id；缺失或不匹配则只写 not-established receipt，不创建 request/outbox/task。
 6. 有 verified related task：按 narrowed/substituted/expanded 建立显式 linked task。任何新 external linked task 都有新的 task_id/effect_request_id 并初始 waiting-approval；internal-only linked task 为 not-required/planned。父 task 的批准永不复用。
 7. terminal task 不原位重开；仍有目标时只建立 successor。
 8. 同一 goal_key + contract_digest 至多一个 active v2 task。
@@ -306,13 +340,13 @@ core 的固定准入顺序：
 
 ### 7.3 ManagedTask 与唯一任务聚合
 
-TaskRuntimeState 是唯一任务聚合，固定包含 owner/install/version、v2 tasks、candidate_receipts、control_facts、current_claims、unknown_facts、legacy_task_history、legacy_candidate_receipts、legacy_dispositions。
+TaskRuntimeState 是唯一任务聚合，固定包含 owner/install/version、v2 tasks、candidate_receipts、transition_facts、task_event_candidate_facts、control_facts、current_claims、unknown_facts、unknown_dispositions、legacy_task_history、legacy_candidate_receipts、legacy_dispositions。
 
 legacy 集合是 non-authoritative history，不是 current task truth；第 12 节规定其 ceiling。
 
 ManagedTask 固定包含：
 
-- task_id、version、goal_key、goal_anchor_ref、contract、contract_digest；
+- task_id、version、goal_key、goal_anchor_ref、goal_signature、contract、contract_digest；
 - effect_request_id 可选；external task 时 = H(task-effect-request-v1, task_id, contract_digest, recipient_ref, effect_kind)，internal-only 时 null；
 - source_bindings；
 - primary_label、phase；
@@ -321,6 +355,10 @@ ManagedTask 固定包含：
 - predecessor_task_ids、successor_task_ids；
 - terminal_fact；
 - created_at_utc、updated_at_utc。
+
+task_id = H(task-id-v2, candidate_id, goal_key, contract_digest)。TaskWorkResult 固定字段为 work_result_id、task_id、expected_task_revision、outcome = progress/await-result、next_step_ref 可选、result_ref 可选、严格有序 followup_candidate_drafts、result_digest；variant 要求 progress 只可有 next_step，await-result 只可有 result_ref，draft source 必须为 task-event。result_digest 覆盖除 work_result_id/result_digest 外的完整 wire，work_result_id = H(task-work-result-v1, task_id, expected_task_revision, result_digest)。
+
+TaskTransitionFact 固定字段为 transition_id、task_id、from_version/to_version、trigger_kind、from/to phase、from/to label、contract_digest、goal_anchor_ref、base_task_state_digest、resulting_task_object_digest、causal_operation_id、occurred_at_utc、transition_digest。resulting_task_object_digest 只覆盖 resulting ManagedTask，不覆盖 aggregate 或 transition/event-fact 集合；transition_id = H(task-transition-v2, base_task_state_digest, causal_operation_id, task_id, from/to version, trigger_kind, resulting_task_object_digest)，transition_digest 覆盖除自身外完整 canonical wire。它不嵌入 containing current-head target/transition，finalized 权限由当前聚合所属的 Ticket115 committed authority 证明，因此不存在 aggregate/target self-reference。所有 task-event resolver 只读这个持久 fact，不把旧 TaskTransition 返回 wrapper 当权威。
 
 TaskControlProjection 固定字段为 deferred_until_utc 可选、next_step_ref 可选、active_source_binding_digests、last_control_id 可选。
 
@@ -333,7 +371,7 @@ OwnerTaskControlFact 只能由 §4.5 finalized owner_interaction_result(kind = t
 | defer | resume_not_before_utc 可选、reason_code | control projection；phase → waiting-owner；清 claim |
 | resume | resumed_from_control_id、next_step_ref 可选 | 清 deferred；批准 current 则 planned，否则 waiting-approval |
 | ordinary-adjustment | previous_next_step_ref、next_step_ref、remove binding digests、add current bindings | 只改 next step/current source；合同不变 |
-| scope-expansion | parent_task_id、child_task_id、relation = expanded、old/new contract digest | 原 task 不改合同；建立 linked child |
+| scope-expansion | parent_task_id、candidate_id、proposed_contract_digest、relation = expanded、old_contract_digest | core 先验证 candidate，再按 task_id 公式派生 child_task_id；提交后的 control fact 增加 derived_child_task_id |
 | owner-cancel | admitted_owner_event_id、reason_code | active → cancelled/closed；terminal 历史不改 |
 
 ordinary-adjustment 若导致任一 TaskContract 字段变化，拒绝并走 linked task。source binding 只能换成 core 已重读的 current binding。
@@ -363,15 +401,15 @@ active phase 只有 waiting-owner、waiting-approval、planned、in-progress、a
 
 | 当前 phase | trigger | 权限/事实 | 下一 phase/label | claim 处理 |
 |---|---|---|---|---|
-| new | establish internal/current-approved | admitted candidate | planned/active | 无 |
-| new | establish needs owner | admitted candidate | waiting-owner/active | 无 |
-| new | establish needs approval | admitted candidate | waiting-approval/active | 无 |
+| new | establish internal | admitted internal-only candidate | planned/active | 无 |
+| new | establish external | admitted owner-delivery candidate | waiting-approval/active | 无 |
 | planned 或 in-progress | claim | CoreCommandCapability + task CAS | phase 不变 | 建立/接管唯一 claim |
 | planned | work.start | live TaskClaimCapability | in-progress/active | 同 CAS 刷新 claim revision/head |
 | in-progress | work.progress | live TaskClaimCapability | in-progress/active | 同 CAS 刷新 claim |
+| in-progress | work.followup-candidate | live TaskClaimCapability + typed TaskWorkResult | phase 按同一 work result 保持 in-progress 或进入 awaiting-result；追加 TaskTransitionFact/TaskEventCandidateFact | 按结果保持或清 claim |
 | in-progress | work.await-result | live TaskClaimCapability + formed result/effect ref | awaiting-result/active | 清 claim |
 | in-progress | worker.replan | live TaskClaimCapability + next_step | planned/active | 清 claim |
-| awaiting-result | result.incomplete | current typed result | planned/active | 无 |
+| awaiting-result | result.incomplete | current typed result + 无 unresolved task unknown，或 current disposition 明确允许继续 | planned/active | 无 |
 | 任一 active | ordinary-adjustment | OwnerTaskControlFact + current source resolver | phase 不变 | 清 claim |
 | 任一 active parent | linked narrowed/substituted admission | admitted candidate + verified related task | parent phase/label 不变；child internal planned 或 external waiting-approval | 清 parent claim |
 | 任一 active parent | linked expanded admission | admitted candidate + exact scope-expansion control | parent phase/label 不变；child waiting-approval | 清 parent claim |
@@ -382,11 +420,12 @@ active phase 只有 waiting-owner、waiting-approval、planned、in-progress、a
 | 任一 active | owner.cancel | current owner control | closed/cancelled | 清 claim |
 | 任一 active | acceptance.complete | current typed result + 全部 criteria | accepted/solved | 清 claim |
 | 任一 active | deterministic.no-path | 第 7.8 节事实 | closed/failed | 清 claim |
-| 任一 active | delivery.unknown | exact effect unknown | awaiting-result/active | 清 claim |
+| 任一 active | delivery.unknown | exact task/effect unknown | awaiting-result/active；追加 TaskUnknownFact | 清 claim |
+| awaiting-result | task.unknown-dispose | current TaskUnknownDispositionFact | rejected/owner-authorized → planned；accepted/delivered/declined 保持 awaiting-result，后续由 result/no-path 决定 | 无 |
 
 release、expiry 或旧 epoch 只清 claim，不自动改变 phase。非法矩阵边拒绝；不保留任意 advance_phase(to_phase) 公共接口。
 
-claim_id = H(task-claim-v2, owner_id, installation_id, task_id, task_revision, runtime_epoch, holder_binding_digest, acquisition_operation_digest)。claim_digest 覆盖 TaskClaimLease 全部字段。
+holder_binding_digest = H(task-holder-binding-v1, registered CoreCommandCapability.capability_id, bootstrap_session_id, owner_id, installation_id, runtime_epoch, peer_role, ordered allowed_task_actions)。task_cas_identity = H(task-cas-identity-v1, task_id, task_revision, TaskRuntimeState.state_digest, current-head generation/revision/transition/writer-fence)。acquisition_operation_digest = H(task-claim-acquire-v1, UnsignedHealthRequest.request_digest, holder_binding_digest, task_cas_identity, ordered requested_task_actions)。claim_id = H(task-claim-v2, owner_id, installation_id, task_id, task_revision, runtime_epoch, holder_binding_digest, acquisition_operation_digest)。claim_digest 覆盖 TaskClaimLease 全部字段。
 
 claim/release 固定规则：
 
@@ -396,6 +435,20 @@ claim/release 固定规则：
 - manual release 只接受与 current claim 精确匹配的 TaskClaimCapability；caller role/holder text 无效。
 - worker transition 保留 claim 时，必须在同一 task CAS 更新 task_revision、task_cas_identity、head_generation；旧 capability 仍须匹配 claim_id/holder/runtime epoch，但下一次调用以更新后的 durable claim 为准。
 - owner/control/approval/result/link transition 清 claim 后，旧 capability 立即 revoke。
+
+TaskUnknownFact 固定字段为 unknown_id、task_id、task_version、effect_id、intent_id、attempt_ref、execution_id、reason、source_delivery_fact_ids、recorded_transition_id、unknown_digest。TaskUnknownDispositionFact 是 append-only closed union，字段为 disposition_id、unknown_id、task_id/version、kind、proof_ref/digest、producer authority、successor_effect_id 可选、decision_id 可选、recorded_transition_id、disposition_digest：
+
+unknown_id = H(task-unknown-v1, task_id, task_version, effect_id, intent_id, attempt_ref, execution_id)；unknown_digest = H(task-unknown-wire-v1, 除 unknown_digest 外的完整 canonical wire)。同一 unknown_id 的任何字段不一致都是 replay mismatch。
+
+| kind | 必需 proof | task 语义 |
+|---|---|---|
+| provider-proved-rejected | 同 execution 的权威 interface-rejected observation，且无冲突/更高层 proof | E0 当前结果已知 rejected；允许同 effect 有界 retry |
+| provider-proved-accepted | 同 execution 的权威 interface-accepted observation，且无冲突 | E0 当前结果已知 accepted；禁止 retry，继续等 delivered/read |
+| provider-proved-delivered | 同 execution 的权威 delivered/read observation | E0 当前结果已知 delivered；可供 reminder-delivery 验收 |
+| owner-authorized-successor | OwnerDecisionFact affirmative + 精确 successor effect_id | E0 历史仍 unknown；任务只允许消费该 E1 后继路径 |
+| owner-declined-repeat | OwnerDecisionFact decline | E0 历史仍 unknown；不重试，可进入 no-path 判断 |
+
+disposition_id = H(task-unknown-disposition-v1, unknown_id, kind, proof_ref, proof_digest, successor_effect_id-or-null)。TaskUnknownFact.unresolved 是派生值：不存在一条 producer/currentness 均有效的上述 disposition 时为 true。unknown/may-have-left 历史永不删除；`result.incomplete`、work 重启和 solved 都必须使用该派生值，不能把 E1 成功误当成 E0 已知。
 
 ### 7.7 typed 结果与 solved
 
@@ -407,7 +460,7 @@ kind 必须等于 task.contract.expected_result_kind。首发 resolver 固定为
 |---|---|---|
 | portrait-update | portrait-committed | Ticket 112 portrait authority |
 | evidence-maintenance | evidence-assessment-committed | Ticket 112 evidence authority |
-| owner-inquiry | owner-answer-admitted | 唯一准入主人事件 authority |
+| owner-inquiry | owner-answer-admitted | §4.5 OwnerAnswerFact |
 | literature-result | qualified-result、no-qualified-result | Ticket 113 governed knowledge result authority |
 | reminder-delivery | delivered | 注册渠道 receipt authority |
 | owner-action | owner-action-admitted | OwnerActionFact |
@@ -421,7 +474,7 @@ kind 必须等于 task.contract.expected_result_kind。首发 resolver 固定为
 | owner-inquiry | result-status-is(owner-answer-admitted)、all-task-sources-current |
 | literature-result | result-status-is(qualified-result 或 no-qualified-result 二选一)、all-task-sources-current |
 | reminder-delivery | this-task-delivery-layer-is(delivered)、all-task-sources-current |
-| owner-action | owner-action-kind-is(contract.required_owner_actions 中唯一 action)、all-task-sources-current |
+| owner-action | owner-action-kind-is(contract.required_owner_actions 中唯一 perform-owner-action.action_kind)、all-task-sources-current |
 
 criterion evaluator 只接受 resolver 表指定 producer 的 current TaskResultBinding/OwnerActionFact/DeliveryFact。solve 必须同时满足 exact current task/contract、上表全部 criteria、producer manifest、current source/evidence revision、无 unresolved unknown、当前控制和批准。accepted、formed、attempted、interface-accepted、read 或任意 owner 文本不能替代。
 
@@ -486,11 +539,13 @@ ReviewStateDigest 固定覆盖当前 TaskRuntimeState digest、portrait/evidence
 
 DailyReviewPending 绑定 LocalDayKey、ReviewStateDigest、action_refs、prepared_at_utc、pending_digest。
 
-DailyReviewLedger 是唯一新复盘完成权威，包含 committed records、current pending 和 ReviewCompletionTombstone。每个 LocalDayKey 至多一个 committed record。
+DailyReviewLedger 是唯一新复盘完成权威，包含 v2 committed records、current pending、ReviewCompletionTombstone 和 exact-v1 legacy_review_history。每个 LocalDayKey 至多一个 v2 committed record；legacy history 不能冒充 v2 record。
 
-ReviewCompletionTombstone 只含 legacy_key_value、source_settings_version/digest、authority_ceiling = prevent-repeat-only、imported_at_transition_id。它只在 legacy_key_value 精确等于 LocalDayKey.value 时阻止重复，不生成 review result、时间、action 或 outbox。
+LegacyReviewRecordV1 精确保留 d468 wire：key、state_digest、changed、action_refs、prepared_at_utc、completed_at_utc、prepare_digest、result_digest、notification_required，再增加 original_wire_digest、CompatibilityFact 和 legacy_record_id = H(legacy-review-record-v1, original_wire_digest)。禁止猜造 v2 record_id、timezone binding、business transition 或 outcome；ceiling = audit-and-prevent-repeat-only。
 
-d468 OwnerSettingsState.completed_review_keys 在首次 v2 normalization 时一次性导入 tombstone。此后该设置字段只作只读兼容投影，不再参与业务决定，也不写新 key。
+ReviewCompletionTombstone 固定字段为 legacy_key_value、ordered source_proofs、authority_ceiling = prevent-repeat-only、imported_at_transition_id、tombstone_digest。source proof 只有 v1-review-record(legacy_record_id, original_wire_digest) 或 v1-settings-key(settings_version, settings_digest)；同 key 的全部 proof 排序合并为一个 tombstone。它只在 legacy_key_value 精确等于 LocalDayKey.value 时阻止重复，不生成 review result、时间、action 或 outbox。
+
+d468 合法 DailyReviewRecord 全部进入 legacy_review_history，并与 OwnerSettingsState.completed_review_keys 在首次 v2 normalization 时共同形成 tombstone。此后旧 record/设置字段只作只读兼容投影，不再参与其他业务决定，也不写新 key。
 
 ### 8.3 固定复盘算法
 
@@ -514,10 +569,10 @@ Cron、startup、Plugin tick 只唤醒 core。core：
 1. verify-existing：按现有密钥验证数据库、row integrity 和当前 manifest。
 2. manifest classify 只允许 exact-d468、ticket115-v2-bootstrap、ticket115-v2；其他 fingerprint、未知受管数据或 MAC 不符 fail closed。
 3. exact-d468 时，在仍为精确 d468 fingerprint 的条件下，用冻结 LegacyTicket115V1Codec 与原 d468 storage/current-head 原语完成唯一 v1 pending 和 auxiliary recovery；不得先建 v2 表或改 manifest，Adapter/model 调用为 0。
-4. recovery-clean 只有在不存在 unresolved v1 prepared、pending effect result、active/orphan owner-delivery ExecutionLease 或未分类 marker 时成立；计算 v1_recovery_clean_digest = H(d468 manifest digest, current v1 aggregate roots, finalized authority, empty recovery-set proof)。
-5. 一个 SQLite 事务创建空 v2 表并写 ticket115-v2-bootstrap manifest，保存 pre_bootstrap_manifest_digest 与 v1_recovery_clean_digest，不改旧聚合。
-6. 若启动时已是 ticket115-v2-bootstrap，必须重新验证 pre-bootstrap digest、recovery-clean digest、旧聚合 roots 和空/合法 v2 staging；不再运行会按 d468 fingerprint 重签的旧 writer。
-7. normalization barrier 用第 12 节 ceiling 一次构造完整四聚合：task 只含 v2 current task 与 typed legacy history；review 含精确保留 record/tombstone；delivery 含 v2 current outbox、typed legacy history 及 §12.3 的 pre-PONR disposition；mandatory 从空状态开始且不倒造历史请求。
+4. recovery-clean 只有在不存在 unresolved v1 prepared、pending effect result、任意 effect kind 的 active ExecutionLease 或未分类 marker 时成立；允许保留已按下表分类且 lease 已 absent/released 的 v1 effect row。构造 LegacyAuxiliaryRecoveryProof 后计算 v1_recovery_clean_digest = H(d468 manifest digest, current v1 aggregate roots, finalized authority, auxiliary recovery proof digest)。
+5. 一个 SQLite 事务创建空 v2 表并写 ticket115-v2-bootstrap manifest，保存 pre_bootstrap_manifest_digest、v1_recovery_clean_digest、auxiliary_recovery_proof_digest 和 normalization_epoch_utc；normalization_epoch_utc 在该事务前只取一次并耐久，之后重启禁止改值。不改旧聚合。
+6. 若启动时已是 ticket115-v2-bootstrap，必须重新验证 pre-bootstrap digest、recovery-clean digest、auxiliary proof、normalization epoch、旧聚合 roots 和空/合法 v2 staging；不再运行会按 d468 fingerprint 重签的旧 writer。
+7. normalization barrier 用第 12 节 ceiling 一次构造完整四聚合：task 只含 v2 current task 与 typed legacy history；review 的 v2 records 为空、旧 record 进入 exact legacy history 并形成 tombstone；delivery 含 v2 current outbox、typed legacy history 及 §12.3 的 pre-PONR disposition；mandatory 从空状态开始且不倒造历史请求。
 8. 以独立 Ticket115PreparedMutationV2 prepare normalization，执行 v2 CAS。CAS 成功返回，或 transition readback 证明 v2 target 已选中，即越过语义不可逆点，只能 roll-forward。
 9. local finalize 同时写四聚合、compat archive、schema-generation = ticket115-v2 和 ticket115-v2 manifest；重新验证 current-head target 和无 pending journal 后才开放公共操作。
 
@@ -529,6 +584,23 @@ v1 prepared 真值表：
 | head 仍是精确 base，transition 不存在 | 重放同一 v1 CAS，再只做 v1 finalize |
 | 强读证明另一 transition 从同一 base 胜出，且本地 current v1 聚合仍等于 prepared base | 删除不可见 v1 prepare |
 | terminal/fence/authority 漂移、读回未知、base/current 不一致 | 保留现场并 fail closed |
+
+v1 auxiliary recovery 对每个 v1 controlled effect 形成 LegacyAuxiliaryRecoveryObservation：effect_kind；owner-delivery 另有精确 v1 outbox layer = none/pre-ponr(formed-or-submitted)/attempted-or-higher/unknown；effect state = none/intent/claiming/executing/terminal；PendingEffectResult = none/unattempted/remote-attempted；lease lookup = not-applicable/absent/active/released/unknown。claiming 的 lookup identity 必须从 ClaimingEffect.intent.authority/effect_id/intent_digest/writer_fence/holder_id 重建；executing 使用其 ExecutionLeaseIdentity。所有恢复 Adapter/model 调用恒为 0。
+
+| effect state / pending | lease lookup | 固定恢复动作与最终分类 |
+|---|---|---|
+| none 或 intent；pending = none | not-applicable | 不做远端调用；只有 outbox = none/pre-ponr 合法，intent 进入 pre-PONR normalization |
+| claiming；pending = none | absent | 保留 exact claim wire并证明无 lease；分类 pre-PONR |
+| claiming；pending = none | active | release_operation_digest = H(ticket115-v1-bootstrap-release-v1, canonical identity, lookup lease digest, finalized authority digest)；释放并强读同 digest released 后分类 pre-PONR |
+| claiming；pending = none | released | released receipt 精确匹配后分类 pre-PONR |
+| executing；pending = none | absent/active/released | active 先按同公式 release/readback；由于 grant 可能已交 Plugin，统一分类 frozen-effect + may-have-left，禁止 pre-PONR/Adapter/retry |
+| executing；pending = unattempted/remote-attempted | active/released | 只调用 d468 已有 pending-result recovery，重放同一 command/operation；完成后必须为 terminal、pending 已清、lease released；按精确 terminal 分类 known 或 frozen unknown |
+| terminal；pending = none | absent/released | 验证 terminal/execution/receipt 一致；保留 exact terminal classification |
+| 任一 | unknown、字段/层级矛盾、pending 无 executing、terminal 仍 active、attempted-or-higher 却 effect 为 none/intent/claiming | 保留全部现场并 fail closed |
+
+非 owner-delivery effect 不进入 Ticket115 outbox，仍必须在 bootstrap 前清掉 active lease：claiming 按上表 absent/release 后保留 pre-execution；executing 且 model_attempt_started = false 可 release 后保留 pre-execution；executing 且 attempt marker = true、或该 effect kind 无等价 marker时按 may-have-left/frozen 保留；有 PendingEffectResult 只走 d468 exact recovery；terminal 只验证。不得由 Ticket115 猜造模型/其他 effect 的业务终态。
+
+LegacyAuxiliaryRecoveryProof 固定字段为 d468_manifest_digest、finalized_authority_digest、ordered observations、ordered release/readback receipt digests、remaining_v1_prepared_ids、remaining_pending_effect_ids、remaining_active_lease_ids、unclassified_marker_ids、proof_digest。后四集合必须全空；proof_digest 覆盖其余完整 canonical wire。这就是 recovery-clean 的“空集合证明”，不得用未枚举摘要替代。
 
 bootstrap/normalization 重启真值表：
 
@@ -544,11 +616,13 @@ bootstrap/normalization 重启真值表：
 
 v1 recovery 后 normalization 是独立 v2 CAS，不能重算或覆盖原 v1 target。schema bootstrap 只增加空结构；v2 CAS 成功或被强读证明选中才是语义不可逆点。
 
+normalization 必须是纯函数：输入只允许 bootstrap manifest、冻结后的 exact d468 roots/wires、LegacyAuxiliaryRecoveryProof 和 finalized authority。所有新 ID/digest 由这些输入计算；时间优先保留 exact legacy UTC 字段，没有该字段时统一使用耐久 normalization_epoch_utc；禁止读取重启当前时钟、随机数、进程 epoch 或网络。相同 bootstrap manifest 在任意次崩溃恢复中必须产生 byte-identical 四聚合、compat entries、receipt、TargetPreimage 和 mutation_body_digest。
+
 ### 9.2 Ticket115PreparedMutationV2
 
 固定字段：
 
-- prepared authority：base head、target head、transition_id、operation_digest；
+- prepared authority：base head、causal_operation_id、TargetPreimage、完整 RevisionTarget、operation_digest；
 - owner_id、installation_id；
 - base_task_digest、base_review_digest、base_delivery_digest、base_mandatory_digest；
 - next TaskRuntimeState、DailyReviewLedger、DeliveryOutboxStateV2、MandatoryRequestState；
@@ -558,11 +632,20 @@ v1 recovery 后 normalization 是独立 v2 CAS，不能重算或覆盖原 v1 tar
 - schema_transition：none 或 v2-bootstrap-to-ticket115-v2；
 - mutation_body_digest。
 
+causal_operation_id 取值固定：health command 使用 request.causal_id；当地日使用 H(local-day-key, review-state-digest)；delivery reserve/reconcile 使用 intent_id + attempt_ref + execution_id + journal_digest；status/mandatory 使用触发的 StatusTransition/causal fact ID；normalization 使用 H(ticket115-normalization-v1, v1_recovery_clean_digest, auxiliary_recovery_proof_digest)。调用者不能另传随机 operation ID。
+
 next_state_digest = H(ticket115-authoritative-state-v2, 四个 next aggregate state_digest)。
 
-next_compat_archive_root = H(ticket115-compat-root-v1, base_compat_archive_root, ordered entry digests)。mutation_body_digest = H(ticket115-mutation-body-v2, prepared base/target authority, 四个 base digests, 四个 next digests, next_state_digest, canonical health_command_receipt-or-null, base/next compat roots, ordered entry digests, schema_transition)。
+next_compat_archive_root = H(ticket115-compat-root-v1, base_compat_archive_root, ordered entry digests)。TargetPreimage 精确字段为 record_id、revision_digest、transition_id，不含 payload_digest 或 operation_digest：transition_id = H(ticket115-transition-v2, base head digest, causal_operation_id)，先于 next aggregate 构造，供各 domain fact 的 recorded_transition_id 使用；revision_digest = H(ticket115-local-revision-v2, next_state_digest, next_compat_archive_root, schema_transition)；record_id = H(ticket115-record-v2, owner_id, installation_id, transition_id)。同一 base + causal operation 若产生不同 revision/body 必须按 replay mismatch 拒绝，不能另选 transition。
 
-current-head target.payload_digest 必须等于 mutation_body_digest；operation_digest = H(ticket115-operation-v2, transition_id, base authority, target authority, mutation_body_digest)。prepared codec 重算并逐项比较。receipt 与 archive 因此与同一 target 绑定，但不改变聚合数量。
+计算顺序固定且无环：
+
+1. 计算四个 next digest、next_state_digest、next_compat_archive_root 和 TargetPreimage；
+2. mutation_body_digest = H(ticket115-mutation-body-v2, base head、causal_operation_id、TargetPreimage、四个 base/next digests、next_state_digest、canonical health_command_receipt-or-null、base/next compat roots、ordered entry digests、schema_transition)；
+3. 构造完整 RevisionTarget(record_id、revision_digest、transition_id、payload_digest = mutation_body_digest)；
+4. operation_digest = H(ticket115-operation-v2, base head, 完整 RevisionTarget, mutation_body_digest, causal_operation_id)。
+
+prepared codec 必须按此顺序重算并逐项比较；禁止把完整 target 或 operation_digest 反向放入 mutation_body_digest。receipt 与 archive因此与同一 target 绑定，但不改变聚合数量。
 
 ### 9.3 固定提交顺序
 
@@ -605,11 +688,11 @@ OutboxAttempt 固定字段：
 - reserved_at_utc；
 - previous_terminal_attempt_ref 可选。
 
-OutboxAttempt 是 release 后的业务投影，不保存 live execution phase。attempt_ref 只在 Ticket115 reserve CAS 分配一次，begin 不再次分配。只有上一 attempt 有严格 Adapter completion 或渠道 readback 证明 interface-rejected，且间隔/max attempts 允许时，才能 reserve 下一 ordinal。interface-accepted、interface-unknown、armed/unknown 都不允许同 effect 自动新增 attempt。
+OutboxAttempt 是 release 后的业务投影，不保存 live execution phase。attempt_ref 只在 Ticket115 reserve CAS 分配一次，begin 不再次分配。只有上一 attempt 的全部耐久证据按 §10.4 被后到的权威 proof 一致裁决为 interface-rejected、没有仍 current 的 interface-unknown/conflict/更高层 proof，且间隔/max attempts 允许时，才能 reserve 下一 ordinal。历史 armed/unknown fact 保留但可被该 typed disposition 解除当前冻结；interface-accepted、仍未解决的 interface-unknown/conflicting 都不允许同 effect 自动新增 attempt。
 
 ### 10.2 事实层
 
-DeliveryFactV2 层级为 formed、business-committed、reserved、dispatch-armed、may-have-left、attempted、interface-accepted/rejected/unknown、delivered、read、actual-action。
+DeliveryFactV2 层级为 formed、business-committed、reserved、dispatch-armed、may-have-left、attempted、interface-accepted/rejected/unknown、delivered、read、actual-action、evidence-conflict。
 
 事实 append-only。dispatch-armed 与 may-have-left 不推出 attempted；accepted 不推出 delivered；delivered 不推出 read；read 不推出 actual-action。
 
@@ -634,6 +717,8 @@ begin 在同一 core write lane 内固定执行：
 6. 持久化精确 ExecutionLease 为 lease-bound。
 7. 再次验证 lease authority 与 current intent；本地 journal 原子写 dispatch-armed。
 8. 返回 AuthorizedDispatch。
+
+begin 的 pre-arm abort 固定为：contact window/当地日尚未到只返回 deferred 并保留同一 reserved attempt；approval/control/route/config/consent/disclosure/terminal 已明确 stale 时，在无 active lease条件下以 Ticket115 CAS 退回 waiting/retire intent，Adapter = 0；head/fence/readback unknown 时保留 reserved/journal并 fail closed。若 stale/unknown 发生在 lease-bound 后，必须先按 §10.5 release + readback，绝不 arm/返回 plan，随后才能执行前述 CAS；没有“放着 active lease 以后再判断”的分支。
 
 execution_id = H(intent_id, attempt_ref, lease_id)。
 
@@ -671,7 +756,7 @@ raised 表示 Plugin 已实际调用 Adapter.send 后捕获异常；begin 后但
 
 DeliveryExecutionResult 固定字段为 execution_id、intent_id、attempt_ref、outcome、ordered_appended_fact_ids、unknown_causal_fact_id 可选、replayed。outcome 只有 accepted、rejected、unknown。CP3 最多产生 E0 与 unknown causal fact；CP4 才把 unknown 派生为 MandatoryRequest，并在精确 OwnerDecisionFact 后建立后继效果。
 
-OwnerDeliveryExecutionJournal 每项固定保存 owner/install、effect/intent/digest/attempt/idempotency、ExecutionLeaseRequest identity、lease identity 可选、acquisition/release operation digest、head/fence、holder binding、execution_id 可选、phase、strict completion 可选、ArmedUnknownFact 可选。它是 live execution/recovery 的唯一真相，不是第五业务聚合。
+OwnerDeliveryExecutionJournal 每项固定字段为 journal_id、owner/install、effect_id、intent_id/semantic_digest、attempt_ref、idempotency_key、ExecutionLeaseRequest identity、lease identity 可选、acquisition/release operation digest、head/fence、holder binding、execution_id 可选、phase、strict completion 可选、ordered_pending_channel_observations、ordered_processed_replay_identities、ArmedUnknownFact 可选、journal_digest。pending observation 保存完整 ChannelReceiptObservation canonical wire/signature/manifest digest，并以 observed_at_utc + replay_identity 排序；processed identity 严格唯一。journal_digest 覆盖除自身外全部字段。它是 live execution/recovery 的唯一真相，不是第五业务聚合。
 
 phase 固定为 lease-requested、lease-bound、dispatch-armed、completion-pending、release-pending、released-awaiting-reconcile、cleared。
 
@@ -685,7 +770,19 @@ ArmedUnknownFact 固定为：
 
 它不含 attempted。
 
-注册渠道回执若命中 active journal execution，只先以严格 envelope/digest 持久化到该 journal，不能绕过 ExecutionLease 做 Ticket115 CAS；release readback 后 reconciliation 以渠道 authority 追加相应 facts。若 execution 已 released/cleared，则入口通过单一 write lane 对 current outbox 做一次幂等 Ticket115 CAS。两条路径使用同一 replay_identity，不能重复追加。
+注册渠道回执若命中 active journal execution，只先以严格 observation 持久化到 ordered_pending_channel_observations，不能绕过 ExecutionLease 做 Ticket115 CAS；release readback 后 reconciliation 以渠道 authority 追加相应 facts。若 execution 已 released/cleared，则入口通过单一 write lane 对 current outbox 做一次幂等 Ticket115 CAS。两条路径使用同一 replay_identity；已在 journal、outbox fact evidence 或 processed identities 任一处出现都只能 replay，不能重复追加。
+
+release 后 reconciliation 先按 replay identity 去重，再按固定层级 armed → attempted → interface results → delivered → read → may-have-left/unknown → conflict 排序追加。attempted 只在 strict completion 或任一受信 channel observation 证明本次 execution 实际到达 Adapter/channel 时追加。current outcome/retry 规则固定为：
+
+| 同一 execution 的耐久证据集合 | current outcome | retry |
+|---|---|---|
+| 任一 delivered/read | delivered/read；保留全部低层历史，低层矛盾另记 DeliveryEvidenceConflictFact | 禁止 |
+| 无更高层，至少一个 interface-accepted，且无 rejected/unknown 冲突 | accepted | 禁止 |
+| 有一致权威 interface-rejected，且无 accepted、仍 current 的 interface-unknown 或更高层；允许存在更早 ArmedUnknownFact | rejected；追加 provider-proved-rejected disposition，历史 unknown 不删除 | bounds 允许时可 reserve 下一 attempt |
+| 无后到 conclusive proof 的 ArmedUnknownFact、任一仍 current 的 interface-unknown，或 accepted/rejected/unknown 相互冲突 | unknown/conflicting-frozen；冲突时追加 DeliveryEvidenceConflictFact | 禁止 |
+| 只有 strict Adapter rejected completion，但已有/后到 channel accepted/unknown/更高层 | 按上三行升级；绝不再使用 rejected 开启 retry | 禁止或按更高层 |
+
+DeliveryEvidenceConflictFact 固定绑定 execution、ordered conflicting evidence digests、最高可信层、conflict_reason、recorded_transition_id 和 fact digest。它不删除任何事实；无法按上表裁决的组合 fail closed，保留 journal/outbox并禁止新 attempt。
 
 ### 10.5 lease release 与恢复
 
@@ -721,8 +818,8 @@ unknown-risk request 披露 E0 可能已离站及重复风险。只有 OwnerDeci
 
 - E1 effect_id、intent、payload、idempotency 由 decision_id 稳定派生；
 - replay 同一 decision 返回同一 E1；
-- E0 永远保持 unknown；
-- decline 只关闭 request，不把 E0 改为 not-delivered。
+- E0 的 unknown/may-have-left 历史永远保留；权威 interface-rejected/accepted/delivered/read 可追加 current outcome 和 §7.6 disposition，但不能删改历史；
+- decline 只关闭 request并形成 owner-declined-repeat disposition，不把 E0 改为 not-delivered。
 
 ## 11. 状态与 MandatoryRequest
 
@@ -777,10 +874,10 @@ MandatoryResolutionFact 是 closed union，公共字段固定为 resolution_id�
 
 | request kind | resolution proof | producer | resolved/superseded |
 |---|---|---|---|
-| status-change | StatusNotificationResolution：同 request/effect 的 delivered/read ChannelReceiptEnvelope，或 finalized owner interaction 对同 request 的 acknowledged | channel authority 或 admitted owner event authority | proof current 时 resolved；未 PONR 被更新 transition 取代时 superseded |
+| status-change | StatusNotificationResolution：同 request/effect 的 delivered/read ChannelReceiptObservation，或 §4.5 StatusAcknowledgementFact | channel authority 或 admitted owner event authority | proof current 时 resolved；未 PONR 被更新 transition 取代时 superseded |
 | authorization-request | AuthorizationResolution：Ticket114 current ExecutionScopeApproval 精确匹配 task/effect/scope，或 finalized owner decline/task cancel | Ticket114 settings authority 或 admitted owner event authority | approval/decline/cancel 时 resolved；task/scope 已被新 causal state替代时 superseded |
 | unknown-risk-decision | OwnerDecisionFact affirmative/decline，精确绑定 unknown/E0/disclosure | admitted owner event authority | resolved；provider readback 在决定前精确解决 E0 时 superseded |
-| capability-gap | CapabilityGapResolution：sealed recovered CapabilityFactEnvelope、finalized owner decline，或 installation terminal fact | Ticket114 capability authority、owner event authority、current-head authority | recovered/declined/terminal 时 resolved；被新的 gap causal state替代时 superseded |
+| capability-gap | CapabilityGapResolution：sealed recovered CapabilityFactEnvelope、finalized owner decline，或 installation terminal fact | Ticket114 capability authority、owner event authority、current-head authority | recovered/declined/terminal 均 resolved；只有出现新的不同 gap causal state 且旧 gap 尚未 resolved 时，旧 request 才 superseded |
 
 MandatoryRequestRecord 固定为 request、lifecycle、projection_history、resolution_fact 可选、superseded_by 可选。lifecycle 只有 pending-route、projected、frozen-unknown、resolved、superseded。任意文本 ref 不能替代上表 typed proof。
 
@@ -791,8 +888,8 @@ MandatoryRequestState 是 obligation/dedupe 唯一真相；不得新增 Mandator
 投影前重读：
 
 - authorization：task 有精确 current approval、owner decline/cancel则 resolved；task terminal 或 scope causal state变化则 superseded；
-- unknown-risk：provider readback 已解决 E0 则 superseded；
-- capability-gap：能力恢复或安装 terminal 则 superseded；
+- unknown-risk：无冲突的权威 interface-rejected/accepted/delivered/read 已追加 E0 current outcome 与 TaskUnknownDisposition 时 superseded；interface-unknown 或冲突不解决；
+- capability-gap：能力恢复、主人 decline 或安装 terminal 形成 typed resolution 并 resolved；只有新的不同 gap causal state 取代未解决旧 gap 时 superseded；
 - status-change：未 PONR 且更新 transition 使旧通知不再代表当前状态，则旧 request superseded-by 最新 transition；
 - owner/install/terminal/consent 不再允许时不投影。
 
@@ -807,7 +904,7 @@ MandatoryRequestState 是 obligation/dedupe 唯一真相；不得新增 Mandator
 3. active intent 在 dispatch-armed 前变 stale：标 retired-pre-ponr，request 回 pending-route；当前 route 下同 request/effect 形成新 intent。
 4. 已 armed 且 outcome unknown：禁止替换，request = frozen-unknown；另建 unknown-risk request。
 5. 有权威 interface-rejected：projection = known-terminal/interface-rejected，可按当前 route 重投影同一 request，仍受 bounds。
-6. interface-accepted 及其后的 route 漂移绝不重投同一 effect。projection = known-terminal/interface-accepted，但 status-change 仍是 delivered-unconfirmed/projected；delivered/read 或精确 owner acknowledgement 才按上表 resolved。
+6. interface-accepted 及其后的 route 漂移绝不重投同一 effect。projection = known-terminal/interface-accepted，但 status-change 仍是 delivered-unconfirmed/projected；delivered/read 或精确 StatusAcknowledgementFact 才按上表 resolved。
 7. delivered/read 可关闭 status-change 的通知义务，但不能关闭 authorization、unknown-risk 或 capability-gap；后三者继续等待各自 typed resolution，且不因 route 漂移重投已经 PONR 的效果。
 request dedupe 按 request_id；intent dedupe 按完整 route/config/consent/disclosure/payload；attempt dedupe 按 intent_id + ordinal。
 
@@ -825,7 +922,7 @@ CompatibilityFact 固定为 compat_id、object kind/ref、source schema/digest�
 | candidate receipt triple | LegacyCandidateReceipt exact triple | exact-replay-only | 同 id+digest 返回原 task_id | 推断新 goal/contract |
 | TaskLease v1 | LegacyClaimRecord | audit-only | 显示已失效 | current claim、holder 权限 |
 | approval v1 | LegacyApprovalRecord | historical-only | 显示原 status/id/version | current scope authorization |
-| review committed v1 | 精确现有 record | retain-exact-layer | 阻止同 key 重复 | 补造 action/result |
+| review committed v1 | LegacyReviewRecordV1 + tombstone | audit-and-prevent-repeat-only | 审计显示、精确 key 阻止重复 | 塞入 v2 records、补造 action/result/timezone/transition |
 | settings completed key | ReviewCompletionTombstone | prevent-repeat-only | 精确 key 阻止重复 | 伪造 record/time |
 | delivery formed/submitted 且无 attempted/lease/observation | LegacyDeliveryHistory + LegacyIntentDispositionFact | pre-ponr-reconcile-only | 当前复核后重投影 v2 或明确 retire | 直接发送旧 wire、证明 attempted |
 | delivery attempted v1 | history + may-have-left | frozen-effect | unknown 历史、风险链 | 证明 attempted、自动重试 |
@@ -849,12 +946,13 @@ d468 ManagedTask 不转换为 v2 ManagedTask。LegacyTaskRecord 原样保存旧�
 
 ### 12.3 review、delivery、status
 
-- review v1 合法 record 保留；旧 pending 只按当前日算法处理。
-- settings.completed_review_keys 只导入 tombstone，原字段只读。
+- review v1 合法 record 只进入 LegacyReviewRecordV1；旧 pending 原 wire 归档后不转换：旧日丢弃，若其 key 是 normalization_epoch_utc 下的 current LocalDayKey 且无 tombstone，则 v2 启动后从当前事实重新计算，不能升级为 committed v2 record或复用旧 action。
+- v1 record key 与 settings.completed_review_keys 只形成 §8.2 tombstone，原字段只读。
 - legacy intent 只有 facts 精确为 formed/submitted、无 DeliveryLease、无 attempted/observation/unknown 时才分类 pre-PONR。normalization 重读其 business fact/source、owner/install、task/control/approval 和当前 route/config/consent/disclosure：
-  - 全部 current：形成新的 OutboxIntentV2，causal_request_id 使用旧 effect_request_id，legacy_origin_intent_id/digest 指回旧 intent，并写 LegacyIntentDispositionFact(reprojected-current, new_intent_id)；
+  - 全部 current：形成新的 OutboxIntentV2 与 formed/business-committed facts；causal_request_id 使用旧 effect_request_id，legacy_origin_intent_id/digest 指回旧 intent；formed_at_utc 使用旧 intent 的合法 formed_at_utc，缺失时使用 normalization_epoch_utc；
   - 任一不 current：不形成 intent，写 retired，reason 只能 causal-stale、task-terminal、control-disabled、approval-invalid、route-or-consent-invalid；
   - 旧 wire 永不直接送入 Adapter。
+- LegacyIntentDispositionFact 固定字段为 disposition_id、legacy_intent_id、legacy_intent_digest、classification = pre-ponr、disposition = reprojected-current/retired、new_intent_id 可选、reason 可选、normalization_source_digest、recorded_at_utc、recorded_transition_id、fact_digest。normalization_source_digest = H(v1_recovery_clean_digest, legacy intent/business/source/task/control/approval digests, current route/config/consent/disclosure digest)。reprojected-current 必须且只能有 new_intent_id；retired 必须且只能有 reason。disposition_id = H(legacy-intent-disposition-v1, legacy_intent_id, legacy_intent_digest, disposition, new_intent_id-or-null, reason-or-null, normalization_source_digest)；fact_digest 覆盖除自身外完整 wire；recorded_at_utc = normalization_epoch_utc，recorded_transition_id = normalization TargetPreimage.transition_id。
 - delivery v1 attempted 全部降为 may-have-left；无注册 attestation 的高层事实 historical-unverified。
 - old DeliveryLease 归档，不进入 current claim。
 - old unknown 永久 frozen；继续只走新 E1。
@@ -879,31 +977,31 @@ d468 ManagedTask 不转换为 v2 ManagedTask。LegacyTaskRecord 原样保存旧�
 
 ### CP0：共享形状、受信入口与升级门
 
-只实现第 6 节值/codec、capability bootstrap、manifest、v1 exact recovery gate、空四聚合、PreparedMutationV2。
+只实现第 6 节值/codec、capability bootstrap、manifest、v1 prepared + auxiliary exact recovery gate、deterministic normalization inputs、空四聚合、无环 PreparedMutationV2。
 
-证明 populated d468 store、tamper fail closed、v1 CAS 崩溃恢复、未解 v1 lease/effect 阻止 v2、四聚合可见性、request/capability 分离、d468 binary 对 v2 fail closed。不得发送。
+证明 populated d468 store、tamper fail closed、v1 CAS 崩溃恢复、auxiliary 真值表每行、claiming active lease、executing/pending-result、未解 lease/effect 阻止 v2、相同 bootstrap byte-identical、digest 计算无环、四聚合可见性、request/capability 分离、d468 binary 对 v2 fail closed。不得发送。
 
 ### CP1：任务、权限与 legacy task
 
-实现三条准入、goal/contract relation、related task 不猜、typed control、phase matrix、TaskClaimCapability、exact approval、typed result/no-path、legacy replay/successor。
+实现 source closed union、稳定 goal inheritance/signature、TaskTransition/EventCandidate facts、goal/contract relation、related task 不猜、无环 task/interaction identity、typed owner answer/control/action、phase matrix、TaskClaimCapability、exact approval、typed result/no-path、TaskUnknownDisposition、legacy replay/successor。
 
 停止条件：第二 claim truth、caller 自签、legacy task 获得 current authority。
 
 ### CP2：当地日与四聚合提交
 
-实现 raw settings timezone binding、DST/跨日/切换、tombstone、同日并发、quiet/current-day/no-backlog、全部 prepare/CAS/finalize 崩溃点、四聚合可见、finalize 前无 plan。
+实现 raw settings timezone binding、DST/跨日/切换、exact-v1 review history/tombstone、同日并发、quiet/current-day/no-backlog、全部 prepare/CAS/finalize 崩溃点、四聚合可见、finalize 前无 plan。
 
 停止条件：owner generation、服务器日期、第五聚合、未来类型依赖。
 
 ### CP3：投递、渠道权限与 unknown
 
-实现唯一 attempt allocation、begin 内部 reserve→reread→lease→arm、ExecutionLease 不变、全部 journal/recovery、release 未证明无 CAS、Adapter 至多一次、层级权限、删除 raw observe authority，以及 E0 unknown/freeze。CP3 不创建 mandatory request、OwnerDecisionFact 或后继效果。
+实现唯一 attempt allocation、begin 内部 reserve→reread→lease→arm、ExecutionLease 不变、完整 channel observation journal、completion/readback 冲突表、全部 recovery、release 未证明无 CAS、Adapter 至多一次、层级权限、删除 raw observe authority，以及 E0 unknown/freeze/current outcome。CP3 不创建 mandatory request、OwnerDecisionFact 或后继效果。
 
 停止条件：第三 reserve 接口、unknown 自动重试、Adapter 写高层事实、真实 Weixin/凭据。
 
 ### CP4：主动状态与 mandatory
 
-实现 transition log、全部主动触发、capability/单项结果分离、四 request identity、causal supersede、route pending/reproject/unknown、硬门、decision/action 分离，以及 unknown-risk request → OwnerDecisionFact → 后继效果的 E1 闭环。
+实现 transition log、全部主动触发、capability/单项结果分离、四 request identity、typed status acknowledgement、causal supersede/resolve、route pending/reproject/unknown、硬门、decision/action 分离，以及 unknown-risk request → OwnerDecisionFact → TaskUnknownDisposition → 后继效果的 E1 闭环。
 
 停止条件：business_status 依赖 route、missing-today=fault、task failed=core fault、第二 mandatory ledger。
 
@@ -956,7 +1054,7 @@ d468 ManagedTask 不转换为 v2 ManagedTask。LegacyTaskRecord 原样保存旧�
 
 ## 16. 冻结、偏差与 amendment
 
-冻结记录必须包含 frozen content commit/tree、implementation base、六轴最终 verdict、前两版 findings 关闭记录、主人确认。只有写入 Ticket 后才改 ready-for-agent。
+冻结记录必须包含 frozen content commit/tree、implementation base、六轴最终 verdict、前三版 findings 关闭记录、主人确认。只有写入 Ticket 后才改 ready-for-agent。
 
 编码 Agent 只能按 CP0→CP5 实施、写要求测试、修 fidelity、记录证据。不得改本文、票的技术路线、状态机、schema、模块职责或验收解释。实现 reviewer 只查 fidelity、回归和证据真实性。
 
@@ -972,9 +1070,9 @@ d468 ManagedTask 不转换为 v2 ManagedTask。LegacyTaskRecord 原样保存旧�
 
 风格、可选重构、另一可行偏好和不影响合同的 P2/P3 进后继 backlog，不触发 amendment。最终 fidelity 后任何产品代码、测试、schema、配置变化都使 verdict 失效；只允许 Ticket/Map 元数据关票。
 
-## 17. 第一、二版 findings 关闭索引
+## 17. 前三版 findings 关闭索引
 
-| Finding | 第三版位置 |
+| Finding | 第四版位置 |
 |---|---|
 | legacy task/receipt 缺字段 | §12.1—§12.2 |
 | candidate/scope relation | §7.1—§7.2 |
@@ -1014,6 +1112,19 @@ d468 ManagedTask 不转换为 v2 ManagedTask。LegacyTaskRecord 原样保存旧�
 | container codec、deep operation、channel seam 不完整 | §4.4、§6.1、§10.3—§10.4 |
 | active status refresh 会重入或崩溃丢触发 | §11.1 |
 | mandatory 四类 resolution/route 生命周期不完整 | §11.3—§11.5 |
+| legacy auxiliary recovery 无可执行真值表 | §9.1 |
+| mutation body/target digest 自引用 | §9.2 |
+| normalization 时间与 disposition 不确定 | §9.1、§12.3 |
+| active channel receipt 无 journal schema/冲突规则 | §10.4 |
+| source union、task-event 路径与稳定 goal 不闭合 | §4.3、§7.1—§7.3 |
+| OwnerInteractionResult identity 循环 | §4.5 |
+| 任意准入主人消息可冒充 owner answer | §4.5、§7.7 |
+| task unknown 无 typed disposition | §7.6、§10.6 |
+| expanded child identity/control 循环 | §7.3—§7.4 |
+| claim 与 channel observation digest 未冻结 | §4.4、§7.6 |
+| d468 review 无 exact legacy container | §6.1、§8.2、§12.3 |
+| mandatory acknowledgement/receipt/resolution 冲突 | §4.5、§11.3—§11.4 |
+| E0 历史 unknown 与 current readback outcome 混淆 | I10、§7.6、§10.4—§10.6、§11.4 |
 
 ## 18. 明确拒绝的路线
 
