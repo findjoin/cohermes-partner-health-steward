@@ -20,13 +20,13 @@ CASE_REGISTRY = (
     ("115-A1-C10", "test_ticket115_tasks.Ticket115TaskEngineTests.test_terminal_task_cannot_reopen_but_can_link_an_explicit_successor", "a terminal task cannot reopen and can only link an explicit successor"),
     ("115-A1-C11", "test_ticket115_integration.Ticket115IntegrationTests.test_review_plugin_inputs_are_wake_only", "the plugin wake surface cannot write a candidate task directly"),
     # A2: task outcomes remain separate from ancillary facts.
-    ("115-A2-C01", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c01_adjustment_is_append_only_and_changes_current_revision", "task adjustment remains an ancillary control fact rather than a task outcome"),
-    ("115-A2-C02", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c02_quiet_review_does_not_change_task_outcome", "a reminder can be quiet without changing task outcome semantics"),
-    ("115-A2-C03", "test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_current_evidence_card_revision", "acceptance uses current evidence rather than a stale data lookup"),
+    ("115-A2-C01", "test_ticket115_tasks.Ticket115TaskEngineTests.test_portrait_update_requires_a_committed_portrait_result", "a portrait-update task solves only from a typed committed portrait result"),
+    ("115-A2-C02", "test_ticket115_tasks.Ticket115TaskEngineTests.test_reminder_delivery_does_not_prove_owner_action", "delivered reminder evidence cannot prove that the owner acted"),
+    ("115-A2-C03", "test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_matching_typed_business_result", "acceptance uses a matching typed business result rather than an unrelated current card"),
     ("115-A2-C04", "test_ticket115_integration.Ticket115IntegrationTests.test_owner_task_cancellation_atomically_closes_active_task_and_claim", "owner cancellation is a task control, not a solved result"),
-    ("115-A2-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_delivery_gap_remains_ancillary_to_the_four_task_labels", "a capability or delivery gap does not become a fifth task label"),
+    ("115-A2-C05", "test_ticket115_tasks.Ticket115TaskEngineTests.test_capability_gap_cannot_be_constructed_as_acceptance_result", "a capability gap cannot be constructed as a solved acceptance result"),
     ("115-A2-C06", "test_ticket115_tasks.Ticket115TaskEngineTests.test_delivery_unknown_is_an_active_ancillary_fact_not_a_fifth_label", "unknown delivery remains an ancillary active fact"),
-    ("115-A2-C07", "test_ticket115_tasks.Ticket115TaskEngineTests.test_solve_requires_acceptance_evidence_to_match_current_revisions", "solved requires acceptance evidence bound to current revisions"),
+    ("115-A2-C07", "test_ticket115_tasks.Ticket115TaskEngineTests.test_literature_no_result_is_an_accepted_business_result", "an in-scope literature search with no qualified result is a typed accepted result"),
     # A3: owner-local-day review.
     ("115-A3-C01", "test_ticket115_tasks.Ticket115DailyReviewTests.test_local_day_key_is_timezone_and_dst_aware", "local day uses timezone and DST-aware identity"),
     ("115-A3-C02", "test_ticket115_tasks.Ticket115DailyReviewTests.test_same_day_crash_resumes_pending_then_commits_exactly_once", "same-day recovery resumes one pending review and commits once"),
@@ -38,7 +38,7 @@ CASE_REGISTRY = (
     ("115-A4-C01", "test_ticket115_storage.Ticket115TypedStorageTests.test_outbox_failure_rolls_back_task_and_review_business_state", "outbox failure rolls back task and review business facts"),
     ("115-A4-C02", "test_ticket115_integration.Ticket115IntegrationTests.test_review_and_outbox_rollback_together", "review and outbox commit atomically"),
     ("115-A4-C03", "test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_abandoned_prepare_without_replaying_transport", "abandoned prepare recovers without transport replay"),
-    ("115-A4-C04", "test_ticket115_plugin_delivery.Ticket115PluginDeliveryBoundaryTests.test_plugin_alone_sends_the_strict_authorized_wire_intent", "adapter effects occur only through the controlled plugin wire"),
+    ("115-A4-C04", "test_ticket115_integration.Ticket115IntegrationTests.test_adapter_source_cannot_write_task_or_review_authority", "adapter-originated task and review writes are rejected before durable authority changes"),
     # A5: immutable, producer-bound delivery evidence.
     ("115-A5-C01", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c01_delivery_evidence_accepts_only_layer_authority", "each evidence layer accepts only its declared producer"),
     ("115-A5-C02", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c02_delivery_evidence_round_trip_preserves_replay_identity", "evidence storage preserves replay identity"),
@@ -57,7 +57,7 @@ CASE_REGISTRY = (
     ("115-A6-C04", "test_ticket115_integration.Ticket115IntegrationTests.test_attempt_for_other_approval_does_not_consume_new_approval", "an old approval cannot consume a new approval"),
     ("115-A6-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_orphan_attempt_without_replaying_transport", "restart recovers an orphan attempt without replaying transport"),
     ("115-A6-C06", "test_ticket115_integration.Ticket115IntegrationTests.test_adapter_exception_freezes_unknown_until_independent_delivery", "adapter exception freezes unknown until independent evidence"),
-    ("115-A6-C07", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a6_c07_task_engine_persists_runtime_epoch_claim_and_rejects_old_holder", "runtime epoch claims survive storage and reject old holders"),
+    ("115-A6-C07", "test_ticket115_integration.Ticket115IntegrationTests.test_restart_rejects_old_holder_phase_solve_and_fail", "restart changes runtime epoch and rejects the old holder for phase, solve, and fail"),
     ("115-A6-C08", "test_ticket115_integration.Ticket115IntegrationTests.test_writer_proof_is_rechecked_after_attempt_before_adapter", "writer fence is rechecked immediately before transport"),
     ("115-A6-C09", "test_ticket115_integration.Ticket115IntegrationTests.test_review_commit_rejects_stale_day_and_fresh_state_change", "stale review state is rejected before effect formation"),
     # A7: sealed business status.
@@ -70,7 +70,7 @@ CASE_REGISTRY = (
     ("115-A8-C03", "test_ticket114_authority_integration.Ticket114AuthorityIntegrationTests.test_114_a5_c21_status_transition_is_deduplicated_across_restart", "status transition replay remains one causal request"),
     ("115-A8-C04", "test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c04_status_transition_emits_one_content_free_request", "status transition forms one content-free request"),
     ("115-A8-C05", "test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_mandatory_request_survives_response_loss_and_restart", "business-status replay emits one mandatory request for one state transition"),
-    ("115-A8-C06", "test_ticket115_integration.Ticket115IntegrationTests.test_not_configured_notification_never_reaches_adapter", "ordinary notification suppression does not create a hidden delivery"),
+    ("115-A8-C06", "test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c06_mandatory_delivery_bypasses_optional_gates_and_reaches_adapter", "mandatory delivery bypasses ordinary notification and proactive-support gates and reaches the adapter once"),
 )
 
 

@@ -67,10 +67,11 @@ class _RecordingAdapter:
         self._status = status_value
         self.calls = 0
         self.saw_sqlite_transaction = False
+        self.last_intent: object | None = None
 
     def send(self, intent: object) -> dict[str, object]:
-        del intent
         self.calls += 1
+        self.last_intent = intent
         connection = getattr(self._store, "_connection")
         self.saw_sqlite_transaction = bool(connection.in_transaction)
         return OwnerDeliveryTransportResult(
@@ -177,9 +178,6 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 for producer in (
                     "health-core.delivery.formed",
                     "health-core.delivery.committed",
-                    "owner-delivery-adapter.attempted",
-                    "owner-delivery-adapter.interface",
-                    "owner-delivery-adapter.unknown",
                 )
             ),
             business_status_clock=lambda: self.base.status_clock_value,
@@ -190,6 +188,14 @@ class Ticket115IntegrationTests(unittest.TestCase):
             health_init_runtime=self.base.init_runtime,
             coarse_router=self.base.router,
             daily_skill_runtime=self.base.sleep_runtime,
+            delivery_evidence_issuers=tuple(
+                self.delivery_issuers[producer]
+                for producer in (
+                    "owner-delivery-adapter.attempted",
+                    "owner-delivery-adapter.interface",
+                    "owner-delivery-adapter.unknown",
+                )
+            ),
         )
         self.base.core = core
         self.base.plugin = plugin
@@ -213,7 +219,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
             "partner_health_steward.core.time.monotonic",
             return_value=marked_at + 301.0,
         ):
-            self.core.recover_owner_delivery_attempts()
+            self.plugin.managed_ticket115_read(peer_id=_PEER)
 
     def _decision(self, wire: dict[str, object]) -> DailyReviewDecision:
         return DailyReviewDecision(
@@ -448,6 +454,7 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 "send one owner-approved daily review summary" + purpose_suffix
             ),
             expected_result="the summary transport outcome is independently observed",
+            expected_result_kind="reminder-delivery",
             assignee="partner-health-plugin",
             allowed_data_categories=("health-evidence",),
             allowed_data_refs=(source_ref,),
@@ -544,6 +551,36 @@ class Ticket115IntegrationTests(unittest.TestCase):
             ),
             expected_version=expected_version,
             suffix=":ticket115-review-summary-notification",
+        )
+
+    def _disable_review_summary(self) -> None:
+        snapshot = self.base.head.read().head
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        self._apply_owner_setting(
+            settings.NotificationUpdate(
+                kind="review_summary",
+                old_state="not-configured",
+                new_state="disabled",
+                generation=snapshot.generation,
+                effective_at_utc=_PREPARED_AT,
+            ),
+            expected_version=current.version,
+            suffix=":ticket115-disable-review-summary-notification",
+        )
+
+    def _pause_proactive_support(self) -> None:
+        snapshot = self.base.head.read().head
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        self._apply_owner_setting(
+            settings.ControlUpdate(
+                control_name="proactive_support",
+                operation="pause",
+                target_ref=None,
+                generation=snapshot.generation,
+                effective_at_utc=_PREPARED_AT,
+            ),
+            expected_version=current.version,
+            suffix=":ticket115-pause-proactive-support",
         )
 
     def _admit_review_task(
@@ -658,6 +695,47 @@ class Ticket115IntegrationTests(unittest.TestCase):
         assert grant is not None
         return grant
 
+    def _deliver_review_task(
+        self,
+        task_id: str,
+        effect_request_id: str,
+        *,
+        suffix: str,
+    ) -> object:
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": intent_id,
+                "attempted_at_utc": _ATTEMPTED_AT,
+                "observed_at_utc": "2026-08-24T03:05:01+00:00",
+            },
+            grant=grant,
+            transport=_RecordingAdapter(self.base.store),
+        )
+        attempted = self._outbox().record(intent_id).fact("attempted")
+        result_ref = f"owner-delivery-result:{suffix}"
+        evidence_ref = f"owner-delivery-evidence:{suffix}"
+        self._health(
+            "delivery.observe",
+            {
+                "intent_id": intent_id,
+                "kind": "delivered",
+                "attempt_ref": attempted.attempt_ref,
+                "result_ref": result_ref,
+                "evidence_ref": evidence_ref,
+                "evidence": self._delivery_evidence(
+                    intent_id,
+                    kind="delivered",
+                    result_ref=result_ref,
+                    evidence_ref=evidence_ref,
+                ),
+                "observed_at_utc": "2026-08-24T03:06:00+00:00",
+            },
+        )
+        return self._outbox().record(intent_id).fact("delivered")
+
     def test_task_claim_and_review_prepare_resume_across_restart(self) -> None:
         task_id, _ = self._admit_review_task()
         claimed = self._transition(
@@ -684,6 +762,67 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(resumed.outcome, "resume-current-day")
         self.assertTrue(resumed.replayed)
         self.assertEqual(resumed.ledger, prepared.ledger)
+
+    def test_restart_rejects_old_holder_phase_solve_and_fail(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="old-holder-after-restart",
+        )
+        task = self._task_state().task(task_id)
+        acceptance = TaskAcceptance.prove(
+            task,
+            (
+                TaskAcceptanceCriterionProof(
+                    criterion=task.acceptance_criteria[0],
+                    result_kind="reminder-delivery",
+                    result_status="delivered",
+                    evidence_refs=("delivery:evidence:old-holder",),
+                    evidence_revision_digests=("sha256:" + "9" * 64,),
+                ),
+            ),
+            accepted_at_utc="2026-08-24T03:02:00+00:00",
+        )
+        old_epoch = self.core._task_runtime_epoch
+        self._restart_core()
+        self.assertNotEqual(self.core._task_runtime_epoch, old_epoch)
+        commands = (
+            (
+                "task.advance",
+                {
+                    "task_id": task_id,
+                    "phase": "awaiting-result",
+                    "advanced_at_utc": "2026-08-24T03:02:00+00:00",
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
+                },
+            ),
+            (
+                "task.solve",
+                {
+                    "acceptance": acceptance.to_storage(),
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
+                },
+            ),
+            (
+                "task.fail",
+                {
+                    "task_id": task_id,
+                    "failed_at_utc": "2026-08-24T03:02:00+00:00",
+                    "claim_id": claim_id,
+                    "holder_role": holder_role,
+                },
+            ),
+        )
+        for action, payload in commands:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(
+                    TaskContractViolation,
+                    "runtime task claim is stale",
+                ):
+                    self._health(action, payload)
+        self.assertEqual(self._task_state().task(task_id).primary_label, "active")
 
     def test_task_mutation_advances_current_head_before_local_visibility(self) -> None:
         candidate, task_id, _ = self._candidate()
@@ -1234,25 +1373,30 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertNotIn("leases", delivery_view)
         self.assertEqual(delivery_view["current_layer"], "submitted")
 
-    def test_core_solve_task_requires_current_evidence_card_revision(self) -> None:
-        task_id, _ = self._admit_review_task(notification_enabled=False)
+    def test_core_solve_task_requires_matching_typed_business_result(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        delivered = self._deliver_review_task(
+            task_id,
+            effect_request_id,
+            suffix="solve-delivered",
+        )
         claim_id, holder_role = self._claim_task(
             task_id,
             suffix="solve-current-evidence",
         )
         task = self._task_state().task(task_id)
-        card = self.base.baseline_card
-        revision_digest = card.revision_digest
         acceptance = TaskAcceptance.prove(
             task,
             (
                 TaskAcceptanceCriterionProof(
                     criterion=task.acceptance_criteria[0],
-                    evidence_refs=(card.evidence_id,),
-                    evidence_revision_digests=(revision_digest,),
+                    result_kind="reminder-delivery",
+                    result_status="delivered",
+                    evidence_refs=(delivered.evidence_ref,),
+                    evidence_revision_digests=(delivered.proof.digest,),
                 ),
             ),
-            accepted_at_utc="2026-08-24T03:02:00+00:00",
+            accepted_at_utc="2026-08-24T03:07:00+00:00",
         )
 
         solved = self._transition(
@@ -2017,8 +2161,9 @@ class Ticket115IntegrationTests(unittest.TestCase):
             this: object,
             completion: object,
             completion_grant: object,
+            evidence: object,
         ) -> None:
-            del this, completion, completion_grant
+            del this, completion, completion_grant, evidence
             raise StoreUnavailable("synthetic owner delivery completion failure")
 
         self.core._complete_owner_delivery_attempt_impl = MethodType(
@@ -2182,6 +2327,12 @@ class Ticket115IntegrationTests(unittest.TestCase):
         unknown = self.plugin.business_status(peer_id=_PEER).projection
         self.assertEqual(unknown.state, "cannot-confirm")
         self.assertNotIn("confirmed-fault", unknown.reason_codes)
+        self.assertTrue(
+            {"tasks", "delivery"}.isdisjoint(
+                unknown.affected_core_domains
+            )
+        )
+        self.assertIn("delivery", unknown.isolated_noncore_domains)
 
     def test_delivery_gap_remains_ancillary_to_the_four_task_labels(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
@@ -2227,16 +2378,221 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 self.plugin.business_status(peer_id=_PEER)
 
         durable = self.store.mandatory_delivery_ledger()
-        self.assertEqual(len(durable.requests), 1)
-        request = durable.requests[0]
-        self.assertTrue(request.body_free)
+        self.assertEqual(
+            {request.kind for request in durable.requests},
+            {"status-change", "unknown-risk-decision"},
+        )
+        self.assertTrue(all(request.body_free for request in durable.requests))
+        durable_outbox = self._outbox()
+        mandatory_records = tuple(
+            record
+            for record in durable_outbox.records
+            if record.intent.mandatory_request_kind is not None
+        )
+        self.assertEqual(len(mandatory_records), len(durable.requests))
+        self.assertTrue(
+            all(
+                any(
+                    self.core._mandatory_request_matches_intent(
+                        request,
+                        record.intent,
+                    )
+                    for record in mandatory_records
+                )
+                for request in durable.requests
+            )
+        )
 
         self._restart_core()
         recovered = self.store.mandatory_delivery_ledger()
         self.assertEqual(recovered, durable)
+        self.assertEqual(self._outbox(), durable_outbox)
         replay = self.plugin.business_status(peer_id=_PEER)
         self.assertIsNone(replay.mandatory_request)
         self.assertEqual(self.store.mandatory_delivery_ledger(), recovered)
+        self.assertEqual(self._outbox(), durable_outbox)
+
+    def test_115_a8_c06_mandatory_delivery_bypasses_optional_gates_and_reaches_adapter(self) -> None:
+        self.base.status_clock_value = datetime.fromisoformat(_PREPARED_AT)
+        prior = status.StatusProjection(
+            state="active",
+            evaluated_at_utc="2026-08-24T02:59:00+00:00",
+            affected_core_domains=(),
+            isolated_noncore_domains=(),
+            reason_codes=(),
+            fact_set_digest="sha256:" + ("e" * 64),
+        )
+        self.assertIsNone(self.store.remember_business_status(prior))
+        self._disable_review_summary()
+        self._pause_proactive_support()
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        self.assertTrue(current.proactive_support_paused)
+        self.assertEqual(
+            dict(current.ordinary_notifications)["review_summary"],
+            "disabled",
+        )
+
+        result = self.plugin.business_status(peer_id=_PEER)
+        self.assertIsNotNone(result.mandatory_request)
+        mandatory_records = tuple(
+            record
+            for record in self._outbox().records
+            if record.intent.mandatory_request_kind == "status-change"
+        )
+        self.assertEqual(len(mandatory_records), 1)
+        intent_id = mandatory_records[0].intent.intent_id
+        grant = self._claimed_delivery(intent_id)
+        adapter = _RecordingAdapter(self.base.store)
+
+        completed = self._effect(
+            "owner-delivery.execute",
+            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+            grant=grant,
+            transport=adapter,
+        )
+
+        self.assertEqual(adapter.calls, 1)
+        self.assertFalse(adapter.saw_sqlite_transaction)
+        self.assertEqual(
+            set(adapter.last_intent),  # type: ignore[arg-type]
+            {
+                "intent_id",
+                "attempt_ref",
+                "destination",
+                "payload_ref",
+                "payload_digest",
+                "idempotency_key",
+            },
+        )
+        self.assertEqual(
+            OwnerDeliveryTransportResult.from_wire(
+                completed["transport_result"]
+            ).status,
+            "accepted",
+        )
+        self.assertEqual(
+            self._outbox().record(intent_id).current_layer,
+            "accepted",
+        )
+
+    def test_mandatory_authorization_and_capability_gap_requests_use_production_outbox(self) -> None:
+        self.base.status_clock_value = datetime.fromisoformat(_PREPARED_AT)
+        authorization_candidate, authorization_task_id, _ = self._candidate(
+            suffix="mandatory-authorization"
+        )
+        authorization_candidate = replace(
+            authorization_candidate,
+            phase="waiting-approval",
+            approval=TaskApprovalBinding.waiting(),
+        )
+        authorization = self._transition(
+            self._health(
+                "task.admit",
+                {
+                    "candidate": authorization_candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+        )
+        self.assertEqual(authorization.task_id, authorization_task_id)
+
+        capability_candidate, _, _ = self._candidate(
+            suffix="mandatory-capability-gap"
+        )
+        capability_candidate = replace(
+            capability_candidate,
+            expected_result_kind="internal-result",
+            external_boundary=TaskExternalBoundary.internal_only(),
+            phase="planned",
+            approval=TaskApprovalBinding.not_required(),
+        )
+        capability_task_id = (
+            "task:"
+            + capability_candidate.semantic_digest.removeprefix("sha256:")[:32]
+            + ":1"
+        )
+        capability = self._transition(
+            self._health(
+                "task.admit",
+                {
+                    "candidate": capability_candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            )
+        )
+        self.assertEqual(capability.task_id, capability_task_id)
+        claim_id, holder_role = self._claim_task(
+            capability_task_id,
+            suffix="mandatory-capability-gap",
+        )
+        self._health(
+            "task.fail",
+            {
+                "task_id": capability_task_id,
+                "failed_at_utc": "2026-08-24T03:02:00+00:00",
+                "claim_id": claim_id,
+                "holder_role": holder_role,
+            },
+        )
+
+        business = self.plugin.business_status(peer_id=_PEER)
+
+        request_kinds = {
+            request.kind
+            for request in self.store.mandatory_delivery_ledger().requests
+        }
+        intent_kinds = {
+            record.intent.mandatory_request_kind
+            for record in self._outbox().records
+            if record.intent.mandatory_request_kind is not None
+        }
+        self.assertTrue(
+            {"authorization-request", "capability-gap"}.issubset(
+                request_kinds
+            )
+        )
+        self.assertEqual(intent_kinds, request_kinds)
+        self.assertEqual(business.projection.state, "abnormal")
+        self.assertIn("tasks", business.projection.affected_core_domains)
+
+    def test_mandatory_delivery_forms_when_notification_is_not_configured(self) -> None:
+        self.base.status_clock_value = datetime.fromisoformat(_PREPARED_AT)
+        prior = status.StatusProjection(
+            state="active",
+            evaluated_at_utc="2026-08-24T02:59:00+00:00",
+            affected_core_domains=(),
+            isolated_noncore_domains=(),
+            reason_codes=(),
+            fact_set_digest="sha256:" + ("d" * 64),
+        )
+        self.assertIsNone(self.store.remember_business_status(prior))
+        current = self.plugin.owner_settings_state(peer_id=_PEER)
+        self.assertEqual(
+            dict(current.ordinary_notifications)["review_summary"],
+            "not-configured",
+        )
+
+        self.plugin.business_status(peer_id=_PEER)
+
+        self.assertEqual(
+            sum(
+                record.intent.mandatory_request_kind == "status-change"
+                for record in self._outbox().records
+            ),
+            1,
+        )
+
+    def test_same_state_business_status_read_does_not_advance_current_head(self) -> None:
+        first = self.plugin.business_status(peer_id=_PEER)
+        after_first = self.base.head.read().head
+
+        second = self.plugin.business_status(peer_id=_PEER)
+        after_second = self.base.head.read().head
+
+        self.assertEqual(first.projection.state, second.projection.state)
+        self.assertIsNone(first.transition)
+        self.assertIsNone(second.transition)
+        self.assertEqual(after_second, after_first)
 
     def test_owner_task_cancellation_atomically_closes_active_task_and_claim(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
@@ -2291,24 +2647,65 @@ class Ticket115IntegrationTests(unittest.TestCase):
             )
         self.assertEqual(self._task_state().tasks, ())
 
+    def test_adapter_source_cannot_write_task_or_review_authority(self) -> None:
+        candidate, _, _ = self._candidate(suffix="adapter-write-rejected")
+        before_head = self.base.head.read().head
+        before_tasks = self._task_state()
+        before_reviews = self._review_ledger()
+        before_outbox = self._outbox()
+        commands = (
+            (
+                "task.admit",
+                {
+                    "candidate": candidate.to_storage(),
+                    "committed_at_utc": _PREPARED_AT,
+                },
+            ),
+            ("review.prepare", {}),
+        )
+        for action, payload in commands:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(
+                    ProtocolViolation,
+                    "health-command-authority-denied",
+                ):
+                    self._health(
+                        action,
+                        payload,
+                        context=self._health_context(
+                            action,
+                            source="owner_delivery_adapter",
+                        ),
+                    )
+                self.assertEqual(self.base.head.read().head, before_head)
+                self.assertEqual(self._task_state(), before_tasks)
+                self.assertEqual(self._review_ledger(), before_reviews)
+                self.assertEqual(self._outbox(), before_outbox)
+
     def test_owner_task_cancellation_preserves_solved_terminal(self) -> None:
-        task_id, _ = self._admit_review_task(notification_enabled=False)
+        task_id, effect_request_id = self._admit_review_task()
+        delivered = self._deliver_review_task(
+            task_id,
+            effect_request_id,
+            suffix="solve-before-owner-cancel",
+        )
         claim_id, holder_role = self._claim_task(
             task_id,
             suffix="solve-before-owner-cancel",
         )
         task = self._task_state().task(task_id)
-        card = self.base.baseline_card
         acceptance = TaskAcceptance.prove(
             task,
             (
                 TaskAcceptanceCriterionProof(
                     criterion=task.acceptance_criteria[0],
-                    evidence_refs=(card.evidence_id,),
-                    evidence_revision_digests=(card.revision_digest,),
+                    result_kind="reminder-delivery",
+                    result_status="delivered",
+                    evidence_refs=(delivered.evidence_ref,),
+                    evidence_revision_digests=(delivered.proof.digest,),
                 ),
             ),
-            accepted_at_utc="2026-08-24T03:02:00+00:00",
+            accepted_at_utc="2026-08-24T03:07:00+00:00",
         )
         self._health(
             "task.solve",
@@ -2332,12 +2729,18 @@ class Ticket115IntegrationTests(unittest.TestCase):
 
     def test_owner_task_cancellation_preserves_failed_terminal(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)
+        claim_id, holder_role = self._claim_task(
+            task_id,
+            suffix="fail-before-owner-cancel",
+        )
         self._health(
             "task.fail",
             {
                 "task_id": task_id,
                 "failed_at_utc": "2026-08-24T03:02:00+00:00",
                 "reason_code": "owner-cancellation-test-terminal",
+                "claim_id": claim_id,
+                "holder_role": holder_role,
             },
         )
         before = self._task_state().task(task_id)

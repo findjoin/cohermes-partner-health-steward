@@ -89,6 +89,10 @@ from .rights import (
 )
 from .settings import OwnerSettingsState
 from .status import BusinessStatusResult
+from .ticket115_contracts import (
+    DeliveryEvidenceChallenge,
+    DeliveryEvidenceIssuer,
+)
 
 
 def _wire_fields(
@@ -145,12 +149,43 @@ class HealthPlugin:
         health_init_runtime: HealthInitRuntime | None = None,
         coarse_router: CoarseMessageRouter | None = None,
         daily_skill_runtime: DailySkillRuntime | None = None,
+        delivery_evidence_issuers: tuple[DeliveryEvidenceIssuer, ...] = (),
     ) -> None:
         self._core = core
         self._admission_policy = admission_policy
         self._health_init_runtime = health_init_runtime
         self._coarse_router = coarse_router
         self._daily_skill_runtime = daily_skill_runtime
+        if type(delivery_evidence_issuers) is not tuple or any(
+            type(issuer) is not DeliveryEvidenceIssuer
+            for issuer in delivery_evidence_issuers
+        ):
+            raise AuthorityValidationError("invalid adapter delivery evidence issuers")
+        self._delivery_evidence_issuers = {
+            issuer.producer_contract: issuer for issuer in delivery_evidence_issuers
+        }
+        if len(self._delivery_evidence_issuers) != len(delivery_evidence_issuers):
+            raise AuthorityValidationError("duplicate adapter delivery evidence issuer")
+        if any(
+            producer
+            not in {
+                "owner-delivery-adapter.attempted",
+                "owner-delivery-adapter.interface",
+                "owner-delivery-adapter.unknown",
+            }
+            for producer in self._delivery_evidence_issuers
+        ):
+            raise AuthorityValidationError(
+                "plugin cannot hold non-adapter delivery evidence issuer"
+            )
+
+    def _issue_delivery_evidence(self, challenge: DeliveryEvidenceChallenge):
+        if type(challenge) is not DeliveryEvidenceChallenge:
+            raise AuthorityValidationError("invalid delivery evidence challenge")
+        issuer = self._delivery_evidence_issuers.get(challenge.producer_contract)
+        if type(issuer) is not DeliveryEvidenceIssuer:
+            raise AuthorityValidationError("adapter-delivery-evidence-issuer-unavailable")
+        return challenge.issue(issuer)
 
     def invoke(self, command: CommandEnvelope, *, peer_id: str) -> Response:
         if type(peer_id) is not str or peer_id != "plugin":
@@ -792,6 +827,18 @@ class HealthPlugin:
         """Return the bounded Ticket 115 managed-read wire projection."""
 
         self._require_ticket115_peer(peer_id)
+        completions = self._core.owner_delivery_recovery_completions()
+        recoveries = tuple(
+            (
+                completion,
+                self._issue_delivery_evidence(
+                    self._core.owner_delivery_completion_evidence_challenge(completion)
+                ),
+            )
+            for completion in completions
+        )
+        if recoveries:
+            self._core.recover_owner_delivery_attempts(recoveries)
         view = self._core.managed_ticket115_read()
         if type(view) is not dict:
             raise AuthorityValidationError("ticket115-read-unavailable")
@@ -859,11 +906,15 @@ class HealthPlugin:
                 frozenset({"intent_id", "attempted_at_utc"}),
                 frozenset({"lease_seconds"}),
             )
+            challenge = self._core.owner_delivery_attempt_evidence_challenge(
+                fields["intent_id"]  # type: ignore[arg-type]
+            )
             return {
                 "send_intent": self._core.prepare_owner_delivery_attempt(
                     fields["intent_id"],  # type: ignore[arg-type]
                     attempted_at_utc=fields["attempted_at_utc"],  # type: ignore[arg-type]
                     lease_seconds=fields.get("lease_seconds", 300),  # type: ignore[arg-type]
+                    evidence=self._issue_delivery_evidence(challenge),
                 ).to_wire()
             }
         if action == "owner-delivery.execute":
@@ -912,9 +963,13 @@ class HealthPlugin:
                     send_intent,
                     observed_at_utc=observed_at_utc,  # type: ignore[arg-type]
                 )
+            challenge = self._core.owner_delivery_completion_evidence_challenge(
+                completion
+            )
             result = self._core.complete_owner_delivery_attempt(
                 completion,
                 grant,
+                self._issue_delivery_evidence(challenge),
             )
             return {
                 "transport_result": result.transport_result.to_wire(),

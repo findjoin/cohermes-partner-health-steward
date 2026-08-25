@@ -41,6 +41,7 @@ def _candidate(*, suffix: str = "", external: bool = False) -> TaskCandidate:
         source_revision_digest=SHA,
         purpose=f"purpose {suffix or 'base'}",
         expected_result="a declared result",
+        expected_result_kind="internal-result",
         assignee="health-steward",
         allowed_data_categories=("portrait",),
         allowed_data_refs=("portrait:sleep",),
@@ -360,6 +361,24 @@ class Ticket115GapContractTests(unittest.TestCase):
                 task_cas_identity="cas:4",
             )
         )
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            _candidate(suffix="stale-acquisition"),
+            committed_at_utc=NOW,
+        )
+        with self.assertRaisesRegex(TaskContractViolation, "CAS identity is stale"):
+            TaskEngine.claim(
+                created.state,
+                created.task_id,
+                holder_id="worker:stale",
+                lease_id="claim:stale-acquisition",
+                acquired_at_utc=NOW,
+                runtime_epoch="epoch:stale-acquisition",
+                acquired_at_monotonic_seconds=1.0,
+                expires_at_monotonic_seconds=5.0,
+                generation=1,
+                task_cas_identity="sha256:" + "0" * 64,
+            )
 
     def test_115_a3_c06_same_local_day_replay_does_not_create_a_second_review(self) -> None:
         ledger = DailyReviewLedger.empty(OWNER, INSTALLATION)

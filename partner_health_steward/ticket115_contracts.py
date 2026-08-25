@@ -331,6 +331,48 @@ class DeliveryEvidenceIssuer:
         )
 
 
+@dataclass(frozen=True)
+class DeliveryEvidenceChallenge:
+    """Exact evidence material core asks the named producer to attest."""
+
+    layer: str
+    generation: int
+    replay_identity: str
+    effect_id: str
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if self.layer not in DeliveryEvidenceAuthority.PRODUCER_BY_LAYER:
+            raise Ticket115ContractViolation("invalid delivery evidence challenge layer")
+        _positive(self.generation, "delivery evidence challenge generation")
+        for value, name in (
+            (self.replay_identity, "delivery evidence challenge replay identity"),
+            (self.effect_id, "delivery evidence challenge effect identifier"),
+            (self.evidence_ref, "delivery evidence challenge reference"),
+        ):
+            _text(value, name)
+
+    @property
+    def producer_contract(self) -> str:
+        return DeliveryEvidenceAuthority.PRODUCER_BY_LAYER[self.layer]
+
+    def issue(self, issuer: DeliveryEvidenceIssuer) -> DeliveryEvidence:
+        if (
+            type(issuer) is not DeliveryEvidenceIssuer
+            or issuer.producer_contract != self.producer_contract
+        ):
+            raise Ticket115ContractViolation(
+                "delivery evidence challenge producer mismatch"
+            )
+        return issuer.issue(
+            layer=self.layer,
+            generation=self.generation,
+            replay_identity=self.replay_identity,
+            effect_id=self.effect_id,
+            evidence_ref=self.evidence_ref,
+        )
+
+
 class DeliveryEvidenceAuthority:
     """Verify producer possession plus exact layer/effect/replay bindings."""
 
@@ -461,6 +503,15 @@ class MandatoryDeliveryRequest:
             }
         )
 
+    @property
+    def revision_digest(self) -> str:
+        return stable_digest(
+            {
+                "contract": "mandatory-delivery-request-v1",
+                "request": self.to_storage(),
+            }
+        )
+
     def to_storage(self) -> dict[str, object]:
         return {
             "request_id": self.request_id,
@@ -529,6 +580,7 @@ class MandatoryDeliveryLedger:
 __all__ = [
     "DeliveryEvidence",
     "DeliveryEvidenceAuthority",
+    "DeliveryEvidenceChallenge",
     "DeliveryEvidenceIssuer",
     "MANDATORY_DELIVERY_KINDS",
     "MandatoryDeliveryLedger",

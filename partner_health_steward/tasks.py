@@ -33,6 +33,15 @@ TASK_UNKNOWN_RESOLUTIONS = (
     "not-delivered",
     "owner-authorized-new-attempt",
 )
+TASK_RESULT_COMPLETION_STATUSES = {
+    "portrait-update": frozenset({"portrait-committed"}),
+    "reminder-delivery": frozenset({"delivered"}),
+    "owner-action": frozenset({"owner-action-admitted"}),
+    "literature-result": frozenset({"qualified-result", "no-qualified-result"}),
+    "information-gap": frozenset({"owner-answer-admitted"}),
+    "internal-result": frozenset({"completed"}),
+}
+TASK_RESULT_KINDS = tuple(TASK_RESULT_COMPLETION_STATUSES)
 
 
 def _mapping(value: object, fields: frozenset[str], name: str) -> Mapping[str, object]:
@@ -290,6 +299,7 @@ def _semantic_digest(
     *,
     purpose: str,
     expected_result: str,
+    expected_result_kind: str,
     assignee: str,
     allowed_data_categories: tuple[str, ...],
     allowed_data_refs: tuple[str, ...],
@@ -300,6 +310,7 @@ def _semantic_digest(
         {
             "purpose": purpose,
             "expected_result": expected_result,
+            "expected_result_kind": expected_result_kind,
             "assignee": assignee,
             "allowed_data_categories": list(allowed_data_categories),
             "allowed_data_refs": list(allowed_data_refs),
@@ -319,6 +330,7 @@ class TaskCandidate:
     source_revision_digest: str
     purpose: str
     expected_result: str
+    expected_result_kind: str
     assignee: str
     allowed_data_categories: tuple[str, ...]
     allowed_data_refs: tuple[str, ...]
@@ -335,6 +347,8 @@ class TaskCandidate:
         _sha256(self.source_revision_digest, "task candidate source revision")
         _text(self.purpose, "task purpose")
         _text(self.expected_result, "task expected result")
+        if self.expected_result_kind not in TASK_RESULT_COMPLETION_STATUSES:
+            raise TaskContractViolation("invalid task expected result kind")
         _text(self.assignee, "task assignee")
         _tuple_texts(self.allowed_data_categories, "allowed task data categories")
         _tuple_texts(self.allowed_data_refs, "allowed task data references")
@@ -351,6 +365,7 @@ class TaskCandidate:
         return _semantic_digest(
             purpose=self.purpose,
             expected_result=self.expected_result,
+            expected_result_kind=self.expected_result_kind,
             assignee=self.assignee,
             allowed_data_categories=self.allowed_data_categories,
             allowed_data_refs=self.allowed_data_refs,
@@ -366,6 +381,7 @@ class TaskCandidate:
             "source_revision_digest": self.source_revision_digest,
             "purpose": self.purpose,
             "expected_result": self.expected_result,
+            "expected_result_kind": self.expected_result_kind,
             "assignee": self.assignee,
             "allowed_data_categories": list(self.allowed_data_categories),
             "allowed_data_refs": list(self.allowed_data_refs),
@@ -387,6 +403,7 @@ class TaskCandidate:
                     "source_revision_digest",
                     "purpose",
                     "expected_result",
+                    "expected_result_kind",
                     "assignee",
                     "allowed_data_categories",
                     "allowed_data_refs",
@@ -408,6 +425,9 @@ class TaskCandidate:
             purpose=_text(stored["purpose"], "task purpose"),
             expected_result=_text(
                 stored["expected_result"], "task expected result"
+            ),
+            expected_result_kind=_text(
+                stored["expected_result_kind"], "task expected result kind"
             ),
             assignee=_text(stored["assignee"], "task assignee"),
             allowed_data_categories=_wire_texts(
@@ -533,6 +553,7 @@ class ManagedTask:
     version: int
     purpose: str
     expected_result: str
+    expected_result_kind: str
     assignee: str
     allowed_data_categories: tuple[str, ...]
     allowed_data_refs: tuple[str, ...]
@@ -556,6 +577,8 @@ class ManagedTask:
         _positive_integer(self.version, "task version")
         _text(self.purpose, "task purpose")
         _text(self.expected_result, "task expected result")
+        if self.expected_result_kind not in TASK_RESULT_COMPLETION_STATUSES:
+            raise TaskContractViolation("invalid task expected result kind")
         _text(self.assignee, "task assignee")
         _tuple_texts(self.allowed_data_categories, "allowed task data categories")
         _tuple_texts(self.allowed_data_refs, "allowed task data references")
@@ -620,6 +643,10 @@ class ManagedTask:
                     acceptance.task_id != self.task_id
                     or acceptance.task_version >= self.version
                     or acceptance.task_semantic_digest != self.semantic_digest
+                    or any(
+                        proof.result_kind != self.expected_result_kind
+                        for proof in acceptance.criterion_proofs
+                    )
                     or tuple(
                         proof.criterion
                         for proof in acceptance.criterion_proofs
@@ -640,6 +667,7 @@ class ManagedTask:
         expected_digest = _semantic_digest(
             purpose=self.purpose,
             expected_result=self.expected_result,
+            expected_result_kind=self.expected_result_kind,
             assignee=self.assignee,
             allowed_data_categories=self.allowed_data_categories,
             allowed_data_refs=self.allowed_data_refs,
@@ -655,6 +683,7 @@ class ManagedTask:
             "version": self.version,
             "purpose": self.purpose,
             "expected_result": self.expected_result,
+            "expected_result_kind": self.expected_result_kind,
             "assignee": self.assignee,
             "allowed_data_categories": list(self.allowed_data_categories),
             "allowed_data_refs": list(self.allowed_data_refs),
@@ -686,6 +715,7 @@ class ManagedTask:
                     "version",
                     "purpose",
                     "expected_result",
+                    "expected_result_kind",
                     "assignee",
                     "allowed_data_categories",
                     "allowed_data_refs",
@@ -720,6 +750,9 @@ class ManagedTask:
             purpose=_text(stored["purpose"], "task purpose"),
             expected_result=_text(
                 stored["expected_result"], "task expected result"
+            ),
+            expected_result_kind=_text(
+                stored["expected_result_kind"], "task expected result kind"
             ),
             assignee=_text(stored["assignee"], "task assignee"),
             allowed_data_categories=_wire_texts(
@@ -770,15 +803,37 @@ class ManagedTask:
 
 
 @dataclass(frozen=True)
+class TaskResultEvidence:
+    """A current typed result fact that can support task acceptance."""
+
+    result_kind: str
+    result_status: str
+    revision_digest: str
+
+    def __post_init__(self) -> None:
+        if self.result_kind not in TASK_RESULT_COMPLETION_STATUSES:
+            raise TaskContractViolation("invalid task result evidence kind")
+        if self.result_status not in TASK_RESULT_COMPLETION_STATUSES[self.result_kind]:
+            raise TaskContractViolation("result status cannot complete this task kind")
+        _sha256(self.revision_digest, "task result evidence revision")
+
+
+@dataclass(frozen=True)
 class TaskAcceptanceCriterionProof:
     """Immutable evidence revisions proving one declared acceptance criterion."""
 
     criterion: str
+    result_kind: str
+    result_status: str
     evidence_refs: tuple[str, ...]
     evidence_revision_digests: tuple[str, ...]
 
     def __post_init__(self) -> None:
         _text(self.criterion, "task acceptance criterion")
+        if self.result_kind not in TASK_RESULT_COMPLETION_STATUSES:
+            raise TaskContractViolation("invalid task acceptance result kind")
+        if self.result_status not in TASK_RESULT_COMPLETION_STATUSES[self.result_kind]:
+            raise TaskContractViolation("result status cannot complete this task kind")
         refs = _tuple_texts(
             self.evidence_refs,
             "task acceptance evidence reference",
@@ -804,6 +859,8 @@ class TaskAcceptanceCriterionProof:
     def to_storage(self) -> dict[str, object]:
         return {
             "criterion": self.criterion,
+            "result_kind": self.result_kind,
+            "result_status": self.result_status,
             "evidence_refs": list(self.evidence_refs),
             "evidence_revision_digests": list(
                 self.evidence_revision_digests
@@ -817,6 +874,8 @@ class TaskAcceptanceCriterionProof:
             frozenset(
                 {
                     "criterion",
+                    "result_kind",
+                    "result_status",
                     "evidence_refs",
                     "evidence_revision_digests",
                 }
@@ -831,6 +890,12 @@ class TaskAcceptanceCriterionProof:
         return cls(
             criterion=_text(
                 stored["criterion"], "task acceptance criterion"
+            ),
+            result_kind=_text(
+                stored["result_kind"], "task acceptance result kind"
+            ),
+            result_status=_text(
+                stored["result_status"], "task acceptance result status"
             ),
             evidence_refs=_wire_texts(
                 stored["evidence_refs"],
@@ -940,6 +1005,10 @@ class TaskAcceptance:
         ):
             raise TaskContractViolation(
                 "task acceptance proof does not cover exact current criteria"
+            )
+        if any(proof.result_kind != task.expected_result_kind for proof in criterion_proofs):
+            raise TaskContractViolation(
+                "task acceptance result kind does not match expected result"
             )
         accepted_at = _utc_time(accepted_at_utc, "task acceptance time")
         return cls(
@@ -1603,6 +1672,7 @@ class TaskEngine:
             version=1,
             purpose=candidate.purpose,
             expected_result=candidate.expected_result,
+            expected_result_kind=candidate.expected_result_kind,
             assignee=candidate.assignee,
             allowed_data_categories=candidate.allowed_data_categories,
             allowed_data_refs=candidate.allowed_data_refs,
@@ -1689,6 +1759,8 @@ class TaskEngine:
             claim_generation = _positive_integer(generation, "task claim generation")
             claim_cas = _text(task_cas_identity, "task claim CAS identity")
             current_cas = stable_digest(task.to_storage())
+            if claim_cas != current_cas:
+                raise TaskContractViolation("task claim CAS identity is stale")
             for existing in state.task_claim_leases:
                 if existing.claim_id != lease_identifier:
                     continue
@@ -2162,19 +2234,18 @@ class TaskEngine:
         state: TaskRuntimeState,
         acceptance: TaskAcceptance,
         *,
-        current_evidence_revisions: Mapping[str, str],
+        current_result_evidence: Mapping[str, TaskResultEvidence],
     ) -> TaskTransition:
         if type(acceptance) is not TaskAcceptance:
             raise TaskContractViolation("invalid task acceptance")
-        if not isinstance(current_evidence_revisions, Mapping):
-            raise TaskContractViolation("invalid current evidence revisions")
-        current_revisions = {
-            _text(ref, "current evidence reference"): _sha256(
-                digest,
-                "current evidence revision",
-            )
-            for ref, digest in current_evidence_revisions.items()
-        }
+        if not isinstance(current_result_evidence, Mapping):
+            raise TaskContractViolation("invalid current task result evidence")
+        current_results: dict[str, TaskResultEvidence] = {}
+        for ref, evidence in current_result_evidence.items():
+            parsed_ref = _text(ref, "current evidence reference")
+            if type(evidence) is not TaskResultEvidence:
+                raise TaskContractViolation("invalid current task result evidence")
+            current_results[parsed_ref] = evidence
         task = state.task(acceptance.task_id)
         if task.primary_label != "active":
             raise TaskContractViolation("terminal task cannot be solved again")
@@ -2193,7 +2264,19 @@ class TaskEngine:
                 "task acceptance does not prove the current criteria"
             )
         if any(
-            current_revisions.get(ref) != digest
+            proof.result_kind != task.expected_result_kind
+            for proof in acceptance.criterion_proofs
+        ):
+            raise TaskContractViolation(
+                "task acceptance result kind does not match expected result"
+            )
+        if any(
+            current_results.get(ref)
+            != TaskResultEvidence(
+                result_kind=proof.result_kind,
+                result_status=proof.result_status,
+                revision_digest=digest,
+            )
             for proof in acceptance.criterion_proofs
             for ref, digest in zip(
                 proof.evidence_refs,
@@ -2201,7 +2284,7 @@ class TaskEngine:
             )
         ):
             raise TaskContractViolation(
-                "task acceptance does not match a current evidence revision"
+                "task acceptance does not match current typed result evidence"
             )
         if datetime.fromisoformat(acceptance.accepted_at_utc) < datetime.fromisoformat(
             task.updated_at_utc

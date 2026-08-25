@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from partner_health_steward import tasking
+from partner_health_steward.initialization import stable_digest
 from partner_health_steward.review import (
     DailyReviewEngine,
     DailyReviewLedger,
@@ -19,6 +21,7 @@ from partner_health_steward.tasks import (
     TaskContractViolation,
     TaskEngine,
     TaskExternalBoundary,
+    TaskResultEvidence,
     TaskRuntimeState,
 )
 
@@ -28,8 +31,12 @@ INSTALLATION = "partner-installation"
 NOW = "2026-08-24T02:00:00+00:00"
 SHA_ONE = "sha256:" + "1" * 64
 SHA_TWO = "sha256:" + "2" * 64
-CURRENT_EVIDENCE_REVISIONS = {
-    "evidence:sleep:accepted": SHA_TWO,
+CURRENT_RESULT_EVIDENCE = {
+    "evidence:sleep:accepted": TaskResultEvidence(
+        result_kind="internal-result",
+        result_status="completed",
+        revision_digest=SHA_TWO,
+    ),
 }
 
 
@@ -51,6 +58,7 @@ def candidate(
         source_revision_digest=source_digest,
         purpose=purpose,
         expected_result=expected_result,
+        expected_result_kind="internal-result",
         assignee="health-steward",
         allowed_data_categories=("portrait", "evidence"),
         allowed_data_refs=("portrait-topic:sleep",),
@@ -68,6 +76,8 @@ def acceptance_for(
 ) -> TaskAcceptance:
     proof = TaskAcceptanceCriterionProof(
         criterion=task.acceptance_criteria[0],
+        result_kind=task.expected_result_kind,
+        result_status="completed",
         evidence_refs=("evidence:sleep:accepted",),
         evidence_revision_digests=(SHA_TWO,),
     )
@@ -112,10 +122,13 @@ class Ticket115TaskValueTests(unittest.TestCase):
             "TASK_APPROVAL_STATUSES",
             "TASK_INITIAL_PHASES",
             "TASK_UNKNOWN_RESOLUTIONS",
+            "TASK_RESULT_KINDS",
+            "TASK_RESULT_COMPLETION_STATUSES",
             "TaskApprovalBinding",
             "TaskAcceptanceCriterionProof",
             "TaskExternalBoundary",
             "TaskTerminalFact",
+            "TaskResultEvidence",
             "TaskUnknownFact",
         ):
             with self.subTest(name=name):
@@ -229,6 +242,8 @@ class Ticket115TaskValueTests(unittest.TestCase):
                 (
                     TaskAcceptanceCriterionProof(
                         criterion="interface accepted",
+                        result_kind="internal-result",
+                        result_status="completed",
                         evidence_refs=("weixin-response:accepted",),
                         evidence_revision_digests=(SHA_ONE,),
                     ),
@@ -241,12 +256,104 @@ class Ticket115TaskValueTests(unittest.TestCase):
         ):
             TaskAcceptanceCriterionProof(
                 criterion=task.acceptance_criteria[0],
+                result_kind="internal-result",
+                result_status="completed",
                 evidence_refs=("evidence:sleep:accepted",),
                 evidence_revision_digests=("unversioned-evidence",),
             )
 
 
 class Ticket115TaskEngineTests(unittest.TestCase):
+    def _solve_typed_result(self, result_kind: str, result_status: str) -> object:
+        proposed = replace(
+            candidate(),
+            candidate_id=f"candidate:typed:{result_kind}:{result_status}",
+            expected_result_kind=result_kind,
+        )
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            proposed,
+            committed_at_utc=NOW,
+        )
+        task = created.state.task(created.task_id)
+        evidence_ref = f"task-result:{result_kind}:{result_status}"
+        proof = TaskAcceptanceCriterionProof(
+            criterion=task.acceptance_criteria[0],
+            result_kind=result_kind,
+            result_status=result_status,
+            evidence_refs=(evidence_ref,),
+            evidence_revision_digests=(SHA_TWO,),
+        )
+        acceptance = TaskAcceptance.prove(
+            task,
+            (proof,),
+            accepted_at_utc="2026-08-24T03:00:00+00:00",
+        )
+        return TaskEngine.solve(
+            created.state,
+            acceptance,
+            current_result_evidence={
+                evidence_ref: TaskResultEvidence(
+                    result_kind=result_kind,
+                    result_status=result_status,
+                    revision_digest=SHA_TWO,
+                )
+            },
+        )
+
+    def test_portrait_update_requires_a_committed_portrait_result(self) -> None:
+        solved = self._solve_typed_result("portrait-update", "portrait-committed")
+        self.assertEqual(solved.state.task(solved.task_id).primary_label, "solved")
+
+    def test_reminder_delivery_does_not_prove_owner_action(self) -> None:
+        solved = self._solve_typed_result("reminder-delivery", "delivered")
+        self.assertEqual(solved.state.task(solved.task_id).primary_label, "solved")
+        owner_action_task = replace(
+            candidate(),
+            candidate_id="candidate:owner-action",
+            expected_result_kind="owner-action",
+        )
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            owner_action_task,
+            committed_at_utc=NOW,
+        )
+        with self.assertRaisesRegex(TaskContractViolation, "result kind"):
+            TaskAcceptance.prove(
+                created.state.task(created.task_id),
+                (
+                    TaskAcceptanceCriterionProof(
+                        criterion=owner_action_task.acceptance_criteria[0],
+                        result_kind="reminder-delivery",
+                        result_status="delivered",
+                        evidence_refs=("delivery:one",),
+                        evidence_revision_digests=(SHA_TWO,),
+                    ),
+                ),
+                accepted_at_utc="2026-08-24T03:00:00+00:00",
+            )
+
+    def test_literature_no_result_is_an_accepted_business_result(self) -> None:
+        solved = self._solve_typed_result(
+            "literature-result",
+            "no-qualified-result",
+        )
+        self.assertEqual(solved.state.task(solved.task_id).primary_label, "solved")
+
+    def test_capability_gap_cannot_be_constructed_as_acceptance_result(self) -> None:
+        created = TaskEngine.admit_candidate(
+            TaskRuntimeState.empty(OWNER, INSTALLATION),
+            candidate(candidate_id="candidate:capability-gap"),
+            committed_at_utc=NOW,
+        )
+        with self.assertRaisesRegex(TaskContractViolation, "result evidence kind"):
+            TaskResultEvidence(
+                result_kind="capability-gap",
+                result_status="unavailable",
+                revision_digest=SHA_TWO,
+            )
+        self.assertEqual(created.state.task(created.task_id).primary_label, "active")
+
     def test_engine_owns_initial_task_state_and_merges_duplicate_basis(self) -> None:
         first = TaskEngine.admit_candidate(
             TaskRuntimeState.empty(OWNER, INSTALLATION),
@@ -284,7 +391,7 @@ class Ticket115TaskEngineTests(unittest.TestCase):
         solved = TaskEngine.solve(
             created.state,
             acceptance_for(created.state.task(created.task_id)),
-            current_evidence_revisions=CURRENT_EVIDENCE_REVISIONS,
+            current_result_evidence=CURRENT_RESULT_EVIDENCE,
         )
         restored = TaskRuntimeState.from_storage(solved.state.to_storage())
         restored_terminal = restored.task(created.task_id).terminal_fact
@@ -343,7 +450,7 @@ class Ticket115TaskEngineTests(unittest.TestCase):
             TaskEngine.solve(
                 advanced.state,
                 stale_acceptance,
-                current_evidence_revisions=CURRENT_EVIDENCE_REVISIONS,
+                current_result_evidence=CURRENT_RESULT_EVIDENCE,
             )
 
         current_task = advanced.state.task(created.task_id)
@@ -358,7 +465,7 @@ class Ticket115TaskEngineTests(unittest.TestCase):
             TaskEngine.solve(
                 advanced.state,
                 predating,
-                current_evidence_revisions=CURRENT_EVIDENCE_REVISIONS,
+                current_result_evidence=CURRENT_RESULT_EVIDENCE,
             )
 
     def test_solve_requires_acceptance_evidence_to_match_current_revisions(
@@ -373,23 +480,27 @@ class Ticket115TaskEngineTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             TaskContractViolation,
-            "current evidence revision",
+            "current typed result evidence",
         ):
             TaskEngine.solve(
                 created.state,
                 acceptance,
-                current_evidence_revisions={
-                    "evidence:sleep:accepted": SHA_ONE,
+                current_result_evidence={
+                    "evidence:sleep:accepted": TaskResultEvidence(
+                        result_kind="internal-result",
+                        result_status="completed",
+                        revision_digest=SHA_ONE,
+                    ),
                 },
             )
         with self.assertRaisesRegex(
             TaskContractViolation,
-            "current evidence revision",
+            "current typed result evidence",
         ):
             TaskEngine.solve(
                 created.state,
                 acceptance,
-                current_evidence_revisions={},
+                current_result_evidence={},
             )
 
     def test_expired_task_lease_can_be_taken_over_but_live_lease_cannot(self) -> None:
@@ -616,27 +727,93 @@ class Ticket115DailyReviewTests(unittest.TestCase):
             INSTALLATION,
             "America/New_York",
             "2026-11-01T05:30:00+00:00",
+            owner_generation=7,
         )
         second_fold = local_day_key(
             OWNER,
             INSTALLATION,
             "America/New_York",
             "2026-11-01T06:30:00+00:00",
+            owner_generation=7,
         )
         utc_key = local_day_key(
             OWNER,
             INSTALLATION,
             "UTC",
             "2026-11-01T05:30:00+00:00",
+            owner_generation=7,
         )
 
         self.assertEqual(first_fold.local_date, "2026-11-01")
+        self.assertEqual(first_fold.owner_generation, 7)
         self.assertEqual(second_fold, first_fold)
         self.assertNotEqual(first_fold, utc_key)
         self.assertEqual(
             type(first_fold).from_storage(first_fold.to_storage()),
             first_fold,
         )
+
+    def test_legacy_review_key_migrates_without_replaying_the_same_day(self) -> None:
+        committed = DailyReviewEngine.commit(
+            DailyReviewEngine.prepare(
+                DailyReviewLedger.empty(OWNER, INSTALLATION),
+                owner_id=OWNER,
+                installation_id=INSTALLATION,
+                timezone_name="Asia/Shanghai",
+                owner_generation=1,
+                observed_at_utc=NOW,
+                current_state_digest=SHA_ONE,
+                changed=False,
+            ),
+            completed_at_utc="2026-08-24T02:01:00+00:00",
+        )
+        wire = committed.ledger.to_storage()
+        record = wire["completed"][0]
+        key = record["key"]
+        del key["owner_generation"]
+        record["prepare_digest"] = stable_digest(
+            {
+                "key": key,
+                "state_digest": record["state_digest"],
+                "changed": record["changed"],
+                "action_refs": record["action_refs"],
+                "prepared_at_utc": record["prepared_at_utc"],
+            }
+        )
+        record["result_digest"] = stable_digest(
+            {
+                "prepare_digest": record["prepare_digest"],
+                "completed_at_utc": record["completed_at_utc"],
+            }
+        )
+
+        migrated = DailyReviewLedger.from_storage(wire)
+        replay = DailyReviewEngine.prepare(
+            migrated,
+            owner_id=OWNER,
+            installation_id=INSTALLATION,
+            timezone_name="Asia/Shanghai",
+            owner_generation=1,
+            observed_at_utc="2026-08-24T03:00:00+00:00",
+            current_state_digest=SHA_TWO,
+            changed=True,
+            action_refs=("task:must-not-replay",),
+        )
+
+        self.assertEqual(migrated.completed[0].key.owner_generation, 1)
+        self.assertIn("owner_generation", migrated.to_storage()["completed"][0]["key"])
+        self.assertEqual(replay.outcome, "already-completed")
+        next_generation = DailyReviewEngine.prepare(
+            migrated,
+            owner_id=OWNER,
+            installation_id=INSTALLATION,
+            timezone_name="Asia/Shanghai",
+            owner_generation=2,
+            observed_at_utc="2026-08-24T03:00:00+00:00",
+            current_state_digest=SHA_TWO,
+            changed=False,
+        )
+        self.assertEqual(next_generation.outcome, "prepared")
 
     def test_timezone_change_suppresses_an_already_reviewed_local_date(
         self,

@@ -80,7 +80,14 @@ def mark_attempted(
         lease_id=lease_id,
         attempt_ref=attempt_ref,
         attempted_at_utc=attempted_at_utc,
-        issuer=ISSUERS["owner-delivery-adapter.attempted"],
+        evidence=ISSUERS["owner-delivery-adapter.attempted"].issue(
+            layer="attempted",
+            generation=state.record(intent_id).intent.route_generation,
+            replay_identity=attempt_ref,
+            effect_id=state.record(intent_id).intent.effect_id,
+            evidence_ref=attempt_ref,
+        ),
+        authority=AUTHORITY,
     )
 
 
@@ -141,12 +148,24 @@ def record_transport_result(
         if result.status == "unknown"
         else "owner-delivery-adapter.interface"
     )
+    record = state.record(intent_id)
+    layer = {
+        "accepted": "interface-accepted",
+        "rejected": "interface-rejected",
+        "unknown": "unknown",
+    }[result.status]
     return OwnerDeliveryEngine.record_transport_result(
         state,
         intent_id,
         attempt_ref=attempt_ref,
         result=result,
         observed_at_utc=observed_at_utc,
-        issuer=ISSUERS[producer],
+        evidence=ISSUERS[producer].issue(
+            layer=layer,
+            generation=record.intent.route_generation,
+            replay_identity=result.result_ref,
+            effect_id=record.intent.effect_id,
+            evidence_ref=result.evidence_ref,
+        ),
         authority=AUTHORITY,
     )

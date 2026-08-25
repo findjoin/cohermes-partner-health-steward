@@ -74,6 +74,7 @@ def _next_task_state() -> TaskRuntimeState:
             source_revision_digest=SHA_ONE,
             purpose="Prove an atomic health-command receipt.",
             expected_result="The task and receipt appear together.",
+            expected_result_kind="internal-result",
             assignee="health-steward",
             allowed_data_categories=("evidence",),
             allowed_data_refs=("evidence:health-command",),

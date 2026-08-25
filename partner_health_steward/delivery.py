@@ -22,6 +22,7 @@ from .ticket115_contracts import (
     DeliveryEvidence,
     DeliveryEvidenceAuthority,
     DeliveryEvidenceIssuer,
+    MANDATORY_DELIVERY_KINDS,
 )
 
 
@@ -147,8 +148,9 @@ def _intent_material(
     route_generation: int,
     payload_ref: str,
     payload_digest: str,
+    mandatory_request_kind: str | None = None,
 ) -> dict[str, object]:
-    return {
+    material: dict[str, object] = {
         "contract": "owner-delivery-intent-v1",
         "effect_kind": effect_kind,
         "owner_id": owner_id,
@@ -163,6 +165,9 @@ def _intent_material(
         "payload_ref": payload_ref,
         "payload_digest": payload_digest,
     }
+    if mandatory_request_kind is not None:
+        material["mandatory_request_kind"] = mandatory_request_kind
+    return material
 
 
 def owner_delivery_idempotency_key(
@@ -178,6 +183,7 @@ def owner_delivery_idempotency_key(
     route_generation: int,
     payload_ref: str,
     payload_digest: str,
+    mandatory_request_kind: str | None = None,
 ) -> str:
     """Return the stable, opaque channel key for one exact owner effect."""
 
@@ -202,9 +208,13 @@ def owner_delivery_idempotency_key(
         "payload_ref": _text(payload_ref, "delivery payload reference"),
         "payload_digest": _sha256(payload_digest, "delivery payload digest"),
     }
-    digest = stable_digest(
-        _intent_material(effect_kind="owner-delivery", **values)
-    )
+    if mandatory_request_kind is not None:
+        if mandatory_request_kind not in MANDATORY_DELIVERY_KINDS:
+            raise DeliveryContractViolation(
+                "invalid mandatory delivery request kind"
+            )
+        values["mandatory_request_kind"] = mandatory_request_kind
+    digest = stable_digest(_intent_material(effect_kind="owner-delivery", **values))
     return "health-owner-delivery:v1:" + digest.removeprefix("sha256:")
 
 
@@ -228,6 +238,7 @@ class OutboxIntent:
     semantic_digest: str
     idempotency_key: str
     formed_at_utc: str
+    mandatory_request_kind: str | None = None
 
     def __post_init__(self) -> None:
         if self.effect_kind == "contact-delivery":
@@ -252,6 +263,13 @@ class OutboxIntent:
         _sha256(self.semantic_digest, "delivery intent semantic digest")
         _text(self.idempotency_key, "delivery idempotency key")
         _utc(self.formed_at_utc, "delivery formation time")
+        if (
+            self.mandatory_request_kind is not None
+            and self.mandatory_request_kind not in MANDATORY_DELIVERY_KINDS
+        ):
+            raise DeliveryContractViolation(
+                "invalid mandatory delivery request kind"
+            )
 
         expected_digest = stable_digest(self.semantic_material())
         expected_intent_id = "outbox:" + expected_digest.removeprefix("sha256:")
@@ -280,6 +298,7 @@ class OutboxIntent:
             route_generation=self.route_generation,
             payload_ref=self.payload_ref,
             payload_digest=self.payload_digest,
+            mandatory_request_kind=self.mandatory_request_kind,
         )
 
     @property
@@ -289,7 +308,7 @@ class OutboxIntent:
         ).hexdigest()
 
     def to_wire(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "intent_id": self.intent_id,
             "effect_kind": self.effect_kind,
             "owner_id": self.owner_id,
@@ -307,13 +326,14 @@ class OutboxIntent:
             "idempotency_key": self.idempotency_key,
             "formed_at_utc": self.formed_at_utc,
         }
+        if self.mandatory_request_kind is not None:
+            value["mandatory_request_kind"] = self.mandatory_request_kind
+        return value
 
     @classmethod
     def from_wire(cls, value: object) -> "OutboxIntent":
-        fields = _mapping(
-            value,
-            frozenset(
-                {
+        legacy_fields = frozenset(
+            {
                     "intent_id",
                     "effect_kind",
                     "owner_id",
@@ -330,11 +350,17 @@ class OutboxIntent:
                     "semantic_digest",
                     "idempotency_key",
                     "formed_at_utc",
-                }
-            ),
-            "outbox intent",
+            }
         )
-        return cls(**fields)  # type: ignore[arg-type]
+        if (
+            type(value) is not dict
+            or frozenset(value)
+            not in {legacy_fields, legacy_fields | {"mandatory_request_kind"}}
+        ):
+            raise DeliveryContractViolation("invalid outbox intent")
+        stored = dict(value)
+        stored.setdefault("mandatory_request_kind", None)
+        return cls(**stored)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1102,7 @@ class OwnerDeliveryEngine:
         payload_ref: str,
         payload_digest: str,
         formed_at_utc: str,
+        mandatory_request_kind: str | None = None,
     ) -> OutboxIntent:
         if effect_kind == "contact-delivery":
             raise DeliveryContractViolation("contact delivery is not enabled")
@@ -1093,6 +1120,7 @@ class OwnerDeliveryEngine:
             route_generation=route_generation,
             payload_ref=payload_ref,
             payload_digest=payload_digest,
+            mandatory_request_kind=mandatory_request_kind,
         )
         digest = "sha256:" + key.rsplit(":", 1)[-1]
         return OutboxIntent(
@@ -1112,6 +1140,7 @@ class OwnerDeliveryEngine:
             semantic_digest=digest,
             idempotency_key=key,
             formed_at_utc=formed_at_utc,
+            mandatory_request_kind=mandatory_request_kind,
         )
 
     @staticmethod
@@ -1253,7 +1282,8 @@ class OwnerDeliveryEngine:
         lease_id: str,
         attempt_ref: str,
         attempted_at_utc: str,
-        issuer: DeliveryEvidenceIssuer,
+        evidence: DeliveryEvidence,
+        authority: DeliveryEvidenceAuthority,
     ) -> DeliveryTransition:
         if type(state) is not DeliveryOutboxState:
             raise DeliveryContractViolation("invalid delivery outbox state")
@@ -1261,16 +1291,24 @@ class OwnerDeliveryEngine:
         lease_identifier = _text(lease_id, "delivery lease identifier")
         attempt = _text(attempt_ref, "delivery attempt reference")
         attempted_at = _utc(attempted_at_utc, "delivery attempt time")
+        try:
+            authority.require(
+                evidence,
+                expected_layer="attempted",
+                expected_generation=record.intent.route_generation,
+                expected_effect_id=record.intent.effect_id,
+                expected_replay_identity=attempt,
+            )
+        except ValueError as exc:
+            raise DeliveryContractViolation(
+                "delivery attempt evidence is not authoritative"
+            ) from exc
+        if evidence.evidence_ref != attempt:
+            raise DeliveryContractViolation("delivery attempt evidence reference mismatch")
         fact = DeliveryFact(
             kind="attempted",
             occurred_at_utc=attempted_at,
-            proof=issuer.issue(
-                layer="attempted",
-                generation=record.intent.route_generation,
-                replay_identity=attempt,
-                effect_id=record.intent.effect_id,
-                evidence_ref=attempt,
-            ),
+            proof=evidence,
             attempt_ref=attempt,
             lease_id=lease_identifier,
         )
@@ -1372,7 +1410,7 @@ class OwnerDeliveryEngine:
         attempt_ref: str,
         result: OwnerDeliveryTransportResult,
         observed_at_utc: str,
-        issuer: DeliveryEvidenceIssuer,
+        evidence: DeliveryEvidence,
         authority: DeliveryEvidenceAuthority,
     ) -> DeliveryTransition:
         """Record one narrow adapter response without implying owner receipt."""
@@ -1389,13 +1427,7 @@ class OwnerDeliveryEngine:
             result_ref=result.result_ref,
             evidence_ref=result.evidence_ref,
             observed_at_utc=observed_at_utc,
-            evidence=issuer.issue(
-                layer=_EVIDENCE_LAYER_BY_FACT_KIND[result.status],
-                generation=state.record(intent_id).intent.route_generation,
-                replay_identity=result.result_ref,
-                effect_id=state.record(intent_id).intent.effect_id,
-                evidence_ref=result.evidence_ref,
-            ),
+            evidence=evidence,
             authority=authority,
         )
 

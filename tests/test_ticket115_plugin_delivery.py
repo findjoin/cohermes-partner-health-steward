@@ -15,6 +15,10 @@ from partner_health_steward.authority import (
 )
 from partner_health_steward.plugin import HealthPlugin
 from partner_health_steward.contract import ProtocolViolation
+from partner_health_steward.ticket115_contracts import (
+    DeliveryEvidenceChallenge,
+    DeliveryEvidenceIssuer,
+)
 
 
 INTENT_ID = "outbox:" + ("1" * 64)
@@ -58,13 +62,14 @@ class _BoundaryCore:
         self,
         completion: object,
         grant: EffectExecutionGrant,
+        evidence: object,
     ) -> SimpleNamespace:
         completion_type = getattr(delivery, "OwnerDeliveryCompletion", None)
         if completion_type is None or type(completion) is not completion_type:
             raise AssertionError(
                 "Plugin must return a strict OwnerDeliveryCompletion to core"
             )
-        self.completion_calls.append((completion, grant))
+        self.completion_calls.append((completion, grant, evidence))
         transport_result = delivery.OwnerDeliveryTransportResult(
             status=completion.status,
             result_ref=completion.result_ref,
@@ -80,6 +85,23 @@ class _BoundaryCore:
             transport_result=transport_result,
             effect_response=_WireValue({"status": "accepted"}),
             delivery_transition=transition,
+        )
+
+    def owner_delivery_completion_evidence_challenge(
+        self,
+        completion: object,
+    ) -> DeliveryEvidenceChallenge:
+        layer = {
+            "accepted": "interface-accepted",
+            "rejected": "interface-rejected",
+            "unknown": "unknown",
+        }[completion.status]
+        return DeliveryEvidenceChallenge(
+            layer=layer,
+            generation=1,
+            replay_identity=completion.result_ref,
+            effect_id="effect:ticket115-plugin-boundary",
+            evidence_ref=completion.evidence_ref,
         )
 
     def execute_owner_delivery(self, *args: object, **kwargs: object) -> object:
@@ -171,7 +193,23 @@ class Ticket115PluginDeliveryBoundaryTests(unittest.TestCase):
 
     def _plugin(self) -> tuple[HealthPlugin, _BoundaryCore]:
         core = _BoundaryCore(self.policy, self.send_intent)
-        return HealthPlugin(core, admission_policy=self.policy), core  # type: ignore[arg-type]
+        issuers = (
+            DeliveryEvidenceIssuer(
+                producer_contract="owner-delivery-adapter.interface",
+                allowed_layers=("interface-accepted", "interface-rejected"),
+                signing_key=b"ticket115-plugin-interface-key",
+            ),
+            DeliveryEvidenceIssuer(
+                producer_contract="owner-delivery-adapter.unknown",
+                allowed_layers=("unknown",),
+                signing_key=b"ticket115-plugin-unknown-key",
+            ),
+        )
+        return HealthPlugin(
+            core,
+            admission_policy=self.policy,
+            delivery_evidence_issuers=issuers,
+        ), core  # type: ignore[arg-type]
 
     def _execute(
         self,
@@ -220,9 +258,10 @@ class Ticket115PluginDeliveryBoundaryTests(unittest.TestCase):
         self.assertEqual(transport.calls, [self.send_intent.to_wire()])
         self.assertIs(type(transport.calls[0]), dict)
         self.assertEqual(len(core.completion_calls), 1)
-        completion, completed_grant = core.completion_calls[0]
+        completion, completed_grant, evidence = core.completion_calls[0]
         self.assertIs(type(completion), completion_type)
         self.assertIs(completed_grant, self.grant)
+        self.assertEqual(evidence.producer_contract, "owner-delivery-adapter.interface")
         self.assertEqual(
             completion.to_wire(),
             {
@@ -247,8 +286,9 @@ class Ticket115PluginDeliveryBoundaryTests(unittest.TestCase):
 
         self.assertEqual(transport.calls, [self.send_intent.to_wire()])
         self.assertEqual(len(core.completion_calls), 1)
-        completion, completed_grant = core.completion_calls[0]
+        completion, completed_grant, evidence = core.completion_calls[0]
         self.assertIs(completed_grant, self.grant)
+        self.assertEqual(evidence.producer_contract, "owner-delivery-adapter.unknown")
         self._assert_unknown_completion(completion)
         self.assertEqual(result["transport_result"]["status"], "unknown")
         self.assert_core_never_received_transport(core, transport)
@@ -292,8 +332,12 @@ class Ticket115PluginDeliveryBoundaryTests(unittest.TestCase):
 
                 self.assertEqual(transport.calls, [self.send_intent.to_wire()])
                 self.assertEqual(len(core.completion_calls), 1)
-                completion, completed_grant = core.completion_calls[0]
+                completion, completed_grant, evidence = core.completion_calls[0]
                 self.assertIs(completed_grant, self.grant)
+                self.assertEqual(
+                    evidence.producer_contract,
+                    "owner-delivery-adapter.unknown",
+                )
                 self._assert_unknown_completion(completion)
                 self.assertEqual(result["transport_result"]["status"], "unknown")
                 self.assert_core_never_received_transport(core, transport)

@@ -130,16 +130,19 @@ def _zone(name: str):
 
 @dataclass(frozen=True, order=True)
 class LocalDayKey:
-    """Stable business identity: owner + installation + timezone + local date."""
+    """Stable review identity for one initialized owner generation and local day."""
 
     owner_id: str
     installation_id: str
     timezone: str
     local_date: str
+    owner_generation: int = 1
 
     def __post_init__(self) -> None:
         _text(self.owner_id, "review owner")
         _text(self.installation_id, "review installation")
+        if type(self.owner_generation) is not int or self.owner_generation < 1:
+            raise ReviewContractViolation("invalid review owner generation")
         _timezone(self.timezone)
         try:
             parsed = date.fromisoformat(_text(self.local_date, "review local date"))
@@ -151,7 +154,7 @@ class LocalDayKey:
     @property
     def value(self) -> str:
         return (
-            f"{self.owner_id}:{self.installation_id}:"
+            f"{self.owner_id}:{self.installation_id}:{self.owner_generation}:"
             f"{self.timezone}:{self.local_date}"
         )
 
@@ -163,17 +166,27 @@ class LocalDayKey:
         return {
             "owner_id": self.owner_id,
             "installation_id": self.installation_id,
+            "owner_generation": self.owner_generation,
             "timezone": self.timezone,
             "local_date": self.local_date,
         }
 
     @classmethod
     def from_storage(cls, value: object) -> "LocalDayKey":
-        stored = _mapping(
-            value,
+        if type(value) is not dict or frozenset(value) not in {
             frozenset({"owner_id", "installation_id", "timezone", "local_date"}),
-            "local-day review key",
-        )
+            frozenset(
+                {
+                    "owner_id",
+                    "installation_id",
+                    "owner_generation",
+                    "timezone",
+                    "local_date",
+                }
+            ),
+        }:
+            raise ReviewContractViolation("invalid local-day review key")
+        stored = value
         return cls(
             owner_id=_text(stored["owner_id"], "review owner"),
             installation_id=_text(
@@ -181,6 +194,13 @@ class LocalDayKey:
             ),
             timezone=_timezone(stored["timezone"]),
             local_date=_text(stored["local_date"], "review local date"),
+            owner_generation=(
+                1
+                if "owner_generation" not in stored
+                else _nonnegative_integer(
+                    stored["owner_generation"], "review owner generation"
+                )
+            ),
         )
 
 
@@ -189,6 +209,8 @@ def local_day_key(
     installation_id: str,
     timezone_name: str,
     observed_at_utc: str | datetime,
+    *,
+    owner_generation: int = 1,
 ) -> LocalDayKey:
     """Compute the current owner-local natural day, including DST folds."""
 
@@ -207,6 +229,7 @@ def local_day_key(
         installation_id=_text(installation_id, "review installation"),
         timezone=normalized_timezone,
         local_date=local.date().isoformat(),
+        owner_generation=owner_generation,
     )
 
 
@@ -220,6 +243,24 @@ def _pending_digest(
     return stable_digest(
         {
             "key": key.to_storage(),
+            "state_digest": state_digest,
+            "changed": changed,
+            "action_refs": list(action_refs),
+            "prepared_at_utc": prepared_at_utc,
+        }
+    )
+
+
+def _legacy_pending_digest(
+    key_storage: Mapping[str, object],
+    state_digest: str,
+    changed: bool,
+    action_refs: tuple[str, ...],
+    prepared_at_utc: str,
+) -> str:
+    return stable_digest(
+        {
+            "key": dict(key_storage),
             "state_digest": state_digest,
             "changed": changed,
             "action_refs": list(action_refs),
@@ -290,23 +331,41 @@ class DailyReviewPending:
             ),
             "pending daily review",
         )
+        key_wire = stored["key"]
+        key = LocalDayKey.from_storage(key_wire)
+        state_digest = _sha256(stored["state_digest"], "pending review state digest")
+        changed = _boolean(stored["changed"], "pending review changed flag")
+        action_refs = _wire_texts(
+            stored["action_refs"],
+            "pending review action reference",
+            ordered=True,
+        )
+        prepared_at = _utc(stored["prepared_at_utc"], "pending review prepare time")
+        prepare_digest = _sha256(stored["prepare_digest"], "pending review digest")
+        legacy = type(key_wire) is dict and "owner_generation" not in key_wire
+        if legacy:
+            if prepare_digest != _legacy_pending_digest(
+                key_wire,
+                state_digest,
+                changed,
+                action_refs,
+                prepared_at,
+            ):
+                raise ReviewContractViolation("pending review digest mismatch")
+            prepare_digest = _pending_digest(
+                key,
+                state_digest,
+                changed,
+                action_refs,
+                prepared_at,
+            )
         return cls(
-            key=LocalDayKey.from_storage(stored["key"]),
-            state_digest=_sha256(
-                stored["state_digest"], "pending review state digest"
-            ),
-            changed=_boolean(stored["changed"], "pending review changed flag"),
-            action_refs=_wire_texts(
-                stored["action_refs"],
-                "pending review action reference",
-                ordered=True,
-            ),
-            prepared_at_utc=_utc(
-                stored["prepared_at_utc"], "pending review prepare time"
-            ),
-            prepare_digest=_sha256(
-                stored["prepare_digest"], "pending review digest"
-            ),
+            key=key,
+            state_digest=state_digest,
+            changed=changed,
+            action_refs=action_refs,
+            prepared_at_utc=prepared_at,
+            prepare_digest=prepare_digest,
         )
 
 
@@ -400,21 +459,60 @@ class DailyReviewRecord:
             ),
             "daily review record",
         )
+        key_wire = stored["key"]
+        key = LocalDayKey.from_storage(key_wire)
+        state_digest = _sha256(stored["state_digest"], "review state digest")
+        changed = _boolean(stored["changed"], "review changed flag")
+        action_refs = _wire_texts(
+            stored["action_refs"], "review action reference", ordered=True
+        )
+        prepared_at = _utc(stored["prepared_at_utc"], "review prepare time")
+        completed_at = _utc(stored["completed_at_utc"], "review completion time")
+        prepare_digest = _sha256(stored["prepare_digest"], "review prepare digest")
+        result_digest = _sha256(stored["result_digest"], "review result digest")
+        legacy = type(key_wire) is dict and "owner_generation" not in key_wire
+        if legacy:
+            if prepare_digest != _legacy_pending_digest(
+                key_wire,
+                state_digest,
+                changed,
+                action_refs,
+                prepared_at,
+            ):
+                raise ReviewContractViolation("review prepare digest mismatch")
+            legacy_pending = DailyReviewPending(
+                key=key,
+                state_digest=state_digest,
+                changed=changed,
+                action_refs=action_refs,
+                prepared_at_utc=prepared_at,
+                prepare_digest=_pending_digest(
+                    key,
+                    state_digest,
+                    changed,
+                    action_refs,
+                    prepared_at,
+                ),
+            )
+            legacy_result = stable_digest(
+                {
+                    "prepare_digest": stored["prepare_digest"],
+                    "completed_at_utc": completed_at,
+                }
+            )
+            if result_digest != legacy_result:
+                raise ReviewContractViolation("review result digest mismatch")
+            prepare_digest = legacy_pending.prepare_digest
+            result_digest = _review_result_digest(legacy_pending, completed_at)
         return cls(
-            key=LocalDayKey.from_storage(stored["key"]),
-            state_digest=_sha256(stored["state_digest"], "review state digest"),
-            changed=_boolean(stored["changed"], "review changed flag"),
-            action_refs=_wire_texts(
-                stored["action_refs"], "review action reference", ordered=True
-            ),
-            prepared_at_utc=_utc(stored["prepared_at_utc"], "review prepare time"),
-            completed_at_utc=_utc(
-                stored["completed_at_utc"], "review completion time"
-            ),
-            prepare_digest=_sha256(
-                stored["prepare_digest"], "review prepare digest"
-            ),
-            result_digest=_sha256(stored["result_digest"], "review result digest"),
+            key=key,
+            state_digest=state_digest,
+            changed=changed,
+            action_refs=action_refs,
+            prepared_at_utc=prepared_at,
+            completed_at_utc=completed_at,
+            prepare_digest=prepare_digest,
+            result_digest=result_digest,
             notification_required=_boolean(
                 stored["notification_required"], "review notification flag"
             ),
@@ -483,6 +581,24 @@ class DailyReviewLedger:
             "pending": None if self.pending is None else self.pending.to_storage(),
         }
 
+    @staticmethod
+    def is_legacy_storage(value: object) -> bool:
+        if type(value) is not dict:
+            return False
+        completed = value.get("completed")
+        pending = value.get("pending")
+        key_values = [] if type(completed) is not list else [
+            record.get("key")
+            for record in completed
+            if type(record) is dict
+        ]
+        if type(pending) is dict:
+            key_values.append(pending.get("key"))
+        return bool(key_values) and all(
+            type(key) is dict and "owner_generation" not in key
+            for key in key_values
+        )
+
     @classmethod
     def from_storage(cls, value: object) -> "DailyReviewLedger":
         stored = _mapping(
@@ -542,6 +658,7 @@ class DailyReviewEngine:
         owner_id: str,
         installation_id: str,
         timezone_name: str,
+        owner_generation: int = 1,
         observed_at_utc: str,
         current_state_digest: str,
         action_refs: tuple[str, ...] = (),
@@ -560,6 +677,7 @@ class DailyReviewEngine:
             installation_id,
             timezone_name,
             observed,
+            owner_generation=owner_generation,
         )
         if not ledger._owns(key):
             raise ReviewContractViolation("review ledger authority mismatch")
@@ -574,7 +692,8 @@ class DailyReviewEngine:
                 True,
             )
         if any(
-            record.key.local_date >= key.local_date
+            record.key.owner_generation == key.owner_generation
+            and record.key.local_date >= key.local_date
             for record in ledger.completed
         ):
             return DailyReviewDecision(
@@ -677,6 +796,7 @@ class DailyReviewEngine:
             pending.key.installation_id,
             pending.key.timezone,
             completed_at,
+            owner_generation=pending.key.owner_generation,
         ) != pending.key:
             raise ReviewContractViolation(
                 "stale pending review cannot cross its owner-local day"

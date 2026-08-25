@@ -6,6 +6,7 @@ from pathlib import Path
 
 from partner_health_steward.authority import AuthorityValidationError
 from partner_health_steward.current_head import InMemoryCurrentHead
+from partner_health_steward.initialization import stable_digest
 from partner_health_steward.delivery import (
     DeliveryOutboxState,
     OwnerDeliveryEngine,
@@ -46,6 +47,7 @@ def _task_state() -> TaskRuntimeState:
             source_revision_digest=SHA_ONE,
             purpose="Confirm the storage recovery path.",
             expected_result="One typed task aggregate survives restart.",
+            expected_result_kind="internal-result",
             assignee="health-steward",
             allowed_data_categories=("evidence",),
             allowed_data_refs=("evidence:storage",),
@@ -350,6 +352,68 @@ class Ticket115TypedStorageTests(unittest.TestCase):
             self.store.delivery_outbox_state(OWNER, INSTALLATION),
             delivery_state,
         )
+        self.assertTrue(self.store.verify_integrity(self.authority))
+
+    def test_legacy_review_key_upgrades_on_restart_without_duplicate_day(self) -> None:
+        prepared = DailyReviewEngine.prepare(
+            DailyReviewLedger.empty(OWNER, INSTALLATION),
+            owner_id=OWNER,
+            installation_id=INSTALLATION,
+            timezone_name="Asia/Shanghai",
+            observed_at_utc="2026-08-24T00:01:00+00:00",
+            current_state_digest=SHA_TWO,
+            changed=False,
+        )
+        current = DailyReviewEngine.commit(
+            prepared,
+            completed_at_utc="2026-08-24T00:02:00+00:00",
+        ).ledger
+        wire = current.to_storage()
+        record = wire["completed"][0]
+        key = record["key"]
+        del key["owner_generation"]
+        record["prepare_digest"] = stable_digest(
+            {
+                "key": key,
+                "state_digest": record["state_digest"],
+                "changed": record["changed"],
+                "action_refs": record["action_refs"],
+                "prepared_at_utc": record["prepared_at_utc"],
+            }
+        )
+        record["result_digest"] = stable_digest(
+            {
+                "prepare_digest": record["prepare_digest"],
+                "completed_at_utc": record["completed_at_utc"],
+            }
+        )
+        self.store.remember_daily_review(prepared.ledger)
+        self.store.remember_daily_review(current)
+        with self.store.transaction() as connection:
+            self.store._assert_integrity_manifest_before_mutation()
+            nonce, ciphertext = self.store._seal("daily-review-ledger:v1", wire)
+            connection.execute(
+                "UPDATE daily_reviews_v1 SET nonce = ?, ciphertext = ? WHERE slot = 1",
+                (nonce, ciphertext),
+            )
+            self.store._refresh_integrity_manifest(connection)
+        self.store.close()
+        self.store = EncryptedStateStore(self.database, self.key_provider)
+
+        restored = self.store.daily_review_ledger()
+        self.assertEqual(restored.completed[0].key.owner_generation, 1)
+        replay = DailyReviewEngine.prepare(
+            restored,
+            owner_id=OWNER,
+            installation_id=INSTALLATION,
+            timezone_name="Asia/Shanghai",
+            owner_generation=1,
+            observed_at_utc="2026-08-24T00:03:00+00:00",
+            current_state_digest=SHA_ONE,
+            changed=True,
+            action_refs=("task:must-not-replay",),
+        )
+        self.assertEqual(replay.outcome, "already-completed")
         self.assertTrue(self.store.verify_integrity(self.authority))
 
     def test_outbox_failure_rolls_back_task_and_review_business_state(self) -> None:

@@ -101,6 +101,9 @@ class Ticket115PreparedMutation:
     task_state: TaskRuntimeState
     review_state: DailyReviewLedger
     delivery_state: DeliveryOutboxState
+    base_business_status_digest: str | None = None
+    business_status_projection: StatusProjection | None = None
+    mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None
     health_command_receipt: HealthCommandReceipt | None = None
 
     def __post_init__(self) -> None:
@@ -127,6 +130,25 @@ class Ticket115PreparedMutation:
             type(self.health_command_receipt) is not HealthCommandReceipt
         ):
             raise AuthorityValidationError("invalid ticket115 health command receipt")
+        business_values = (
+            self.base_business_status_digest,
+            self.business_status_projection,
+            self.mandatory_delivery_ledger,
+        )
+        if any(value is not None for value in business_values):
+            if (
+                self.base_business_status_digest is None
+                or type(self.business_status_projection) is not StatusProjection
+                or type(self.mandatory_delivery_ledger)
+                is not MandatoryDeliveryLedger
+            ):
+                raise AuthorityValidationError(
+                    "incomplete ticket115 business status payload"
+                )
+            _owner_recovery_digest(
+                self.base_business_status_digest,
+                "ticket115 base business status digest",
+            )
         authorities = {
             (self.task_state.owner_id, self.task_state.installation_id),
             (self.review_state.owner_id, self.review_state.installation_id),
@@ -147,13 +169,47 @@ class Ticket115PreparedMutation:
         task_state: TaskRuntimeState,
         review_state: DailyReviewLedger,
         delivery_state: DeliveryOutboxState,
+        business_status_projection: StatusProjection | None = None,
+        mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None,
     ) -> str:
+        value: dict[str, object] = {
+            "kind": "ticket115-authoritative-state-v1",
+            "task_state": task_state.to_storage(),
+            "review_state": review_state.to_storage(),
+            "delivery_state": delivery_state.to_wire(),
+        }
+        if business_status_projection is not None:
+            if type(mandatory_delivery_ledger) is not MandatoryDeliveryLedger:
+                raise AuthorityValidationError(
+                    "ticket115 business status ledger required"
+                )
+            value["business_status"] = {
+                "projection": business_status_projection.to_storage(),
+                "mandatory_delivery_ledger": (
+                    mandatory_delivery_ledger.to_storage()
+                ),
+            }
+        elif mandatory_delivery_ledger is not None:
+            raise AuthorityValidationError(
+                "ticket115 business status projection required"
+            )
+        return stable_digest(value)
+
+    @staticmethod
+    def business_status_digest(
+        projection: StatusProjection | None,
+        ledger: MandatoryDeliveryLedger,
+    ) -> str:
+        if projection is not None and type(projection) is not StatusProjection:
+            raise AuthorityValidationError("invalid ticket115 business status")
+        if type(ledger) is not MandatoryDeliveryLedger:
+            raise AuthorityValidationError("invalid ticket115 mandatory ledger")
         return stable_digest(
             {
-                "kind": "ticket115-authoritative-state-v1",
-                "task_state": task_state.to_storage(),
-                "review_state": review_state.to_storage(),
-                "delivery_state": delivery_state.to_wire(),
+                "projection": (
+                    None if projection is None else projection.to_storage()
+                ),
+                "mandatory_delivery_ledger": ledger.to_storage(),
             }
         )
 
@@ -163,6 +219,8 @@ class Ticket115PreparedMutation:
             self.task_state,
             self.review_state,
             self.delivery_state,
+            self.business_status_projection,
+            self.mandatory_delivery_ledger,
         )
 
     @property
@@ -171,6 +229,7 @@ class Ticket115PreparedMutation:
             base_task_digest=self.base_task_digest,
             base_review_digest=self.base_review_digest,
             base_delivery_digest=self.base_delivery_digest,
+            base_business_status_digest=self.base_business_status_digest,
             next_state_digest=self.next_state_digest,
             health_command_receipt=self.health_command_receipt,
         )
@@ -181,6 +240,7 @@ class Ticket115PreparedMutation:
         base_task_digest: str,
         base_review_digest: str,
         base_delivery_digest: str,
+        base_business_status_digest: str | None,
         next_state_digest: str,
         health_command_receipt: HealthCommandReceipt | None,
     ) -> str:
@@ -197,6 +257,8 @@ class Ticket115PreparedMutation:
             value["health_command_receipt"] = (
                 health_command_receipt.to_storage()
             )
+        if base_business_status_digest is not None:
+            value["base"]["business_status"] = base_business_status_digest  # type: ignore[index]
         return stable_digest(value)
 
     @classmethod
@@ -210,6 +272,10 @@ class Ticket115PreparedMutation:
         task_state: TaskRuntimeState,
         review_state: DailyReviewLedger,
         delivery_state: DeliveryOutboxState,
+        current_business_status_projection: StatusProjection | None = None,
+        current_mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None,
+        business_status_projection: StatusProjection | None = None,
+        mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None,
         health_command_receipt: HealthCommandReceipt | None = None,
     ) -> "Ticket115PreparedMutation":
         base_digests = (
@@ -217,15 +283,46 @@ class Ticket115PreparedMutation:
             stable_digest(current_review_state.to_storage()),
             stable_digest(current_delivery_state.to_wire()),
         )
+        include_business_status = business_status_projection is not None
+        if include_business_status != (
+            type(mandatory_delivery_ledger) is MandatoryDeliveryLedger
+        ):
+            raise AuthorityValidationError(
+                "incomplete ticket115 business status payload"
+            )
+        if include_business_status and (
+            current_business_status_projection is not None
+            and type(current_business_status_projection) is not StatusProjection
+        ):
+            raise AuthorityValidationError(
+                "invalid current ticket115 business status"
+            )
+        if include_business_status and type(
+            current_mandatory_delivery_ledger
+        ) is not MandatoryDeliveryLedger:
+            raise AuthorityValidationError(
+                "current ticket115 mandatory ledger required"
+            )
+        base_business_status_digest = (
+            cls.business_status_digest(
+                current_business_status_projection,
+                current_mandatory_delivery_ledger,  # type: ignore[arg-type]
+            )
+            if include_business_status
+            else None
+        )
         next_state_digest = cls.state_digest(
             task_state,
             review_state,
             delivery_state,
+            business_status_projection,
+            mandatory_delivery_ledger,
         )
         mutation_digest = cls._mutation_digest(
             base_task_digest=base_digests[0],
             base_review_digest=base_digests[1],
             base_delivery_digest=base_digests[2],
+            base_business_status_digest=base_business_status_digest,
             next_state_digest=next_state_digest,
             health_command_receipt=health_command_receipt,
         )
@@ -255,11 +352,14 @@ class Ticket115PreparedMutation:
             task_state=task_state,
             review_state=review_state,
             delivery_state=delivery_state,
+            base_business_status_digest=base_business_status_digest,
+            business_status_projection=business_status_projection,
+            mandatory_delivery_ledger=mandatory_delivery_ledger,
             health_command_receipt=health_command_receipt,
         )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "prepared": self.prepared.to_storage(),
             "owner_id": self.owner_id,
             "installation_id": self.installation_id,
@@ -275,6 +375,21 @@ class Ticket115PreparedMutation:
                 else self.health_command_receipt.to_storage()
             ),
         }
+        if self.business_status_projection is not None:
+            value.update(
+                {
+                    "base_business_status_digest": (
+                        self.base_business_status_digest
+                    ),
+                    "business_status_projection": (
+                        self.business_status_projection.to_storage()
+                    ),
+                    "mandatory_delivery_ledger": (
+                        self.mandatory_delivery_ledger.to_storage()  # type: ignore[union-attr]
+                    ),
+                }
+            )
+        return value
 
     @classmethod
     def from_storage(cls, value: object) -> "Ticket115PreparedMutation":
@@ -291,10 +406,20 @@ class Ticket115PreparedMutation:
                 "delivery_state",
             }
         )
+        extended_fields = legacy_fields | {
+            "base_business_status_digest",
+            "business_status_projection",
+            "mandatory_delivery_ledger",
+        }
         if (
             type(value) is not dict
             or frozenset(value)
-            not in {legacy_fields, legacy_fields | {"health_command_receipt"}}
+            not in {
+                legacy_fields,
+                legacy_fields | {"health_command_receipt"},
+                extended_fields,
+                extended_fields | {"health_command_receipt"},
+            }
         ):
             raise KeyUnavailable("invalid ticket115 prepared mutation")
         stored = value
@@ -311,6 +436,23 @@ class Ticket115PreparedMutation:
                 review_state=DailyReviewLedger.from_storage(stored["review_state"]),
                 delivery_state=DeliveryOutboxState.from_wire(
                     stored["delivery_state"]
+                ),
+                base_business_status_digest=stored.get(
+                    "base_business_status_digest"
+                ),  # type: ignore[arg-type]
+                business_status_projection=(
+                    None
+                    if stored.get("business_status_projection") is None
+                    else StatusProjection.from_storage(
+                        stored["business_status_projection"]
+                    )
+                ),
+                mandatory_delivery_ledger=(
+                    None
+                    if stored.get("mandatory_delivery_ledger") is None
+                    else MandatoryDeliveryLedger.from_storage(
+                        stored["mandatory_delivery_ledger"]
+                    )
                 ),
                 health_command_receipt=(
                     None
@@ -3605,6 +3747,55 @@ class EncryptedStateStore:
         except (StatusContractViolation, Ticket115ContractViolation) as exc:
             raise KeyUnavailable("invalid mandatory delivery ledger") from exc
 
+    def business_status_state(
+        self,
+    ) -> tuple[StatusProjection | None, MandatoryDeliveryLedger]:
+        """Return the projection and mandatory ledger from one stored value."""
+
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None, MandatoryDeliveryLedger()
+        try:
+            return self._decode_business_status_value(
+                self._open("business-status", row[0], row[1])
+            )
+        except (StatusContractViolation, Ticket115ContractViolation) as exc:
+            raise KeyUnavailable("invalid business status state") from exc
+
+    def _write_business_status_state(
+        self,
+        connection: sqlite3.Connection,
+        projection: StatusProjection,
+        ledger: MandatoryDeliveryLedger,
+    ) -> None:
+        if (
+            type(projection) is not StatusProjection
+            or type(ledger) is not MandatoryDeliveryLedger
+        ):
+            raise AuthorityValidationError("invalid business status state")
+        previous, current_ledger = self.business_status_state()
+        del previous
+        if ledger.requests[: len(current_ledger.requests)] != current_ledger.requests:
+            raise AuthorityValidationError(
+                "mandatory delivery ledger is append-only"
+            )
+        nonce, ciphertext = self._seal(
+            "business-status",
+            self._business_status_value(projection, ledger),
+        )
+        connection.execute(
+            """
+            INSERT INTO business_status_v1(slot, nonce, ciphertext)
+            VALUES (1, ?, ?)
+            ON CONFLICT(slot) DO UPDATE SET
+                nonce=excluded.nonce,
+                ciphertext=excluded.ciphertext
+            """,
+            (nonce, ciphertext),
+        )
+
     def remember_business_status(
         self,
         projection: StatusProjection,
@@ -3779,7 +3970,10 @@ class EncryptedStateStore:
             row[1],
         )
         ledger = self._daily_review_ledger_from_wire(wire)
-        if self._daily_review_ledger_wire(ledger) != wire:
+        if (
+            self._daily_review_ledger_wire(ledger) != wire
+            and not DailyReviewLedger.is_legacy_storage(wire)
+        ):
             raise KeyUnavailable("daily review ledger round-trip mismatch")
         return ledger
 
@@ -4061,10 +4255,22 @@ class EncryptedStateStore:
             mutation.owner_id,
             mutation.installation_id,
         )
-        return self._ticket115_state_digests(current) == (
+        aggregates_current = self._ticket115_state_digests(current) == (
             mutation.base_task_digest,
             mutation.base_review_digest,
             mutation.base_delivery_digest,
+        )
+        if not aggregates_current:
+            return False
+        if mutation.base_business_status_digest is None:
+            return True
+        projection, ledger = self.business_status_state()
+        return (
+            Ticket115PreparedMutation.business_status_digest(
+                projection,
+                ledger,
+            )
+            == mutation.base_business_status_digest
         )
 
     def prepare_ticket115_mutation(
@@ -4302,6 +4508,8 @@ class EncryptedStateStore:
         task_state: TaskRuntimeState | None,
         review_state: DailyReviewLedger | None,
         delivery_state: DeliveryOutboxState | None,
+        business_status_projection: StatusProjection | None = None,
+        mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None,
     ) -> None:
         notifying_reviews = (
             ()
@@ -4341,12 +4549,92 @@ class EncryptedStateStore:
                         "notifying daily review requires its exact new "
                         "owner-delivery intent"
                     )
+        has_business_status = business_status_projection is not None
+        if has_business_status != (
+            type(mandatory_delivery_ledger) is MandatoryDeliveryLedger
+        ):
+            raise AuthorityValidationError(
+                "incomplete ticket115 business status state"
+            )
+        current_delivery = None
+        new_records: tuple[object, ...] = ()
+        if delivery_state is not None:
+            current_delivery = self.delivery_outbox_state(
+                delivery_state.owner_id,
+                delivery_state.installation_id,
+            )
+            current_intents = {
+                record.intent.intent_id for record in current_delivery.records
+            }
+            new_records = tuple(
+                record
+                for record in delivery_state.records
+                if record.intent.intent_id not in current_intents
+            )
+        new_mandatory_records = tuple(
+            record
+            for record in new_records
+            if record.intent.mandatory_request_kind is not None
+        )
+        if new_mandatory_records and not has_business_status:
+            raise AuthorityValidationError(
+                "mandatory outbox intent requires atomic business status"
+            )
+        if has_business_status:
+            assert mandatory_delivery_ledger is not None
+            _, current_ledger = self.business_status_state()
+            if (
+                mandatory_delivery_ledger.requests[
+                    : len(current_ledger.requests)
+                ]
+                != current_ledger.requests
+            ):
+                raise AuthorityValidationError(
+                    "mandatory delivery ledger is append-only"
+                )
+            issued_requests = mandatory_delivery_ledger.requests[
+                len(current_ledger.requests) :
+            ]
+
+            def matches_request(record: object, request: object) -> bool:
+                intent = record.intent
+                return (
+                    type(request) is MandatoryDeliveryRequest
+                    and intent.mandatory_request_kind == request.kind
+                    and intent.source_ref == request.request_id
+                    and intent.business_fact_ref == request.causal_state_id
+                    and intent.business_revision_digest
+                    == request.revision_digest
+                )
+
+            for record in new_mandatory_records:
+                if sum(
+                    matches_request(record, request)
+                    for request in mandatory_delivery_ledger.requests
+                ) != 1:
+                    raise AuthorityValidationError(
+                        "mandatory outbox intent is not ledger-bound"
+                    )
+            for request in issued_requests:
+                if sum(
+                    matches_request(record, request)
+                    for record in new_mandatory_records
+                ) != 1:
+                    raise AuthorityValidationError(
+                        "mandatory request requires its exact new outbox intent"
+                    )
         if task_state is not None:
             self._write_task_runtime(connection, task_state)
         if review_state is not None:
             self._write_daily_review_ledger(connection, review_state)
         if delivery_state is not None:
             self._write_delivery_outbox(connection, delivery_state)
+        if has_business_status:
+            self._write_business_status_state(
+                connection,
+                business_status_projection,  # type: ignore[arg-type]
+                mandatory_delivery_ledger,  # type: ignore[arg-type]
+            )
 
     def commit_ticket115_facts(
         self,
@@ -4442,6 +4730,12 @@ class EncryptedStateStore:
                 task_state=mutation.task_state,
                 review_state=mutation.review_state,
                 delivery_state=mutation.delivery_state,
+                business_status_projection=(
+                    mutation.business_status_projection
+                ),
+                mandatory_delivery_ledger=(
+                    mutation.mandatory_delivery_ledger
+                ),
             )
             if mutation.health_command_receipt is not None:
                 self._write_health_command_receipt(

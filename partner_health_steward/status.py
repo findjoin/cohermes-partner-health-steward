@@ -59,11 +59,22 @@ PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS = MappingProxyType(
         for domain in CORE_STATUS_DOMAINS
     }
 )
+PRODUCTION_OPTIONAL_STATUS_PRODUCER_IDS = MappingProxyType(
+    {"delivery": "health-core.status.delivery-effects"}
+)
+PRODUCTION_OPTIONAL_STATUS_PRODUCER_CONTRACT_VERSIONS = MappingProxyType(
+    {"delivery": "delivery-effect-fact-v1"}
+)
 PRODUCTION_STATUS_PRODUCER_CONTRACTS = MappingProxyType(
     {
         PRODUCTION_STATUS_PRODUCER_IDS[domain]:
         PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS[domain]
         for domain in CORE_STATUS_DOMAINS
+    }
+    | {
+        PRODUCTION_OPTIONAL_STATUS_PRODUCER_IDS[domain]:
+        PRODUCTION_OPTIONAL_STATUS_PRODUCER_CONTRACT_VERSIONS[domain]
+        for domain in PRODUCTION_OPTIONAL_STATUS_PRODUCER_IDS
     }
 )
 FUTURE_STATUS_DOMAINS = frozenset(

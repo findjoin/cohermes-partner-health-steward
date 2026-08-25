@@ -202,11 +202,11 @@ Verification evidence before review checkpoint:
 | 115-A1-C11 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_plugin_inputs_are_wake_only` | `HealthCore` review wake/controlled protocol boundary | green |
 | 115-A2-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c01_adjustment_is_append_only_and_changes_current_revision` | `TaskEngine.adjust`, append-only `TaskControlFact` | green |
 | 115-A2-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a2_c02_quiet_review_does_not_change_task_outcome` | `DailyReviewDecision.notification_required`, independent task primary label | green |
-| 115-A2-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_current_evidence_card_revision` | `HealthCore.solve_task`, `TaskAcceptance` current evidence binding | green |
+| 115-A2-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_matching_typed_business_result` | `HealthCore.solve_task`, `TaskResultEvidence`, typed `TaskAcceptance` binding | green |
 | 115-A2-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_owner_task_cancellation_atomically_closes_active_task_and_claim` | `HealthCore.cancel_task`, `TaskEngine.cancel`, claim release | green |
-| 115-A2-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_delivery_gap_remains_ancillary_to_the_four_task_labels` | `TaskEngine.mark_delivery_unknown`, four-label task projection | green |
+| 115-A2-C05 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_capability_gap_cannot_be_constructed_as_acceptance_result` | `TASK_RESULT_COMPLETION_STATUSES`, `TaskResultEvidence` validation | green |
 | 115-A2-C06 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_delivery_unknown_is_an_active_ancillary_fact_not_a_fifth_label` | `TaskEngine.mark_delivery_unknown`, `TaskUnknownFact` | green |
-| 115-A2-C07 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_solve_requires_acceptance_evidence_to_match_current_revisions` | `TaskEngine.solve`, `TaskAcceptance` | green |
+| 115-A2-C07 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_literature_no_result_is_an_accepted_business_result` | typed `literature-result/no-qualified-result` acceptance | green |
 | 115-A3-C01 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_local_day_key_is_timezone_and_dst_aware` | `local_day_key`, `LocalDayKey` | green |
 | 115-A3-C02 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_same_day_crash_resumes_pending_then_commits_exactly_once` | `DailyReviewEngine.prepare`, `DailyReviewEngine.commit` | green |
 | 115-A3-C03 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_stale_pending_is_discarded_without_backlog_and_only_current_day_runs` | `DailyReviewEngine.recover_pending` | green |
@@ -216,7 +216,7 @@ Verification evidence before review checkpoint:
 | 115-A4-C01 | `test_ticket115_storage.Ticket115TypedStorageTests.test_outbox_failure_rolls_back_task_and_review_business_state` | `EncryptedStateStore.commit_ticket115_facts` | green |
 | 115-A4-C02 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_and_outbox_rollback_together` | `HealthCore._prepare_ticket115_facts_open`, `_complete_ticket115_mutation` | green |
 | 115-A4-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_abandoned_prepare_without_replaying_transport` | `HealthCore.recover_owner_delivery_attempts`, mutation recovery | green |
-| 115-A4-C04 | `test_ticket115_plugin_delivery.Ticket115PluginDeliveryBoundaryTests.test_plugin_alone_sends_the_strict_authorized_wire_intent` | controlled Plugin -> core delivery wire, `OwnerDeliveryEngine.submit` | green |
+| 115-A4-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_adapter_source_cannot_write_task_or_review_authority` | trusted health-command source/scope checks before head/task/review/outbox mutation | green |
 | 115-A5-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c01_delivery_evidence_accepts_only_layer_authority` | `DeliveryEvidenceAuthority.require`, `PRODUCER_BY_LAYER` | green |
 | 115-A5-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c02_delivery_evidence_round_trip_preserves_replay_identity` | `DeliveryEvidence.to_storage/from_storage` | green |
 | 115-A5-C03 | `test_ticket115_delivery.Ticket115DeliveryTests.test_accepted_delivered_and_read_are_distinct_facts` | `DeliveryFact`, `OutboxRecord` layer validation | green |
@@ -233,26 +233,27 @@ Verification evidence before review checkpoint:
 | 115-A6-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_attempt_for_other_approval_does_not_consume_new_approval` | owner-delivery approval/currentness recheck | green |
 | 115-A6-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_orphan_attempt_without_replaying_transport` | `HealthCore.recover_owner_delivery_attempts` | green |
 | 115-A6-C06 | `test_ticket115_integration.Ticket115IntegrationTests.test_adapter_exception_freezes_unknown_until_independent_delivery` | adapter completion -> `TaskEngine.mark_delivery_unknown` | green |
-| 115-A6-C07 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a6_c07_task_engine_persists_runtime_epoch_claim_and_rejects_old_holder` | `TaskRuntimeState`, persisted `TaskClaimLease.runtime_epoch` | green |
+| 115-A6-C07 | `test_ticket115_integration.Ticket115IntegrationTests.test_restart_rejects_old_holder_phase_solve_and_fail` | `TaskClaimLease.runtime_epoch`, current claim checks on advance/solve/fail | green |
 | 115-A6-C08 | `test_ticket115_integration.Ticket115IntegrationTests.test_writer_proof_is_rechecked_after_attempt_before_adapter` | writer-fence recheck immediately before adapter | green |
 | 115-A6-C09 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_commit_rejects_stale_day_and_fresh_state_change` | review current-head/day guard | green |
-| 115-A7-C01 | `test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault` | `HealthCore._production_status_inputs`, `StatusProjector.project` | green |
+| 115-A7-C01 | `test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault` | `HealthCore._production_status_inputs`, sealed core facts plus isolated non-core delivery effect | green |
 | 115-A7-C02 | `test_ticket114_status.Ticket114BusinessStatusTests.test_114_a5_c06_unknown_domain_or_producer_cannot_activate` | `CapabilityFactAuthority`, `StatusProjector.project` | green |
 | 115-A7-C03 | `test_ticket114_status.Ticket114BusinessStatusTests.test_114_a5_c11_identical_fact_replay_is_deterministic_and_emits_no_second_transition` | `StatusProjector.transition`, persisted status projection | green |
 | 115-A8-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c01_mandatory_request_is_content_free` | `MandatoryDeliveryRequest` | green |
 | 115-A8-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c02_mandatory_request_dedupes_replay_and_keeps_new_cause` | `MandatoryDeliveryLedger.issue`, causal-state dedupe | green |
 | 115-A8-C03 | `test_ticket114_authority_integration.Ticket114AuthorityIntegrationTests.test_114_a5_c21_status_transition_is_deduplicated_across_restart` | persisted `StatusTransition`, replay identity | green |
 | 115-A8-C04 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c04_status_transition_emits_one_content_free_request` | `StatusProjector.transition`, `MandatoryDeliveryRequest` | green |
-| 115-A8-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_mandatory_request_survives_response_loss_and_restart` | `HealthCore.business_status`, `EncryptedStateStore.remember_business_status_transition`, durable `MandatoryDeliveryLedger` | green |
-| 115-A8-C06 | `test_ticket115_integration.Ticket115IntegrationTests.test_not_configured_notification_never_reaches_adapter` | notification preference gate, `HealthCore._owner_delivery_sendable_open` | green |
+| 115-A8-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_mandatory_request_survives_response_loss_and_restart` | `Ticket115PreparedMutation`, atomic projection/ledger/outbox finalize, replay recovery | green |
+| 115-A8-C06 | `test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c06_mandatory_delivery_bypasses_optional_gates_and_reaches_adapter` | mandatory intent marker/currentness checks; actual fake-adapter accepted result while ordinary notifications are disabled and proactive support is paused | green |
 
 Verification evidence before the review checkpoint:
 
-- `python -m unittest discover -v -s tests -p "test_ticket115_*.py"` -> `Ran 128 tests in 88.195s ... OK`.
-- `python -m unittest discover -v` -> `Ran 701 tests in 209.530s ... OK`.
+- `python -m unittest discover -v -s tests -p "test_ticket115_*.py"` -> `Ran 140 tests in 89.860s ... OK`.
+- `python -m unittest discover -v` -> `Ran 713 tests in 220.254s ... OK`.
 - `python -m compileall -q partner_health_steward tests` -> exit `0`.
 - `git diff --check` -> exit `0` (only existing LF/CRLF conversion warnings, no whitespace error).
 - `python -m unittest ...test_115_registry_self_validates_every_observable_target` -> `OK`; registry resolves all 56 targets.
 - Environment: Python `3.11.6`, SQLite `3.42.0`, `cryptography 3.3.1`.
-- `tests/ticket115_case_registry.py` resolves all 56 unique Case targets and rejects duplicate test targets; `test_existing_delivery_schema_adds_actual_action_without_losing_facts` separately proves the old observation table upgrades without fact loss.
+- `tests/ticket115_case_registry.py` resolves `56` Case IDs to `56` unique test targets. `test_mandatory_authorization_and_capability_gap_requests_use_production_outbox` additionally proves production formation for authorization/capability-gap requests; the A8-C05 path proves status-change plus unknown-risk formation, atomic persistence, restart and replay; `test_same_state_business_status_read_does_not_advance_current_head` proves a same-state read does not manufacture a CAS.
+- `git ls-files --others --exclude-standard` returned empty; no untracked implementation or evidence file exists.
 - 本节提交后固定的 commit/tree 将作为两位 fresh reviewer 的共同交审 identity，并在最终 `## Answer` 记录；当前尚无通过 verdict。未添加真实 Hermes、Weixin、模型、网络、部署或 Ticket 116 行为。

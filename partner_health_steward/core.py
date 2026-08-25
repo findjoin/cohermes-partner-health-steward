@@ -144,7 +144,10 @@ from .delivery import (
 from .ticket115_contracts import (
     DeliveryEvidence,
     DeliveryEvidenceAuthority,
+    DeliveryEvidenceChallenge,
     DeliveryEvidenceIssuer,
+    MandatoryDeliveryLedger,
+    MandatoryDeliveryRequest,
 )
 from .probe import ProbeReport, ProbeState
 from .owner_authority import (
@@ -176,11 +179,15 @@ from .status import (
     CapabilityFactAuthority,
     CapabilityRequirement,
     CORE_STATUS_DOMAINS,
+    PRODUCTION_OPTIONAL_STATUS_PRODUCER_CONTRACT_VERSIONS,
+    PRODUCTION_OPTIONAL_STATUS_PRODUCER_IDS,
     PRODUCTION_STATUS_PRODUCER_CONTRACTS,
     PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS,
     PRODUCTION_STATUS_PRODUCER_IDS,
     StatusContractViolation,
+    StatusProjection,
     StatusProjector,
+    StatusTransition,
 )
 from .storage import (
     CausalIdConflict,
@@ -208,6 +215,7 @@ from .tasks import (
     TaskCandidate,
     TaskContractViolation,
     TaskEngine,
+    TaskResultEvidence,
     TaskRuntimeState,
     TaskTransition,
 )
@@ -1031,6 +1039,17 @@ class HealthCore:
         }
         if len(issuers) != len(delivery_evidence_issuers):
             raise AuthorityValidationError("duplicate delivery evidence issuer")
+        if any(
+            producer
+            not in {
+                "health-core.delivery.formed",
+                "health-core.delivery.committed",
+            }
+            for producer in issuers
+        ):
+            raise AuthorityValidationError(
+                "core cannot hold a non-core delivery evidence issuer"
+            )
         if issuers and delivery_evidence_authority is None:
             raise AuthorityValidationError("delivery evidence authority required")
         if delivery_evidence_authority is not None:
@@ -6111,6 +6130,8 @@ class HealthCore:
         task_state: TaskRuntimeState | None = None,
         review_state: DailyReviewLedger | None = None,
         delivery_state: DeliveryOutboxState | None = None,
+        business_status_projection: StatusProjection | None = None,
+        mandatory_delivery_ledger: MandatoryDeliveryLedger | None = None,
         health_command_receipt: HealthCommandReceipt | None = None,
     ) -> Ticket115PreparedMutation | None:
         """Persist one complete invisible aggregate revision before remote CAS."""
@@ -6123,10 +6144,15 @@ class HealthCore:
         next_delivery = (
             current_delivery if delivery_state is None else delivery_state
         )
+        current_business_status, current_mandatory_ledger = (
+            self._store.business_status_state()
+        )
         if (
             next_task == current_task
             and next_review == current_review
             and next_delivery == current_delivery
+            and business_status_projection is None
+            and mandatory_delivery_ledger is None
             and health_command_receipt is None
         ):
             return None
@@ -6138,6 +6164,10 @@ class HealthCore:
             task_state=next_task,
             review_state=next_review,
             delivery_state=next_delivery,
+            current_business_status_projection=current_business_status,
+            current_mandatory_delivery_ledger=current_mandatory_ledger,
+            business_status_projection=business_status_projection,
+            mandatory_delivery_ledger=mandatory_delivery_ledger,
             health_command_receipt=health_command_receipt,
         )
         self._store.prepare_ticket115_mutation(mutation)
@@ -6474,7 +6504,14 @@ class HealthCore:
             if action == "task.fail":
                 fields = _ticket115_wire_fields(
                     payload,
-                    frozenset({"task_id", "failed_at_utc"}),
+                    frozenset(
+                        {
+                            "task_id",
+                            "failed_at_utc",
+                            "claim_id",
+                            "holder_role",
+                        }
+                    ),
                     frozenset({"reason_code"}),
                 )
                 transition = self.fail_task(
@@ -6484,6 +6521,8 @@ class HealthCore:
                         "reason_code",
                         "no-reasonable-path",
                     ),  # type: ignore[arg-type]
+                    claim_id=fields["claim_id"],  # type: ignore[arg-type]
+                    holder_role=fields["holder_role"],  # type: ignore[arg-type]
                     _health_command=command,
                 )
                 return _ticket115_task_transition_wire(transition)
@@ -6902,13 +6941,66 @@ class HealthCore:
             state: TaskRuntimeState,
             settings: OwnerSettingsState,
         ) -> TaskTransition:
-            # Acceptance must bind to the evidence revisions that are current
+            # Acceptance binds to typed business-result facts that are current
             # in the same serialized authority lane as the task transition.
             daily_state = self._store.daily_state()
-            current_evidence_revisions = {
-                card.evidence_id: card.revision_digest
-                for card in daily_state.current_evidence_cards
+            current_result_evidence: dict[str, TaskResultEvidence] = {}
+            for revision in daily_state.portrait_revisions:
+                if revision.action not in {"update", "degrade"}:
+                    continue
+                ref = "portrait-revision:" + revision.decision_digest.removeprefix(
+                    "sha256:"
+                )
+                current_result_evidence[ref] = TaskResultEvidence(
+                    result_kind="portrait-update",
+                    result_status="portrait-committed",
+                    revision_digest=stable_digest(revision.to_storage()),
+                )
+            result_markers = {
+                "task-result:literature:qualified-result": (
+                    "literature-result",
+                    "qualified-result",
+                    "task-process",
+                ),
+                "task-result:literature:no-qualified-result": (
+                    "literature-result",
+                    "no-qualified-result",
+                    "task-process",
+                ),
+                "task-result:information-gap:owner-answer-admitted": (
+                    "information-gap",
+                    "owner-answer-admitted",
+                    "personal-health",
+                ),
+                "task-result:internal:completed": (
+                    "internal-result",
+                    "completed",
+                    "task-process",
+                ),
             }
+            for card in daily_state.current_evidence_cards:
+                for marker in card.proves:
+                    binding = result_markers.get(marker)
+                    if binding is None or card.evidence_type != binding[2]:
+                        continue
+                    current_result_evidence[card.evidence_id] = TaskResultEvidence(
+                        result_kind=binding[0],
+                        result_status=binding[1],
+                        revision_digest=card.revision_digest,
+                    )
+            outbox = self._ticket115_outbox_state_open(settings)
+            for record in outbox.records:
+                for fact_kind, result_kind, result_status in (
+                    ("delivered", "reminder-delivery", "delivered"),
+                    ("actual-action", "owner-action", "owner-action-admitted"),
+                ):
+                    fact = record.optional_fact(fact_kind)
+                    if fact is not None:
+                        current_result_evidence[fact.evidence_ref] = TaskResultEvidence(
+                            result_kind=result_kind,
+                            result_status=result_status,
+                            revision_digest=fact.proof.digest,
+                        )
             return TaskEngine.solve(
                 self._consume_task_claim_open(
                     state,
@@ -6918,7 +7010,7 @@ class HealthCore:
                     generation=settings.version,
                 ),
                 acceptance,
-                current_evidence_revisions=current_evidence_revisions,
+                current_result_evidence=current_result_evidence,
             )
 
         return self._mutate_ticket115_task(
@@ -6963,11 +7055,22 @@ class HealthCore:
         *,
         failed_at_utc: str,
         reason_code: str = "no-reasonable-path",
+        claim_id: str,
+        holder_role: str,
         _health_command: TrustedHealthCommand,
     ) -> TaskTransition:
         return self._mutate_ticket115_task(
-            lambda state: TaskEngine.fail(
-                state,
+            lambda state: (_ for _ in ()).throw(
+                AuthorityValidationError("task-claim-settings-required")
+            ),
+            operation_with_settings=lambda state, settings: TaskEngine.fail(
+                self._consume_task_claim_open(
+                    state,
+                    task_id,
+                    claim_id=claim_id,
+                    holder_role=holder_role,
+                    generation=settings.version,
+                ),
                 task_id,
                 failed_at_utc=failed_at_utc,
                 reason_code=reason_code,
@@ -7059,6 +7162,27 @@ class HealthCore:
             and not settings.proactive_support_paused
             and dict(settings.ordinary_notifications).get("review_summary")
             == "enabled"
+            and self._owner_contact_window_allows(settings, observed_at_utc)
+        )
+
+    def _mandatory_owner_delivery_controls_allow_open(
+        self,
+        settings: OwnerSettingsState,
+        *,
+        observed_at_utc: str,
+    ) -> bool:
+        """Keep route consent current without applying optional-support gates."""
+
+        return (
+            settings.consent_enabled
+            and settings.consent_path_status == "active"
+            and settings.consent_route_id == settings.current_route_id
+            and settings.consent_first_hop_recipient
+            == settings.current_first_hop_recipient
+            and settings.consent_configuration_generation
+            == settings.current_configuration_generation
+            and settings.consent_disclosure_version
+            == settings.current_disclosure_version
             and self._owner_contact_window_allows(settings, observed_at_utc)
         )
 
@@ -7273,6 +7397,12 @@ class HealthCore:
             ),
         )
 
+    def _owner_generation_open(self) -> int:
+        initialization = self._store.initialization()
+        if initialization is None or initialization.phase != "enabled":
+            raise AuthorityValidationError("owner-generation-unavailable")
+        return max(1, initialization.draft.prepared_authority.generation)
+
     def daily_review_ledger(self) -> DailyReviewLedger:
         """Return the current owner-local review ledger."""
 
@@ -7304,6 +7434,7 @@ class HealthCore:
                     owner_id=settings.owner_id,
                     installation_id=settings.installation_id,
                     timezone_name=settings.timezone,
+                    owner_generation=self._owner_generation_open(),
                     observed_at_utc=observed_at_utc,
                     current_state_digest=state_digest,
                     action_refs=action_refs,
@@ -7388,6 +7519,7 @@ class HealthCore:
                         settings.installation_id,
                         settings.timezone,
                         completed_at_utc,
+                        owner_generation=self._owner_generation_open(),
                     )
                     if current_key != pending.key:
                         raise ReviewContractViolation(
@@ -7494,7 +7626,6 @@ class HealthCore:
     def managed_ticket115_read(self) -> dict[str, object]:
         """Project tasks, reviews, and delivery facts from one authority read."""
 
-        self.recover_owner_delivery_attempts()
         with self._lifecycle_lock:
             with self._ticket115_write_authority() as (_, settings):
                 tasks = self._ticket115_task_state_open(settings)
@@ -7606,7 +7737,7 @@ class HealthCore:
         DeliveryOutboxState,
         OutboxRecord,
         TaskRuntimeState,
-        DailyReviewRecord,
+        DailyReviewRecord | MandatoryDeliveryRequest,
     ] | None:
         if (
             type(intent) is not OutboxIntent
@@ -7618,8 +7749,26 @@ class HealthCore:
         try:
             outbox = self._ticket115_outbox_state_open(settings)
             outbox_record = outbox.record(intent.intent_id)
-            review = self._store.daily_review(intent.business_fact_ref)
             task_state = self._ticket115_task_state_open(settings)
+            if intent.mandatory_request_kind is not None:
+                request = next(
+                    (
+                        item
+                        for item in self._store.mandatory_delivery_ledger().requests
+                        if self._mandatory_request_matches_intent(item, intent)
+                    ),
+                    None,
+                )
+                return (
+                    outbox,
+                    outbox_record,
+                    task_state,
+                    request,
+                ) if (
+                    outbox_record.intent == intent
+                    and type(request) is MandatoryDeliveryRequest
+                ) else None
+            review = self._store.daily_review(intent.business_fact_ref)
             task = task_state.task(intent.source_ref)
         except (AuthorityValidationError, DeliveryContractViolation, TaskContractViolation):
             return None
@@ -7662,38 +7811,18 @@ class HealthCore:
         DeliveryOutboxState,
         OutboxRecord,
         TaskRuntimeState,
-        DailyReviewRecord,
+        DailyReviewRecord | MandatoryDeliveryRequest,
     ] | None:
         binding = self._owner_delivery_binding_open(intent, settings)
         if binding is None:
             return None
-        outbox, outbox_record, task_state, review = binding
-        task = task_state.task(intent.source_ref)
-        try:
-            current_review_key = local_day_key(
-                settings.owner_id,
-                settings.installation_id,
-                settings.timezone,
-                observed_at_utc,
-            )
-        except ReviewContractViolation:
-            return None
-        approval_binding = task.approval
+        outbox, outbox_record, task_state, business_binding = binding
         try:
             destination = self._owner_weixin_destination_open(settings)
         except AuthorityValidationError:
             return None
-        approval = next(
-            (
-                item
-                for item in settings.approvals
-                if item.approval_id == approval_binding.approval_id
-            ),
-            None,
-        )
         if (
-            review.key != current_review_key
-            or intent.route_id != destination.route_id
+            intent.route_id != destination.route_id
             or intent.route_generation != settings.current_configuration_generation
             or intent.recipient_ref != destination.owner_sender_id
             or outbox_record.unknown_frozen
@@ -7709,6 +7838,60 @@ class HealthCore:
             or outbox_record.current_layer != "attempted"
         ):
             return None
+        if intent.mandatory_request_kind is not None:
+            if type(business_binding) is not MandatoryDeliveryRequest:
+                return None
+            if business_binding.kind == "status-change":
+                status_requests = tuple(
+                    request
+                    for request in self._store.mandatory_delivery_ledger().requests
+                    if request.kind == "status-change"
+                )
+                if (
+                    not status_requests
+                    or business_binding != status_requests[-1]
+                ):
+                    return None
+            elif business_binding not in (
+                self._task_mandatory_delivery_requests_open(task_state)
+            ):
+                return None
+            if not self._mandatory_owner_delivery_controls_allow_open(
+                settings,
+                observed_at_utc=observed_at_utc,
+            ):
+                return None
+            if (
+                required_lease is not None
+                and required_lease.intent_digest != intent.semantic_digest
+            ):
+                return None
+            return binding
+        if type(business_binding) is not DailyReviewRecord:
+            return None
+        review = business_binding
+        task = task_state.task(intent.source_ref)
+        try:
+            current_review_key = local_day_key(
+                settings.owner_id,
+                settings.installation_id,
+                settings.timezone,
+                observed_at_utc,
+                owner_generation=self._owner_generation_open(),
+            )
+        except ReviewContractViolation:
+            return None
+        if review.key != current_review_key:
+            return None
+        approval_binding = task.approval
+        approval = next(
+            (
+                item
+                for item in settings.approvals
+                if item.approval_id == approval_binding.approval_id
+            ),
+            None,
+        )
         if not self._owner_delivery_scope_allows_open(
             settings,
             task,
@@ -7932,6 +8115,7 @@ class HealthCore:
     def _record_orphan_owner_delivery_unknown(
         self,
         completion: OwnerDeliveryCompletion,
+        evidence: DeliveryEvidence,
     ) -> DeliveryTransition | None:
         """CAS-publish conservative uncertainty after execution is no longer live."""
 
@@ -7956,15 +8140,14 @@ class HealthCore:
                 attempt_ref=completion.attempt_ref,
                 result=transport,
                 observed_at_utc=completion.observed_at_utc,
-                issuer=self._delivery_evidence_issuer_open(
-                    "owner-delivery-adapter.unknown"
-                ),
+                evidence=evidence,
                 authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
             )
             task_state = self._ticket115_task_state_open(settings)
             task_transition = (
                 None
-                if completion.intent_id in task_state.delivery_unknown_refs
+                if current.intent.mandatory_request_kind is not None
+                or completion.intent_id in task_state.delivery_unknown_refs
                 else TaskEngine.mark_delivery_unknown(
                     task_state,
                     current.intent.source_ref,
@@ -8043,7 +8226,42 @@ class HealthCore:
         if current == stored:
             self._store.write_effect(effect_id, "unknown", terminal)
 
-    def recover_owner_delivery_attempts(self) -> tuple[DeliveryTransition, ...]:
+    def owner_delivery_recovery_completions(
+        self,
+    ) -> tuple[OwnerDeliveryCompletion, ...]:
+        """Return deterministic orphan observations for Plugin to attest."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return ()
+            with self._ticket115_write_authority() as (_, settings):
+                orphan_attempts = tuple(
+                    (record.intent, attempted)
+                    for record in self._ticket115_outbox_state_open(settings).records
+                    if record.current_layer == "attempted"
+                    and not self._owner_delivery_attempt_is_active(
+                        record.intent.intent_id
+                    )
+                    and (attempted := record.optional_fact("attempted")) is not None
+                )
+            completions = []
+            for intent, attempted in orphan_attempts:
+                observed_at_utc = self._owner_delivery_clock_utc_open()
+                if observed_at_utc is None:
+                    raise AuthorityValidationError("owner-delivery-clock-unavailable")
+                completions.append(
+                    self._orphan_owner_delivery_completion(
+                        intent,
+                        attempted.attempt_ref,
+                        observed_at_utc,
+                    )
+                )
+            return tuple(completions)
+
+    def recover_owner_delivery_attempts(
+        self,
+        recoveries: tuple[tuple[OwnerDeliveryCompletion, DeliveryEvidence], ...],
+    ) -> tuple[DeliveryTransition, ...]:
         """Freeze attempts inherited from an earlier process without sending again."""
 
         recovered: list[DeliveryTransition] = []
@@ -8061,15 +8279,23 @@ class HealthCore:
                     and (attempted := record.optional_fact("attempted")) is not None
                 )
 
+            recovery_by_intent = {
+                completion.intent_id: (completion, evidence)
+                for completion, evidence in recoveries
+            }
+            if len(recovery_by_intent) != len(recoveries):
+                raise AuthorityValidationError("duplicate owner delivery recovery")
+            expected_intents = {intent.intent_id for intent, _ in orphan_attempts}
+            if set(recovery_by_intent) != expected_intents:
+                raise AuthorityValidationError("owner delivery recovery set mismatch")
+
             for intent, attempted in orphan_attempts:
-                observed_at_utc = self._owner_delivery_clock_utc_open()
-                if observed_at_utc is None:
-                    raise AuthorityValidationError("owner-delivery-clock-unavailable")
-                completion = self._orphan_owner_delivery_completion(
-                    intent,
-                    attempted.attempt_ref,
-                    observed_at_utc,
-                )
+                completion, evidence = recovery_by_intent[intent.intent_id]
+                if (
+                    completion.attempt_ref != attempted.attempt_ref
+                    or completion.status != "unknown"
+                ):
+                    raise AuthorityValidationError("owner delivery recovery mismatch")
                 effect_id = self._effect_id(intent.effect_request_id)
                 stored = self._store.effect(effect_id)
                 if stored is None or stored.state in {
@@ -8077,7 +8303,10 @@ class HealthCore:
                     "rejected",
                     "unknown",
                 }:
-                    transition = self._record_orphan_owner_delivery_unknown(completion)
+                    transition = self._record_orphan_owner_delivery_unknown(
+                        completion,
+                        evidence,
+                    )
                     if transition is not None:
                         recovered.append(transition)
                     continue
@@ -8107,7 +8336,8 @@ class HealthCore:
                         observed_at_utc=completion.observed_at_utc,
                     )
                     transition = self._record_orphan_owner_delivery_unknown(
-                        completion
+                        completion,
+                        evidence,
                     )
                     if transition is not None:
                         recovered.append(transition)
@@ -8131,12 +8361,16 @@ class HealthCore:
                             observed_at_utc=completion.observed_at_utc,
                         )
                         transition = self._record_orphan_owner_delivery_unknown(
-                            completion
+                            completion,
+                            evidence,
                         )
                         if transition is not None:
                             recovered.append(transition)
                         continue
-                    transition = self._record_orphan_owner_delivery_unknown(completion)
+                    transition = self._record_orphan_owner_delivery_unknown(
+                        completion,
+                        evidence,
+                    )
                     if transition is not None:
                         recovered.append(transition)
                     continue
@@ -8145,9 +8379,47 @@ class HealthCore:
                     intent.intent_id,
                     _OWNER_DELIVERY_ATTEMPT_AUTHORIZED,
                 )
-                result = self.complete_owner_delivery_attempt(completion, grant)
+                result = self.complete_owner_delivery_attempt(
+                    completion,
+                    grant,
+                    evidence,
+                )
                 recovered.append(result.delivery_transition)
         return tuple(recovered)
+
+    def owner_delivery_attempt_evidence_challenge(
+        self,
+        intent_id: str,
+    ) -> DeliveryEvidenceChallenge:
+        """Expose only exact attempted-layer material to the adapter producer."""
+
+        validate_opaque_text(intent_id, "owner delivery intent identifier")
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (_, settings):
+                record = self._ticket115_outbox_state_open(settings).record(intent_id)
+                intent = record.intent
+                authorization_time = self._owner_delivery_clock_utc_open()
+                if (
+                    authorization_time is None
+                    or record.optional_fact("attempted") is not None
+                    or self._owner_delivery_sendable_open(
+                        intent,
+                        settings,
+                        observed_at_utc=authorization_time,
+                    )
+                    is None
+                ):
+                    raise AuthorityValidationError(
+                        "owner-delivery-authorization-required"
+                    )
+                attempt_ref = self._owner_delivery_attempt_ref(intent)
+                return DeliveryEvidenceChallenge(
+                    layer="attempted",
+                    generation=intent.route_generation,
+                    replay_identity=attempt_ref,
+                    effect_id=intent.effect_id,
+                    evidence_ref=attempt_ref,
+                )
 
     def prepare_owner_delivery_attempt(
         self,
@@ -8155,6 +8427,7 @@ class HealthCore:
         *,
         attempted_at_utc: str,
         lease_seconds: int = 300,
+        evidence: DeliveryEvidence,
     ) -> OwnerDeliverySendIntent:
         """CAS-publish the sole send attempt before any execution lease exists."""
 
@@ -8200,9 +8473,8 @@ class HealthCore:
                     lease_id=lease_id,
                     attempt_ref=attempt_ref,
                     attempted_at_utc=attempted_at_utc,
-                    issuer=self._delivery_evidence_issuer_open(
-                        "owner-delivery-adapter.attempted"
-                    ),
+                    evidence=evidence,
+                    authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
                 )
                 attempted_state = replace(
                     attempted.state,
@@ -8341,17 +8613,48 @@ class HealthCore:
             ),
         )
 
+    def owner_delivery_completion_evidence_challenge(
+        self,
+        completion: OwnerDeliveryCompletion,
+    ) -> DeliveryEvidenceChallenge:
+        """Expose the exact adapter terminal material without signing it in core."""
+
+        if type(completion) is not OwnerDeliveryCompletion:
+            raise AuthorityValidationError("invalid owner delivery completion")
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (_, settings):
+                record = self._ticket115_outbox_state_open(settings).record(
+                    completion.intent_id
+                )
+                attempted = record.optional_fact("attempted")
+                if attempted is None or attempted.attempt_ref != completion.attempt_ref:
+                    raise AuthorityValidationError("owner-delivery-attempt-mismatch")
+                layer = {
+                    "accepted": "interface-accepted",
+                    "rejected": "interface-rejected",
+                    "unknown": "unknown",
+                }[completion.status]
+                return DeliveryEvidenceChallenge(
+                    layer=layer,
+                    generation=record.intent.route_generation,
+                    replay_identity=completion.result_ref,
+                    effect_id=record.intent.effect_id,
+                    evidence_ref=completion.evidence_ref,
+                )
+
     def complete_owner_delivery_attempt(
         self,
         completion: OwnerDeliveryCompletion,
         grant: EffectExecutionGrant,
+        evidence: DeliveryEvidence,
     ) -> OwnerDeliveryExecutionResult:
-        return self._complete_owner_delivery_attempt_impl(completion, grant)
+        return self._complete_owner_delivery_attempt_impl(completion, grant, evidence)
 
     def _complete_owner_delivery_attempt_impl(
         self,
         completion: OwnerDeliveryCompletion,
         grant: EffectExecutionGrant,
+        evidence: DeliveryEvidence,
     ) -> OwnerDeliveryExecutionResult:
         """Release the generic lease, then CAS-publish the exact terminal fact."""
 
@@ -8420,16 +8723,15 @@ class HealthCore:
                     attempt_ref=completion.attempt_ref,
                     result=transport,
                     observed_at_utc=completion.observed_at_utc,
-                    issuer=self._delivery_evidence_issuer_open(
-                        "owner-delivery-adapter.unknown"
-                        if transport.status == "unknown"
-                        else "owner-delivery-adapter.interface"
-                    ),
+                    evidence=evidence,
                     authority=self._delivery_evidence_authority,  # type: ignore[arg-type]
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
-                if transport.status == "unknown":
+                if (
+                    transport.status == "unknown"
+                    and intent.mandatory_request_kind is None
+                ):
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
@@ -8507,7 +8809,11 @@ class HealthCore:
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
                 unresolved = intent.intent_id in task_state.delivery_unknown_refs
-                if kind == "unknown" and not unresolved:
+                if (
+                    kind == "unknown"
+                    and not unresolved
+                    and intent.mandatory_request_kind is None
+                ):
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
@@ -8552,9 +8858,9 @@ class HealthCore:
     ) -> tuple[tuple[CapabilityRequirement, ...], tuple[object, ...]]:
         """Convert current domain authorities into sealed, body-free facts.
 
-        The complete requirement manifest is always present.  Domains owned by
-        Ticket 115 or Ticket 116 deliberately have no envelope yet, so their
-        absence remains visible to ``StatusProjector`` as ``cannot-confirm``.
+        The complete core requirement manifest is always present. Ticket 115
+        contributes current task/review/delivery facts and an optional,
+        isolated fact for individual delivery effects whose result is unknown.
         """
 
         signer = self._status_fact_authority
@@ -8563,6 +8869,7 @@ class HealthCore:
 
         expectations: dict[str, tuple[int, str, str]] = {}
         facts: list[object] = []
+        optional_requirements: list[CapabilityRequirement] = []
         for domain in CORE_STATUS_DOMAINS:
             unavailable_digest = stable_digest(
                 {
@@ -8612,6 +8919,31 @@ class HealthCore:
             )
 
         authority = self._store.finalized_authority()
+        isolated_delivery_records: tuple[OutboxRecord, ...] = ()
+        isolated_owner_delivery_effect_unknown = False
+        if authority is not None:
+            try:
+                stored_settings = self._current_owner_settings(authority)
+                delivery_snapshot = self._ticket115_outbox_state_open(
+                    stored_settings
+                )
+            except AuthorityValidationError:
+                pass
+            else:
+                isolated_delivery_records = tuple(
+                    record
+                    for record in delivery_snapshot.records
+                    if record.current_layer == "unknown"
+                )
+                unresolved_effects = frozenset(
+                    self._store.unresolved_effects()
+                )
+                isolated_owner_delivery_effect_unknown = bool(
+                    unresolved_effects
+                ) and unresolved_effects == frozenset(
+                    record.intent.effect_id
+                    for record in isolated_delivery_records
+                )
         if authority is not None:
             head_revision = stable_digest(
                 {
@@ -8627,6 +8959,7 @@ class HealthCore:
             head_state = (
                 "confirmed-ok"
                 if probe.state is ProbeState.HEALTHY
+                or isolated_owner_delivery_effect_unknown
                 else "confirmed-fault"
                 if probe.reason_code == "current-head-terminal"
                 else "unknown"
@@ -8648,7 +8981,10 @@ class HealthCore:
         # A non-healthy current-head proof cannot establish that any other
         # producer snapshot is current.  Preserve those domains as missing
         # rather than turning process or adapter liveness into business facts.
-        if probe.state is ProbeState.HEALTHY and authority is not None:
+        if (
+            probe.state is ProbeState.HEALTHY
+            or isolated_owner_delivery_effect_unknown
+        ) and authority is not None:
             initialization = self._store.initialization()
             initialization_current = (
                 initialization is not None
@@ -8737,8 +9073,11 @@ class HealthCore:
                 seal_current(
                     "tasks",
                     state=(
-                        "unknown"
-                        if task_state.delivery_unknown_refs
+                        "confirmed-fault"
+                        if any(
+                            task.primary_label == "failed"
+                            for task in task_state.tasks
+                        )
                         else "confirmed-ok"
                     ),
                     generation=task_generation,
@@ -8778,14 +9117,7 @@ class HealthCore:
                 delivery_generation = max(1, delivery_state.version)
                 seal_current(
                     "delivery",
-                    state=(
-                        "unknown"
-                        if any(
-                            record.current_layer in {"attempted", "unknown"}
-                            for record in delivery_state.records
-                        )
-                        else "confirmed-ok"
-                    ),
+                    state="confirmed-ok",
                     generation=delivery_generation,
                     revision_digest=delivery_revision,
                     transition_id=(
@@ -8797,6 +9129,67 @@ class HealthCore:
                         + delivery_revision.removeprefix("sha256:"),
                     ),
                 )
+                if isolated_delivery_records:
+                    optional_revision = stable_digest(
+                        {
+                            "contract": "isolated-owner-delivery-effects-v1",
+                            "intent_ids": [
+                                record.intent.intent_id
+                                for record in isolated_delivery_records
+                            ],
+                            "layers": [
+                                record.current_layer
+                                for record in isolated_delivery_records
+                            ],
+                        }
+                    )
+                    optional_generation = max(
+                        1,
+                        delivery_state.version,
+                    )
+                    optional_transition = (
+                        "status-fact:delivery-effects:"
+                        + optional_revision.removeprefix("sha256:")
+                    )
+                    optional_producer = (
+                        PRODUCTION_OPTIONAL_STATUS_PRODUCER_IDS["delivery"]
+                    )
+                    optional_contract = (
+                        PRODUCTION_OPTIONAL_STATUS_PRODUCER_CONTRACT_VERSIONS[
+                            "delivery"
+                        ]
+                    )
+                    facts.append(
+                        signer.seal(
+                            domain="delivery",
+                            requiredness="non-core",
+                            state="isolated",
+                            generation=optional_generation,
+                            revision_digest=optional_revision,
+                            transition_id=optional_transition,
+                            producer_id=optional_producer,
+                            producer_contract_version=optional_contract,
+                            evidence_refs=tuple(
+                                "owner-delivery-effect:"
+                                + record.intent.intent_id.removeprefix(
+                                    "outbox:"
+                                )
+                                for record in isolated_delivery_records
+                            ),
+                            valid_until_utc=valid_until_utc,
+                        )
+                    )
+                    optional_requirements.append(
+                        CapabilityRequirement(
+                            domain="delivery",
+                            requiredness="non-core",
+                            producer_id=optional_producer,
+                            producer_contract_version=optional_contract,
+                            expected_generation=optional_generation,
+                            expected_revision_digest=optional_revision,
+                            expected_transition_id=optional_transition,
+                        )
+                    )
 
                 if self._model_authority_digest is not None:
                     route_state = (
@@ -8850,7 +9243,197 @@ class HealthCore:
             )
             for domain in CORE_STATUS_DOMAINS
         )
-        return requirements, tuple(facts)
+        return requirements + tuple(optional_requirements), tuple(facts)
+
+    @staticmethod
+    def _mandatory_request(
+        *,
+        kind: str,
+        causal_material: dict[str, object],
+        generation: int,
+        reason_code: str,
+    ) -> MandatoryDeliveryRequest:
+        causal_digest = stable_digest(
+            {
+                "contract": "mandatory-owner-causal-state-v1",
+                "kind": kind,
+                "material": causal_material,
+            }
+        ).removeprefix("sha256:")
+        causal_state_id = f"mandatory-state:{kind}:{causal_digest}"
+        return MandatoryDeliveryRequest(
+            request_id=f"mandatory-request:{kind}:{causal_digest}",
+            kind=kind,
+            causal_state_id=causal_state_id,
+            generation=generation,
+            reason_code=reason_code,
+        )
+
+    def _task_mandatory_delivery_requests_open(
+        self,
+        task_state: TaskRuntimeState,
+    ) -> tuple[MandatoryDeliveryRequest, ...]:
+        requests: list[MandatoryDeliveryRequest] = []
+        for task in task_state.tasks:
+            if (
+                task.primary_label == "active"
+                and task.approval.status == "waiting"
+            ):
+                requests.append(
+                    self._mandatory_request(
+                        kind="authorization-request",
+                        causal_material={
+                            "task_id": task.task_id,
+                            "task_version": task.version,
+                            "task_semantic_digest": task.semantic_digest,
+                        },
+                        generation=task.version,
+                        reason_code="task-execution-authorization-required",
+                    )
+                )
+            terminal = task.terminal_fact
+            if (
+                task.primary_label == "failed"
+                and terminal is not None
+                and terminal.reason_code
+                in {"no-reasonable-path", "capability-gap"}
+            ):
+                requests.append(
+                    self._mandatory_request(
+                        kind="capability-gap",
+                        causal_material={
+                            "task_id": task.task_id,
+                            "task_version": task.version,
+                            "terminal_reason": terminal.reason_code,
+                            "terminal_at_utc": terminal.recorded_at_utc,
+                        },
+                        generation=task.version,
+                        reason_code="task-capability-gap",
+                    )
+                )
+        for fact in task_state.unknown_facts:
+            if fact.unresolved and fact.possibly_external:
+                requests.append(
+                    self._mandatory_request(
+                        kind="unknown-risk-decision",
+                        causal_material={
+                            "unknown_id": fact.unknown_id,
+                            "task_id": fact.task_id,
+                            "effect_ref": fact.effect_ref,
+                            "reason_code": fact.reason_code,
+                        },
+                        generation=1,
+                        reason_code="possible-external-effect-owner-decision",
+                    )
+                )
+        return tuple(
+            sorted(
+                requests,
+                key=lambda request: (
+                    request.kind,
+                    request.causal_state_id,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _mandatory_request_matches_intent(
+        request: MandatoryDeliveryRequest,
+        intent: OutboxIntent,
+    ) -> bool:
+        return (
+            intent.mandatory_request_kind == request.kind
+            and intent.source_ref == request.request_id
+            and intent.business_fact_ref == request.causal_state_id
+            and intent.business_revision_digest == request.revision_digest
+        )
+
+    def _submit_missing_mandatory_intents_open(
+        self,
+        settings: OwnerSettingsState,
+        outbox: DeliveryOutboxState,
+        requests: tuple[MandatoryDeliveryRequest, ...],
+        *,
+        formed_at_utc: str,
+    ) -> DeliveryOutboxState:
+        destination = self._owner_weixin_destination_open(settings)
+        state = outbox
+        for request in requests:
+            if any(
+                self._mandatory_request_matches_intent(
+                    request,
+                    record.intent,
+                )
+                for record in state.records
+            ):
+                continue
+            request_material = {
+                "contract": "mandatory-owner-delivery-v1",
+                "owner_id": settings.owner_id,
+                "installation_id": settings.installation_id,
+                "request": request.to_storage(),
+            }
+            request_digest = stable_digest(request_material)
+            effect_request_id = (
+                "mandatory-owner-delivery:"
+                + request_digest.removeprefix("sha256:")
+            )
+            intent = OwnerDeliveryEngine.form_intent(
+                effect_kind="owner-delivery",
+                owner_id=settings.owner_id,
+                installation_id=settings.installation_id,
+                effect_request_id=effect_request_id,
+                business_fact_ref=request.causal_state_id,
+                business_revision_digest=request.revision_digest,
+                source_ref=request.request_id,
+                recipient_ref=destination.owner_sender_id,
+                route_id=destination.route_id,
+                route_generation=settings.current_configuration_generation,
+                payload_ref=(
+                    "mandatory-owner-request:"
+                    + request_digest.removeprefix("sha256:")
+                ),
+                payload_digest=stable_digest(
+                    {
+                        "contract": "mandatory-owner-payload-v1",
+                        "kind": request.kind,
+                        "request_id": request.request_id,
+                        "reason_code": request.reason_code,
+                    }
+                ),
+                formed_at_utc=formed_at_utc,
+                mandatory_request_kind=request.kind,
+            )
+            state = OwnerDeliveryEngine.submit(
+                state,
+                intent,
+                submitted_at_utc=formed_at_utc,
+                formed_issuer=self._delivery_evidence_issuer_open(
+                    "health-core.delivery.formed"
+                ),
+                committed_issuer=self._delivery_evidence_issuer_open(
+                    "health-core.delivery.committed"
+                ),
+            ).state
+        return (
+            state
+            if state == outbox
+            else replace(state, version=outbox.version + 1)
+        )
+
+    def _ticket115_delivery_evidence_available(self) -> bool:
+        return (
+            type(self._delivery_evidence_authority)
+            is DeliveryEvidenceAuthority
+            and all(
+                type(self._delivery_evidence_issuers.get(producer))
+                is DeliveryEvidenceIssuer
+                for producer in (
+                    "health-core.delivery.formed",
+                    "health-core.delivery.committed",
+                )
+            )
+        )
 
     def business_status(self) -> BusinessStatusResult:
         """Return the business tri-state and one durable state-change fact."""
@@ -8859,41 +9442,120 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("business-status-unavailable")
             try:
-                evaluated_at = self._business_status_clock()
-                if (
-                    type(evaluated_at) is not datetime
-                    or evaluated_at.tzinfo is None
-                    or evaluated_at.utcoffset() != timedelta(0)
-                ):
-                    raise AuthorityValidationError(
-                        "invalid business status clock result"
+                with self._ticket115_write_authority() as (head, settings):
+                    evaluated_at = self._business_status_clock()
+                    if (
+                        type(evaluated_at) is not datetime
+                        or evaluated_at.tzinfo is None
+                        or evaluated_at.utcoffset() != timedelta(0)
+                    ):
+                        raise AuthorityValidationError(
+                            "invalid business status clock result"
+                        )
+                    evaluated_at_utc = evaluated_at.isoformat()
+                    valid_until_utc = (
+                        evaluated_at + timedelta(minutes=5)
+                    ).isoformat()
+                    probe = self._probe_open()
+                    requirements, facts = self._production_status_inputs(
+                        probe=probe,
+                        valid_until_utc=valid_until_utc,
                     )
-                evaluated_at_utc = evaluated_at.isoformat()
-                valid_until_utc = (
-                    evaluated_at + timedelta(minutes=5)
-                ).isoformat()
-                probe = self._probe_open()
-                requirements, facts = self._production_status_inputs(
-                    probe=probe,
-                    valid_until_utc=valid_until_utc,
-                )
-                projector = StatusProjector(
-                    authority=self._status_fact_authority,  # type: ignore[arg-type]
-                    requirements=requirements,
-                )
-                projection = projector.project(
-                    facts,
-                    evaluated_at_utc=evaluated_at_utc,
-                )
-                _, transition, mandatory_request = (
-                    self._store.remember_business_status_transition(
-                        projection,
+                    projector = StatusProjector(
+                        authority=self._status_fact_authority,  # type: ignore[arg-type]
+                        requirements=requirements,
+                    )
+                    projection = projector.project(
+                        facts,
+                        evaluated_at_utc=evaluated_at_utc,
+                    )
+                    previous, ledger = self._store.business_status_state()
+                    transition = (
+                        None
+                        if previous is None
+                        else StatusTransition.between(previous, projection)
+                    )
+                    status_request = StatusProjector.mandatory_delivery_request(
+                        transition,
                         generation=max(
                             requirement.expected_generation
                             for requirement in requirements
                         ),
                     )
-                )
+                    current_task_state = self._ticket115_task_state_open(
+                        settings
+                    )
+                    task_requests = self._task_mandatory_delivery_requests_open(
+                        current_task_state
+                    )
+                    newly_issued: list[MandatoryDeliveryRequest] = []
+                    for request in (
+                        (() if status_request is None else (status_request,))
+                        + task_requests
+                    ):
+                        ledger, issued = ledger.issue(request)
+                        if issued:
+                            newly_issued.append(request)
+                    mandatory_request = next(
+                        (
+                            request
+                            for request in newly_issued
+                            if request.kind == "status-change"
+                        ),
+                        None,
+                    )
+                    if not self._ticket115_delivery_evidence_available():
+                        _, transition, mandatory_request = (
+                            self._store.remember_business_status_transition(
+                                projection,
+                                generation=max(
+                                    requirement.expected_generation
+                                    for requirement in requirements
+                                ),
+                            )
+                        )
+                        return BusinessStatusResult(
+                            projection,
+                            transition,
+                            mandatory_request,
+                        )
+                    current_outbox = self._ticket115_outbox_state_open(
+                        settings
+                    )
+                    status_requests = tuple(
+                        request
+                        for request in ledger.requests
+                        if request.kind == "status-change"
+                    )
+                    requests_to_enqueue = tuple(
+                        request
+                        for request in (
+                            (() if not status_requests else (status_requests[-1],))
+                            + task_requests
+                        )
+                    )
+                    outbox = self._submit_missing_mandatory_intents_open(
+                        settings,
+                        current_outbox,
+                        requests_to_enqueue,
+                        formed_at_utc=evaluated_at_utc,
+                    )
+                    if not newly_issued and outbox == current_outbox:
+                        if previous is None:
+                            self._store.remember_business_status(projection)
+                        return BusinessStatusResult(
+                            projection,
+                            transition,
+                            mandatory_request,
+                        )
+                    mutation = self._prepare_ticket115_facts_open(
+                        head,
+                        settings,
+                        delivery_state=outbox,
+                        business_status_projection=projection,
+                        mandatory_delivery_ledger=ledger,
+                    )
+                self._complete_ticket115_mutation(mutation)
                 return BusinessStatusResult(
                     projection,
                     transition,
