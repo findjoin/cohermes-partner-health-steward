@@ -1,6 +1,6 @@
-# Ticket 115 增量架构冻结草案
+# Ticket 115 增量架构冻结设计
 
-> 状态：等待主人确认。实现基线为 `d468e0ac3e33a37efd53f03328f16dcbc42cff09`；`3fa4d01c` 的长设计和 `23d4827` salvage 只作历史取证，不是实施路线。本草案适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
+> 状态：frozen。主人于 2026-08-26 确认正文及两项残余风险处理；冻结候选 commit 为 `b0d104cde54072adb4bc1f7061d1dc7da68e7c24`，tree 为 `cdae4ace0aa967b3c19567d45ae68fc3e7f237e4`。实现基线为 `d468e0ac3e33a37efd53f03328f16dcbc42cff09`；`3fa4d01c` 的长设计和 `23d4827` salvage 只作历史取证，不是实施路线。本设计适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
 
 ## 目标与范围
 

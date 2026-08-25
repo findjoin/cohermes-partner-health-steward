@@ -1,7 +1,7 @@
 # 115 - 实现任务当地日复盘与分层主人投递
 
 Type: task
-Status: needs-info
+Status: ready-for-agent
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-implement-strict-health-llm-governed-knowledge-and-nondiagnostic-answer.md), [114 - 实现主人设置数据权利与业务状态](114-implement-owner-settings-data-rights-and-business-status.md)
 
@@ -11,8 +11,8 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 
 - 产品代码基线固定为 `d468e0ac3e33a37efd53f03328f16dcbc42cff09`；当前 Ticket 115 专项测试为 `102/102` 绿色，先验收现有行为，不预设重写。
 - `23d4827557b532f4eee4fe5511c458ed2b5d8e15` salvage 和 `3fa4d01c` 长设计只读保留。前者增加约 7,919 行仍未闭合，后者增长到千余行且四轮审查未通过，均不得整体采用。
-- 唯一增量 HOW 是[Ticket 115 增量架构冻结草案](../design/115-frozen-implementation-design.md)，并受[`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)约束。
-- 本票保持 `needs-info`，等待主人确认草案中的残余风险处理；确认并记录设计提交身份后才改为 `ready-for-agent`。
+- 唯一增量 HOW 是[Ticket 115 增量架构冻结设计](../design/115-frozen-implementation-design.md)，并受[`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)约束。
+- 主人已于 2026-08-26 确认两项残余风险处理。冻结候选 commit 为 `b0d104cde54072adb4bc1f7061d1dc7da68e7c24`，tree 为 `cdae4ace0aa967b3c19567d45ae68fc3e7f237e4`；本票现为 `ready-for-agent`。
 
 ## 产品验收
 
