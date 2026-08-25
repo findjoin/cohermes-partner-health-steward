@@ -134,7 +134,7 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 - 验证结果：Ticket 115 `102/102`、项目全量 `675/675`、`compileall` 和 `git diff --check` 全部通过；最终实现提交为 `6a25954`，实施证据提交为 `af80dc7`。
 - 结论仅覆盖本地合成 Plugin/core 与 fake transport；真实 Partner Hermes、Weixin、模型、部署、医学审核和生产 canary 仍不属于本票验收。
 
-## Implementation evidence (unreviewed)
+## Superseded implementation evidence (prior unreviewed checkpoint)
 
 本次差额实施固定 `review_base=1ed58fc7c7b04419bcabbc3961af0ffe90fb2609`，只修改任务差额合同、公开 tasking surface、合同类型、逐 Case 注册表和本票状态元数据；Ticket 116 未开始。以下映射来自 `tests/ticket115_case_registry.py`，是实施证据，不是双轴审查结论。
 
@@ -182,3 +182,76 @@ Verification evidence before review checkpoint:
 - `git diff --check` -> exit `0`.
 - Environment: Python `3.11.6`, SQLite `3.42.0`, `cryptography 3.3.1`.
 - `reviewed_commit` and tree identity are intentionally left blank until the implementation evidence is committed and the worktree is clean; fresh Spec/Standards review is still required.
+
+## Implementation evidence (unreviewed)
+
+本段是当前 115-A1—A8 差额实施的逐 Case 证据，不是双轴审查结论。实施前固定 `review_base=1ed58fc7c7b04419bcabbc3961af0ffe90fb2609`；本次只修改 115 实现、测试和 Case registry，保留既有六项绿色基线，Ticket 116 未开始。Case ID、可观察结果和测试目标以 `tests/ticket115_case_registry.py:CASE_REGISTRY` 为唯一同步清单；以下 56 个 Case 均由 registry 自验证并在专项/全量 unittest 输出中单独可见。
+
+| Case | Test evidence | Implementation symbol(s) | Result |
+|---|---|---|---|
+| 115-A1-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c01_defer_is_a_fact_and_keeps_active_label` | `TaskEngine.defer`, `TaskControlFact` | green |
+| 115-A1-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c02_scope_expansion_creates_linked_waiting_task` | `TaskEngine.adjust`, `TaskEngine.link_successor`, `ExecutionScopeApproval` | green |
+| 115-A1-C03 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_engine_owns_initial_task_state_and_merges_duplicate_basis` | `TaskEngine.admit_candidate`, `TaskRuntimeState.candidate_receipts` | green |
+| 115-A1-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_owner_task_cancellation_tombstone_blocks_later_admission` | `HealthCore.cancel_task`, `TaskEngine.admit_candidate`, `cancelled_task_refs` tombstone | green |
+| 115-A1-C05 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c05_scope_expansion_consumes_only_exact_current_approval` | `TaskEngine.adjust`, exact `ExecutionScopeApproval` matching | green |
+| 115-A1-C06 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c06_scope_expansion_requires_a_current_approval` | `TaskEngine.adjust`, approval-currentness validation | green |
+| 115-A1-C07 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c07_revoked_scope_approval_is_rejected` | `TaskEngine.adjust`, approval revocation check | green |
+| 115-A1-C08 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c08_phase_progression_keeps_the_active_primary_label` | `TaskEngine.advance_phase`, `TaskState.primary_label` | green |
+| 115-A1-C09 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a1_c09_primary_labels_are_mutually_exclusive` | `TASK_PRIMARY_LABELS`, `TaskState` validation | green |
+| 115-A1-C10 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_terminal_task_cannot_reopen_but_can_link_an_explicit_successor` | `TaskEngine.solve`, `TaskEngine.link_successor` | green |
+| 115-A1-C11 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_plugin_inputs_are_wake_only` | `HealthCore` review wake/controlled protocol boundary | green |
+| 115-A2-C01 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_engine_owns_initial_task_state_and_merges_duplicate_basis` | `TaskEngine.admit_candidate`, governed task source fields | green |
+| 115-A2-C02 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_quiet_review_has_no_notification_and_commit_cannot_change_pending` | `DailyReviewDecision.notification_required`, review commit guard | green |
+| 115-A2-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_core_solve_task_requires_current_evidence_card_revision` | `HealthCore.solve_task`, `TaskAcceptance` current evidence binding | green |
+| 115-A2-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_owner_task_cancellation_atomically_closes_active_task_and_claim` | `HealthCore.cancel_task`, `TaskEngine.cancel`, claim release | green |
+| 115-A2-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault` | `HealthCore._production_status_inputs`, `StatusProjector` | green |
+| 115-A2-C06 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_delivery_unknown_is_an_active_ancillary_fact_not_a_fifth_label` | `TaskEngine.mark_delivery_unknown`, `TaskUnknownFact` | green |
+| 115-A2-C07 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_solve_requires_acceptance_evidence_to_match_current_revisions` | `TaskEngine.solve`, `TaskAcceptance` | green |
+| 115-A3-C01 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_local_day_key_is_timezone_and_dst_aware` | `local_day_key`, `LocalDayKey` | green |
+| 115-A3-C02 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_same_day_crash_resumes_pending_then_commits_exactly_once` | `DailyReviewEngine.prepare`, `DailyReviewEngine.commit` | green |
+| 115-A3-C03 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_stale_pending_is_discarded_without_backlog_and_only_current_day_runs` | `DailyReviewEngine.recover_pending` | green |
+| 115-A3-C04 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_timezone_change_suppresses_an_already_reviewed_local_date` | `DailyReviewEngine`, local-day/timezone generation | green |
+| 115-A3-C05 | `test_ticket115_tasks.Ticket115DailyReviewTests.test_quiet_review_has_no_notification_and_commit_cannot_change_pending` | `DailyReviewDecision`, pending review immutability | green |
+| 115-A3-C06 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a3_c06_same_local_day_replay_does_not_create_a_second_review` | `DailyReviewEngine.commit`, persisted review ledger | green |
+| 115-A4-C01 | `test_ticket115_storage.Ticket115TypedStorageTests.test_outbox_failure_rolls_back_task_and_review_business_state` | `EncryptedStateStore.commit_ticket115_facts` | green |
+| 115-A4-C02 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_and_outbox_rollback_together` | `HealthCore._prepare_ticket115_facts_open`, `_complete_ticket115_mutation` | green |
+| 115-A4-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_abandoned_prepare_without_replaying_transport` | `HealthCore.recover_owner_delivery_attempts`, mutation recovery | green |
+| 115-A4-C04 | `test_ticket115_plugin_delivery.Ticket115PluginDeliveryBoundaryTests.test_plugin_alone_sends_the_strict_authorized_wire_intent` | controlled Plugin -> core delivery wire, `OwnerDeliveryEngine.submit` | green |
+| 115-A5-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c01_delivery_evidence_accepts_only_layer_authority` | `DeliveryEvidenceAuthority.require`, `PRODUCER_BY_LAYER` | green |
+| 115-A5-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c02_delivery_evidence_round_trip_preserves_replay_identity` | `DeliveryEvidence.to_storage/from_storage` | green |
+| 115-A5-C03 | `test_ticket115_delivery.Ticket115DeliveryTests.test_accepted_delivered_and_read_are_distinct_facts` | `DeliveryFact`, `OutboxRecord` layer validation | green |
+| 115-A5-C04 | `test_ticket115_delivery.Ticket115DeliveryTests.test_rejected_is_an_explicit_interface_fact_not_owner_delivery` | `OwnerDeliveryEngine.record_observation` | green |
+| 115-A5-C05 | `test_ticket115_delivery.Ticket115DeliveryTests.test_unknown_freezes_automatic_retry_without_erasing_later_proof` | `OutboxRecord.unknown_frozen`, observation ledger | green |
+| 115-A5-C06 | `test_ticket115_storage.Ticket115TypedStorageTests.test_outbox_history_rejects_fact_deletion_and_modification` | `EncryptedStateStore._write_delivery_outbox` history checks | green |
+| 115-A5-C07 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c07_production_delivery_fact_exposes_bound_authoritative_evidence` | `DeliveryFact.evidence`, producer/generation/attestation/replay binding | green |
+| 115-A5-C08 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c08_actual_action_requires_the_admitted_event_producer` | actual-action authority and admitted-event producer validation | green |
+| 115-A5-C09 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a5_c09_out_of_order_delivery_facts_are_rejected` | `OutboxRecord._validate_known_layer_times`, observation ordering | green |
+| 115-A5-C10 | `test_ticket115_delivery.Ticket115DeliveryTests.test_unknown_freezes_automatic_retry_without_erasing_later_proof` | immutable observation append/replay handling | green |
+| 115-A6-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a6_c01_task_claim_lease_rejects_cross_epoch_and_stale_cas` | `TaskClaimLease.can_commit`, CAS identity | green |
+| 115-A6-C02 | `test_ticket115_tasks.Ticket115TaskEngineTests.test_expired_task_lease_can_be_taken_over_but_live_lease_cannot` | `TaskEngine.claim`, `TaskClaimLease.is_active` | green |
+| 115-A6-C03 | `test_ticket115_integration.Ticket115IntegrationTests.test_delivery_rechecks_current_evidence_revision_before_adapter` | `HealthCore._owner_delivery_sendable_open` | green |
+| 115-A6-C04 | `test_ticket115_integration.Ticket115IntegrationTests.test_attempt_for_other_approval_does_not_consume_new_approval` | owner-delivery approval/currentness recheck | green |
+| 115-A6-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_restart_recovers_orphan_attempt_without_replaying_transport` | `HealthCore.recover_owner_delivery_attempts` | green |
+| 115-A6-C06 | `test_ticket115_integration.Ticket115IntegrationTests.test_adapter_exception_freezes_unknown_until_independent_delivery` | adapter completion -> `TaskEngine.mark_delivery_unknown` | green |
+| 115-A6-C07 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a6_c07_task_engine_persists_runtime_epoch_claim_and_rejects_old_holder` | `TaskRuntimeState`, persisted `TaskClaimLease.runtime_epoch` | green |
+| 115-A6-C08 | `test_ticket115_integration.Ticket115IntegrationTests.test_writer_proof_is_rechecked_after_attempt_before_adapter` | writer-fence recheck immediately before adapter | green |
+| 115-A6-C09 | `test_ticket115_integration.Ticket115IntegrationTests.test_review_commit_rejects_stale_day_and_fresh_state_change` | review current-head/day guard | green |
+| 115-A7-C01 | `test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_domains_are_sealed_and_unknown_is_not_fault` | `HealthCore._production_status_inputs`, `StatusProjector.project` | green |
+| 115-A7-C02 | `test_ticket114_status.Ticket114BusinessStatusTests.test_114_a5_c06_unknown_domain_or_producer_cannot_activate` | `CapabilityFactAuthority`, `StatusProjector.project` | green |
+| 115-A7-C03 | `test_ticket114_status.Ticket114BusinessStatusTests.test_114_a5_c11_identical_fact_replay_is_deterministic_and_emits_no_second_transition` | `StatusProjector.transition`, persisted status projection | green |
+| 115-A8-C01 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c01_mandatory_request_is_content_free` | `MandatoryDeliveryRequest` | green |
+| 115-A8-C02 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c02_mandatory_request_dedupes_replay_and_keeps_new_cause` | `MandatoryDeliveryLedger.issue`, causal-state dedupe | green |
+| 115-A8-C03 | `test_ticket114_authority_integration.Ticket114AuthorityIntegrationTests.test_114_a5_c21_status_transition_is_deduplicated_across_restart` | persisted `StatusTransition`, replay identity | green |
+| 115-A8-C04 | `test_ticket115_gap_contracts.Ticket115GapContractTests.test_115_a8_c04_status_transition_emits_one_content_free_request` | `StatusProjector.transition`, `MandatoryDeliveryRequest` | green |
+| 115-A8-C05 | `test_ticket115_integration.Ticket115IntegrationTests.test_115_a8_c05_business_status_replay_emits_one_mandatory_request` | `HealthCore.business_status`, persisted business-status transition | green |
+| 115-A8-C06 | `test_ticket115_integration.Ticket115IntegrationTests.test_not_configured_notification_never_reaches_adapter` | notification preference gate, `HealthCore._owner_delivery_sendable_open` | green |
+
+Verification evidence before the review checkpoint:
+
+- `python -m unittest discover -v -s tests -p "test_ticket115_*.py"` -> `Ran 123 tests in 77.316s ... OK`.
+- `python -m unittest discover -v` -> `Ran 696 tests in 217.984s ... OK`.
+- `python -m compileall -q partner_health_steward tests` -> exit `0`.
+- `git diff --check` -> exit `0` (only existing LF/CRLF conversion warnings, no whitespace error).
+- `python -m unittest ...test_115_registry_self_validates_every_observable_target` -> `OK`; registry resolves all 56 targets.
+- Environment: Python `3.11.6`, SQLite `3.42.0`, `cryptography 3.3.1`.
+- Checkpoint identity is intentionally not filled until the implementation evidence is committed and the worktree is clean; fresh Spec/Standards review remains required. No real Hermes, Weixin, model, network, deployment, or Ticket 116 behavior was added.

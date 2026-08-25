@@ -307,7 +307,8 @@ class Ticket115IntegrationTests(unittest.TestCase):
             expected_settings_version=expected_version,
             command_suffix=suffix,
         )
-        self.assertEqual(self.base._prepare(request).status, "accepted")
+        prepared = self.base._prepare(request)
+        self.assertEqual(prepared.status, "accepted", prepared)
         self.assertEqual(self.base._commit(request).status, "accepted")
         self.assertEqual(self.base._finalize(request).status, "accepted")
 
@@ -1950,6 +1951,39 @@ class Ticket115IntegrationTests(unittest.TestCase):
         unknown = self.plugin.business_status(peer_id=_PEER).projection
         self.assertEqual(unknown.state, "cannot-confirm")
         self.assertNotIn("confirmed-fault", unknown.reason_codes)
+
+    def test_115_a8_c05_business_status_replay_emits_one_mandatory_request(self) -> None:
+        prior = status.StatusProjection(
+            state="active",
+            evaluated_at_utc="2026-08-24T11:59:00+00:00",
+            affected_core_domains=(),
+            isolated_noncore_domains=(),
+            reason_codes=(),
+            fact_set_digest="sha256:" + ("f" * 64),
+        )
+        self.assertIsNone(self.store.remember_business_status(prior))
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+            grant=grant,
+            transport=_RaisingAdapter(),
+        )
+
+        first = self.plugin.business_status(peer_id=_PEER)
+        replay = self.plugin.business_status(peer_id=_PEER)
+        self.assertIsNotNone(first.mandatory_request)
+        assert first.mandatory_request is not None
+        self.assertTrue(first.mandatory_request.body_free)
+        self.assertIsNotNone(first.transition)
+        assert first.transition is not None
+        self.assertEqual(
+            first.mandatory_request.causal_state_id,
+            first.transition.transition_id,
+        )
+        self.assertIsNone(replay.mandatory_request)
 
     def test_owner_task_cancellation_atomically_closes_active_task_and_claim(self) -> None:
         task_id, _ = self._admit_review_task(notification_enabled=False)

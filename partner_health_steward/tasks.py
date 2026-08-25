@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from .initialization import stable_digest
+from .settings import ExecutionScopeApproval
+from .ticket115_contracts import TaskClaimLease
 
 
 class TaskContractViolation(ValueError):
@@ -1248,6 +1250,7 @@ class TaskRuntimeState:
     unknown_facts: tuple[TaskUnknownFact, ...] = ()
     active_claims: tuple[TaskLease, ...] = ()
     control_facts: tuple[TaskControlFact, ...] = ()
+    task_claim_leases: tuple[TaskClaimLease, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.owner_id, "task owner")
@@ -1310,6 +1313,33 @@ class TaskRuntimeState:
             raise TaskContractViolation("task control facts must be uniquely ordered")
         if any(fact.task_id not in task_id_set for fact in self.control_facts):
             raise TaskContractViolation("task control fact points outside state")
+        if type(self.task_claim_leases) is not tuple or any(
+            type(claim) is not TaskClaimLease for claim in self.task_claim_leases
+        ):
+            raise TaskContractViolation("invalid runtime task claim leases")
+        runtime_claim_ids = tuple(claim.claim_id for claim in self.task_claim_leases)
+        if runtime_claim_ids != tuple(sorted(runtime_claim_ids)) or len(
+            runtime_claim_ids
+        ) != len(set(runtime_claim_ids)):
+            raise TaskContractViolation(
+                "runtime task claim leases must be uniquely ordered"
+            )
+        runtime_claimed_tasks = tuple(
+            claim.task_id for claim in self.task_claim_leases
+        )
+        if len(runtime_claimed_tasks) != len(set(runtime_claimed_tasks)):
+            raise TaskContractViolation(
+                "task may have only one runtime task claim lease"
+            )
+        if any(claim.task_id not in task_id_set for claim in self.task_claim_leases):
+            raise TaskContractViolation("runtime task claim points outside state")
+        if any(
+            self.task(claim.task_id).primary_label != "active"
+            for claim in self.task_claim_leases
+        ):
+            raise TaskContractViolation(
+                "terminal task cannot retain a runtime task claim"
+            )
 
     @classmethod
     def empty(cls, owner_id: str, installation_id: str) -> "TaskRuntimeState":
@@ -1322,6 +1352,7 @@ class TaskRuntimeState:
             unknown_facts=(),
             active_claims=(),
             control_facts=(),
+            task_claim_leases=(),
         )
 
     def task(self, task_id: str) -> ManagedTask:
@@ -1349,6 +1380,9 @@ class TaskRuntimeState:
             "unknown_facts": [fact.to_storage() for fact in self.unknown_facts],
             "active_claims": [claim.to_storage() for claim in self.active_claims],
             "control_facts": [fact.to_storage() for fact in self.control_facts],
+            "task_claim_leases": [
+                claim.to_storage() for claim in self.task_claim_leases
+            ],
         }
 
     @classmethod
@@ -1367,6 +1401,8 @@ class TaskRuntimeState:
         if frozenset(value) not in {
             frozenset(expected),
             frozenset(expected | {"control_facts"}),
+            frozenset(expected | {"task_claim_leases"}),
+            frozenset(expected | {"control_facts", "task_claim_leases"}),
         }:
             raise TaskContractViolation("invalid task runtime state")
         stored = value
@@ -1375,9 +1411,17 @@ class TaskRuntimeState:
         raw_unknowns = stored["unknown_facts"]
         raw_claims = stored["active_claims"]
         raw_controls = stored.get("control_facts", [])
+        raw_runtime_claims = stored.get("task_claim_leases", [])
         if any(
             type(value) is not list
-            for value in (raw_tasks, raw_receipts, raw_unknowns, raw_claims, raw_controls)
+            for value in (
+                raw_tasks,
+                raw_receipts,
+                raw_unknowns,
+                raw_claims,
+                raw_controls,
+                raw_runtime_claims,
+            )
         ):
             raise TaskContractViolation("invalid task runtime collection")
         receipts: list[tuple[str, str, str]] = []
@@ -1405,6 +1449,9 @@ class TaskRuntimeState:
             active_claims=tuple(TaskLease.from_storage(item) for item in raw_claims),
             control_facts=tuple(
                 TaskControlFact.from_storage(item) for item in raw_controls
+            ),
+            task_claim_leases=tuple(
+                TaskClaimLease.from_storage(item) for item in raw_runtime_claims
             ),
         )
 
@@ -1592,6 +1639,11 @@ class TaskEngine:
         lease_id: str,
         acquired_at_utc: str,
         lease_seconds: int = 300,
+        runtime_epoch: str | None = None,
+        acquired_at_monotonic_seconds: float | None = None,
+        expires_at_monotonic_seconds: float | None = None,
+        generation: int | None = None,
+        task_cas_identity: str | None = None,
     ) -> TaskTransition:
         if type(state) is not TaskRuntimeState:
             raise TaskContractViolation("invalid task runtime state")
@@ -1606,6 +1658,59 @@ class TaskEngine:
         acquired_text = _utc_time(acquired_at_utc, "task lease acquisition time")
         acquired = datetime.fromisoformat(acquired_text)
         expiry = (acquired + timedelta(seconds=duration)).isoformat()
+        runtime_values = (
+            runtime_epoch,
+            acquired_at_monotonic_seconds,
+            expires_at_monotonic_seconds,
+            generation,
+            task_cas_identity,
+        )
+        if runtime_epoch is None and any(
+            value is not None for value in runtime_values[1:]
+        ):
+            raise TaskContractViolation(
+                "runtime task claim fields must be supplied together"
+            )
+        if runtime_epoch is not None and any(
+            value is None for value in runtime_values[1:]
+        ):
+            raise TaskContractViolation(
+                "runtime task claim fields must be supplied together"
+            )
+        runtime_claim_mode = runtime_epoch is not None
+        if runtime_claim_mode:
+            epoch = _text(runtime_epoch, "task claim runtime epoch")
+            if type(acquired_at_monotonic_seconds) is not float:
+                raise TaskContractViolation("invalid task claim acquisition clock")
+            if type(expires_at_monotonic_seconds) is not float:
+                raise TaskContractViolation("invalid task claim expiry clock")
+            if expires_at_monotonic_seconds <= acquired_at_monotonic_seconds:
+                raise TaskContractViolation("task claim must expire after acquisition")
+            claim_generation = _positive_integer(generation, "task claim generation")
+            claim_cas = _text(task_cas_identity, "task claim CAS identity")
+            current_cas = stable_digest(task.to_storage())
+            for existing in state.task_claim_leases:
+                if existing.claim_id != lease_identifier:
+                    continue
+                if existing.runtime_epoch != epoch:
+                    continue
+                if (
+                    existing.task_id == task.task_id
+                    and existing.runtime_epoch == epoch
+                    and existing.acquired_at_monotonic_seconds
+                    == acquired_at_monotonic_seconds
+                    and existing.expires_at_monotonic_seconds
+                    == expires_at_monotonic_seconds
+                    and existing.generation == claim_generation
+                    and existing.task_revision == task.version
+                    and existing.task_cas_identity == current_cas == claim_cas
+                ):
+                    return TaskTransition(state, task.task_id, "claimed", True)
+                raise TaskContractViolation("task claim identifier was reused")
+        else:
+            epoch = None
+            claim_generation = None
+            claim_cas = None
         for existing in state.active_claims:
             if existing.lease_id != lease_identifier:
                 continue
@@ -1620,12 +1725,58 @@ class TaskEngine:
         active = tuple(
             claim for claim in state.active_claims if claim.is_active(acquired_text)
         )
-        if any(claim.task_id == task.task_id for claim in active):
+        if not runtime_claim_mode and any(
+            claim.task_id == task.task_id for claim in active
+        ):
             raise TaskContractViolation("task already has an active claim")
         taken_over = any(
             claim.task_id == task.task_id and not claim.is_active(acquired_text)
             for claim in state.active_claims
         )
+        runtime_claims = state.task_claim_leases
+        if runtime_claim_mode:
+            assert epoch is not None
+            active_runtime_claim_task_ids = {
+                claim.task_id
+                for claim in state.task_claim_leases
+                if claim.is_active(
+                    runtime_epoch=epoch,
+                    monotonic_seconds=acquired_at_monotonic_seconds,
+                )
+            }
+            if any(
+                claim.task_id == task.task_id
+                and claim.task_id in active_runtime_claim_task_ids
+                for claim in state.active_claims
+            ):
+                raise TaskContractViolation("task already has an active runtime claim")
+            taken_over = taken_over or any(
+                claim.task_id == task.task_id
+                and claim.task_id in active_runtime_claim_task_ids
+                for claim in state.active_claims
+            )
+            active = tuple(
+                claim for claim in active if claim.task_id != task.task_id
+            )
+            active_runtime_claims = tuple(
+                claim
+                for claim in runtime_claims
+                if claim.is_active(
+                    runtime_epoch=epoch,
+                    monotonic_seconds=acquired_at_monotonic_seconds,
+                )
+            )
+            if any(claim.task_id == task.task_id for claim in active_runtime_claims):
+                raise TaskContractViolation("task already has an active runtime claim")
+            taken_over = taken_over or any(
+                claim.task_id == task.task_id
+                and not claim.is_active(
+                    runtime_epoch=epoch,
+                    monotonic_seconds=acquired_at_monotonic_seconds,
+                )
+                for claim in runtime_claims
+            )
+            runtime_claims = active_runtime_claims
         lease = TaskLease(
             lease_id=lease_identifier,
             task_id=task.task_id,
@@ -1639,6 +1790,33 @@ class TaskEngine:
             version=task.version + 1,
             updated_at_utc=acquired_text,
         )
+        if runtime_claim_mode:
+            assert epoch is not None
+            assert claim_generation is not None
+            assert claim_cas is not None
+            runtime_claims = tuple(
+                sorted(
+                    runtime_claims
+                    + (
+                        TaskClaimLease(
+                            claim_id=lease_identifier,
+                            task_id=task.task_id,
+                            generation=claim_generation,
+                            holder_role=holder,
+                            runtime_epoch=epoch,
+                            acquired_at_monotonic_seconds=acquired_at_monotonic_seconds,
+                            expires_at_monotonic_seconds=(
+                                expires_at_monotonic_seconds
+                                if expires_at_monotonic_seconds is not None
+                                else acquired_at_monotonic_seconds + duration
+                            ),
+                            task_revision=next_task.version,
+                            task_cas_identity=stable_digest(next_task.to_storage()),
+                        ),
+                    ),
+                    key=lambda item: item.claim_id,
+                )
+            )
         next_state = replace(
             state,
             version=state.version + 1,
@@ -1646,6 +1824,7 @@ class TaskEngine:
             active_claims=tuple(
                 sorted(active + (lease,), key=lambda item: item.lease_id)
             ),
+            task_claim_leases=runtime_claims,
         )
         return TaskTransition(
             next_state,
@@ -1660,6 +1839,8 @@ class TaskEngine:
         *,
         holder_id: str,
         observed_at_utc: str,
+        runtime_epoch: str | None = None,
+        monotonic_seconds: float | None = None,
     ) -> TaskTransition:
         if type(state) is not TaskRuntimeState:
             raise TaskContractViolation("invalid task runtime state")
@@ -1677,6 +1858,26 @@ class TaskEngine:
         task = state.task(lease.task_id)
         if task.primary_label != "active":
             raise TaskContractViolation("terminal task cannot release a claim")
+        runtime_claim = next(
+            (
+                item
+                for item in state.task_claim_leases
+                if item.claim_id == lease_identifier
+            ),
+            None,
+        )
+        if runtime_claim is not None:
+            if runtime_epoch is None or type(monotonic_seconds) is not float:
+                raise TaskContractViolation(
+                    "runtime task claim context is required for release"
+                )
+            if not runtime_claim.can_commit(
+                runtime_epoch=runtime_epoch,
+                monotonic_seconds=monotonic_seconds,
+                task_revision=task.version,
+                task_cas_identity=stable_digest(task.to_storage()),
+            ):
+                raise TaskContractViolation("runtime task claim is stale")
         next_task = replace(
             task,
             phase="planned",
@@ -1689,6 +1890,11 @@ class TaskEngine:
             tasks=_replace_task(state, next_task),
             active_claims=tuple(
                 item for item in state.active_claims if item.lease_id != lease_identifier
+            ),
+            task_claim_leases=tuple(
+                item
+                for item in state.task_claim_leases
+                if item.claim_id != lease_identifier
             ),
         )
         return TaskTransition(next_state, task.task_id, "released")
@@ -1753,6 +1959,7 @@ class TaskEngine:
         adjusted_at_utc: str,
         scope_expanded: bool = False,
         cancelled_task_refs: tuple[str, ...] = (),
+        current_approval: ExecutionScopeApproval | None = None,
     ) -> TaskTransition:
         """Adjust a task, or create a linked task when scope expands."""
 
@@ -1781,6 +1988,38 @@ class TaskEngine:
                 cancelled_task_refs=cancelled_task_refs,
             )
             successor = linked.state.task(linked.task_id)
+            if candidate.approval.status not in {"waiting", "bound"}:
+                raise TaskContractViolation(
+                    "scope-expanded task must await or hold a current approval"
+                )
+            if candidate.approval.status == "bound":
+                approval = current_approval
+                if type(approval) is not ExecutionScopeApproval:
+                    raise TaskContractViolation(
+                        "scope-expanded task requires the exact current approval"
+                    )
+                if (
+                    approval.revoked
+                    or datetime.fromisoformat(approval.expires_at_utc)
+                    <= datetime.fromisoformat(at)
+                    or approval.approval_id != candidate.approval.approval_id
+                    or approval.approval_version != candidate.approval.approval_version
+                    or approval.owner_id != state.owner_id
+                    or approval.installation_id != state.installation_id
+                    or approval.task_id != successor.task_id
+                    or approval.assignee != candidate.assignee
+                    or approval.purpose != candidate.purpose
+                    or approval.allowed_data_categories
+                    != candidate.allowed_data_categories
+                    or approval.allowed_data_refs != candidate.allowed_data_refs
+                    or approval.first_hop_recipient
+                    not in candidate.external_boundary.recipient_refs
+                    or approval.external_effect_kind
+                    not in candidate.external_boundary.effect_kinds
+                ):
+                    raise TaskContractViolation(
+                        "scope-expanded task approval is not current and exact"
+                    )
             fact = TaskControlFact(
                 fact_id="task-control:"
                 + stable_digest(
@@ -2028,6 +2267,11 @@ class TaskEngine:
                 active_claims=tuple(
                     item for item in state.active_claims if item.task_id != task.task_id
                 ),
+                task_claim_leases=tuple(
+                    item
+                    for item in state.task_claim_leases
+                    if item.task_id != task.task_id
+                ),
             ),
             task.task_id,
             "cancelled",
@@ -2104,6 +2348,11 @@ class TaskEngine:
                 active_claims=tuple(
                     item for item in state.active_claims if item.task_id != task.task_id
                 ),
+                task_claim_leases=tuple(
+                    item
+                    for item in state.task_claim_leases
+                    if item.task_id != task.task_id
+                ),
             ),
             task.task_id,
             "failed",
@@ -2162,6 +2411,11 @@ class TaskEngine:
             ),
             active_claims=tuple(
                 item for item in state.active_claims if item.task_id != task.task_id
+            ),
+            task_claim_leases=tuple(
+                item
+                for item in state.task_claim_leases
+                if item.task_id != task.task_id
             ),
         )
         return TaskTransition(next_state, task.task_id, "delivery-unknown")

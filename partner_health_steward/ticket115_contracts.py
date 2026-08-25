@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from datetime import datetime
+from math import isfinite
+from types import MappingProxyType
 from typing import Mapping
 
 from .initialization import stable_digest
@@ -78,9 +80,15 @@ class TaskClaimLease:
             _text(value, name)
         _positive(self.generation, "task claim generation")
         _positive(self.task_revision, "task claim revision")
-        if type(self.acquired_at_monotonic_seconds) is not float:
+        if (
+            type(self.acquired_at_monotonic_seconds) is not float
+            or not isfinite(self.acquired_at_monotonic_seconds)
+        ):
             raise Ticket115ContractViolation("invalid task claim acquisition clock")
-        if type(self.expires_at_monotonic_seconds) is not float:
+        if (
+            type(self.expires_at_monotonic_seconds) is not float
+            or not isfinite(self.expires_at_monotonic_seconds)
+        ):
             raise Ticket115ContractViolation("invalid task claim expiry clock")
         if self.expires_at_monotonic_seconds <= self.acquired_at_monotonic_seconds:
             raise Ticket115ContractViolation("task claim must expire after acquisition")
@@ -126,9 +134,34 @@ class TaskClaimLease:
 
     @classmethod
     def from_storage(cls, value: object) -> "TaskClaimLease":
-        if type(value) is not dict:
+        fields = frozenset(
+            {
+                "claim_id",
+                "task_id",
+                "generation",
+                "holder_role",
+                "runtime_epoch",
+                "acquired_at_monotonic_seconds",
+                "expires_at_monotonic_seconds",
+                "task_revision",
+                "task_cas_identity",
+            }
+        )
+        if type(value) is not dict or frozenset(value) != fields:
             raise Ticket115ContractViolation("invalid task claim lease")
-        return cls(**value)  # type: ignore[arg-type]
+        return cls(
+            claim_id=_text(value["claim_id"], "task claim identifier"),
+            task_id=_text(value["task_id"], "task claim task identifier"),
+            generation=_positive(value["generation"], "task claim generation"),
+            holder_role=_text(value["holder_role"], "task claim holder role"),
+            runtime_epoch=_text(value["runtime_epoch"], "task claim runtime epoch"),
+            acquired_at_monotonic_seconds=value["acquired_at_monotonic_seconds"],  # type: ignore[arg-type]
+            expires_at_monotonic_seconds=value["expires_at_monotonic_seconds"],  # type: ignore[arg-type]
+            task_revision=_positive(value["task_revision"], "task claim revision"),
+            task_cas_identity=_text(
+                value["task_cas_identity"], "task claim CAS identity"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -202,7 +235,7 @@ class DeliveryEvidence:
 class DeliveryEvidenceAuthority:
     """Restrict which producer may prove each delivery layer."""
 
-    PRODUCER_BY_LAYER = {
+    PRODUCER_BY_LAYER = MappingProxyType({
         "formed": "health-core.delivery.formed",
         "business-committed": "health-core.delivery.committed",
         "attempted": "owner-delivery-adapter.attempted",
@@ -212,7 +245,7 @@ class DeliveryEvidenceAuthority:
         "delivered": "weixin.channel.receipt",
         "read": "weixin.channel.receipt",
         "actual-action": "owner.admitted-event",
-    }
+    })
 
     @classmethod
     def verify(cls, evidence: DeliveryEvidence) -> bool:
@@ -268,7 +301,6 @@ class MandatoryDeliveryRequest:
                 "kind": self.kind,
                 "causal_state_id": self.causal_state_id,
                 "generation": self.generation,
-                "reason_code": self.reason_code,
             }
         )
 

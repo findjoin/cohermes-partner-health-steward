@@ -16,6 +16,11 @@ from dataclasses import InitVar, dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
 
+from .ticket115_contracts import (
+    MandatoryDeliveryLedger,
+    MandatoryDeliveryRequest,
+)
+
 
 class StatusContractViolation(ValueError):
     """A value cannot cross the sealed business-status fact boundary."""
@@ -660,11 +665,16 @@ class BusinessStatusResult:
 
     projection: StatusProjection
     transition: StatusTransition | None
+    mandatory_request: MandatoryDeliveryRequest | None = None
 
     def __post_init__(self) -> None:
         if type(self.projection) is not StatusProjection:
             raise StatusContractViolation("invalid business status projection")
         if self.transition is None:
+            if self.mandatory_request is not None:
+                raise StatusContractViolation(
+                    "mandatory status request requires a new transition"
+                )
             return
         if (
             type(self.transition) is not StatusTransition
@@ -675,6 +685,13 @@ class BusinessStatusResult:
             != self.projection.affected_core_domains
         ):
             raise StatusContractViolation("invalid business status transition")
+        if self.mandatory_request is not None and (
+            type(self.mandatory_request) is not MandatoryDeliveryRequest
+            or self.mandatory_request.kind != "status-change"
+            or self.mandatory_request.causal_state_id
+            != self.transition.transition_id
+        ):
+            raise StatusContractViolation("invalid mandatory status request")
 
 
 class StatusProjector:
@@ -940,3 +957,23 @@ class StatusProjector:
         current: StatusProjection,
     ) -> StatusTransition | None:
         return StatusTransition.between(previous, current)
+
+    @staticmethod
+    def mandatory_delivery_request(
+        transition: StatusTransition | None,
+        *,
+        generation: int,
+    ) -> MandatoryDeliveryRequest | None:
+        if transition is None:
+            return None
+        request = MandatoryDeliveryRequest(
+            request_id="mandatory:" + transition.transition_id,
+            kind="status-change",
+            causal_state_id=transition.transition_id,
+            generation=generation,
+            reason_code=(
+                f"{transition.previous_state}-to-{transition.current_state}"
+            ),
+        )
+        _, issued = MandatoryDeliveryLedger().issue(request)
+        return request if issued else None

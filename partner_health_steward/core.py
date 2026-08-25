@@ -1045,6 +1045,9 @@ class HealthCore:
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
+        # Task claims compare monotonic clocks only inside this process epoch.
+        # A recreated core therefore cannot inherit a holder's commit authority.
+        self._task_runtime_epoch = "task-runtime:" + secrets.token_urlsafe(24)
         self._writer_holder_sessions: dict[tuple[str, str], WriterHolderSession] = {}
         # Serializes lifecycle handoff with every public operation that can
         # mint or consume a writer proof.  ``close`` must not release its host
@@ -6397,6 +6400,7 @@ class HealthCore:
                             "observed_at_utc",
                         }
                     ),
+                    frozenset({"producer_contract"}),
                 )
                 transition = self.record_owner_delivery_observation(
                     fields["intent_id"],  # type: ignore[arg-type]
@@ -6405,6 +6409,7 @@ class HealthCore:
                     result_ref=fields["result_ref"],  # type: ignore[arg-type]
                     evidence_ref=fields["evidence_ref"],  # type: ignore[arg-type]
                     observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
+                    producer_contract=fields.get("producer_contract"),
                     _health_command=command,
                 )
                 return _ticket115_delivery_transition_wire(transition)
@@ -6520,15 +6525,27 @@ class HealthCore:
         lease_seconds: int = 300,
         _health_command: TrustedHealthCommand | None = None,
     ) -> TaskTransition:
-        return self._mutate_ticket115_task(
-            lambda state: TaskEngine.claim(
+        def claim_with_runtime(state: TaskRuntimeState) -> TaskTransition:
+            acquired_monotonic = time.monotonic()
+            authority = self._store.finalized_authority()
+            if authority is None:
+                raise AuthorityValidationError("task-claim-authority-unavailable")
+            return TaskEngine.claim(
                 state,
                 task_id,
                 holder_id=holder_id,
                 lease_id=lease_id,
                 acquired_at_utc=acquired_at_utc,
                 lease_seconds=lease_seconds,
-            ),
+                runtime_epoch=self._task_runtime_epoch,
+                acquired_at_monotonic_seconds=acquired_monotonic,
+                expires_at_monotonic_seconds=acquired_monotonic + lease_seconds,
+                generation=max(1, authority.generation),
+                task_cas_identity=stable_digest(state.task(task_id).to_storage()),
+            )
+
+        return self._mutate_ticket115_task(
+            claim_with_runtime,
             health_command=_health_command,
             health_command_action="task.claim",
         )
@@ -6541,13 +6558,18 @@ class HealthCore:
         observed_at_utc: str,
         _health_command: TrustedHealthCommand | None = None,
     ) -> TaskTransition:
-        return self._mutate_ticket115_task(
-            lambda state: TaskEngine.release_claim(
+        def release_with_runtime(state: TaskRuntimeState) -> TaskTransition:
+            return TaskEngine.release_claim(
                 state,
                 lease_id,
                 holder_id=holder_id,
                 observed_at_utc=observed_at_utc,
-            ),
+                runtime_epoch=self._task_runtime_epoch,
+                monotonic_seconds=time.monotonic(),
+            )
+
+        return self._mutate_ticket115_task(
+            release_with_runtime,
             health_command=_health_command,
             health_command_action="task.release",
         )
@@ -8105,6 +8127,7 @@ class HealthCore:
         result_ref: str,
         evidence_ref: str,
         observed_at_utc: str,
+        producer_contract: str | None = None,
         _health_command: TrustedHealthCommand | None = None,
     ) -> DeliveryTransition:
         """Append independent channel evidence without rewriting transport facts."""
@@ -8127,6 +8150,7 @@ class HealthCore:
                     result_ref=result_ref,
                     evidence_ref=evidence_ref,
                     observed_at_utc=observed_at_utc,
+                    producer_contract=producer_contract,
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
@@ -8519,7 +8543,18 @@ class HealthCore:
                     if previous is None
                     else projector.transition(previous, projection)
                 )
-                return BusinessStatusResult(projection, transition)
+                mandatory_request = StatusProjector.mandatory_delivery_request(
+                    transition,
+                    generation=max(
+                        requirement.expected_generation
+                        for requirement in requirements
+                    ),
+                )
+                return BusinessStatusResult(
+                    projection,
+                    transition,
+                    mandatory_request,
+                )
             except (
                 KeyUnavailable,
                 StoreUnavailable,
