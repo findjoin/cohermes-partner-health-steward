@@ -176,6 +176,7 @@ from .status import (
     PRODUCTION_STATUS_PRODUCER_CONTRACT_VERSIONS,
     PRODUCTION_STATUS_PRODUCER_IDS,
     StatusContractViolation,
+    StatusProjection,
     StatusProjector,
     StatusTransition,
 )
@@ -2960,7 +2961,11 @@ class HealthCore:
                     False,
                 )
 
-        if command.action not in _PROBE_BYPASS_ACTIONS:
+        mandatory_owner_decision = self._is_current_mandatory_owner_decision_open(
+            command,
+            head,
+        )
+        if command.action not in _PROBE_BYPASS_ACTIONS and not mandatory_owner_decision:
             report = self._probe_for_head(head)
             if report.state is ProbeState.HEALTHY and self._current_writer_proof(head) is None:
                 return _Handled(
@@ -3004,6 +3009,39 @@ class HealthCore:
         if command.action == "effect.result":
             raise StoreUnavailable("effect result must use the remote handler")
         raise ProtocolViolation("unknown action")
+
+    def _is_current_mandatory_owner_decision_open(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> bool:
+        """Recognize only a persisted, exact mandatory owner-decision intent."""
+
+        if command.action != "effect.request":
+            return False
+        payload = command.payload
+        if (
+            not isinstance(payload, EffectRequestPayload)
+            or payload.effect_kind != "owner-delivery"
+            or payload.business_source_causal_id is None
+        ):
+            return False
+        try:
+            settings = self._current_owner_settings(head)
+            outbox = self._ticket115_outbox_state_open(settings)
+            intent = outbox.record(payload.business_source_causal_id).intent
+        except (
+            AuthorityValidationError,
+            DeliveryContractViolation,
+            SettingsContractViolation,
+        ):
+            return False
+        return (
+            command.causal_id == intent.effect_request_id
+            and payload.business_source_causal_id == intent.intent_id
+            and payload.request_digest == intent.semantic_digest
+            and self._owner_decision_request_kind_open(intent, outbox) is not None
+        )
 
     def _is_confirmed_daily_source_alias_replay(
         self,
@@ -5627,8 +5665,6 @@ class HealthCore:
                     if stored is None:
                         return None
                     unresolved_effects = self._store.unresolved_effects()
-                    if unresolved_effects != (intent.effect_id,):
-                        return None
                     candidate_intent = (
                         stored.payload
                         if stored.state == "intent"
@@ -5647,9 +5683,8 @@ class HealthCore:
                             if observed_at_utc is None:
                                 return None
                             settings = self._current_owner_settings(head)
-                            outbox_record = self._ticket115_outbox_state_open(
-                                settings
-                            ).record(
+                            outbox = self._ticket115_outbox_state_open(settings)
+                            outbox_record = outbox.record(
                                 candidate_intent.business_source_causal_id
                             )
                             outbox_intent = outbox_record.intent
@@ -5659,6 +5694,14 @@ class HealthCore:
                                 or
                                 candidate_intent.intent_digest
                                 != outbox_intent.semantic_digest
+                            ):
+                                return None
+                            if unresolved_effects != (intent.effect_id,) and not (
+                                self._mandatory_owner_delivery_unresolved_effects_allow_open(
+                                    outbox_intent,
+                                    outbox,
+                                    unresolved_effects,
+                                )
                             ):
                                 return None
                             if self._owner_delivery_sendable_open(
@@ -5676,6 +5719,8 @@ class HealthCore:
                             ValueError,
                         ):
                             return None
+                    elif unresolved_effects != (intent.effect_id,):
+                        return None
                     if stored.state == "intent" and type(stored.payload) is EffectIntent:
                         issued_intent = stored.payload
                         if issued_intent != intent or issued_intent.authority.mismatch_reason(head) is not None:
@@ -6782,24 +6827,37 @@ class HealthCore:
         )
 
     @staticmethod
+    def _owner_delivery_approval_binding_digest(
+        approval: ExecutionScopeApproval,
+    ) -> str:
+        return stable_digest(
+            {
+                "contract": "ticket115-owner-delivery-approval-binding-v1",
+                "owner_id": approval.owner_id,
+                "installation_id": approval.installation_id,
+                "task_id": approval.task_id,
+                "approval_id": approval.approval_id,
+                "approval_version": approval.approval_version,
+                "approved_effect_request_id": approval.effect_request_id,
+            }
+        )
+
+    @staticmethod
     def _owner_delivery_attempt_usage(
         outbox: DeliveryOutboxState,
         *,
         task_id: str,
-        approval: ExecutionScopeApproval,
+        approval_binding_digest: str,
         excluded_attempt: tuple[str, str] | None = None,
     ) -> tuple[int, str | None]:
         attempted_facts = tuple(
             fact
             for record in outbox.records
-            if (
-                record.intent.source_ref == task_id
-                and (
-                    record.intent.effect_request_id == approval.effect_request_id
-                    or record.intent.effect_request_id.startswith(
-                        approval.effect_request_id + ":"
-                    )
-                )
+            if record.intent.source_ref == task_id
+            and (
+                record.intent.approval_binding_digest
+                == approval_binding_digest
+                or record.intent.authorization_kind == "legacy"
             )
             and (fact := record.optional_fact("attempted")) is not None
             and (
@@ -6852,7 +6910,9 @@ class HealthCore:
                 self._owner_delivery_attempt_usage(
                     outbox,
                     task_id=task.task_id,
-                    approval=approval,
+                    approval_binding_digest=(
+                        self._owner_delivery_approval_binding_digest(approval)
+                    ),
                     excluded_attempt=excluded_attempt,
                 )
             )
@@ -7191,6 +7251,23 @@ class HealthCore:
                             raise ReviewContractViolation(
                                 "review delivery task boundary mismatch"
                             )
+                        approval = next(
+                            (
+                                item
+                                for item in settings.approvals
+                                if item.approval_id == task.approval.approval_id
+                            ),
+                            None,
+                        )
+                        if (
+                            task.approval.status != "bound"
+                            or approval is None
+                            or approval.approval_version
+                            != task.approval.approval_version
+                        ):
+                            raise ReviewContractViolation(
+                                "review delivery approval binding mismatch"
+                            )
                         intent = OwnerDeliveryEngine.form_intent(
                             effect_kind="owner-delivery",
                             owner_id=settings.owner_id,
@@ -7207,6 +7284,12 @@ class HealthCore:
                             payload_ref=delivery.payload_ref,
                             payload_digest=delivery.payload_digest,
                             formed_at_utc=delivery.formed_at_utc,
+                            authorization_kind="approval",
+                            approval_binding_digest=(
+                                self._owner_delivery_approval_binding_digest(
+                                    approval
+                                )
+                            ),
                         )
                         submitted = OwnerDeliveryEngine.submit(
                             self._ticket115_outbox_state_open(settings),
@@ -7377,6 +7460,14 @@ class HealthCore:
                 return (outbox, outbox_record, task_state, None)
             review = self._store.daily_review(intent.business_fact_ref)
             task = task_state.task(intent.source_ref)
+            approval = next(
+                (
+                    item
+                    for item in settings.approvals
+                    if item.approval_id == task.approval.approval_id
+                ),
+                None,
+            )
         except (AuthorityValidationError, DeliveryContractViolation, TaskContractViolation):
             return None
         daily_state = self._store.daily_state()
@@ -7400,6 +7491,17 @@ class HealthCore:
                 == (intent.recipient_ref,)
                 and task.external_boundary.effect_kinds
                 == ("owner-delivery",)
+                and intent.authorization_kind in {"legacy", "approval"}
+                and (
+                    intent.authorization_kind == "legacy"
+                    or (
+                        approval is not None
+                        and intent.approval_binding_digest
+                        == self._owner_delivery_approval_binding_digest(
+                            approval
+                        )
+                    )
+                )
                 and self._task_evidence_bindings_are_current(task, daily_state)
                 and review.state_digest == current_review_state_digest
             )
@@ -7422,6 +7524,8 @@ class HealthCore:
     ) -> str | None:
         request_id = intent.effect_request_id
         if request_id.startswith(_OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX):
+            if intent.authorization_kind not in {"legacy", "delivery-unknown"}:
+                return None
             source_intent_id = request_id.removeprefix(
                 _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX
             )
@@ -7438,7 +7542,12 @@ class HealthCore:
                 return None
             if (
                 source.current_layer != "unknown"
-                or self._owner_decision_prefix_present(source.intent)
+                or source.intent.authorization_kind
+                in {"delivery-unknown", "status-transition"}
+                or (
+                    source.intent.authorization_kind == "legacy"
+                    and self._owner_decision_prefix_present(source.intent)
+                )
             ):
                 return None
             expected_revision_digest = stable_digest(
@@ -7469,6 +7578,8 @@ class HealthCore:
             return "delivery-unknown"
 
         if request_id.startswith(_OWNER_DECISION_STATUS_TRANSITION_PREFIX):
+            if intent.authorization_kind not in {"legacy", "status-transition"}:
+                return None
             transition_id = request_id.removeprefix(
                 _OWNER_DECISION_STATUS_TRANSITION_PREFIX
             )
@@ -7481,13 +7592,47 @@ class HealthCore:
             ):
                 return None
             projection = self._store.business_status_projection()
-            if (
-                projection is None
-                or intent.business_revision_digest != projection.fact_set_digest
-            ):
+            if projection is None:
+                return None
+            if intent.authorization_kind == "status-transition":
+                if (projection.state == "active") != intent.status_target_active:
+                    return None
+            elif intent.business_revision_digest != projection.fact_set_digest:
                 return None
             return "status-transition"
         return None
+
+    def _mandatory_owner_delivery_unresolved_effects_allow_open(
+        self,
+        intent: OutboxIntent,
+        outbox: DeliveryOutboxState,
+        unresolved_effects: tuple[str, ...],
+    ) -> bool:
+        decision_kind = self._owner_decision_request_kind_open(intent, outbox)
+        if decision_kind is None:
+            return False
+        own_effect_id = self._effect_id(intent.effect_request_id)
+        allowed = {own_effect_id}
+        if decision_kind == "delivery-unknown":
+            sources = (outbox.record(intent.source_ref),)
+        else:
+            sources = tuple(
+                record
+                for record in outbox.records
+                if record.current_layer == "unknown"
+                and self._owner_decision_request_kind_open(
+                    record.intent,
+                    outbox,
+                )
+                is None
+            )
+        allowed.update(
+            self._effect_id(record.intent.effect_request_id)
+            for record in sources
+        )
+        return own_effect_id in unresolved_effects and set(
+            unresolved_effects
+        ).issubset(allowed)
 
     def _owner_decision_delivery_request_state_open(
         self,
@@ -7525,6 +7670,7 @@ class HealthCore:
                 }
             ),
             formed_at_utc=observed_at_utc,
+            authorization_kind="delivery-unknown",
         )
         return OwnerDeliveryEngine.submit(
             outbox,
@@ -8793,6 +8939,7 @@ class HealthCore:
     def _submit_status_transition_owner_decision(
         self,
         transition: StatusTransition,
+        previous: object,
         *,
         observed_at_utc: str,
     ) -> None:
@@ -8800,8 +8947,17 @@ class HealthCore:
             transition.current_state == "active"
         ):
             return
+        relevant_domains = (
+            transition.affected_core_domains
+            if transition.current_state != "active"
+            else (
+                previous.affected_core_domains
+                if type(previous) is StatusProjection
+                else ()
+            )
+        )
         if not (
-            set(transition.affected_core_domains)
+            set(relevant_domains)
             & {"tasks", "daily_review", "delivery"}
         ):
             return
@@ -8833,6 +8989,8 @@ class HealthCore:
                     }
                 ),
                 formed_at_utc=observed_at_utc,
+                authorization_kind="status-transition",
+                status_target_active=(transition.current_state == "active"),
             )
             submitted = OwnerDeliveryEngine.submit(
                 self._ticket115_outbox_state_open(settings),
@@ -8888,6 +9046,7 @@ class HealthCore:
                 if transition is not None:
                     self._submit_status_transition_owner_decision(
                         transition,
+                        previous,
                         observed_at_utc=evaluated_at_utc,
                     )
                 self._store.remember_business_status(projection)

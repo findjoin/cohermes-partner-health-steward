@@ -43,6 +43,12 @@ DELIVERY_OBSERVATION_KINDS = (
     "unknown",
 )
 OWNER_DELIVERY_TRANSPORT_STATUSES = ("accepted", "rejected", "unknown")
+OWNER_DELIVERY_AUTHORIZATION_KINDS = (
+    "legacy",
+    "approval",
+    "delivery-unknown",
+    "status-transition",
+)
 
 _FACT_ORDER = {kind: index for index, kind in enumerate(DELIVERY_FACT_KINDS)}
 _MAX_TEXT_BYTES = 4_096
@@ -128,8 +134,11 @@ def _intent_material(
     route_generation: int,
     payload_ref: str,
     payload_digest: str,
+    authorization_kind: str = "legacy",
+    approval_binding_digest: str | None = None,
+    status_target_active: bool | None = None,
 ) -> dict[str, object]:
-    return {
+    material: dict[str, object] = {
         "contract": "owner-delivery-intent-v1",
         "effect_kind": effect_kind,
         "owner_id": owner_id,
@@ -144,6 +153,14 @@ def _intent_material(
         "payload_ref": payload_ref,
         "payload_digest": payload_digest,
     }
+    if authorization_kind != "legacy":
+        material.update(
+            contract="owner-delivery-intent-v2",
+            authorization_kind=authorization_kind,
+            approval_binding_digest=approval_binding_digest,
+            status_target_active=status_target_active,
+        )
+    return material
 
 
 def owner_delivery_idempotency_key(
@@ -159,6 +176,9 @@ def owner_delivery_idempotency_key(
     route_generation: int,
     payload_ref: str,
     payload_digest: str,
+    authorization_kind: str = "legacy",
+    approval_binding_digest: str | None = None,
+    status_target_active: bool | None = None,
 ) -> str:
     """Return the stable, opaque channel key for one exact owner effect."""
 
@@ -184,9 +204,16 @@ def owner_delivery_idempotency_key(
         "payload_digest": _sha256(payload_digest, "delivery payload digest"),
     }
     digest = stable_digest(
-        _intent_material(effect_kind="owner-delivery", **values)
+        _intent_material(
+            effect_kind="owner-delivery",
+            authorization_kind=authorization_kind,
+            approval_binding_digest=approval_binding_digest,
+            status_target_active=status_target_active,
+            **values,
+        )
     )
-    return "health-owner-delivery:v1:" + digest.removeprefix("sha256:")
+    version = "v1" if authorization_kind == "legacy" else "v2"
+    return f"health-owner-delivery:{version}:" + digest.removeprefix("sha256:")
 
 
 @dataclass(frozen=True)
@@ -209,6 +236,9 @@ class OutboxIntent:
     semantic_digest: str
     idempotency_key: str
     formed_at_utc: str
+    authorization_kind: str = "legacy"
+    approval_binding_digest: str | None = None
+    status_target_active: bool | None = None
 
     def __post_init__(self) -> None:
         if self.effect_kind == "contact-delivery":
@@ -233,11 +263,37 @@ class OutboxIntent:
         _sha256(self.semantic_digest, "delivery intent semantic digest")
         _text(self.idempotency_key, "delivery idempotency key")
         _utc(self.formed_at_utc, "delivery formation time")
+        if self.authorization_kind not in OWNER_DELIVERY_AUTHORIZATION_KINDS:
+            raise DeliveryContractViolation("invalid delivery authorization kind")
+        if self.authorization_kind == "approval":
+            _sha256(
+                self.approval_binding_digest,
+                "delivery approval binding digest",
+            )
+            if self.status_target_active is not None:
+                raise DeliveryContractViolation(
+                    "approval delivery cannot carry status direction"
+                )
+        elif self.authorization_kind == "status-transition":
+            if self.approval_binding_digest is not None or type(
+                self.status_target_active
+            ) is not bool:
+                raise DeliveryContractViolation(
+                    "status delivery requires its active-boundary direction"
+                )
+        elif (
+            self.approval_binding_digest is not None
+            or self.status_target_active is not None
+        ):
+            raise DeliveryContractViolation(
+                "delivery authorization binding does not match its kind"
+            )
 
         expected_digest = stable_digest(self.semantic_material())
         expected_intent_id = "outbox:" + expected_digest.removeprefix("sha256:")
+        key_version = "v1" if self.authorization_kind == "legacy" else "v2"
         expected_key = (
-            "health-owner-delivery:v1:"
+            f"health-owner-delivery:{key_version}:"
             + expected_digest.removeprefix("sha256:")
         )
         if self.semantic_digest != expected_digest:
@@ -261,6 +317,9 @@ class OutboxIntent:
             route_generation=self.route_generation,
             payload_ref=self.payload_ref,
             payload_digest=self.payload_digest,
+            authorization_kind=self.authorization_kind,
+            approval_binding_digest=self.approval_binding_digest,
+            status_target_active=self.status_target_active,
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -281,34 +340,47 @@ class OutboxIntent:
             "semantic_digest": self.semantic_digest,
             "idempotency_key": self.idempotency_key,
             "formed_at_utc": self.formed_at_utc,
+            "authorization_kind": self.authorization_kind,
+            "approval_binding_digest": self.approval_binding_digest,
+            "status_target_active": self.status_target_active,
         }
 
     @classmethod
     def from_wire(cls, value: object) -> "OutboxIntent":
-        fields = _mapping(
-            value,
-            frozenset(
-                {
-                    "intent_id",
-                    "effect_kind",
-                    "owner_id",
-                    "installation_id",
-                    "effect_request_id",
-                    "business_fact_ref",
-                    "business_revision_digest",
-                    "source_ref",
-                    "recipient_ref",
-                    "route_id",
-                    "route_generation",
-                    "payload_ref",
-                    "payload_digest",
-                    "semantic_digest",
-                    "idempotency_key",
-                    "formed_at_utc",
-                }
-            ),
-            "outbox intent",
+        legacy_fields = frozenset(
+            {
+                "intent_id",
+                "effect_kind",
+                "owner_id",
+                "installation_id",
+                "effect_request_id",
+                "business_fact_ref",
+                "business_revision_digest",
+                "source_ref",
+                "recipient_ref",
+                "route_id",
+                "route_generation",
+                "payload_ref",
+                "payload_digest",
+                "semantic_digest",
+                "idempotency_key",
+                "formed_at_utc",
+            }
         )
+        current_fields = legacy_fields | {
+            "authorization_kind",
+            "approval_binding_digest",
+            "status_target_active",
+        }
+        if type(value) is not dict or frozenset(value) not in {
+            legacy_fields,
+            current_fields,
+        }:
+            raise DeliveryContractViolation("invalid outbox intent")
+        fields = dict(value)
+        fields.setdefault("authorization_kind", "legacy")
+        fields.setdefault("approval_binding_digest", None)
+        fields.setdefault("status_target_active", None)
         return cls(**fields)  # type: ignore[arg-type]
 
 
@@ -1015,6 +1087,9 @@ class OwnerDeliveryEngine:
         payload_ref: str,
         payload_digest: str,
         formed_at_utc: str,
+        authorization_kind: str = "legacy",
+        approval_binding_digest: str | None = None,
+        status_target_active: bool | None = None,
     ) -> OutboxIntent:
         if effect_kind == "contact-delivery":
             raise DeliveryContractViolation("contact delivery is not enabled")
@@ -1032,6 +1107,9 @@ class OwnerDeliveryEngine:
             route_generation=route_generation,
             payload_ref=payload_ref,
             payload_digest=payload_digest,
+            authorization_kind=authorization_kind,
+            approval_binding_digest=approval_binding_digest,
+            status_target_active=status_target_active,
         )
         digest = "sha256:" + key.rsplit(":", 1)[-1]
         return OutboxIntent(
@@ -1051,6 +1129,9 @@ class OwnerDeliveryEngine:
             semantic_digest=digest,
             idempotency_key=key,
             formed_at_utc=formed_at_utc,
+            authorization_kind=authorization_kind,
+            approval_binding_digest=approval_binding_digest,
+            status_target_active=status_target_active,
         )
 
     @staticmethod
