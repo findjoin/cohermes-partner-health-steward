@@ -9,10 +9,11 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 
 ## 当前状态与门禁
 
-- 产品代码基线固定为 `d468e0ac3e33a37efd53f03328f16dcbc42cff09`；当前 Ticket 115 专项测试为 `102/102` 绿色，先验收现有行为，不预设重写。
+- 历史 characterization 基线为 `d468e0ac3e33a37efd53f03328f16dcbc42cff09`；当前有界恢复代码与旧测试基线为 `d1b29e4ebbdcdcfcc7d86077290d9cced40cc02a`。旧的 `122/122` 绿色只证明旧测试通过，不再作为闭票门。
 - `23d4827557b532f4eee4fe5511c458ed2b5d8e15` salvage 和 `3fa4d01c` 长设计只读保留。前者增加约 7,919 行仍未闭合，后者增长到千余行且四轮审查未通过，均不得整体采用。
 - 唯一增量 HOW 是[Ticket 115 增量架构冻结设计](../design/115-frozen-implementation-design.md)，并受[`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)约束。
-- 主人已于 2026-08-26 确认两项残余风险处理。冻结候选 commit 为 `b0d104cde54072adb4bc1f7061d1dc7da68e7c24`，tree 为 `cdae4ace0aa967b3c19567d45ae68fc3e7f237e4`；本票现为 `ready-for-agent`。
+- 独立测试权威为[Ticket 115 冻结验收测试合同](../design/115-frozen-verification-contract.md)。编码 Agent 不得修改其中列出的 verifier-owned 测试；只能让测试门从红转绿。
+- 测试门在 `d1b29e4` 上确认六个既有合同缺口：opaque intent 不能绕过批准次数或最小联系间隔；状态下降请求在后续投影后仍须可发送；`abnormal/cannot-confirm → active` 均须请求一次；unknown 的必要主人决定请求必须实际可发送。Ticket 保持 `claimed`，这些门与全量回归全部通过前不得闭票。
 
 ## 产品验收
 
@@ -28,7 +29,7 @@ Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-im
 
 Ticket 116 的诊断安全和联系人投递、Ticket 117 的删除迁移、Ticket 118 的真实宿主／Weixin 接线、Ticket 119 的生产 canary 与主人验收均不属于本票。fake Adapter 只能证明本地 Plugin/core 行为，不能证明真实渠道送达、已读或幂等能力。
 
-实施 Agent 必须先对 `d468e0a` 做 characterization 差额盘点：已有正确行为保持不动；只有能独立复现的验收缺口才添加失败测试并作最小局部修复。实现后审查只检查产品验收、冻结一致性、回归和证据真实性；新 finding 按治理文件分类，不能直接扩写架构。
+characterization 与独立红测已经完成。实施 Agent 必须从测试门 commit 开始，只修复已冻结的六类缺口（七个红灯）；不得重新盘点全票、不得新增或修改 verifier-owned 测试，也不得扩写架构。实现后审查只检查产品验收、冻结一致性、同一组 hidden variants、回归和证据真实性；新 finding 按治理文件分类，不能自动延长本票。
 
 至少运行 Ticket 115 专项、受影响的 Ticket 110—114 回归、全量测试、`compileall` 和 `git diff --check`。满足产品验收、必要验证与一致性审查后追加 `## Answer`、设为 `resolved` 并更新 Map。
 
