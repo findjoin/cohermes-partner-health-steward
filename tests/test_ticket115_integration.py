@@ -3382,6 +3382,66 @@ class Ticket115IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(adapter.calls, 1)
 
+        before_second_down_ids = {
+            record.intent.intent_id for record in self._outbox().records
+        }
+        with self._controlled_status_inputs(task_state="unknown"):
+            second_down = self.plugin.business_status(peer_id=_PEER)
+        self.assertIsNotNone(second_down.transition)
+        assert second_down.transition is not None
+        self.assertEqual(
+            (
+                second_down.transition.previous_state,
+                second_down.transition.current_state,
+            ),
+            ("active", "cannot-confirm"),
+        )
+        second_down_records = tuple(
+            record
+            for record in self._outbox().records
+            if record.intent.intent_id not in before_second_down_ids
+        )
+        self.assertEqual(len(second_down_records), 1)
+        self.assertEqual(
+            second_down_records[0].intent.source_ref,
+            second_down.transition.transition_id,
+        )
+        self.assertNotEqual(
+            second_down_records[0].intent.intent_id,
+            down_records[0].intent.intent_id,
+        )
+        self._restart_core()
+
+        with self.assertRaisesRegex(
+            AuthorityValidationError,
+            "owner-delivery-authorization-required",
+        ):
+            self._effect(
+                "owner-delivery.prepare",
+                {
+                    "intent_id": down_records[0].intent.intent_id,
+                    "attempted_at_utc": "2026-08-24T12:03:00+00:00",
+                },
+            )
+
+        second_down_attempted_at_utc = "2026-08-24T12:04:00+00:00"
+        second_down_grant = self._claimed_delivery(
+            second_down_records[0].intent.intent_id,
+            attempted_at_utc=second_down_attempted_at_utc,
+        )
+        second_down_adapter = _RecordingAdapter(self.base.store)
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": second_down_records[0].intent.intent_id,
+                "attempted_at_utc": second_down_attempted_at_utc,
+                "observed_at_utc": "2026-08-24T12:04:01+00:00",
+            },
+            grant=second_down_grant,
+            transport=second_down_adapter,
+        )
+        self.assertEqual(second_down_adapter.calls, 1)
+
     @contextmanager
     def _controlled_status_inputs(self, *, task_state: str = "confirmed-ok"):
         """Arrange signed status facts; business_status remains the stimulus."""
