@@ -177,6 +177,7 @@ from .status import (
     PRODUCTION_STATUS_PRODUCER_IDS,
     StatusContractViolation,
     StatusProjector,
+    StatusTransition,
 )
 from .storage import (
     CausalIdConflict,
@@ -253,6 +254,8 @@ _TICKET115_HEALTH_COMMAND_AUTHORITY = {
 _OWNER_DELIVERY_ATTEMPT_MARKER_TTL_SECONDS = 300.0
 _OWNER_DELIVERY_ATTEMPT_PREPARED = "prepared"
 _OWNER_DELIVERY_ATTEMPT_AUTHORIZED = "authorized-in-flight"
+_OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX = "owner-decision:delivery-unknown:"
+_OWNER_DECISION_STATUS_TRANSITION_PREFIX = "owner-decision:status-transition:"
 
 
 class _TrustedHealthCommandReplay(Exception):
@@ -6756,6 +6759,7 @@ class HealthCore:
         settings: OwnerSettingsState,
         *,
         observed_at_utc: str,
+        mandatory: bool = False,
     ) -> bool:
         return (
             settings.consent_enabled
@@ -6767,10 +6771,13 @@ class HealthCore:
             == settings.current_configuration_generation
             and settings.consent_disclosure_version
             == settings.current_disclosure_version
-            and settings.proactive_contact
-            and not settings.proactive_support_paused
-            and dict(settings.ordinary_notifications).get("review_summary")
-            == "enabled"
+            and (mandatory or settings.proactive_contact)
+            and (mandatory or not settings.proactive_support_paused)
+            and (
+                mandatory
+                or dict(settings.ordinary_notifications).get("review_summary")
+                == "enabled"
+            )
             and self._owner_contact_window_allows(settings, observed_at_utc)
         )
 
@@ -6843,7 +6850,7 @@ class HealthCore:
                 owner_id=settings.owner_id,
                 installation_id=settings.installation_id,
                 task_id=task.task_id,
-                effect_request_id=effect_request_id,
+                effect_request_id=approval.effect_request_id,
                 assignee=task.assignee,
                 purpose=task.purpose,
                 data_categories=task.allowed_data_categories,
@@ -7323,7 +7330,7 @@ class HealthCore:
         DeliveryOutboxState,
         OutboxRecord,
         TaskRuntimeState,
-        DailyReviewRecord,
+        DailyReviewRecord | None,
     ] | None:
         if (
             type(intent) is not OutboxIntent
@@ -7332,11 +7339,20 @@ class HealthCore:
             or intent.installation_id != settings.installation_id
         ):
             return None
+        decision_kind = self._owner_decision_request_kind(intent)
         try:
             outbox = self._ticket115_outbox_state_open(settings)
             outbox_record = outbox.record(intent.intent_id)
-            review = self._store.daily_review(intent.business_fact_ref)
             task_state = self._ticket115_task_state_open(settings)
+            if decision_kind is not None:
+                if outbox_record.intent != intent:
+                    return None
+                if decision_kind == "delivery-unknown":
+                    source = outbox.record(intent.source_ref)
+                    if source.current_layer != "unknown":
+                        return None
+                return (outbox, outbox_record, task_state, None)
+            review = self._store.daily_review(intent.business_fact_ref)
             task = task_state.task(intent.source_ref)
         except (AuthorityValidationError, DeliveryContractViolation, TaskContractViolation):
             return None
@@ -7367,6 +7383,61 @@ class HealthCore:
             else None
         )
 
+    @staticmethod
+    def _owner_decision_request_kind(intent: OutboxIntent) -> str | None:
+        if intent.effect_request_id.startswith(
+            _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX
+        ):
+            return "delivery-unknown"
+        if intent.effect_request_id.startswith(
+            _OWNER_DECISION_STATUS_TRANSITION_PREFIX
+        ):
+            return "status-transition"
+        return None
+
+    @staticmethod
+    def _owner_decision_delivery_request_state_open(
+        outbox: DeliveryOutboxState,
+        intent: OutboxIntent,
+        *,
+        observed_at_utc: str,
+    ) -> DeliveryOutboxState:
+        if HealthCore._owner_decision_request_kind(intent) is not None:
+            return outbox
+        request_id = _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX + intent.intent_id
+        revision_digest = stable_digest(
+            {
+                "contract": "ticket115-owner-decision-delivery-unknown-v1",
+                "source_intent_id": intent.intent_id,
+                "source_intent_digest": intent.semantic_digest,
+            }
+        )
+        decision_intent = OwnerDeliveryEngine.form_intent(
+            effect_kind="owner-delivery",
+            owner_id=intent.owner_id,
+            installation_id=intent.installation_id,
+            effect_request_id=request_id,
+            business_fact_ref="owner-decision-fact:" + intent.intent_id,
+            business_revision_digest=revision_digest,
+            source_ref=intent.intent_id,
+            recipient_ref=intent.recipient_ref,
+            route_id=intent.route_id,
+            route_generation=intent.route_generation,
+            payload_ref="owner-decision-payload:" + intent.intent_id,
+            payload_digest=stable_digest(
+                {
+                    "contract": "ticket115-owner-decision-payload-v1",
+                    "source_intent_id": intent.intent_id,
+                }
+            ),
+            formed_at_utc=observed_at_utc,
+        )
+        return OwnerDeliveryEngine.submit(
+            outbox,
+            decision_intent,
+            submitted_at_utc=observed_at_utc,
+        ).state
+
     def _owner_delivery_sendable_open(
         self,
         intent: OutboxIntent,
@@ -7379,12 +7450,47 @@ class HealthCore:
         DeliveryOutboxState,
         OutboxRecord,
         TaskRuntimeState,
-        DailyReviewRecord,
+        DailyReviewRecord | None,
     ] | None:
         binding = self._owner_delivery_binding_open(intent, settings)
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
+        decision_kind = self._owner_decision_request_kind(intent)
+        if decision_kind is not None:
+            try:
+                destination = self._owner_weixin_destination_open(settings)
+            except AuthorityValidationError:
+                return None
+            if (
+                not self._owner_delivery_global_controls_allow_open(
+                    settings,
+                    observed_at_utc=observed_at_utc,
+                    mandatory=True,
+                )
+                or intent.route_id != destination.route_id
+                or intent.route_generation
+                != settings.current_configuration_generation
+                or intent.recipient_ref != destination.owner_sender_id
+                or outbox_record.unknown_frozen
+            ):
+                return None
+            attempted = outbox_record.optional_fact("attempted")
+            if expected_attempt_ref is None:
+                if attempted is not None:
+                    return None
+            elif (
+                attempted is None
+                or attempted.attempt_ref != expected_attempt_ref
+                or outbox_record.current_layer != "attempted"
+            ):
+                return None
+            if (
+                required_lease is not None
+                and required_lease.intent_digest != intent.semantic_digest
+            ):
+                return None
+            return binding
         task = task_state.task(intent.source_ref)
         if (
             expected_attempt_ref is None
@@ -7414,7 +7520,8 @@ class HealthCore:
             None,
         )
         if (
-            review.key != current_review_key
+            review is None
+            or review.key != current_review_key
             or intent.route_id != destination.route_id
             or intent.route_generation != settings.current_configuration_generation
             or intent.recipient_ref != destination.owner_sender_id
@@ -7680,9 +7787,13 @@ class HealthCore:
                 observed_at_utc=completion.observed_at_utc,
             )
             task_state = self._ticket115_task_state_open(settings)
+            decision_kind = self._owner_decision_request_kind(current.intent)
             task_transition = (
                 None
-                if completion.intent_id in task_state.delivery_unknown_refs
+                if (
+                    decision_kind is not None
+                    or completion.intent_id in task_state.delivery_unknown_refs
+                )
                 else TaskEngine.mark_delivery_unknown(
                     task_state,
                     current.intent.source_ref,
@@ -7690,13 +7801,21 @@ class HealthCore:
                     observed_at_utc=completion.observed_at_utc,
                 )
             )
+            delivery_state = transition.state
+            if completion.status == "unknown":
+                delivery_state = self._owner_decision_delivery_request_state_open(
+                    delivery_state,
+                    current.intent,
+                    observed_at_utc=completion.observed_at_utc,
+                )
+            delivery_state = replace(delivery_state, version=outbox.version + 1)
             mutation = self._prepare_ticket115_facts_open(
                 head,
                 settings,
                 task_state=(
                     None if task_transition is None else task_transition.state
                 ),
-                delivery_state=transition.state,
+                delivery_state=delivery_state,
             )
         self._complete_ticket115_mutation(mutation)
         return transition
@@ -8138,13 +8257,22 @@ class HealthCore:
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
-                if transport.status == "unknown":
+                decision_kind = self._owner_decision_request_kind(intent)
+                if transport.status == "unknown" and decision_kind is None:
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
                         effect_ref=intent.intent_id,
                         observed_at_utc=completion.observed_at_utc,
                     )
+                delivery_state = delivery_transition.state
+                if transport.status == "unknown":
+                    delivery_state = self._owner_decision_delivery_request_state_open(
+                        delivery_state,
+                        intent,
+                        observed_at_utc=completion.observed_at_utc,
+                    )
+                delivery_state = replace(delivery_state, version=outbox.version + 1)
                 mutation = self._prepare_ticket115_facts_open(
                     head,
                     settings,
@@ -8153,7 +8281,7 @@ class HealthCore:
                         if task_transition is None
                         else task_transition.state
                     ),
-                    delivery_state=delivery_transition.state,
+                    delivery_state=delivery_state,
                 )
             self._complete_ticket115_mutation(mutation)
             self._clear_owner_delivery_attempt_started(completion.intent_id)
@@ -8197,15 +8325,20 @@ class HealthCore:
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
+                decision_kind = self._owner_decision_request_kind(intent)
                 unresolved = intent.intent_id in task_state.delivery_unknown_refs
-                if kind == "unknown" and not unresolved:
+                if kind == "unknown" and decision_kind is None and not unresolved:
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
                         effect_ref=intent.intent_id,
                         observed_at_utc=observed_at_utc,
                     )
-                elif unresolved and kind in {"delivered", "read", "rejected"}:
+                elif (
+                    decision_kind is None
+                    and unresolved
+                    and kind in {"delivered", "read", "rejected"}
+                ):
                     task_transition = TaskEngine.resolve_delivery_unknown(
                         task_state,
                         intent.intent_id,
@@ -8216,6 +8349,14 @@ class HealthCore:
                         ),
                         resolved_at_utc=observed_at_utc,
                     )
+                delivery_state = transition.state
+                if kind == "unknown":
+                    delivery_state = self._owner_decision_delivery_request_state_open(
+                        delivery_state,
+                        intent,
+                        observed_at_utc=observed_at_utc,
+                    )
+                delivery_state = replace(delivery_state, version=outbox.version + 1)
                 receipt = (
                     None
                     if _health_command is None
@@ -8233,7 +8374,7 @@ class HealthCore:
                         if task_transition is None
                         else task_transition.state
                     ),
-                    delivery_state=transition.state,
+                    delivery_state=delivery_state,
                     health_command_receipt=receipt,
                 )
             self._complete_ticket115_mutation(mutation)
@@ -8547,6 +8688,58 @@ class HealthCore:
         )
         return requirements, tuple(facts)
 
+    def _submit_status_transition_owner_decision(
+        self,
+        transition: StatusTransition,
+        *,
+        observed_at_utc: str,
+    ) -> None:
+        if not (
+            set(transition.affected_core_domains)
+            & {"tasks", "daily_review", "delivery"}
+        ):
+            return
+        with self._ticket115_write_authority() as (head, settings):
+            try:
+                destination = self._owner_weixin_destination_open(settings)
+            except AuthorityValidationError:
+                return
+            request_id = (
+                _OWNER_DECISION_STATUS_TRANSITION_PREFIX
+                + transition.transition_id
+            )
+            intent = OwnerDeliveryEngine.form_intent(
+                effect_kind="owner-delivery",
+                owner_id=settings.owner_id,
+                installation_id=settings.installation_id,
+                effect_request_id=request_id,
+                business_fact_ref=transition.transition_id,
+                business_revision_digest=transition.projection_digest,
+                source_ref=transition.transition_id,
+                recipient_ref=destination.owner_sender_id,
+                route_id=destination.route_id,
+                route_generation=settings.current_configuration_generation,
+                payload_ref="owner-decision-status-payload:" + transition.transition_id,
+                payload_digest=stable_digest(
+                    {
+                        "contract": "ticket115-owner-decision-status-v1",
+                        "transition": transition.to_storage(),
+                    }
+                ),
+                formed_at_utc=observed_at_utc,
+            )
+            submitted = OwnerDeliveryEngine.submit(
+                self._ticket115_outbox_state_open(settings),
+                intent,
+                submitted_at_utc=observed_at_utc,
+            )
+            mutation = self._prepare_ticket115_facts_open(
+                head,
+                settings,
+                delivery_state=submitted.state,
+            )
+        self._complete_ticket115_mutation(mutation)
+
     def business_status(self) -> BusinessStatusResult:
         """Return the business tri-state and one durable state-change fact."""
 
@@ -8580,12 +8773,18 @@ class HealthCore:
                     facts,
                     evaluated_at_utc=evaluated_at_utc,
                 )
-                previous = self._store.remember_business_status(projection)
+                previous = self._store.business_status_projection()
                 transition = (
                     None
                     if previous is None
                     else projector.transition(previous, projection)
                 )
+                if transition is not None:
+                    self._submit_status_transition_owner_decision(
+                        transition,
+                        observed_at_utc=evaluated_at_utc,
+                    )
+                self._store.remember_business_status(projection)
                 return BusinessStatusResult(projection, transition)
             except (
                 KeyUnavailable,

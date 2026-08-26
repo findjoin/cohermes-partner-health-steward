@@ -1886,6 +1886,100 @@ class Ticket115IntegrationTests(unittest.TestCase):
             transport_result.result_ref,
         )
 
+    def test_unknown_owner_delivery_forms_one_independent_owner_decision_request(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        adapter = _RaisingAdapter()
+
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": intent_id,
+                "attempted_at_utc": _ATTEMPTED_AT,
+                "observed_at_utc": "2026-08-24T03:05:01+00:00",
+            },
+            grant=grant,
+            transport=adapter,
+        )
+
+        records = self._outbox().records
+        self.assertEqual(len(records), 2)
+        decision_records = tuple(
+            record for record in records if record.intent.intent_id != intent_id
+        )
+        self.assertEqual(len(decision_records), 1)
+        decision = decision_records[0]
+        self.assertNotEqual(decision.intent.effect_request_id, effect_request_id)
+        self.assertNotEqual(decision.intent.intent_id, intent_id)
+        self.assertEqual(adapter.calls, 1)
+
+        decision_id = decision.intent.intent_id
+        self._effect(
+            "owner-delivery.prepare",
+            {
+                "intent_id": decision_id,
+                "attempted_at_utc": "2026-08-24T03:06:01+00:00",
+            },
+        )
+        self.assertEqual(len(self._outbox().records), 2)
+        self._restart_core()
+        self.assertEqual(len(self._outbox().records), 2)
+
+    def test_ticket115_status_transition_forms_one_current_owner_decision_request(self) -> None:
+        prior = status.StatusProjection(
+            state="active",
+            evaluated_at_utc="2026-08-24T11:59:00+00:00",
+            affected_core_domains=(),
+            isolated_noncore_domains=(),
+            reason_codes=(),
+            fact_set_digest="sha256:" + ("f" * 64),
+        )
+        self.assertIsNone(self.store.remember_business_status(prior))
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        grant = self._claimed_delivery(intent_id)
+        self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": intent_id,
+                "attempted_at_utc": _ATTEMPTED_AT,
+                "observed_at_utc": "2026-08-24T03:05:01+00:00",
+            },
+            grant=grant,
+            transport=_RaisingAdapter(),
+        )
+
+        first = self.plugin.business_status(peer_id=_PEER)
+        self.assertIsNotNone(first.transition)
+        assert first.transition is not None
+        self.assertTrue(
+            {"tasks", "delivery"}.intersection(first.transition.affected_core_domains)
+        )
+        records = self._outbox().records
+        status_records = tuple(
+            record
+            for record in records
+            if record.intent.effect_request_id.startswith(
+                "owner-decision:status-transition:"
+            )
+        )
+        self.assertEqual(len(status_records), 1)
+        replay = self.plugin.business_status(peer_id=_PEER)
+        self.assertIsNone(replay.transition)
+        self.assertEqual(
+            len(
+                tuple(
+                    record
+                    for record in self._outbox().records
+                    if record.intent.effect_request_id.startswith(
+                        "owner-decision:status-transition:"
+                    )
+                )
+            ),
+            1,
+        )
+
     def test_attempted_delivery_can_settle_unknown_after_defer_without_retry(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
         intent_id = self._commit_review_outbox(task_id, effect_request_id)
@@ -2025,6 +2119,93 @@ class Ticket115IntegrationTests(unittest.TestCase):
                 {
                     "intent_id": old_intent_id,
                     "attempted_at_utc": "2026-08-25T03:01:01+00:00",
+                },
+            )
+
+    def test_defer_expiry_allows_current_intent_to_send_once_with_current_approval(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        old_intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-defer-expiry-current-send",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        refreshed = self._wake_review("2026-08-25T03:00:00+00:00")
+        self.base.owner_clock_value = datetime.fromisoformat(
+            "2026-08-25T03:01:00+00:00"
+        )
+        new_effect_request_id = effect_request_id + ":ticket115-defer-expiry-current-send"
+        committed = self._decision(
+            self._health(
+                "review.commit",
+                {
+                    "decision": self._decision_wire(refreshed),
+                    "delivery": {
+                        "effect_request_id": new_effect_request_id,
+                        "source_task_id": task_id,
+                        "payload_ref": "payload:ticket115-current-review-summary",
+                        "payload_digest": "sha256:" + ("9" * 64),
+                        "formed_at_utc": "2026-08-25T03:00:30+00:00",
+                        "submitted_at_utc": "2026-08-25T03:01:00+00:00",
+                    },
+                },
+            )
+        )
+        self.assertEqual(committed.outcome, "committed")
+        new_intent_id = next(
+            record.intent.intent_id
+            for record in self._outbox().records
+            if record.intent.effect_request_id == new_effect_request_id
+        )
+
+        prepared = self._effect(
+            "owner-delivery.prepare",
+            {
+                "intent_id": new_intent_id,
+                "attempted_at_utc": "2026-08-25T03:01:01+00:00",
+            },
+        )
+        issued = Response.from_wire(
+            self._effect(
+                "owner-delivery.issue",
+                {"intent_id": new_intent_id},
+            )["response"]
+        )
+        self.assertEqual(issued.status, "accepted")
+        assert issued.meta is not None
+        grant = self.plugin.claim_effect_execution(issued.meta.intent)
+        self.assertIsNotNone(grant)
+        assert grant is not None
+        adapter = _RecordingAdapter(self.base.store)
+        executed = self._effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": new_intent_id,
+                "attempted_at_utc": "2026-08-25T03:01:01+00:00",
+            },
+            grant=grant,
+            transport=adapter,
+        )
+
+        self.assertEqual(prepared["send_intent"]["intent_id"], new_intent_id)
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(
+            Response.from_wire(executed["effect_response"]).status,
+            "accepted",
+        )
+        with self.assertRaises(AuthorityValidationError):
+            self._effect(
+                "owner-delivery.prepare",
+                {
+                    "intent_id": old_intent_id,
+                    "attempted_at_utc": "2026-08-25T03:01:02+00:00",
                 },
             )
 
