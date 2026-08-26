@@ -6784,14 +6784,23 @@ class HealthCore:
     @staticmethod
     def _owner_delivery_attempt_usage(
         outbox: DeliveryOutboxState,
-        effect_request_id: str,
         *,
+        task_id: str,
+        approval: ExecutionScopeApproval,
         excluded_attempt: tuple[str, str] | None = None,
     ) -> tuple[int, str | None]:
         attempted_facts = tuple(
             fact
             for record in outbox.records
-            if record.intent.effect_request_id == effect_request_id
+            if (
+                record.intent.source_ref == task_id
+                and (
+                    record.intent.effect_request_id == approval.effect_request_id
+                    or record.intent.effect_request_id.startswith(
+                        approval.effect_request_id + ":"
+                    )
+                )
+            )
             and (fact := record.optional_fact("attempted")) is not None
             and (
                 excluded_attempt is None
@@ -6813,12 +6822,12 @@ class HealthCore:
         approval: ExecutionScopeApproval | None,
         outbox: DeliveryOutboxState,
         *,
-        effect_request_id: str,
         recipient_ref: str,
         route_id: str,
         route_generation: int,
         observed_at_utc: str,
         excluded_attempt: tuple[str, str] | None = None,
+        enforce_contact_limits: bool = True,
     ) -> bool:
         approval_binding = task.approval
         if (
@@ -6838,11 +6847,17 @@ class HealthCore:
             )
         ):
             return False
-        attempts_used, last_contact_at_utc = self._owner_delivery_attempt_usage(
-            outbox,
-            effect_request_id,
-            excluded_attempt=excluded_attempt,
-        )
+        if enforce_contact_limits:
+            attempts_used, last_contact_at_utc = (
+                self._owner_delivery_attempt_usage(
+                    outbox,
+                    task_id=task.task_id,
+                    approval=approval,
+                    excluded_attempt=excluded_attempt,
+                )
+            )
+        else:
+            attempts_used, last_contact_at_utc = 0, None
         try:
             consumption = ExecutionScopeConsumptionRequest(
                 approval_id=approval.approval_id,
@@ -6956,11 +6971,11 @@ class HealthCore:
                 task,
                 approval,
                 outbox,
-                effect_request_id=approval.effect_request_id,
                 recipient_ref=destination.owner_sender_id,
                 route_id=destination.route_id,
                 route_generation=settings.current_configuration_generation,
                 observed_at_utc=observed_at_utc,
+                enforce_contact_limits=False,
             ):
                 refs.append(task.task_id)
         return tuple(sorted(refs))
@@ -7339,11 +7354,19 @@ class HealthCore:
             or intent.installation_id != settings.installation_id
         ):
             return None
-        decision_kind = self._owner_decision_request_kind(intent)
         try:
             outbox = self._ticket115_outbox_state_open(settings)
             outbox_record = outbox.record(intent.intent_id)
             task_state = self._ticket115_task_state_open(settings)
+            decision_kind = self._owner_decision_request_kind_open(
+                intent,
+                outbox,
+            )
+            if (
+                self._owner_decision_prefix_present(intent)
+                and decision_kind is None
+            ):
+                return None
             if decision_kind is not None:
                 if outbox_record.intent != intent:
                     return None
@@ -7384,25 +7407,96 @@ class HealthCore:
         )
 
     @staticmethod
-    def _owner_decision_request_kind(intent: OutboxIntent) -> str | None:
-        if intent.effect_request_id.startswith(
-            _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX
-        ):
+    def _owner_decision_prefix_present(intent: OutboxIntent) -> bool:
+        return intent.effect_request_id.startswith(
+            (
+                _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX,
+                _OWNER_DECISION_STATUS_TRANSITION_PREFIX,
+            )
+        )
+
+    def _owner_decision_request_kind_open(
+        self,
+        intent: OutboxIntent,
+        outbox: DeliveryOutboxState,
+    ) -> str | None:
+        request_id = intent.effect_request_id
+        if request_id.startswith(_OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX):
+            source_intent_id = request_id.removeprefix(
+                _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX
+            )
+            if (
+                not source_intent_id
+                or intent.source_ref != source_intent_id
+                or intent.business_fact_ref
+                != "owner-decision-fact:" + source_intent_id
+            ):
+                return None
+            try:
+                source = outbox.record(source_intent_id)
+            except DeliveryContractViolation:
+                return None
+            if (
+                source.current_layer != "unknown"
+                or self._owner_decision_prefix_present(source.intent)
+            ):
+                return None
+            expected_revision_digest = stable_digest(
+                {
+                    "contract": "ticket115-owner-decision-delivery-unknown-v1",
+                    "source_intent_id": source.intent.intent_id,
+                    "source_intent_digest": source.intent.semantic_digest,
+                }
+            )
+            expected_payload_ref = "owner-decision-payload:" + source_intent_id
+            expected_payload_digest = stable_digest(
+                {
+                    "contract": "ticket115-owner-decision-payload-v1",
+                    "source_intent_id": source_intent_id,
+                }
+            )
+            if (
+                intent.owner_id != source.intent.owner_id
+                or intent.installation_id != source.intent.installation_id
+                or intent.business_revision_digest != expected_revision_digest
+                or intent.recipient_ref != source.intent.recipient_ref
+                or intent.route_id != source.intent.route_id
+                or intent.route_generation != source.intent.route_generation
+                or intent.payload_ref != expected_payload_ref
+                or intent.payload_digest != expected_payload_digest
+            ):
+                return None
             return "delivery-unknown"
-        if intent.effect_request_id.startswith(
-            _OWNER_DECISION_STATUS_TRANSITION_PREFIX
-        ):
+
+        if request_id.startswith(_OWNER_DECISION_STATUS_TRANSITION_PREFIX):
+            transition_id = request_id.removeprefix(
+                _OWNER_DECISION_STATUS_TRANSITION_PREFIX
+            )
+            if (
+                not transition_id
+                or intent.source_ref != transition_id
+                or intent.business_fact_ref != transition_id
+                or intent.payload_ref
+                != "owner-decision-status-payload:" + transition_id
+            ):
+                return None
+            projection = self._store.business_status_projection()
+            if (
+                projection is None
+                or intent.business_revision_digest != projection.fact_set_digest
+            ):
+                return None
             return "status-transition"
         return None
 
-    @staticmethod
     def _owner_decision_delivery_request_state_open(
+        self,
         outbox: DeliveryOutboxState,
         intent: OutboxIntent,
         *,
         observed_at_utc: str,
     ) -> DeliveryOutboxState:
-        if HealthCore._owner_decision_request_kind(intent) is not None:
+        if self._owner_decision_request_kind_open(intent, outbox) is not None:
             return outbox
         request_id = _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX + intent.intent_id
         revision_digest = stable_digest(
@@ -7456,7 +7550,7 @@ class HealthCore:
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
-        decision_kind = self._owner_decision_request_kind(intent)
+        decision_kind = self._owner_decision_request_kind_open(intent, outbox)
         if decision_kind is not None:
             try:
                 destination = self._owner_weixin_destination_open(settings)
@@ -7543,7 +7637,6 @@ class HealthCore:
             task,
             approval,
             outbox,
-            effect_request_id=intent.effect_request_id,
             recipient_ref=intent.recipient_ref,
             route_id=intent.route_id,
             route_generation=intent.route_generation,
@@ -7787,7 +7880,10 @@ class HealthCore:
                 observed_at_utc=completion.observed_at_utc,
             )
             task_state = self._ticket115_task_state_open(settings)
-            decision_kind = self._owner_decision_request_kind(current.intent)
+            decision_kind = self._owner_decision_request_kind_open(
+                current.intent,
+                outbox,
+            )
             task_transition = (
                 None
                 if (
@@ -8257,7 +8353,10 @@ class HealthCore:
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
-                decision_kind = self._owner_decision_request_kind(intent)
+                decision_kind = self._owner_decision_request_kind_open(
+                    intent,
+                    outbox,
+                )
                 if transport.status == "unknown" and decision_kind is None:
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
@@ -8325,7 +8424,10 @@ class HealthCore:
                 )
                 task_state = self._ticket115_task_state_open(settings)
                 task_transition: TaskTransition | None = None
-                decision_kind = self._owner_decision_request_kind(intent)
+                decision_kind = self._owner_decision_request_kind_open(
+                    intent,
+                    outbox,
+                )
                 unresolved = intent.intent_id in task_state.delivery_unknown_refs
                 if kind == "unknown" and decision_kind is None and not unresolved:
                     task_transition = TaskEngine.mark_delivery_unknown(
@@ -8694,6 +8796,10 @@ class HealthCore:
         *,
         observed_at_utc: str,
     ) -> None:
+        if (transition.previous_state == "active") == (
+            transition.current_state == "active"
+        ):
+            return
         if not (
             set(transition.affected_core_domains)
             & {"tasks", "daily_review", "delivery"}
