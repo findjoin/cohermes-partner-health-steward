@@ -1933,6 +1933,38 @@ class Ticket115IntegrationTests(unittest.TestCase):
         self.assertEqual(self.core.recover_owner_delivery_attempts(), ())
         self.assertEqual(adapter.calls, 1)
 
+    def test_deferred_prepared_attempt_never_reaches_adapter(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+
+        self._effect(
+            "owner-delivery.prepare",
+            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+        )
+        self.assertEqual(self._outbox().record(intent_id).current_layer, "attempted")
+
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-prepared-attempt-defer",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        issued = Response.from_wire(
+            self._effect(
+                "owner-delivery.issue",
+                {"intent_id": intent_id},
+            )["response"]
+        )
+        adapter = _RecordingAdapter(self.base.store)
+        self.assertEqual(issued.status, "rejected")
+        self.assertEqual(adapter.calls, 0)
+
     def test_deferred_unsent_intent_does_not_starve_fresh_expired_review_intent(self) -> None:
         task_id, effect_request_id = self._admit_review_task()
         old_intent_id = self._commit_review_outbox(task_id, effect_request_id)

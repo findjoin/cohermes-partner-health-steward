@@ -7319,8 +7319,6 @@ class HealthCore:
         self,
         intent: OutboxIntent,
         settings: OwnerSettingsState,
-        *,
-        allow_deferred_attempt: bool = False,
     ) -> tuple[
         DeliveryOutboxState,
         OutboxRecord,
@@ -7364,13 +7362,7 @@ class HealthCore:
                 and task.external_boundary.effect_kinds
                 == ("owner-delivery",)
                 and self._task_evidence_bindings_are_current(task, daily_state)
-                and (
-                    review.state_digest == current_review_state_digest
-                    or (
-                        allow_deferred_attempt
-                        and task.deferred_until_utc is not None
-                    )
-                )
+                and review.state_digest == current_review_state_digest
             )
             else None
         )
@@ -7389,11 +7381,7 @@ class HealthCore:
         TaskRuntimeState,
         DailyReviewRecord,
     ] | None:
-        binding = self._owner_delivery_binding_open(
-            intent,
-            settings,
-            allow_deferred_attempt=expected_attempt_ref is not None,
-        )
+        binding = self._owner_delivery_binding_open(intent, settings)
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
