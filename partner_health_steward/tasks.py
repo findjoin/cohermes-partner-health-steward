@@ -2057,6 +2057,7 @@ class TaskEngine:
             terminal_fact=terminal,
             version=task.version + 1,
             updated_at_utc=at,
+            deferred_until_utc=None,
         )
         return TaskTransition(
             replace(
@@ -2388,7 +2389,11 @@ class TaskEngine:
         effect = _text(effect_ref, "task delivery effect reference")
         reason = _text(reason_code, "task delivery unknown reason")
         observed = _utc_time(observed_at_utc, "task delivery unknown time")
-        task = _task_available_for_action(task, observed)
+        # An in-flight external attempt may settle as unknown while the owner
+        # has deferred the task. Preserve that durable deferral fact; only an
+        # already expired deferral is cleared while recording the observation.
+        if not _task_is_deferred(task, observed):
+            task = _task_available_for_action(task, observed)
         _boolean(possibly_external, "task delivery unknown external flag")
         for fact in state.unknown_facts:
             if fact.effect_ref != effect:

@@ -662,6 +662,69 @@ class Ticket115IntegrationTests(unittest.TestCase):
         assert pending is not None
         self.assertEqual(pending.action_refs, ())
 
+    def test_owner_cancel_clears_defer_fact_through_owner_mutation_chain(self) -> None:
+        task_id, _ = self._admit_review_task(notification_enabled=False)
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-owner-task-defer-before-cancel",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        cancel_request = self._owner_task_cancellation_request(
+            task_id,
+            suffix=":ticket115-owner-task-cancel-after-defer",
+        )
+        self.assertEqual(self.base._prepare(cancel_request).status, "accepted")
+        self.assertEqual(self.base._commit(cancel_request).status, "accepted")
+        self.assertEqual(self.base._finalize(cancel_request).status, "accepted")
+
+        task = self._task_state().task(task_id)
+        self.assertEqual(task.primary_label, "cancelled")
+        self.assertIsNone(task.deferred_until_utc)
+
+    def test_review_after_defer_expiry_detects_restored_actionable_set(self) -> None:
+        task_id, _ = self._admit_review_task()
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-review-expiry",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        quiet = self._wake_review("2026-08-24T03:30:00+00:00")
+        self.assertEqual(quiet.ledger.pending.action_refs, ())  # type: ignore[union-attr]
+        self.base.owner_clock_value = datetime.fromisoformat(
+            "2026-08-24T03:31:00+00:00"
+        )
+        committed = self._decision(
+            self._health(
+                "review.commit",
+                {"decision": self._decision_wire(quiet)},
+            )
+        )
+        self.assertIsNotNone(committed.record)
+        assert committed.record is not None
+
+        expired = self._wake_review("2026-08-25T03:00:00+00:00")
+        pending = expired.ledger.pending
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertTrue(pending.changed)
+        self.assertEqual(pending.action_refs, (task_id,))
+        self.assertTrue(pending.notification_required)
+        self.assertEqual(pending.state_digest, committed.record.state_digest)
+
     def test_owner_in_scope_adjustment_is_atomic_and_invalidates_old_version(self) -> None:
         candidate, _, effect_request_id = self._candidate()
         candidate = replace(
@@ -1822,6 +1885,116 @@ class Ticket115IntegrationTests(unittest.TestCase):
             .result_ref,
             transport_result.result_ref,
         )
+
+    def test_attempted_delivery_can_settle_unknown_after_defer_without_retry(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        intent_id = self._commit_review_outbox(task_id, effect_request_id)
+
+        prepared = self._effect(
+            "owner-delivery.prepare",
+            {"intent_id": intent_id, "attempted_at_utc": _ATTEMPTED_AT},
+        )
+        adapter = _RaisingAdapter()
+        with self.assertRaisesRegex(RuntimeError, "synthetic owner delivery transport failure"):
+            adapter.send(prepared["send_intent"])
+
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-attempted-then-defer",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        self._recover_after_owner_delivery_marker_ttl(intent_id)
+
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(
+            self._outbox().record(intent_id).current_layer,
+            "unknown",
+        )
+        self.assertIn(intent_id, self._task_state().delivery_unknown_refs)
+        self.assertEqual(
+            self._task_state().task(task_id).deferred_until_utc,
+            "2026-08-24T04:00:00+00:00",
+        )
+        with self.assertRaises(AuthorityValidationError):
+            self._effect(
+                "owner-delivery.prepare",
+                {
+                    "intent_id": intent_id,
+                    "attempted_at_utc": "2026-08-24T03:05:02+00:00",
+                },
+            )
+        self.assertEqual(self.core.recover_owner_delivery_attempts(), ())
+        self.assertEqual(adapter.calls, 1)
+
+    def test_deferred_unsent_intent_does_not_starve_fresh_expired_review_intent(self) -> None:
+        task_id, effect_request_id = self._admit_review_task()
+        old_intent_id = self._commit_review_outbox(task_id, effect_request_id)
+        defer_request = self._owner_task_mutation_request(
+            task_id,
+            TaskOwnerMutation.defer(
+                task_id,
+                deferred_until_utc="2026-08-24T04:00:00+00:00",
+            ),
+            suffix=":ticket115-old-intent-defer",
+        )
+        self.assertEqual(self.base._prepare(defer_request).status, "accepted")
+        self.assertEqual(self.base._commit(defer_request).status, "accepted")
+        self.assertEqual(self.base._finalize(defer_request).status, "accepted")
+
+        refreshed = self._wake_review("2026-08-25T03:00:00+00:00")
+        pending = refreshed.ledger.pending
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertTrue(pending.changed)
+        self.assertEqual(pending.action_refs, (task_id,))
+
+        self.base.owner_clock_value = datetime.fromisoformat(
+            "2026-08-25T03:01:00+00:00"
+        )
+        new_effect_request_id = effect_request_id + ":ticket115-after-defer"
+        committed = self._decision(
+            self._health(
+                "review.commit",
+                {
+                    "decision": self._decision_wire(refreshed),
+                    "delivery": {
+                        "effect_request_id": new_effect_request_id,
+                        "source_task_id": task_id,
+                        "payload_ref": "payload:ticket115-review-summary-after-defer",
+                        "payload_digest": "sha256:" + ("8" * 64),
+                        "formed_at_utc": "2026-08-25T03:00:30+00:00",
+                        "submitted_at_utc": "2026-08-25T03:01:00+00:00",
+                    },
+                },
+            )
+        )
+        self.assertEqual(committed.outcome, "committed")
+        self.assertEqual(len(self._outbox().records), 2)
+        self.assertIn(old_intent_id, tuple(item.intent.intent_id for item in self._outbox().records))
+        self.assertEqual(
+            len(
+                {
+                    item.intent.effect_request_id
+                    for item in self._outbox().records
+                }
+            ),
+            2,
+        )
+        with self.assertRaises(AuthorityValidationError):
+            self._effect(
+                "owner-delivery.prepare",
+                {
+                    "intent_id": old_intent_id,
+                    "attempted_at_utc": "2026-08-25T03:01:01+00:00",
+                },
+            )
 
     def test_restart_recovers_orphan_attempt_without_replaying_transport(self) -> None:
         task_id, effect_request_id = self._admit_review_task()

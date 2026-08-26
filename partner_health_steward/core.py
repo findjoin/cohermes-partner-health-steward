@@ -6934,6 +6934,12 @@ class HealthCore:
                 or any(
                     record.intent.effect_request_id
                     == approval.effect_request_id
+                    and not (
+                        record.current_layer == "submitted"
+                        and task.deferred_until_utc is not None
+                        and datetime.fromisoformat(record.intent.formed_at_utc)
+                        < datetime.fromisoformat(task.updated_at_utc)
+                    )
                     for record in outbox.records
                 )
             ):
@@ -6976,15 +6982,18 @@ class HealthCore:
                 ),
             )
         )
+        action_refs = self._daily_review_action_refs_open(
+            settings,
+            task_state,
+            daily_state,
+            observed_at_utc=observed_at_utc,
+        )
         return (
             state_digest,
-            previous is None or previous.state_digest != state_digest,
-            self._daily_review_action_refs_open(
-                settings,
-                task_state,
-                daily_state,
-                observed_at_utc=observed_at_utc,
-            ),
+            previous is None
+            or previous.state_digest != state_digest
+            or previous.action_refs != action_refs,
+            action_refs,
         )
 
     def daily_review_ledger(self) -> DailyReviewLedger:
@@ -7310,6 +7319,8 @@ class HealthCore:
         self,
         intent: OutboxIntent,
         settings: OwnerSettingsState,
+        *,
+        allow_deferred_attempt: bool = False,
     ) -> tuple[
         DeliveryOutboxState,
         OutboxRecord,
@@ -7353,7 +7364,13 @@ class HealthCore:
                 and task.external_boundary.effect_kinds
                 == ("owner-delivery",)
                 and self._task_evidence_bindings_are_current(task, daily_state)
-                and review.state_digest == current_review_state_digest
+                and (
+                    review.state_digest == current_review_state_digest
+                    or (
+                        allow_deferred_attempt
+                        and task.deferred_until_utc is not None
+                    )
+                )
             )
             else None
         )
@@ -7372,12 +7389,19 @@ class HealthCore:
         TaskRuntimeState,
         DailyReviewRecord,
     ] | None:
-        binding = self._owner_delivery_binding_open(intent, settings)
+        binding = self._owner_delivery_binding_open(
+            intent,
+            settings,
+            allow_deferred_attempt=expected_attempt_ref is not None,
+        )
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
         task = task_state.task(intent.source_ref)
-        if TaskEngine.is_deferred(task, observed_at_utc):
+        if (
+            expected_attempt_ref is None
+            and TaskEngine.is_deferred(task, observed_at_utc)
+        ):
             return None
         try:
             current_review_key = local_day_key(
