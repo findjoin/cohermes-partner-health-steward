@@ -7595,6 +7595,12 @@ class HealthCore:
             if projection is None:
                 return None
             if intent.authorization_kind == "status-transition":
+                try:
+                    leaves = outbox.status_transition_leaf_intent_ids()
+                except DeliveryContractViolation:
+                    return None
+                if len(leaves) != 1 or intent.intent_id not in leaves:
+                    return None
                 if (projection.state == "active") != intent.status_target_active:
                     return None
             elif intent.business_revision_digest != projection.fact_set_digest:
@@ -8966,6 +8972,7 @@ class HealthCore:
                 destination = self._owner_weixin_destination_open(settings)
             except AuthorityValidationError:
                 return
+            outbox = self._ticket115_outbox_state_open(settings)
             request_id = (
                 _OWNER_DECISION_STATUS_TRANSITION_PREFIX
                 + transition.transition_id
@@ -8991,9 +8998,10 @@ class HealthCore:
                 formed_at_utc=observed_at_utc,
                 authorization_kind="status-transition",
                 status_target_active=(transition.current_state == "active"),
+                status_supersedes_refs=outbox.status_transition_leaf_intent_ids(),
             )
             submitted = OwnerDeliveryEngine.submit(
-                self._ticket115_outbox_state_open(settings),
+                outbox,
                 intent,
                 submitted_at_utc=observed_at_utc,
             )

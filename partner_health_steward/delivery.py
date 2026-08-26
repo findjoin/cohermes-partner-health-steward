@@ -104,6 +104,38 @@ def _utc_datetime(value: object, name: str) -> datetime:
     return datetime.fromisoformat(_utc(value, name))
 
 
+def _status_supersession_refs(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if type(value) is not tuple:
+        raise DeliveryContractViolation(
+            "status supersession references must be a tuple"
+        )
+    refs = tuple(
+        _text(item, "status supersession reference")
+        for item in value
+    )
+    if len(refs) != len(set(refs)):
+        raise DeliveryContractViolation(
+            "status supersession references must be unique"
+        )
+    return refs
+
+
+def _intent_wire_version(
+    authorization_kind: str,
+    status_supersedes_refs: tuple[str, ...] | None,
+) -> str:
+    if authorization_kind == "legacy":
+        return "v1"
+    if (
+        authorization_kind == "status-transition"
+        and status_supersedes_refs is not None
+    ):
+        return "v3"
+    return "v2"
+
+
 def validate_owner_delivery_observed_at(value: object) -> str:
     """Validate the timestamp before a transport side effect is attempted."""
 
@@ -137,6 +169,7 @@ def _intent_material(
     authorization_kind: str = "legacy",
     approval_binding_digest: str | None = None,
     status_target_active: bool | None = None,
+    status_supersedes_refs: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     material: dict[str, object] = {
         "contract": "owner-delivery-intent-v1",
@@ -160,6 +193,11 @@ def _intent_material(
             approval_binding_digest=approval_binding_digest,
             status_target_active=status_target_active,
         )
+    if authorization_kind == "status-transition" and status_supersedes_refs is not None:
+        material.update(
+            contract="owner-delivery-intent-v3",
+            status_supersedes_refs=status_supersedes_refs,
+        )
     return material
 
 
@@ -179,6 +217,7 @@ def owner_delivery_idempotency_key(
     authorization_kind: str = "legacy",
     approval_binding_digest: str | None = None,
     status_target_active: bool | None = None,
+    status_supersedes_refs: tuple[str, ...] | None = None,
 ) -> str:
     """Return the stable, opaque channel key for one exact owner effect."""
 
@@ -209,10 +248,11 @@ def owner_delivery_idempotency_key(
             authorization_kind=authorization_kind,
             approval_binding_digest=approval_binding_digest,
             status_target_active=status_target_active,
+            status_supersedes_refs=status_supersedes_refs,
             **values,
         )
     )
-    version = "v1" if authorization_kind == "legacy" else "v2"
+    version = _intent_wire_version(authorization_kind, status_supersedes_refs)
     return f"health-owner-delivery:{version}:" + digest.removeprefix("sha256:")
 
 
@@ -239,6 +279,7 @@ class OutboxIntent:
     authorization_kind: str = "legacy"
     approval_binding_digest: str | None = None
     status_target_active: bool | None = None
+    status_supersedes_refs: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.effect_kind == "contact-delivery":
@@ -270,9 +311,12 @@ class OutboxIntent:
                 self.approval_binding_digest,
                 "delivery approval binding digest",
             )
-            if self.status_target_active is not None:
+            if (
+                self.status_target_active is not None
+                or self.status_supersedes_refs is not None
+            ):
                 raise DeliveryContractViolation(
-                    "approval delivery cannot carry status direction"
+                    "approval delivery cannot carry status authorization"
                 )
         elif self.authorization_kind == "status-transition":
             if self.approval_binding_digest is not None or type(
@@ -281,9 +325,11 @@ class OutboxIntent:
                 raise DeliveryContractViolation(
                     "status delivery requires its active-boundary direction"
                 )
+            _status_supersession_refs(self.status_supersedes_refs)
         elif (
             self.approval_binding_digest is not None
             or self.status_target_active is not None
+            or self.status_supersedes_refs is not None
         ):
             raise DeliveryContractViolation(
                 "delivery authorization binding does not match its kind"
@@ -291,7 +337,10 @@ class OutboxIntent:
 
         expected_digest = stable_digest(self.semantic_material())
         expected_intent_id = "outbox:" + expected_digest.removeprefix("sha256:")
-        key_version = "v1" if self.authorization_kind == "legacy" else "v2"
+        key_version = _intent_wire_version(
+            self.authorization_kind,
+            self.status_supersedes_refs,
+        )
         expected_key = (
             f"health-owner-delivery:{key_version}:"
             + expected_digest.removeprefix("sha256:")
@@ -320,6 +369,7 @@ class OutboxIntent:
             authorization_kind=self.authorization_kind,
             approval_binding_digest=self.approval_binding_digest,
             status_target_active=self.status_target_active,
+            status_supersedes_refs=self.status_supersedes_refs,
         )
 
     def to_wire(self) -> dict[str, object]:
@@ -343,6 +393,11 @@ class OutboxIntent:
             "authorization_kind": self.authorization_kind,
             "approval_binding_digest": self.approval_binding_digest,
             "status_target_active": self.status_target_active,
+            "status_supersedes_refs": (
+                None
+                if self.status_supersedes_refs is None
+                else list(self.status_supersedes_refs)
+            ),
         }
 
     @classmethod
@@ -372,15 +427,26 @@ class OutboxIntent:
             "approval_binding_digest",
             "status_target_active",
         }
+        next_fields = current_fields | {"status_supersedes_refs"}
         if type(value) is not dict or frozenset(value) not in {
             legacy_fields,
             current_fields,
+            next_fields,
         }:
             raise DeliveryContractViolation("invalid outbox intent")
         fields = dict(value)
         fields.setdefault("authorization_kind", "legacy")
         fields.setdefault("approval_binding_digest", None)
         fields.setdefault("status_target_active", None)
+        fields.setdefault("status_supersedes_refs", None)
+        if fields["status_supersedes_refs"] is not None:
+            if type(fields["status_supersedes_refs"]) is not list:
+                raise DeliveryContractViolation(
+                    "invalid status supersession references"
+                )
+            fields["status_supersedes_refs"] = tuple(
+                fields["status_supersedes_refs"]
+            )
         return cls(**fields)  # type: ignore[arg-type]
 
 
@@ -1010,6 +1076,7 @@ class DeliveryOutboxState:
             for record in self.records
         ):
             raise DeliveryContractViolation("delivery outbox authority mismatch")
+        self._validate_status_transition_supersession_graph()
 
     @classmethod
     def empty(
@@ -1028,6 +1095,79 @@ class DeliveryOutboxState:
             if record.intent.intent_id == parsed:
                 return record
         raise DeliveryContractViolation("outbox intent does not exist")
+
+    def _validate_status_transition_supersession_graph(self) -> None:
+        by_intent_id = {
+            record.intent.intent_id: record for record in self.records
+        }
+        edges: dict[str, tuple[str, ...]] = {}
+        for record in self.records:
+            intent = record.intent
+            refs = intent.status_supersedes_refs
+            if intent.authorization_kind != "status-transition":
+                if refs is not None:  # pragma: no cover - intent validates this
+                    raise DeliveryContractViolation(
+                        "non-status delivery has status supersession references"
+                    )
+                continue
+            if refs is None:
+                continue
+            edges[intent.intent_id] = refs
+            for ref in refs:
+                target = by_intent_id.get(ref)
+                if target is None:
+                    raise DeliveryContractViolation(
+                        "status supersession target does not exist"
+                    )
+                if (
+                    target.intent.owner_id != intent.owner_id
+                    or target.intent.installation_id != intent.installation_id
+                    or target.intent.authorization_kind != "status-transition"
+                ):
+                    raise DeliveryContractViolation(
+                        "status supersession target authority mismatch"
+                    )
+                if ref == intent.intent_id:
+                    raise DeliveryContractViolation(
+                        "status supersession cannot self-reference"
+                    )
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(intent_id: str) -> None:
+            if intent_id in visiting:
+                raise DeliveryContractViolation(
+                    "status supersession graph contains a cycle"
+                )
+            if intent_id in visited:
+                return
+            visiting.add(intent_id)
+            for ref in edges.get(intent_id, ()):
+                visit(ref)
+            visiting.remove(intent_id)
+            visited.add(intent_id)
+
+        for intent_id in edges:
+            visit(intent_id)
+
+    def status_transition_leaf_intent_ids(self) -> tuple[str, ...]:
+        """Return status intents not superseded by a persisted successor."""
+
+        self._validate_status_transition_supersession_graph()
+        superseded_ids = {
+            ref
+            for record in self.records
+            if record.intent.authorization_kind == "status-transition"
+            and record.intent.status_supersedes_refs is not None
+            for ref in record.intent.status_supersedes_refs
+        }
+        return tuple(
+            record.intent.intent_id
+            for record in self.records
+            if record.intent.authorization_kind == "status-transition"
+            and record.intent.intent_id not in superseded_ids
+        )
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -1090,11 +1230,14 @@ class OwnerDeliveryEngine:
         authorization_kind: str = "legacy",
         approval_binding_digest: str | None = None,
         status_target_active: bool | None = None,
+        status_supersedes_refs: tuple[str, ...] | None = None,
     ) -> OutboxIntent:
         if effect_kind == "contact-delivery":
             raise DeliveryContractViolation("contact delivery is not enabled")
         if effect_kind != "owner-delivery":
             raise DeliveryContractViolation("unsupported delivery effect kind")
+        if authorization_kind == "status-transition" and status_supersedes_refs is None:
+            status_supersedes_refs = ()
         key = owner_delivery_idempotency_key(
             owner_id=owner_id,
             installation_id=installation_id,
@@ -1110,6 +1253,7 @@ class OwnerDeliveryEngine:
             authorization_kind=authorization_kind,
             approval_binding_digest=approval_binding_digest,
             status_target_active=status_target_active,
+            status_supersedes_refs=status_supersedes_refs,
         )
         digest = "sha256:" + key.rsplit(":", 1)[-1]
         return OutboxIntent(
@@ -1132,6 +1276,7 @@ class OwnerDeliveryEngine:
             authorization_kind=authorization_kind,
             approval_binding_digest=approval_binding_digest,
             status_target_active=status_target_active,
+            status_supersedes_refs=status_supersedes_refs,
         )
 
     @staticmethod
