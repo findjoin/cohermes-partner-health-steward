@@ -79,6 +79,16 @@ Ticket 113 的 model/knowledge、Ticket 114 的 controls/status 和 Ticket 115 �
 
 任何生产实现修改前，fresh-context Spec reviewer 与 Standards reviewer 必须对同一 checkpoint 的 characterization、冻结设计和冻结测试门给出 `pass`。任一冻结产物变化都必须形成新 checkpoint 并重新预审。测试文件、fixture、helper 和实现 slice 不属于产品架构；除 verifier-owned 文件外由编码 Agent 在冻结门范围内选择。
 
+#### 已冻结的 pre-code checkpoint
+
+- 主人于 2026-08-27 明确确认按本节治理路线执行：116 立即完成编码前设计与测试门；117—119 只统一执行合同与停止规则，轮到实施时再分别冻结；119 聚焦真实环境和上线证据，不借验收重构产品。
+- `review_base` / frozen commit：`0619314b9392cfc890771c2e86170556e2cef160`；tree：`c4de97add8050f27358f40e558f9de66a5f32bc4`。
+- 冻结设计 blob：`849663048b86d60d908ceb82506f062b7ee7bea2`；冻结验证合同 blob：`2f3e04242613752e54956abe6c5107ba7a9969da`；verifier-owned 测试 blob：`9f34e858a73d38240c6ae98c1fc1cc748858e263`。
+- `tests/test_ticket116_integration.py` SHA-256：`933EBF72EB32CC58CD2601A2DD7F4185074BF311C6F5F5718B022C50B923D6DD`。编码前实跑为 `12 tests / 1 FAIL / 11 dependency SKIP / 0 ERROR`：唯一真实红灯是 Core 尚无受管安全/诊断资产构造接缝；该接缝实现后，11 个后继门自动展开。完成条件保持 `12 PASS / 0 SKIP / 0 ERROR`。
+- characterization：Ticket 113 `99/99`、Ticket 114 `210/210`、Ticket 115 `135/135` 全绿；`compileall`、`git diff --check` 与本地 Markdown 链接检查通过。
+- 编码前 reviewer：`ticket116_architecture`（Spec/architecture）、`ticket115_gate_spec`（test executability/quality）、`future_ticket_contracts`（Standards/governance）均对最终稳定快照给出 `PASS`，无 P0/P1/P2；`ticket116_verification` 独立编写并封存测试门。
+- 该 frozen commit 只包含合同、设计和测试门，没有修改产品代码或 `main`。编码 Agent 必须以此 commit 为 `review_base`；若上述三个 blob 任一变化，立即停止并返回冻结阶段。
+
 ### 一致性实施、核验、停止与闭票
 
 以通过编码前预审的冻结 checkpoint 为 `review_base`。编码 Agent 只可做使已封存红灯转绿所必需的最小实现修改，并保留既有绿色行为；不得修改冻结设计、冻结验证合同或 verifier-owned 测试，不得新增测试类别、产品功能或验收门。
