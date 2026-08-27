@@ -53,12 +53,6 @@ _MODEL_SCHEMA_NAME = "synthetic-ticket116-diagnosis-v1"
 _MODEL_SCHEMA_DIGEST = "sha256:" + ("d" * 64)
 _RELEASE_DIGEST = "sha256:" + ("8" * 64)
 _SCOPE_ID = "synthetic-bmi-scope"
-_SAFETY_BUNDLE_HASH = (
-    "sha256:5ffbf9018418e18b10a95892653922de8b3787945b4f4d5f411737dbebc015f3"
-)
-_SCOPE_BUNDLE_HASH = (
-    "sha256:1aa8d01fd5b0ef1d89e6b085d04e7f2ab23574af8c697e5da33e1cae9aefaabe"
-)
 _MINIMUM_TEMPLATE_REF = "minimum-help-template:synthetic-v1"
 _DANGER_TEMPLATE_REF = "danger-owner-template:synthetic-v1"
 _UNKNOWN_TEMPLATE_REF = "danger-unknown-template:synthetic-v1"
@@ -70,6 +64,18 @@ def _declared_bundle_digest(bundle: Mapping[str, object]) -> str:
 
     payload = {key: value for key, value in bundle.items() if key != "bundle_hash"}
     return stable_digest(payload)
+
+
+def _asset_bundle_hash(assets: Mapping[str, object], bundle_name: str) -> str:
+    """Read the declared address from the exact synthetic asset being used."""
+
+    bundle = assets.get(bundle_name)
+    if not isinstance(bundle, Mapping):
+        raise AssertionError(f"synthetic assets have no {bundle_name}")
+    declared = bundle.get("bundle_hash")
+    if not isinstance(declared, str):
+        raise AssertionError(f"{bundle_name} has no declared bundle hash")
+    return declared
 
 
 class _RecordingModelAdapter:
@@ -137,6 +143,8 @@ class Ticket116VerificationTests(unittest.TestCase):
         self.harness.setUp()
         self.base = self.harness.base
         self._command_index = 0
+        self._configured_safety_bundle_hash: str | None = None
+        self._configured_scope_bundle_hash: str | None = None
         self.route = FirstHopRoute(
             route_id="jojo-responses-v1",
             provider="synthetic-provider",
@@ -210,6 +218,18 @@ class Ticket116VerificationTests(unittest.TestCase):
     def core(self) -> HealthCore:
         return self.base.core
 
+    @property
+    def safety_bundle_hash(self) -> str:
+        if self._configured_safety_bundle_hash is None:
+            raise AssertionError("no safety rule bundle is currently configured")
+        return self._configured_safety_bundle_hash
+
+    @property
+    def scope_bundle_hash(self) -> str:
+        if self._configured_scope_bundle_hash is None:
+            raise AssertionError("no diagnostic scope bundle is currently configured")
+        return self._configured_scope_bundle_hash
+
     def _synthetic_assets(
         self,
         *,
@@ -280,7 +300,6 @@ class Ticket116VerificationTests(unittest.TestCase):
             "safety_rule_bundle": {
                 "bundle_id": "synthetic-safety-rules",
                 "version": "1.0.0-test",
-                "bundle_hash": _SAFETY_BUNDLE_HASH,
                 "synthetic": True,
                 "rights_status": (
                     "approved-synthetic" if safety_rules_current else "unknown"
@@ -314,7 +333,6 @@ class Ticket116VerificationTests(unittest.TestCase):
             "diagnostic_scope_bundle": {
                 "scope_id": _SCOPE_ID,
                 "version": "1.0.0-test",
-                "bundle_hash": _SCOPE_BUNDLE_HASH,
                 "release_digest": _RELEASE_DIGEST,
                 "synthetic": True,
                 "medical_use": False,
@@ -365,6 +383,8 @@ class Ticket116VerificationTests(unittest.TestCase):
     ) -> None:
         """Expand downstream gates only after the shared asset seam exists."""
 
+        safety_bundle_hash = _asset_bundle_hash(assets, "safety_rule_bundle")
+        scope_bundle_hash = _asset_bundle_hash(assets, "diagnostic_scope_bundle")
         self.assertTrue(self.base.core.close().complete)
         acceptance_kwargs = (
             {}
@@ -421,6 +441,8 @@ class Ticket116VerificationTests(unittest.TestCase):
         self.base.core = core
         self.base.plugin = plugin
         self.base.correction_plugin = plugin
+        self._configured_safety_bundle_hash = safety_bundle_hash
+        self._configured_scope_bundle_hash = scope_bundle_hash
 
     def _health_context(
         self,
@@ -685,7 +707,7 @@ class Ticket116VerificationTests(unittest.TestCase):
         event_ref: str = "event:synthetic-measurement",
         applicable_period: str = "2026-08-24",
         evidence_revision_digest: str | None = None,
-        scope_bundle_hash: str = _SCOPE_BUNDLE_HASH,
+        scope_bundle_hash: str | None = None,
         run_receipt_ref: str | None = None,
     ) -> dict[str, object]:
         evidence = self.base.baseline_card
@@ -695,7 +717,11 @@ class Ticket116VerificationTests(unittest.TestCase):
             "event_ref": event_ref,
             "applicable_period": applicable_period,
             "scope_id": _SCOPE_ID,
-            "scope_bundle_hash": scope_bundle_hash,
+            "scope_bundle_hash": (
+                self.scope_bundle_hash
+                if scope_bundle_hash is None
+                else scope_bundle_hash
+            ),
             "minimum_evidence": {
                 "evidence_ref": evidence.evidence_id,
                 "evidence_revision_digest": (
@@ -728,7 +754,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "event_ref": event_ref,
             "applicable_period": applicable_period,
             "scope_id": _SCOPE_ID,
-            "scope_bundle_hash": _SCOPE_BUNDLE_HASH,
+            "scope_bundle_hash": self.scope_bundle_hash,
             "judgment": {
                 "kind": "synthetic-bmi-classification",
                 "classification": classification,
@@ -860,6 +886,11 @@ class Ticket116VerificationTests(unittest.TestCase):
 
         run_ref = "acceptance-run-receipt:ticket116-active-fixture"
         acceptance_ref = "owner-acceptance-receipt:ticket116-active-fixture"
+        staged_assets = self._synthetic_assets(scope_state="staged")
+        scope_bundle_hash = _asset_bundle_hash(
+            staged_assets,
+            "diagnostic_scope_bundle",
+        )
         generation = self.base.head.read().head.generation
         run_fact = {
             "receipt_kind": "ticket119-acceptance-run",
@@ -867,7 +898,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "owner_id": _OWNER_ID,
             "installation_id": _INSTALLATION_ID,
             "release_digest": _RELEASE_DIGEST,
-            "bundle_hash": _SCOPE_BUNDLE_HASH,
+            "bundle_hash": scope_bundle_hash,
             "generation": generation,
             "run_id": "ticket119-run:ticket116-active-fixture",
             "gate_id": "119-G12",
@@ -876,7 +907,7 @@ class Ticket116VerificationTests(unittest.TestCase):
         }
         run_provider = _AcceptanceEvidenceProvider({run_ref: run_fact})
         self._restart_with_assets(
-            self._synthetic_assets(scope_state="staged"),
+            staged_assets,
             acceptance_evidence_provider=run_provider,
         )
         ready_scope = self._managed_read()["scope"]
@@ -933,7 +964,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "owner_id": _OWNER_ID,
                     "installation_id": _INSTALLATION_ID,
                     "release_digest": _RELEASE_DIGEST,
-                    "bundle_hash": _SCOPE_BUNDLE_HASH,
+                    "bundle_hash": run_fact["bundle_hash"],
                     "generation": generation,
                     "run_id": run_fact["run_id"],
                     "gate_id": run_fact["gate_id"],
@@ -1164,7 +1195,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "safety.evaluate",
                     {
                         "source_causal_id": f"ticket116-safety:{suffix}",
-                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                        "safety_rule_bundle_hash": self.safety_bundle_hash,
                         "facts": facts,
                     },
                     suffix=suffix,
@@ -1287,6 +1318,12 @@ class Ticket116VerificationTests(unittest.TestCase):
     def test_v116_04_scope_persists_only_staged_or_active(self) -> None:
         """Break caught: readiness or acceptance mode becomes durable scope state."""
 
+        initial_assets = self._synthetic_assets(scope_state="staged")
+        scope_bundle_hash = _asset_bundle_hash(
+            initial_assets,
+            "diagnostic_scope_bundle",
+        )
+
         def acceptance_run_fact(suffix: str) -> dict[str, object]:
             return {
                 "receipt_kind": "ticket119-acceptance-run",
@@ -1294,7 +1331,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "owner_id": _OWNER_ID,
                 "installation_id": _INSTALLATION_ID,
                 "release_digest": _RELEASE_DIGEST,
-                "bundle_hash": _SCOPE_BUNDLE_HASH,
+                "bundle_hash": scope_bundle_hash,
                 "generation": self.base.head.read().head.generation,
                 "run_id": f"ticket119-run:{suffix}",
                 "gate_id": "119-G12",
@@ -1316,7 +1353,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "owner_id": _OWNER_ID,
                 "installation_id": _INSTALLATION_ID,
                 "release_digest": _RELEASE_DIGEST,
-                "bundle_hash": _SCOPE_BUNDLE_HASH,
+                "bundle_hash": run_fact["bundle_hash"],
                 "generation": run_fact["generation"],
                 "run_id": run_fact["run_id"],
                 "gate_id": run_fact["gate_id"],
@@ -1343,7 +1380,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             }
         )
         self._restart_with_assets(
-            self._synthetic_assets(),
+            initial_assets,
             acceptance_evidence_provider=provider,
         )
         before = self._managed_read()["scope"]
@@ -1952,7 +1989,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "safety.evaluate",
             {
                 "source_causal_id": first_source,
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "unknown",
@@ -1968,7 +2005,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "safety.evaluate",
                 {
                     "source_causal_id": second_source,
-                    "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                    "safety_rule_bundle_hash": self.safety_bundle_hash,
                     "facts": {
                         "safety_capability": "available",
                         "danger": "unknown",
@@ -2253,7 +2290,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "safety.evaluate",
                     {
                         "source_causal_id": f"ticket116-safety:contact-{state}",
-                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                        "safety_rule_bundle_hash": self.safety_bundle_hash,
                         "facts": {
                             "safety_capability": "available",
                             "danger": "confirmed",
@@ -2293,7 +2330,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                         "source_causal_id": "ticket116-safety:dedicated-resume",
                         "event_time": "2026-08-24T03:46:00+00:00",
                         "owner_recognizable_name": "合成主人称呼",
-                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                        "safety_rule_bundle_hash": self.safety_bundle_hash,
                         "facts": {
                             "safety_capability": "available",
                             "danger": "confirmed",
@@ -2317,7 +2354,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:contact-unknown",
                 "event_time": "2026-08-24T03:50:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2359,7 +2396,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:contact-extra-field",
                 "event_time": "2026-08-24T03:50:05+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2465,7 +2502,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:authority-change",
                 "event_time": "2026-08-24T04:00:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2517,7 +2554,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:no-departure",
                 "event_time": "2026-08-24T04:10:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2633,7 +2670,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "safety.evaluate",
             {
                 "source_causal_id": "ticket116-safety:contact-unavailable-status",
-                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "safety_rule_bundle_hash": self.safety_bundle_hash,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
