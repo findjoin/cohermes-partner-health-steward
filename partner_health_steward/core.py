@@ -7156,11 +7156,15 @@ class HealthCore:
         return diagnoses
 
     def _reconcile_ticket116_scope_invalidation(self) -> None:
-        """Persist scope-loss successors through the existing command CAS."""
+        """Persist diagnostic-basis-loss successors through the existing CAS."""
 
         assets = self._ticket116_assets
-        if assets is None or diagnostic_prerequisites_current(assets):
+        if assets is None or (
+            diagnostic_prerequisites_current(assets)
+            and self._ticket116_knowledge_current()
+        ):
             return
+        self._recover_ticket115_mutation()
         while True:
             current = next(
                 (
