@@ -1,6 +1,6 @@
 # Ticket 115 冻结验收测试合同
 
-> 状态：verification-frozen。适用基线为 `d1b29e4ebbdcdcfcc7d86077290d9cced40cc02a`。本文件只把 Ticket 115 已确认的七项产品验收和五类冻结故障翻译成可重复测试，不新增功能、不指定私有实现，也不重开架构。
+> 状态：verification-refrozen。当前差额基线为 `5a362fa9f24925d01eb258526691de06e65bfc12`；`d1b29e4ebbdcdcfcc7d86077290d9cced40cc02a` 的首轮红灯证据继续保留。本文件只把 Ticket 115 已确认的七项产品验收和五类冻结故障翻译成可重复测试，不新增功能、不指定私有实现，也不重开架构。
 
 ## 1. 测试权威与边界
 
@@ -48,8 +48,8 @@
 
 必须证明：
 
-1. 同一决定的业务事实、review 和 outbox intent 在 finalize 后同现；任一 prepare、CAS/readback 或 finalize 故障时不得部分可见。
-2. CAS 结果未知或进程重启时只能恢复原决定或停止；不得形成第二份业务结果。
+1. 同一决定的业务事实、review 和 outbox intent 在 finalize 后同现；任一 prepare、CAS/readback 或 finalize 故障时不得部分可见。`StatusProjection` 与由其变化形成的 status-transition outbox 也必须在同一次 finalize 中同成同败。
+2. CAS 结果未知或进程重启时只能恢复原决定或停止；不得形成第二份业务结果。状态投影写入失败后的重启只能完成原决定一次，不能遗留部分 outbox、重新形成冲突 identity 或要求主人盲目重试。
 3. finalize 前 Adapter 调用为 0；finalize 后 Adapter 在 SQLite 事务外精确调用一次。
 
 权威证据来自 `test_ticket115_storage.py` 的原子写入/回滚、`test_ticket115_integration.py` 的 current-head/CAS/finalize 恢复和事务外 Adapter 测试。故障 hook 只负责触发，结论以受管读取和 Adapter 为准。
@@ -88,7 +88,7 @@ Ticket 114 精确绑定的是主人批准的外部效果根；Ticket 115 的每�
 1. 普通投递 unknown 时形成一份独立、当前因果的主人决定请求；普通通知关闭和主动支持暂停不能吞掉它；请求本身完整到达 fake Adapter 一次。
 2. unknown 已被独立观察解决时，尚未发送的旧决定请求保留历史但失去 currentness，重启后仍不能到达 Adapter。
 3. Ticket 115 核心域从 `active` 进入 `abnormal/cannot-confirm`，以及从两种 nonactive 状态恢复 `active`，各形成一份可发送请求；nonactive→nonactive、active→active 和无变化不新增请求。
-4. 请求形成后的同状态重投影与重启不能使它自我失效，也不能重复形成；相反方向的新 transition 会使旧方向请求失效。
+4. 请求形成后的同状态重投影与重启不能使它自我失效，也不能重复形成；相反方向的新 transition 会使旧方向请求失效。能够验证为历史 status-transition 的 v1/v2 请求属于同一后继关系，一经后继取代，即使状态后来回到相同摘要也不得复活；身份不能可靠确认的旧请求保守冻结。
 5. 普通 review intent 伪造 mandatory ID 必须得到唯一明确拒绝，Adapter 为 0。
 
 独立门：
@@ -101,6 +101,7 @@ Ticket 114 精确绑定的是主人批准的外部效果根；Ticket 115 的每�
 - `test_verification_gate_opposite_status_transition_supersedes_old_request`
 - `test_verification_gate_cannot_confirm_to_active_requests_once`
 - `test_verification_gate_abnormal_to_active_requests_once`
+- `test_verification_gate_legacy_v1_status_request_stays_superseded_after_state_cycles`
 - `test_nonactive_to_nonactive_status_change_is_not_mandatory`
 - `test_review_delivery_cannot_forge_mandatory_owner_decision_identity`
 
@@ -114,13 +115,15 @@ Ticket 114 精确绑定的是主人批准的外部效果根；Ticket 115 的每�
 
 | 冻结故障 | 必须覆盖的等价类 | 精确外部结果 |
 |---|---|---|
-| F1 重复/并发/重启 | causal replay 与 conflict、业务查重、同日唤醒、effect claim | 一份当前结果；Adapter 最多 1 |
-| F2 prepare/CAS/readback/finalize | 各 checkpoint 单独失败或未知 | 全有或全无；finalize 前 Adapter 0 |
+| F1 重复/并发/重启 | causal replay 与 conflict、业务查重、同日唤醒、effect claim、历史请求跨状态循环 | 一份当前结果；旧请求不复活；Adapter 最多 1 |
+| F2 prepare/CAS/readback/finalize | 各 checkpoint 单独失败或未知、status projection/outbox 同事务回滚与恢复 | 全有或全无；重启只恢复原决定；finalize 前 Adapter 0 |
 | F3 currentness 漂移 | 证据、批准/额度、控制/窗口、时区、route、head、fence | 每个失效子例 Adapter 0 |
 | F4 外发结果未知 | 异常、响应丢失、发送后本地失败 | unknown；重启后 Adapter 总计 1 |
 | F5 低层越权 | terminal/acceptance、层级、mandatory identity、全局状态 | 权威结果不变；Adapter 0 或仅合法 request 1 |
 
 这里的“等价类”是停止边界：不做所有字段的笛卡尔积，不为另一种合理实现偏好新增测试。hidden 集合在测试门 commit 前一次性封存为 opaque ID、时间边界、重启、双向状态四类，每类最多一个变体；编码开始后不得新增类别，修复后只重跑同一集合。
+
+本次重新冻结的两个实例分别属于既有 115-F.4/F1 和 115-C.1—2/F2；它们没有增加新的产品目标、故障类别或 hidden 变体。
 
 ## 4. 防假绿规则
 
@@ -147,10 +150,12 @@ Ticket 114 精确绑定的是主人批准的外部效果根；Ticket 115 的每�
 
 十四个 verifier-owned 定向方法在该基线上为 `7 passed / 7 failed`。七个红灯对应上表六类缺口；通过项覆盖 mandatory ID 防伪、unknown 来源解决后旧请求失效、批准撤回、关闭联系窗口、route generation 漂移、持久普通控制旁路和 `active→abnormal`。红灯修复不得破坏这些既有绿色边界。
 
+在差额基线 `5a362fa9f24925d01eb258526691de06e65bfc12` 上，原十四门为 `14/14` 通过；重新冻结的两门为 `0/2`，失败分别是旧 v1 请求在状态循环后仍获准 prepare，以及 status outbox 已提交但 projection 写入失败后重启重放发生 identity 冲突。因此当前十六门的预期红灯基线为 `14 passed / 2 failed`。
+
 编码前先在测试门 commit 上单独运行 verifier-owned 门并保存红灯；这些红灯证明测试确实能抓住当前缺口。编码后必须依次通过：
 
 ```text
-python -m unittest -v tests.test_ticket115_integration.Ticket115IntegrationTests.test_unknown_owner_delivery_forms_one_independent_owner_decision_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_transition_forms_one_current_owner_decision_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_review_delivery_cannot_forge_mandatory_owner_decision_identity tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_attempt_budget_counts_opaque_current_intents tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_contact_interval_counts_opaque_current_intents tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_revoked_approval_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_closed_contact_window_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_route_generation_drift_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_mandatory_status_bypasses_persisted_ordinary_controls tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_active_to_abnormal_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_opposite_status_transition_supersedes_old_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_cannot_confirm_to_active_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_abnormal_to_active_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_unknown_request_expires_with_source_unknown
+python -m unittest -v tests.test_ticket115_integration.Ticket115IntegrationTests.test_unknown_owner_delivery_forms_one_independent_owner_decision_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_ticket115_status_transition_forms_one_current_owner_decision_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_review_delivery_cannot_forge_mandatory_owner_decision_identity tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_attempt_budget_counts_opaque_current_intents tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_contact_interval_counts_opaque_current_intents tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_revoked_approval_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_closed_contact_window_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_route_generation_drift_stops_before_adapter tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_mandatory_status_bypasses_persisted_ordinary_controls tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_active_to_abnormal_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_opposite_status_transition_supersedes_old_request tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_cannot_confirm_to_active_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_abnormal_to_active_requests_once tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_unknown_request_expires_with_source_unknown tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_legacy_v1_status_request_stays_superseded_after_state_cycles tests.test_ticket115_integration.Ticket115IntegrationTests.test_verification_gate_status_projection_and_outbox_rollback_and_replay_together
 python -m unittest discover -s tests -p "test_ticket115*.py" -v
 python -m unittest discover -s tests -p "test_ticket114*.py" -v
 python -m unittest discover -s tests -v
@@ -161,7 +166,7 @@ git diff --check
 完成还要求：
 
 1. `tests/test_ticket115_integration.py` 和本合同相对测试门 commit 没有被实现 Agent 修改；
-2. 七轴各有可定位的通过证据，五类冻结故障各有至少一个明确、可定位的负例；七个红门保留 `d1b29e4` 红灯证据；
+2. 七轴各有可定位的通过证据，五类冻结故障各有至少一个明确、可定位的负例；七个首轮红门保留 `d1b29e4` 红灯证据，两个差额红门保留 `5a362fa` 红灯证据；
 3. 独立 reviewer 的已封存 hidden variants、Spec 轴与 Standards 轴均通过；治理规则未认定为 blocker 的意见不得延长本票；
 4. 没有把真实 Weixin、生产 canary 或 Ticket 116+ 冒充为本地已验证；
 5. 只有以上全部满足，才可勾选 Ticket 115、写 `## Answer`、标记 `resolved` 并更新唯一 Map。
