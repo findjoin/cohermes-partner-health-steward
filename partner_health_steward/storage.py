@@ -94,6 +94,7 @@ class Ticket115PreparedMutation:
     health_command_receipt: HealthCommandReceipt | None = None
     base_status_digest: str | None = None
     status_projection: StatusProjection | None = None
+    managed_effect_intent: EffectIntent | None = None
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedTransition:
@@ -119,6 +120,12 @@ class Ticket115PreparedMutation:
             type(self.health_command_receipt) is not HealthCommandReceipt
         ):
             raise AuthorityValidationError("invalid ticket115 health command receipt")
+        if self.managed_effect_intent is not None and (
+            type(self.managed_effect_intent) is not EffectIntent
+            or self.managed_effect_intent.authority != self.prepared.base
+            or self.health_command_receipt is None
+        ):
+            raise AuthorityValidationError("invalid ticket115 managed effect intent")
         if self.status_projection is None:
             if self.base_status_digest is not None:
                 raise AuthorityValidationError(
@@ -183,6 +190,7 @@ class Ticket115PreparedMutation:
             base_delivery_digest=self.base_delivery_digest,
             next_state_digest=self.next_state_digest,
             health_command_receipt=self.health_command_receipt,
+            managed_effect_intent=self.managed_effect_intent,
             base_status_digest=self.base_status_digest,
             includes_status=self.status_projection is not None,
         )
@@ -195,6 +203,7 @@ class Ticket115PreparedMutation:
         base_delivery_digest: str,
         next_state_digest: str,
         health_command_receipt: HealthCommandReceipt | None,
+        managed_effect_intent: EffectIntent | None = None,
         base_status_digest: str | None = None,
         includes_status: bool = False,
     ) -> str:
@@ -211,6 +220,8 @@ class Ticket115PreparedMutation:
             value["health_command_receipt"] = (
                 health_command_receipt.to_storage()
             )
+        if managed_effect_intent is not None:
+            value["managed_effect_intent"] = managed_effect_intent.to_storage()
         if includes_status:
             value["base"]["status"] = base_status_digest  # type: ignore[index]
         return stable_digest(value)
@@ -227,6 +238,7 @@ class Ticket115PreparedMutation:
         review_state: DailyReviewLedger,
         delivery_state: DeliveryOutboxState,
         health_command_receipt: HealthCommandReceipt | None = None,
+        managed_effect_intent: EffectIntent | None = None,
         current_status_projection: StatusProjection | None = None,
         status_projection: StatusProjection | None = None,
     ) -> "Ticket115PreparedMutation":
@@ -252,6 +264,7 @@ class Ticket115PreparedMutation:
             base_delivery_digest=base_digests[2],
             next_state_digest=next_state_digest,
             health_command_receipt=health_command_receipt,
+            managed_effect_intent=managed_effect_intent,
             base_status_digest=base_status_digest,
             includes_status=status_projection is not None,
         )
@@ -282,6 +295,7 @@ class Ticket115PreparedMutation:
             review_state=review_state,
             delivery_state=delivery_state,
             health_command_receipt=health_command_receipt,
+            managed_effect_intent=managed_effect_intent,
             base_status_digest=base_status_digest,
             status_projection=status_projection,
         )
@@ -303,6 +317,10 @@ class Ticket115PreparedMutation:
                 else self.health_command_receipt.to_storage()
             ),
         }
+        if self.managed_effect_intent is not None:
+            value["managed_effect_intent"] = (
+                self.managed_effect_intent.to_storage()
+            )
         if self.status_projection is not None:
             value["base_status_digest"] = self.base_status_digest
             value["status_projection"] = self.status_projection.to_storage()
@@ -329,8 +347,12 @@ class Ticket115PreparedMutation:
         allowed_fields = {
             legacy_fields,
             legacy_fields | {"health_command_receipt"},
+            legacy_fields | {"health_command_receipt", "managed_effect_intent"},
             legacy_fields | status_fields,
             legacy_fields | {"health_command_receipt"} | status_fields,
+            legacy_fields
+            | {"health_command_receipt", "managed_effect_intent"}
+            | status_fields,
         }
         if type(value) is not dict or frozenset(value) not in allowed_fields:
             raise KeyUnavailable("invalid ticket115 prepared mutation")
@@ -353,6 +375,13 @@ class Ticket115PreparedMutation:
                     None
                     if receipt_wire is None
                     else HealthCommandReceipt.from_storage(receipt_wire)
+                ),
+                managed_effect_intent=(
+                    None
+                    if stored.get("managed_effect_intent") is None
+                    else EffectIntent.from_storage(
+                        stored["managed_effect_intent"]
+                    )
                 ),
                 base_status_digest=stored.get("base_status_digest"),  # type: ignore[arg-type]
                 status_projection=(
@@ -2656,6 +2685,35 @@ class EncryptedStateStore:
             raise CausalIdConflict("causal-id-conflict") from exc
         return True
 
+    def _write_managed_effect_intent(
+        self,
+        connection: sqlite3.Connection,
+        effect_intent: EffectIntent,
+    ) -> None:
+        if type(effect_intent) is not EffectIntent:
+            raise AuthorityValidationError("managed effect intent required")
+        self._validate_effect_write(
+            effect_intent.effect_id,
+            "intent",
+            effect_intent,
+        )
+        existing = self.effect(effect_intent.effect_id)
+        if existing is not None and (
+            existing.state != "intent"
+            or existing.payload != effect_intent
+        ):
+            raise AuthorityValidationError("managed effect intent conflict")
+        if existing is None:
+            nonce, ciphertext = self._seal(
+                f"effect:{effect_intent.effect_id}:intent",
+                effect_intent.to_storage(),
+            )
+            connection.execute(
+                "INSERT INTO effects(effect_id, state, nonce, ciphertext) "
+                "VALUES (?, 'intent', ?, ?)",
+                (effect_intent.effect_id, nonce, ciphertext),
+            )
+
     def commit_managed_command_intent(
         self,
         receipt: HealthCommandReceipt,
@@ -2677,27 +2735,7 @@ class EncryptedStateStore:
             self._assert_integrity_manifest_before_mutation()
             self._write_health_command_receipt(connection, receipt)
             if effect_intent is not None:
-                self._validate_effect_write(
-                    effect_intent.effect_id,
-                    "intent",
-                    effect_intent,
-                )
-                existing = self.effect(effect_intent.effect_id)
-                if existing is not None and (
-                    existing.state != "intent"
-                    or existing.payload != effect_intent
-                ):
-                    raise AuthorityValidationError("managed effect intent conflict")
-                if existing is None:
-                    nonce, ciphertext = self._seal(
-                        f"effect:{effect_intent.effect_id}:intent",
-                        effect_intent.to_storage(),
-                    )
-                    connection.execute(
-                        "INSERT INTO effects(effect_id, state, nonce, ciphertext) "
-                        "VALUES (?, 'intent', ?, ?)",
-                        (effect_intent.effect_id, nonce, ciphertext),
-                    )
+                self._write_managed_effect_intent(connection, effect_intent)
             if delivery_state is not None:
                 self._commit_ticket115_facts_in_transaction(
                     connection,
@@ -4422,6 +4460,20 @@ class EncryptedStateStore:
                 self._write_health_command_receipt(
                     connection,
                     mutation.health_command_receipt,
+                )
+            if mutation.managed_effect_intent is not None:
+                intent = mutation.managed_effect_intent
+                self._write_managed_effect_intent(
+                    connection,
+                    EffectIntent(
+                        effect_id=intent.effect_id,
+                        effect_kind=intent.effect_kind,
+                        intent_digest=intent.intent_digest,
+                        authority=committed.committed,
+                        business_source_causal_id=(
+                            intent.business_source_causal_id
+                        ),
+                    ),
                 )
             self._write_record_row(
                 connection,

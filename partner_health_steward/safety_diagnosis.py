@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Mapping
 
 from .authority import AuthorityValidationError, validate_opaque_text
+from .initialization import stable_digest
 
 
 _SHA256_PREFIX = "sha256:"
@@ -37,6 +38,21 @@ def _sha256(value: object, name: str) -> str:
     except ValueError as exc:
         raise AuthorityValidationError(f"invalid {name}") from exc
     return value
+
+
+def _content_addressed_bundle(value: object, name: str) -> dict[str, object]:
+    """Validate one bundle's declaration against all managed content."""
+
+    bundle = _mapping(value, name)
+    declared = _sha256(bundle.get("bundle_hash"), f"{name} hash")
+    content = {
+        key: item
+        for key, item in bundle.items()
+        if key != "bundle_hash"
+    }
+    if declared != stable_digest(content):
+        raise AuthorityValidationError(f"{name} content address mismatch")
+    return bundle
 
 
 def canonical_json_copy(value: object) -> object:
@@ -77,10 +93,9 @@ def validate_assets(value: object) -> dict[str, object]:
 
 
 def _validate_minimum_help_bundle(value: object) -> None:
-    bundle = _mapping(value, "minimum help bundle")
+    bundle = _content_addressed_bundle(value, "minimum help bundle")
     validate_opaque_text(bundle.get("bundle_id"), "minimum help bundle identifier")
     validate_opaque_text(bundle.get("version"), "minimum help bundle version")
-    _sha256(bundle.get("bundle_hash"), "minimum help bundle hash")
     if bundle.get("language") != "zh-CN":
         raise AuthorityValidationError("minimum help bundle language unavailable")
     templates = _mapping(bundle.get("templates"), "minimum help templates")
@@ -91,10 +106,9 @@ def _validate_minimum_help_bundle(value: object) -> None:
 
 
 def _validate_safety_rule_bundle(value: object) -> None:
-    bundle = _mapping(value, "safety rule bundle")
+    bundle = _content_addressed_bundle(value, "safety rule bundle")
     validate_opaque_text(bundle.get("bundle_id"), "safety rule bundle identifier")
     validate_opaque_text(bundle.get("version"), "safety rule bundle version")
-    _sha256(bundle.get("bundle_hash"), "safety rule bundle hash")
     if type(bundle.get("synthetic")) is not bool:
         raise AuthorityValidationError("invalid safety rule synthetic flag")
     rules = bundle.get("rules")
@@ -107,10 +121,9 @@ def _validate_safety_rule_bundle(value: object) -> None:
 
 
 def _validate_scope_bundle(value: object) -> None:
-    bundle = _mapping(value, "diagnostic scope bundle")
+    bundle = _content_addressed_bundle(value, "diagnostic scope bundle")
     validate_opaque_text(bundle.get("scope_id"), "diagnostic scope identifier")
     validate_opaque_text(bundle.get("version"), "diagnostic scope version")
-    _sha256(bundle.get("bundle_hash"), "diagnostic scope bundle hash")
     _sha256(bundle.get("release_digest"), "diagnostic scope release digest")
     if bundle.get("persistent_state") not in _SCOPE_STATES:
         raise AuthorityValidationError("invalid diagnostic scope state")

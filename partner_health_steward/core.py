@@ -1066,6 +1066,9 @@ class HealthCore:
         except ValueError as exc:
             raise AuthorityValidationError("invalid model authority digest") from exc
         self._model_authority_digest = model_authority_digest
+        self._ticket116_knowledge_refs = tuple(
+            release.release_id for release in knowledge_releases
+        )
         self._ticket116_assets_supplied = safety_diagnostic_assets is not None
         self._ticket116_assets = (
             None
@@ -5428,6 +5431,47 @@ class HealthCore:
         except Exception:
             return None
 
+    @staticmethod
+    def _same_effect_intent_without_authority(
+        left: EffectIntent,
+        right: EffectIntent,
+    ) -> bool:
+        return (
+            left.effect_id == right.effect_id
+            and left.effect_kind == right.effect_kind
+            and left.intent_digest == right.intent_digest
+            and left.business_source_causal_id
+            == right.business_source_causal_id
+        )
+
+    def _ticket116_effect_intent_was_issued(
+        self,
+        intent: EffectIntent,
+    ) -> bool:
+        for result in self._ticket116_results():
+            candidates: list[object] = [result.get("model_intent")]
+            for field in ("contact_alert", "contact_correction"):
+                value = result.get(field)
+                if type(value) is dict:
+                    candidates.append(value.get("effect_intent"))
+            for candidate in candidates:
+                try:
+                    if EffectIntent.from_wire_metadata(candidate) == intent:
+                        return True
+                except (AuthorityValidationError, TypeError, ValueError):
+                    continue
+        return False
+
+    def _effect_intent_matches_claim(
+        self,
+        stored: EffectIntent,
+        requested: EffectIntent,
+    ) -> bool:
+        return stored == requested or (
+            self._same_effect_intent_without_authority(stored, requested)
+            and self._ticket116_effect_intent_was_issued(requested)
+        )
+
     def claim_effect_execution(self, intent: EffectIntent) -> EffectExecutionGrant | None:
         """Claim an effect under a durable terminal-observation tripwire."""
 
@@ -5924,7 +5968,14 @@ class HealthCore:
                         return None
                     if stored.state == "intent" and type(stored.payload) is EffectIntent:
                         issued_intent = stored.payload
-                        if issued_intent != intent or issued_intent.authority.mismatch_reason(head) is not None:
+                        if (
+                            not self._effect_intent_matches_claim(
+                                issued_intent,
+                                intent,
+                            )
+                            or issued_intent.authority.mismatch_reason(head)
+                            is not None
+                        ):
                             return None
                         session = self._execution_capability_session(issued_intent.authority, writer_proof)
                         if session is None:
@@ -5947,7 +5998,13 @@ class HealthCore:
                     elif stored.state == "claiming" and type(stored.payload) is ClaimingEffect:
                         claim = stored.payload
                         issued_intent = claim.intent
-                        if type(issued_intent) is not EffectIntent or issued_intent != intent:
+                        if (
+                            type(issued_intent) is not EffectIntent
+                            or not self._effect_intent_matches_claim(
+                                issued_intent,
+                                intent,
+                            )
+                        ):
                             return None
                         if issued_intent.authority.mismatch_reason(head) is not None:
                             return None
@@ -6370,6 +6427,7 @@ class HealthCore:
         review_state: DailyReviewLedger | None = None,
         delivery_state: DeliveryOutboxState | None = None,
         health_command_receipt: HealthCommandReceipt | None = None,
+        managed_effect_intent: EffectIntent | None = None,
         current_status_projection: StatusProjection | None = None,
         status_projection: StatusProjection | None = None,
     ) -> Ticket115PreparedMutation | None:
@@ -6388,6 +6446,7 @@ class HealthCore:
             and next_review == current_review
             and next_delivery == current_delivery
             and health_command_receipt is None
+            and managed_effect_intent is None
             and status_projection is None
         ):
             return None
@@ -6400,6 +6459,7 @@ class HealthCore:
             review_state=next_review,
             delivery_state=next_delivery,
             health_command_receipt=health_command_receipt,
+            managed_effect_intent=managed_effect_intent,
             current_status_projection=current_status_projection,
             status_projection=status_projection,
         )
@@ -6667,28 +6727,25 @@ class HealthCore:
                     command_digest=command.command_digest,
                     result=result,
                 )
-                if command.action in {
-                    "safety.evaluate",
-                    "safety.correct",
-                    "diagnosis.prepare",
-                }:
-                    if (
-                        effect_intent is not None
-                        and effect_intent.authority != head
-                    ):
-                        raise AuthorityValidationError(
-                            "managed effect authority changed"
-                        )
-                    self._store.commit_managed_command_intent(
-                        receipt,
-                        effect_intent,
-                        delivery_state,
+                if (
+                    effect_intent is not None
+                    and effect_intent.authority != head
+                ):
+                    raise AuthorityValidationError(
+                        "managed effect authority changed"
                     )
+                if (
+                    command.action == "diagnosis.prepare"
+                    and result.get("status") != "model-ready"
+                ):
+                    self._store.commit_managed_command_intent(receipt)
                     return result
                 mutation = self._prepare_ticket115_facts_open(
                     head,
                     settings,
+                    delivery_state=delivery_state,
                     health_command_receipt=receipt,
+                    managed_effect_intent=effect_intent,
                 )
             self._complete_ticket115_mutation(mutation)
         return result
@@ -6700,7 +6757,9 @@ class HealthCore:
         correction: bool = False,
     ) -> SupportContactSettings | None:
         contact = settings.support_contact
-        if type(contact) is not SupportContactSettings or contact.dedicated_paused:
+        if type(contact) is not SupportContactSettings:
+            return None
+        if contact.dedicated_paused and not correction:
             return None
         status = (
             contact.correction_authority_status
@@ -6889,6 +6948,24 @@ class HealthCore:
             == governed_route.configuration_generation
         )
 
+    def _ticket116_knowledge_current(self) -> bool:
+        """Revalidate the constructor-bound releases at the current clock."""
+
+        pipeline = self._non_diagnostic_pipeline
+        if type(pipeline) is not NonDiagnosticReplyPipeline:
+            return False
+        try:
+            valid_at = self._knowledge_clock()
+            if type(valid_at) is not datetime:
+                return False
+            pipeline.with_current_owner_cards(
+                (),
+                knowledge_valid_at=valid_at.isoformat(),
+            )
+        except Exception:
+            return False
+        return True
+
     def _execute_ticket116_diagnosis_prepare(
         self,
         command: TrustedHealthCommand,
@@ -6902,6 +6979,7 @@ class HealthCore:
         }
         if set(payload) != required or type(payload.get("minimum_evidence")) is not dict:
             raise ProtocolViolation("invalid diagnosis preparation fields")
+        self._reconcile_ticket116_scope_invalidation()
         assets = self._ticket116_assets
         if assets is None:
             return self._commit_ticket116_result(
@@ -6909,6 +6987,7 @@ class HealthCore:
                 {"_ticket116_action": command.action, "status": "rejected"},
             )
         scope = assets.get("diagnostic_scope_bundle")
+        safety_bundle = assets.get("safety_rule_bundle")
         with self._ticket115_write_authority() as (head, settings):
             if command.generation != head.generation:
                 return {
@@ -6943,6 +7022,7 @@ class HealthCore:
                 and not settings.recording_stopped
                 and self._store.unresolved_daily_turn() is None
                 and self._ticket116_route_current(settings)
+                and self._ticket116_knowledge_current()
                 and self._ticket116_evidence_current(evidence)
                 and type(observed_at) is datetime
                 and diagnostic_measurement_eligible(
@@ -7029,7 +7109,26 @@ class HealthCore:
                     "request": request.to_wire(),
                     "model_intent": effect.to_wire_metadata(),
                     "model_effect_id": effect.effect_id,
-                    "_preparation": payload,
+                    "_preparation": {
+                        **payload,
+                        "_expected_refs": {
+                            "knowledge_refs": list(
+                                self._ticket116_knowledge_refs
+                            ),
+                            "safety_bundle_ref": (
+                                f"{safety_bundle['bundle_id']}@"
+                                f"{safety_bundle['version']}"
+                            ),
+                            "template_bundle_ref": ticket116_template_ref(
+                                assets,
+                                "minimum_help",
+                            ),
+                            "model_capability_ref": (
+                                f"{profile.profile_id}@"
+                                f"{profile.profile_version}"
+                            ),
+                        },
+                    },
                 }
         return self._commit_ticket116_result(
             command,
@@ -7054,33 +7153,67 @@ class HealthCore:
                         item["exit_reason"] = successor.get("reason")
                 if not any(item["diagnosis_ref"] == successor["diagnosis_ref"] for item in diagnoses):
                     diagnoses.append(successor)
-        # Scope prerequisite loss is a deterministic invalidation successor.
-        assets = self._ticket116_assets
-        if assets is not None and not diagnostic_prerequisites_current(assets):
-            for item in tuple(diagnoses):
-                if item.get("current") is not True:
-                    continue
-                item["current"] = False
-                item["exit_reason"] = "diagnostic-scope-invalidated"
-                identity = stable_digest(
-                    {
-                        "contract": "ticket116-scope-invalidation-v1",
-                        "predecessor_ref": item["diagnosis_ref"],
-                        "bundle": assets.get("diagnostic_scope_bundle"),
-                    }
-                ).removeprefix("sha256:")
-                diagnoses.append(
-                    {
-                        **item,
-                        "diagnosis_ref": "diagnosis:ticket116-invalidation:" + identity,
-                        "predecessor_ref": item["diagnosis_ref"],
-                        "outcome": "withdraw",
-                        "reason": "diagnostic-scope-invalidated",
-                        "correction_ref": "scope-currentness:invalidated",
-                        "current": False,
-                    }
-                )
         return diagnoses
+
+    def _reconcile_ticket116_scope_invalidation(self) -> None:
+        """Persist scope-loss successors through the existing command CAS."""
+
+        assets = self._ticket116_assets
+        if assets is None or diagnostic_prerequisites_current(assets):
+            return
+        while True:
+            current = next(
+                (
+                    item
+                    for item in self._ticket116_diagnoses_projection()
+                    if item.get("current") is True
+                ),
+                None,
+            )
+            if current is None:
+                return
+            predecessor_ref = current.get("diagnosis_ref")
+            if type(predecessor_ref) is not str:
+                raise AuthorityValidationError(
+                    "invalid current diagnosis reference"
+                )
+            identity = stable_digest(
+                {
+                    "contract": "ticket116-scope-invalidation-v1",
+                    "predecessor_ref": predecessor_ref,
+                    "bundle": assets.get("diagnostic_scope_bundle"),
+                }
+            ).removeprefix("sha256:")
+            with self._ticket115_write_authority() as (head, _settings):
+                corrected_at = self._owner_settings_clock()
+                if (
+                    type(corrected_at) is not datetime
+                    or corrected_at.tzinfo is None
+                ):
+                    raise AuthorityValidationError(
+                        "scope invalidation clock unavailable"
+                    )
+            command = TrustedHealthCommand(
+                action="diagnosis.correct",
+                source="diagnostic_runtime",
+                causal_id="ticket116-scope-invalidation:" + identity,
+                generation=head.generation,
+                scope=("diagnosis:correct",),
+                payload={
+                    "diagnosis_ref": predecessor_ref,
+                    "correction_ref": "scope-currentness:invalidated",
+                    "corrected_at_utc": corrected_at.astimezone(
+                        timezone.utc
+                    ).isoformat(),
+                    "outcome": "withdraw",
+                    "reason": "diagnostic-scope-invalidated",
+                },
+            )
+            result = self._execute_ticket116_diagnosis_correct(command)
+            if result.get("status") not in {"revised", "replayed"}:
+                raise AuthorityValidationError(
+                    "scope invalidation successor unavailable"
+                )
 
     def _execute_ticket116_diagnosis_commit(
         self,
@@ -7095,6 +7228,7 @@ class HealthCore:
             raise ProtocolViolation("invalid diagnosis commit")
         if payload.get("commit_kind") != "diagnostic-judgment":
             raise ProtocolViolation("invalid diagnosis commit kind")
+        self._reconcile_ticket116_scope_invalidation()
         source = payload["source_causal_id"]
         effect_id = payload["model_effect_id"]
         recovered = next(
@@ -7165,13 +7299,22 @@ class HealthCore:
             )
             run_ref = None if prepared is None else prepared.get("run_receipt_ref")
             active = self._ticket116_scope_is_active()
+            observed_run = self._ticket116_read_acceptance_fact(run_ref)
+            run_generation = (
+                None
+                if observed_run is None
+                or type(observed_run.get("generation")) is not int
+                else observed_run["generation"]
+            )
             staged_run_current = (
                 not active
                 and type(run_ref) is str
                 and payload.get("run_receipt_ref") == run_ref
+                and run_generation is not None
+                and head.generation == run_generation + 1
                 and self._ticket116_valid_run_fact(
                     run_ref,
-                    head=head,
+                    head=replace(head, generation=run_generation),
                     settings=settings,
                 )
                 is not None
@@ -7180,6 +7323,7 @@ class HealthCore:
                 type(evidence) is not dict
                 or not self._ticket116_evidence_current(evidence)
                 or not self._ticket116_route_current(settings)
+                or not self._ticket116_knowledge_current()
                 or settings.recording_stopped
                 or not safety_rules_current(assets or {})
                 or not diagnostic_prerequisites_current(assets or {})
@@ -7207,6 +7351,13 @@ class HealthCore:
                         or judgment.get("classification") != classification
                         or judgment.get("unit") != "kg/m^2"
                         or candidate_wire.get("evidence_refs") != [evidence.get("evidence_ref")]
+                        or type(preparation.get("_expected_refs")) is not dict
+                        or any(
+                            candidate_wire.get(field) != expected
+                            for field, expected in preparation[
+                                "_expected_refs"
+                            ].items()
+                        )
                     ):
                         valid = False
             if not valid or candidate_wire is None or type(preparation) is not dict:
@@ -7335,6 +7486,7 @@ class HealthCore:
             "run_receipt_ref", "acceptance_receipt_ref"
         }:
             raise ProtocolViolation("invalid diagnosis activation")
+        self._reconcile_ticket116_scope_invalidation()
         run_ref = payload["run_receipt_ref"]
         acceptance_ref = payload["acceptance_receipt_ref"]
         with self._ticket115_write_authority() as (head, settings):
@@ -7345,13 +7497,13 @@ class HealthCore:
                 or type(observed_run.get("generation")) is not int
                 else observed_run["generation"]
             )
-            # The diagnosis commit is the sole expected authority advance
-            # between consuming a staged run and activating it.  Any further
-            # generation advance is unrelated drift and invalidates the run.
+            # Consuming the staged run and committing its diagnosis each
+            # advance authority once.  Any further generation advance is
+            # unrelated drift and invalidates the run.
             run_fact = (
                 None
                 if run_generation is None
-                or head.generation != run_generation + 1
+                or head.generation != run_generation + 2
                 else self._ticket116_valid_run_fact(
                     run_ref,
                     head=replace(head, generation=run_generation),
@@ -7543,6 +7695,7 @@ class HealthCore:
             assets = self._ticket116_assets
             if assets is None:
                 raise AuthorityValidationError("safety-diagnosis-read-unavailable")
+            self._reconcile_ticket116_scope_invalidation()
             results = self._ticket116_results()
             active_result = next(
                 (

@@ -303,11 +303,59 @@ class HealthPlugin:
                         )
                 router = self._coarse_router
                 if type(router) is not CoarseMessageRouter:
-                    return Response(
-                        "unavailable",
-                        envelope.causal_id,
-                        "daily-routing-unavailable",
+                    admitted = self.invoke(
+                        CommandEnvelope(
+                            peer="plugin",
+                            action="inbound.admit",
+                            source="health_weixin",
+                            causal_id=envelope.causal_id,
+                            generation=message.generation,
+                            scope=("inbound:admit",),
+                            payload=InboundAdmitPayload(envelope, policy),
+                        ),
+                        peer_id=peer_id,
                     )
+                    if admitted.status not in {"accepted", "replayed"}:
+                        return admitted
+                    try:
+                        safety = self.health_operation(
+                            "safety.evaluate",
+                            {
+                                "source_causal_id": envelope.causal_id,
+                                "safety_rule_bundle_hash": (
+                                    self._core.ticket116_safety_rule_bundle_hash()
+                                ),
+                                "facts": {
+                                    "safety_capability": "unavailable",
+                                    "danger": "unknown",
+                                    "scope": "out-of-scope",
+                                },
+                            },
+                            context={
+                                "source": "safety_runtime",
+                                "causal_id": (
+                                    "ticket116-inbound-safety:"
+                                    + envelope.causal_id
+                                ),
+                                "generation": message.generation,
+                                "scope": ["safety:evaluate"],
+                            },
+                            peer_id=peer_id,
+                        )
+                        return Response(
+                            "accepted",
+                            envelope.causal_id,
+                            "ticket116-safety-result",
+                            {
+                                "branch": safety["branch"],
+                                "owner_result": safety["owner_result"],
+                                "contact_alert": safety["contact_alert"],
+                            },
+                        )
+                    finally:
+                        self._core.release_recording_plaintext_if_unowned(
+                            envelope.causal_id
+                        )
                 classification = router.classify(
                     envelope.body,
                     envelope.requested_capability,

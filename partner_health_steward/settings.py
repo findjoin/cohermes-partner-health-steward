@@ -2965,16 +2965,6 @@ class OwnerSettingsEngine:
                 current,
                 version=current.version + 1,
                 dedicated_paused=True,
-                alert_authority_status=(
-                    "revoked"
-                    if current.alert_authority_status == "approved"
-                    else current.alert_authority_status
-                ),
-                correction_authority_status=(
-                    "revoked"
-                    if current.correction_authority_status == "approved"
-                    else current.correction_authority_status
-                ),
             )
         elif operation == "resume":
             if not current.dedicated_paused:
