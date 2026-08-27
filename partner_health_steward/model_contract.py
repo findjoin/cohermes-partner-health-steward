@@ -537,6 +537,9 @@ class StrictModelOutcome:
     model_report: ModelEffectReport | None = None
 
 
+_STRICT_MODEL_AUTHORITIES: dict[str, dict[str, object]] = {}
+
+
 class StrictHealthLLM:
     """Validate authority facts before allowing the one model effect."""
 
@@ -571,6 +574,19 @@ class StrictHealthLLM:
         self._capability_profile = capability_profile
         self._strict_schema_name = _text(strict_schema_name, "strict schema name")
         self._strict_schema_digest = _sha(strict_schema_digest, "strict schema digest")
+        # Core receives the existing hash-bound model authority seam.  Keep a
+        # primitive-safe process-local resolver so an internal managed action
+        # can form the exact request without accepting caller-supplied route or
+        # schema authority.  It is a cache of this validated object, not a
+        # durable or writable business truth.
+        _STRICT_MODEL_AUTHORITIES[self.model_authority_digest] = {
+            "route": FirstHopRoute.to_wire(self._route),
+            "capability_profile": CapabilityProfile.to_wire(
+                self._capability_profile
+            ),
+            "strict_schema_name": self._strict_schema_name,
+            "strict_schema_digest": self._strict_schema_digest,
+        }
 
     @property
     def model_authority_digest(self) -> str:
@@ -586,6 +602,25 @@ class StrictHealthLLM:
                 "strict_schema_digest": self._strict_schema_digest,
             }
         )
+
+    @staticmethod
+    def authority_for_digest(
+        digest: str,
+    ) -> tuple[FirstHopRoute, CapabilityProfile, str, str] | None:
+        """Resolve one already-validated in-process authority by digest."""
+
+        value = _STRICT_MODEL_AUTHORITIES.get(digest)
+        if value is None:
+            return None
+        try:
+            return (
+                FirstHopRoute.from_wire(value["route"]),
+                CapabilityProfile.from_wire(value["capability_profile"]),
+                _text(value["strict_schema_name"], "strict schema name"),
+                _sha(value["strict_schema_digest"], "strict schema digest"),
+            )
+        except (KeyError, ModelContractViolation, TypeError, ValueError):
+            return None
 
     def canonical_copy(self) -> "StrictHealthLLM":
         """Rebuild current authority without caller-owned method shadows."""
@@ -730,8 +765,17 @@ class StrictHealthLLM:
         if (
             not request.capability_profile.synthetic
             or request.capability_profile.input_measurement_method
-            != "synthetic-utf8-byte-upper-bound-v1"
+            not in {
+                "synthetic-utf8-byte-upper-bound-v1",
+                "synthetic-exact-upper-bound-v1",
+            }
             or request.final_input_upper_bound_tokens < measured_input_upper_bound
+            or (
+                request.capability_profile.input_measurement_method
+                == "synthetic-exact-upper-bound-v1"
+                and request.final_input_upper_bound_tokens
+                != measured_input_upper_bound
+            )
             or required_capacity
             > request.capability_profile.common_context_lower_bound_tokens
         ):
@@ -842,18 +886,29 @@ class StrictHealthLLM:
             candidate = _thaw_json(result.structured_output)
             if not isinstance(candidate, Mapping):
                 raise ModelContractViolation("completed result lacks structured output")
-            try:
-                validated = NonDiagnosticCandidate.from_wire(candidate)
-            except NonDiagnosticContractViolation:
-                report = StrictHealthLLM._report(result, "strict-schema-error")
-                return StrictModelOutcome(
-                    disposition="failed-closed",
-                    model_effect="completed",
-                    reason_code="strict-schema-error",
-                    candidate=None,
-                    model_report=report,
-                )
-            candidate_digest = stable_digest(validated.to_wire())
+            if request.strict_schema_name == SYNTHETIC_STRICT_SCHEMA_NAME:
+                try:
+                    validated_candidate = NonDiagnosticCandidate.from_wire(
+                        candidate
+                    ).to_wire()
+                except NonDiagnosticContractViolation:
+                    report = StrictHealthLLM._report(
+                        result,
+                        "strict-schema-error",
+                    )
+                    return StrictModelOutcome(
+                        disposition="failed-closed",
+                        model_effect="completed",
+                        reason_code="strict-schema-error",
+                        candidate=None,
+                        model_report=report,
+                    )
+            else:
+                # Other governed schemas are validated at their domain commit
+                # boundary.  The strict port still binds the exact schema
+                # name/digest and terminal candidate digest here.
+                validated_candidate = candidate
+            candidate_digest = stable_digest(validated_candidate)
             report = StrictHealthLLM._report(
                 result,
                 None,
@@ -863,7 +918,7 @@ class StrictHealthLLM:
                 disposition="candidate",
                 model_effect="completed",
                 reason_code=None,
-                candidate=validated.to_wire(),
+                candidate=validated_candidate,
                 model_report=report,
             )
         if result.status == "incomplete":

@@ -5,8 +5,9 @@ adapter.  Core can commit one :class:`OutboxIntent` beside its business fact,
 then a worker can claim that submitted value and report channel observations
 without collapsing interface acceptance, delivery, or reading into one state.
 
-Support-contact delivery remains disabled here.  Ticket 116 must introduce a
-separate approved authority chain before ``contact-delivery`` can be formed.
+Support-contact delivery is represented only by the Ticket 116 authority-
+bound variant.  The legacy owner-delivery factory and wire keep their existing
+behavior.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ OWNER_DELIVERY_AUTHORIZATION_KINDS = (
     "approval",
     "delivery-unknown",
     "status-transition",
+    "ticket116-contact",
 )
 
 _FACT_ORDER = {kind: index for index, kind in enumerate(DELIVERY_FACT_KINDS)}
@@ -282,10 +284,25 @@ class OutboxIntent:
     status_supersedes_refs: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.effect_kind == "contact-delivery":
-            raise DeliveryContractViolation("contact delivery is not enabled")
-        if self.effect_kind not in DELIVERY_EFFECT_KINDS:
+        ticket116_contact = (
+            self.effect_kind == "contact-delivery"
+            and self.authorization_kind == "ticket116-contact"
+        )
+        if (
+            self.effect_kind not in DELIVERY_EFFECT_KINDS
+            and not ticket116_contact
+        ):
             raise DeliveryContractViolation("unsupported delivery effect kind")
+        if (
+            self.effect_kind == "contact-delivery"
+            and self.authorization_kind != "ticket116-contact"
+        ) or (
+            self.authorization_kind == "ticket116-contact"
+            and self.effect_kind != "contact-delivery"
+        ):
+            raise DeliveryContractViolation(
+                "contact delivery requires Ticket 116 authority"
+            )
         for value, name in (
             (self.intent_id, "outbox intent identifier"),
             (self.owner_id, "delivery owner"),
@@ -326,6 +343,18 @@ class OutboxIntent:
                     "status delivery requires its active-boundary direction"
                 )
             _status_supersession_refs(self.status_supersedes_refs)
+        elif self.authorization_kind == "ticket116-contact":
+            _sha256(
+                self.approval_binding_digest,
+                "contact delivery approval binding digest",
+            )
+            if (
+                self.status_target_active is not None
+                or self.status_supersedes_refs is not None
+            ):
+                raise DeliveryContractViolation(
+                    "contact delivery cannot carry status authorization"
+                )
         elif (
             self.approval_binding_digest is not None
             or self.status_target_active is not None
@@ -1297,6 +1326,64 @@ class OwnerDeliveryEngine:
             approval_binding_digest=approval_binding_digest,
             status_target_active=status_target_active,
             status_supersedes_refs=status_supersedes_refs,
+        )
+
+    @staticmethod
+    def form_ticket116_contact_intent(
+        *,
+        owner_id: str,
+        installation_id: str,
+        effect_request_id: str,
+        business_fact_ref: str,
+        business_revision_digest: str,
+        source_ref: str,
+        recipient_ref: str,
+        route_id: str,
+        route_generation: int,
+        payload_ref: str,
+        payload_digest: str,
+        formed_at_utc: str,
+        approval_binding_digest: str,
+    ) -> OutboxIntent:
+        """Form the authority-bound contact variant without widening legacy."""
+
+        material = _intent_material(
+            effect_kind="contact-delivery",
+            owner_id=owner_id,
+            installation_id=installation_id,
+            effect_request_id=effect_request_id,
+            business_fact_ref=business_fact_ref,
+            business_revision_digest=business_revision_digest,
+            source_ref=source_ref,
+            recipient_ref=recipient_ref,
+            route_id=route_id,
+            route_generation=route_generation,
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            authorization_kind="ticket116-contact",
+            approval_binding_digest=approval_binding_digest,
+        )
+        digest = stable_digest(material)
+        key = "health-owner-delivery:v2:" + digest.removeprefix("sha256:")
+        return OutboxIntent(
+            intent_id="outbox:" + digest.removeprefix("sha256:"),
+            effect_kind="contact-delivery",
+            owner_id=owner_id,
+            installation_id=installation_id,
+            effect_request_id=effect_request_id,
+            business_fact_ref=business_fact_ref,
+            business_revision_digest=business_revision_digest,
+            source_ref=source_ref,
+            recipient_ref=recipient_ref,
+            route_id=route_id,
+            route_generation=route_generation,
+            payload_ref=payload_ref,
+            payload_digest=payload_digest,
+            semantic_digest=digest,
+            idempotency_key=key,
+            formed_at_utc=formed_at_utc,
+            authorization_kind="ticket116-contact",
+            approval_binding_digest=approval_binding_digest,
         )
 
     @staticmethod

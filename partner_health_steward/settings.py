@@ -1453,7 +1453,15 @@ class SupportContactCommand:
                     "support-contact control cannot carry a replacement contact"
                 )
             if self.operation in _SUPPORT_CONTACT_AUTHORITY_OPERATIONS:
-                _text(self.authority_id, "support-contact authority identifier")
+                if self.authority_id is None and self.operation not in {
+                    "revoke_alert_authority",
+                    "revoke_correction_authority",
+                }:
+                    raise SettingsContractViolation(
+                        "support-contact authority identifier required"
+                    )
+                if self.authority_id is not None:
+                    _text(self.authority_id, "support-contact authority identifier")
             elif self.authority_id is not None:
                 raise SettingsContractViolation(
                     "support-contact pause control cannot carry authority"
@@ -2957,6 +2965,16 @@ class OwnerSettingsEngine:
                 current,
                 version=current.version + 1,
                 dedicated_paused=True,
+                alert_authority_status=(
+                    "revoked"
+                    if current.alert_authority_status == "approved"
+                    else current.alert_authority_status
+                ),
+                correction_authority_status=(
+                    "revoked"
+                    if current.correction_authority_status == "approved"
+                    else current.correction_authority_status
+                ),
             )
         elif operation == "resume":
             if not current.dedicated_paused:
@@ -2979,6 +2997,7 @@ class OwnerSettingsEngine:
                 alert_authority_binding=current.expected_authority_binding(),
             )
         elif operation == "revoke_alert_authority":
+            authority_id = authority_id or current.alert_approval_id
             if (
                 current.alert_authority_status != "approved"
                 or authority_id != current.alert_approval_id
@@ -3002,6 +3021,7 @@ class OwnerSettingsEngine:
                 correction_authority_binding=current.expected_authority_binding(),
             )
         elif operation == "revoke_correction_authority":
+            authority_id = authority_id or current.correction_authority_id
             if (
                 current.correction_authority_status != "approved"
                 or authority_id != current.correction_authority_id

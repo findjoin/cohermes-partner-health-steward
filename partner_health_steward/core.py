@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Iterator, Protocol, TypeVar
+from typing import Callable, Iterator, Mapping, Protocol, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .admission import (
@@ -97,11 +97,25 @@ from .health_commands import (
 )
 from .knowledge import KnowledgeRelease
 from .model_contract import (
+    FirstHopRoute,
+    ModelMessage,
     ModelTransportResult,
     StrictHealthLLM,
     StrictModelAdapter,
     StrictModelOutcome,
     StrictModelRequest,
+)
+from .safety_diagnosis import (
+    diagnostic_measurement_eligible,
+    diagnostic_prerequisites_current,
+    minimum_help_current,
+    owner_result as ticket116_owner_result,
+    recompute_bmi,
+    safety_branch,
+    safety_rules_current,
+    scope_wire as ticket116_scope_wire,
+    template_ref as ticket116_template_ref,
+    validate_assets as validate_ticket116_assets,
 )
 from .nondiagnostic import (
     ApprovedClaimAtom,
@@ -158,6 +172,7 @@ from .rights import (
     RightsContractViolation,
 )
 from .settings import (
+    ControlUpdate,
     ExecutionScopeApproval,
     ExecutionScopeConsumptionRequest,
     ORDINARY_NOTIFICATION_KINDS,
@@ -166,6 +181,7 @@ from .settings import (
     OwnerSettingsState,
     RouteConfigurationUpdate,
     SettingsContractViolation,
+    SupportContactCommand,
     SupportContactSettings,
 )
 from .status import (
@@ -248,6 +264,29 @@ _TICKET115_HEALTH_COMMAND_AUTHORITY = {
     "review.prepare": ("health_tasks", ("review:prepare",)),
     "review.commit": ("health_tasks", ("review:commit",)),
     "delivery.observe": ("owner_delivery_adapter", ("delivery:observe",)),
+}
+
+_TICKET116_HEALTH_COMMAND_AUTHORITY = {
+    "safety.evaluate": frozenset({("safety_runtime", ("safety:evaluate",))}),
+    "safety.correct": frozenset({("safety_runtime", ("safety:correct",))}),
+    "diagnosis.prepare": frozenset(
+        {
+            ("diagnostic_runtime", ("diagnosis:prepare",)),
+            ("ticket119_acceptance_runtime", ("diagnosis:prepare",)),
+        }
+    ),
+    "diagnosis.commit": frozenset(
+        {
+            ("diagnostic_runtime", ("diagnosis:commit",)),
+            ("ticket119_acceptance_runtime", ("diagnosis:commit",)),
+        }
+    ),
+    "diagnosis.correct": frozenset(
+        {("diagnostic_runtime", ("diagnosis:correct",))}
+    ),
+    "diagnosis.activate": frozenset(
+        {("ticket119_acceptance_runtime", ("diagnosis:activate",))}
+    ),
 }
 
 # A process-local marker only protects the short hand-off between authorization
@@ -961,6 +1000,8 @@ class HealthCore:
         knowledge_clock: Callable[[], datetime] | None = None,
         approved_claims: tuple[ApprovedClaimAtom, ...] = (),
         approved_templates: tuple[ApprovedReplyTemplate, ...] = (),
+        safety_diagnostic_assets: Mapping[str, object] | None = None,
+        acceptance_evidence_provider: object | None = None,
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -1025,6 +1066,17 @@ class HealthCore:
         except ValueError as exc:
             raise AuthorityValidationError("invalid model authority digest") from exc
         self._model_authority_digest = model_authority_digest
+        self._ticket116_assets_supplied = safety_diagnostic_assets is not None
+        self._ticket116_assets = (
+            None
+            if safety_diagnostic_assets is None
+            else validate_ticket116_assets(dict(safety_diagnostic_assets))
+        )
+        if acceptance_evidence_provider is not None and not callable(
+            getattr(acceptance_evidence_provider, "read", None)
+        ):
+            raise AuthorityValidationError("invalid acceptance evidence provider")
+        self._acceptance_evidence_provider = acceptance_evidence_provider
         if knowledge_clock is not None and not callable(knowledge_clock):
             raise AuthorityValidationError("invalid knowledge clock")
         self._knowledge_clock = (
@@ -1070,6 +1122,7 @@ class HealthCore:
         self._observed_model_preflight_failures: dict[
             tuple[str, str, str], str
         ] = {}
+        self._observed_diagnosis_candidates: dict[str, Mapping[str, object]] = {}
         # A stopped-recording source is never persisted with its body.  The
         # exact admitted envelope may exist only for the current live turn so
         # a body-free temporary answer or an owner correction can still be
@@ -2966,7 +3019,38 @@ class HealthCore:
             command,
             head,
         )
-        if command.action not in _PROBE_BYPASS_ACTIONS and not mandatory_owner_decision:
+        ticket116_safety_admission = (
+            command.action == "inbound.admit"
+            and isinstance(command.payload, InboundAdmitPayload)
+            and self.ticket116_rule_facts_for_body(
+                command.payload.envelope.body
+            )
+            is not None
+            and self._ticket116_only_unresolved_contact_effects()
+        )
+        ticket116_contact_authority_change = (
+            command.action == "owner.prepare"
+            and isinstance(command.payload, OwnerPreparePayload)
+            and (
+                type(command.payload.request.settings_command)
+                is SupportContactCommand
+                or (
+                    type(command.payload.request.settings_command)
+                    is ControlUpdate
+                    and command.payload.request.settings_command.control_name
+                    == "recording"
+                )
+            )
+            and command.payload.request.pending_correction is None
+            and command.payload.request.daily_turn_draft is None
+            and self._ticket116_only_unresolved_contact_effects()
+        )
+        if (
+            command.action not in _PROBE_BYPASS_ACTIONS
+            and not mandatory_owner_decision
+            and not ticket116_safety_admission
+            and not ticket116_contact_authority_change
+        ):
             report = self._probe_for_head(head)
             if report.state is ProbeState.HEALTHY and self._current_writer_proof(head) is None:
                 return _Handled(
@@ -3335,14 +3419,28 @@ class HealthCore:
 
         current_settings = self._current_owner_settings(head)
         if request.expected_settings_version != current_settings.version:
-            return _Handled(
-                Response(
-                    "rejected",
-                    command.causal_id,
-                    "owner-settings-version-mismatch",
-                ),
-                True,
-            )
+            if (
+                request.expected_settings_version < current_settings.version
+                and type(request.settings_command) is ControlUpdate
+                and request.settings_command.control_name == "recording"
+                and request.pending_correction is None
+                and request.daily_turn_draft is None
+            ):
+                request = OwnerMutationRequest.form(
+                    context=request.context,
+                    expected_settings_version=current_settings.version,
+                    requested_at_utc=request.requested_at_utc,
+                    settings_command=request.settings_command,
+                )
+            else:
+                return _Handled(
+                    Response(
+                        "rejected",
+                        command.causal_id,
+                        "owner-settings-version-mismatch",
+                    ),
+                    True,
+                )
 
         settings_result: dict[str, object] | None = None
         next_settings = current_settings
@@ -3355,6 +3453,17 @@ class HealthCore:
                     or observed_at.utcoffset() is None
                 ):
                     raise ValueError("owner settings clock must be timezone-aware")
+                if (
+                    type(request.settings_command) is ControlUpdate
+                    and request.settings_command.control_name == "recording"
+                    and request.settings_command.operation == "resume"
+                    and current_settings.recording_stopped_at_utc is not None
+                ):
+                    stopped_at = datetime.fromisoformat(
+                        current_settings.recording_stopped_at_utc
+                    )
+                    if observed_at <= stopped_at:
+                        observed_at = stopped_at + timedelta(microseconds=1)
                 core_committed_at = observed_at.astimezone(timezone.utc).isoformat()
             except Exception as exc:
                 raise StoreUnavailable("owner settings clock unavailable") from exc
@@ -5501,14 +5610,34 @@ class HealthCore:
                         return self._model_authorization_failure()
                     if self._writer_entry_preflight() is not None:
                         return self._model_authorization_failure()
-                    source_binding = self._daily_source_binding(
-                        source_causal_id
-                    )
+                    source_binding = self._daily_source_binding(source_causal_id)
                     daily = self._store.daily_turn(source_causal_id)
+                    ticket116_execution = execution_candidate = None
+                    # A Ticket 116 request is already bound by its managed
+                    # command receipt/effect intent rather than a daily-turn
+                    # evidence stage.
+                    for managed in self._ticket116_results():
+                        if (
+                            managed.get("_ticket116_action") == "diagnosis.prepare"
+                            and managed.get("status") == "model-ready"
+                            and managed.get("model_effect_id")
+                            == getattr(getattr(grant, "lease", None), "effect_id", None)
+                            and type(managed.get("_preparation")) is dict
+                            and managed["_preparation"].get("source_causal_id")
+                            == source_causal_id
+                        ):
+                            execution_candidate = managed
+                            break
+                    ticket116_execution = execution_candidate is not None
                     if (
-                        source_binding is None
-                        or daily is None
-                        or daily.phase != "evidence-finalized"
+                        (
+                            not ticket116_execution
+                            and (
+                                source_binding is None
+                                or daily is None
+                                or daily.phase != "evidence-finalized"
+                            )
+                        )
                         or self._model_authority_digest is None
                         or model_authority_digest != self._model_authority_digest
                     ):
@@ -5586,6 +5715,39 @@ class HealthCore:
             if type(outcome.model_report) is not ModelEffectReport:
                 outcome = unknown_outcome
             self._observed_model_reports[key] = outcome.model_report
+            if execution.intent.effect_id.startswith("effect:ticket116-model:"):
+                if outcome.candidate is not None:
+                    self._observed_diagnosis_candidates[
+                        execution.intent.effect_id
+                    ] = outcome.candidate
+                terminal_command = CommandEnvelope(
+                    peer="plugin",
+                    action="effect.result",
+                    source="ticket116_model_runtime",
+                    causal_id=(
+                        "ticket116-model-result:"
+                        + stable_digest(
+                            {
+                                "effect_id": execution.intent.effect_id,
+                                "lease_id": execution.lease.lease_id,
+                                "report": outcome.model_report.digest,
+                            }
+                        ).removeprefix("sha256:")
+                    ),
+                    generation=execution.lease.authority.generation,
+                    scope=("effect:result",),
+                    payload=EffectResultPayload(
+                        effect_id=execution.intent.effect_id,
+                        intent_digest=execution.intent.intent_digest,
+                        lease_id=execution.lease.lease_id,
+                        completion_capability=grant.completion_capability,  # type: ignore[union-attr]
+                        status=outcome.model_report.outer_effect_status,
+                        terminal=True,
+                        result_digest=outcome.model_report.digest,
+                        model_report=outcome.model_report,
+                    ),
+                )
+                self.handle(terminal_command)
             return outcome
 
     def _claim_effect_execution_open(self, intent: EffectIntent) -> EffectExecutionGrant | None:
@@ -5678,6 +5840,9 @@ class HealthCore:
                     if (
                         type(candidate_intent) is EffectIntent
                         and candidate_intent.effect_kind == "owner-delivery"
+                        and not candidate_intent.effect_id.startswith(
+                            "effect:ticket116-contact"
+                        )
                     ):
                         try:
                             observed_at_utc = self._owner_delivery_clock_utc_open()
@@ -5718,6 +5883,41 @@ class HealthCore:
                             SettingsContractViolation,
                             TypeError,
                             ValueError,
+                        ):
+                            return None
+                    elif (
+                        type(candidate_intent) is EffectIntent
+                        and candidate_intent.effect_id.startswith(
+                            "effect:ticket116-contact"
+                        )
+                    ):
+                        try:
+                            settings = self._current_owner_settings(head)
+                            contact_record = self._ticket115_outbox_state_open(
+                                settings
+                            ).record(
+                                candidate_intent.business_source_causal_id
+                            )
+                            contact_outbox = contact_record.intent
+                            if (
+                                contact_outbox.effect_kind != "contact-delivery"
+                                or contact_outbox.authorization_kind
+                                != "ticket116-contact"
+                                or contact_outbox.effect_request_id
+                                != candidate_intent.effect_id
+                                or contact_outbox.semantic_digest
+                                != candidate_intent.intent_digest
+                                or contact_record.current_layer != "submitted"
+                            ):
+                                return None
+                        except (
+                            AuthorityValidationError,
+                            DeliveryContractViolation,
+                        ):
+                            return None
+                        if any(
+                            not effect_id.startswith("effect:ticket116-contact")
+                            for effect_id in unresolved_effects
                         ):
                             return None
                     elif unresolved_effects != (intent.effect_id,):
@@ -5841,9 +6041,17 @@ class HealthCore:
             if self._closed:
                 return None
             try:
-                if self._probe_open().state is not ProbeState.HEALTHY:
-                    return None
-                return self._store.source_receipt(causal_id)
+                report = self._probe_open()
+                receipt = self._store.source_receipt(causal_id)
+                if report.state is ProbeState.HEALTHY:
+                    return receipt
+                if (
+                    self._ticket116_only_unresolved_contact_effects()
+                    and receipt is not None
+                    and receipt.envelope.body is None
+                ):
+                    return receipt
+                return None
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
 
@@ -5987,7 +6195,7 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("owner-settings-unavailable")
             try:
-                if self._probe_open().state is not ProbeState.HEALTHY:
+                if self.probe().state is not ProbeState.HEALTHY:
                     raise AuthorityValidationError("owner-settings-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
@@ -6334,6 +6542,1310 @@ class HealthCore:
         except _TrustedHealthCommandReplay as replay:
             return replay.result
 
+    @staticmethod
+    def _ticket116_command_authorized(command: TrustedHealthCommand) -> bool:
+        allowed = _TICKET116_HEALTH_COMMAND_AUTHORITY.get(command.action)
+        return allowed is not None and (command.source, command.scope) in allowed
+
+    def _ticket116_results(self) -> tuple[dict[str, object], ...]:
+        results: list[dict[str, object]] = []
+        for receipt in self._store.health_command_receipts():
+            result = receipt.result
+            if (
+                type(result) is dict
+                and result.get("_ticket116_action")
+                in _TICKET116_HEALTH_COMMAND_AUTHORITY
+            ):
+                results.append(result)
+        return tuple(results)
+
+    def _ticket116_scope_is_active(self) -> bool:
+        return any(
+            item.get("_ticket116_action") == "diagnosis.activate"
+            and item.get("status") == "committed"
+            for item in self._ticket116_results()
+        )
+
+    def _ticket116_consumed_run_refs(self) -> frozenset[str]:
+        return frozenset(
+            item["run_receipt_ref"]
+            for item in self._ticket116_results()
+            if item.get("_ticket116_action") == "diagnosis.prepare"
+            and item.get("status") == "model-ready"
+            and type(item.get("run_receipt_ref")) is str
+        )
+
+    def _ticket116_terminal_run_refs(self) -> frozenset[str]:
+        return frozenset(
+            item["run_receipt_ref"]
+            for item in self._ticket116_results()
+            if item.get("_ticket116_action") == "diagnosis.activate"
+            and item.get("status") != "committed"
+            and type(item.get("run_receipt_ref")) is str
+        )
+
+    def _ticket116_read_acceptance_fact(
+        self,
+        receipt_ref: object,
+    ) -> dict[str, object] | None:
+        if type(receipt_ref) is not str or not receipt_ref:
+            return None
+        provider = self._acceptance_evidence_provider
+        read = None if provider is None else getattr(provider, "read", None)
+        if not callable(read):
+            return None
+        try:
+            value = read(receipt_ref)
+            if type(value) is not dict:
+                return None
+            return json.loads(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            return None
+
+    def _ticket116_valid_run_fact(
+        self,
+        receipt_ref: object,
+        *,
+        head: AuthoritySnapshot,
+        settings: OwnerSettingsState,
+    ) -> dict[str, object] | None:
+        assets = self._ticket116_assets
+        if assets is None:
+            return None
+        scope = assets.get("diagnostic_scope_bundle")
+        fact = self._ticket116_read_acceptance_fact(receipt_ref)
+        if type(scope) is not dict or fact is None:
+            return None
+        expected = {
+            "receipt_kind": "ticket119-acceptance-run",
+            "status": "current",
+            "owner_id": settings.owner_id,
+            "installation_id": settings.installation_id,
+            "release_digest": scope.get("release_digest"),
+            "bundle_hash": scope.get("bundle_hash"),
+            "generation": head.generation,
+        }
+        if any(fact.get(key) != value for key, value in expected.items()):
+            return None
+        for key in ("run_id", "gate_id", "issued_at_utc", "expires_at_utc"):
+            if type(fact.get(key)) is not str:
+                return None
+        try:
+            expires = datetime.fromisoformat(fact["expires_at_utc"])
+        except (TypeError, ValueError):
+            return None
+        if expires.tzinfo is None or expires <= datetime.now(timezone.utc):
+            return None
+        return fact
+
+    def _commit_ticket116_result(
+        self,
+        command: TrustedHealthCommand,
+        result: dict[str, object],
+        *,
+        effect_intent: EffectIntent | None = None,
+        delivery_state: DeliveryOutboxState | None = None,
+    ) -> dict[str, object]:
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (head, settings):
+                self._recheck_trusted_health_command_open(
+                    head,
+                    command,
+                    expected_action=command.action,
+                )
+                if command.generation != head.generation:
+                    raise ProtocolViolation("generation mismatch")
+                receipt = HealthCommandReceipt(
+                    causal_id=command.causal_id,
+                    command_digest=command.command_digest,
+                    result=result,
+                )
+                if command.action in {
+                    "safety.evaluate",
+                    "safety.correct",
+                    "diagnosis.prepare",
+                }:
+                    if (
+                        effect_intent is not None
+                        and effect_intent.authority != head
+                    ):
+                        raise AuthorityValidationError(
+                            "managed effect authority changed"
+                        )
+                    self._store.commit_managed_command_intent(
+                        receipt,
+                        effect_intent,
+                        delivery_state,
+                    )
+                    return result
+                mutation = self._prepare_ticket115_facts_open(
+                    head,
+                    settings,
+                    health_command_receipt=receipt,
+                )
+            self._complete_ticket115_mutation(mutation)
+        return result
+
+    def _ticket116_contact_current(
+        self,
+        settings: OwnerSettingsState,
+        *,
+        correction: bool = False,
+    ) -> SupportContactSettings | None:
+        contact = settings.support_contact
+        if type(contact) is not SupportContactSettings or contact.dedicated_paused:
+            return None
+        status = (
+            contact.correction_authority_status
+            if correction
+            else contact.alert_authority_status
+        )
+        binding = (
+            contact.correction_authority_binding
+            if correction
+            else contact.alert_authority_binding
+        )
+        if (
+            contact.route_generation
+            != settings.current_configuration_generation
+            or status != "approved"
+            or binding != contact.expected_authority_binding()
+        ):
+            return None
+        return contact
+
+    def _execute_ticket116_safety(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        if type(payload) is not dict:
+            raise ProtocolViolation("invalid safety payload")
+        allowed = {
+            "source_causal_id", "safety_rule_bundle_hash", "facts",
+            "event_time", "owner_recognizable_name",
+        }
+        if not {"source_causal_id", "safety_rule_bundle_hash", "facts"}.issubset(payload) or not set(payload).issubset(allowed):
+            raise ProtocolViolation("invalid safety payload fields")
+        assets = self._ticket116_assets
+        if assets is None or not minimum_help_current(assets):
+            raise AuthorityValidationError("minimum-help-bundle-unavailable")
+        safety_bundle = assets.get("safety_rule_bundle")
+        rules_current = safety_rules_current(assets)
+        if (
+            type(safety_bundle) is not dict
+            or payload["safety_rule_bundle_hash"] != safety_bundle.get("bundle_hash")
+        ):
+            rules_current = False
+        branch = (
+            "safety-capability-unavailable"
+            if not rules_current
+            else safety_branch(payload["facts"])
+        )
+        template_name = {
+            "safety-capability-unavailable": "minimum_help",
+            "danger-escalation": "danger_owner",
+            "danger-unknown": "danger_unknown",
+            "out-of-scope": "out_of_scope",
+        }.get(branch)
+        owner = (
+            None
+            if template_name is None
+            else ticket116_owner_result(ticket116_template_ref(assets, template_name))
+        )
+        effect: EffectIntent | None = None
+        delivery_state: DeliveryOutboxState | None = None
+        contact_wire: dict[str, object] | None = None
+        contact_internal: dict[str, object] | None = None
+        with self._ticket115_write_authority() as (head, settings):
+            contact = (
+                self._ticket116_contact_current(settings)
+                if branch == "danger-escalation"
+                else None
+            )
+            event_time = payload.get("event_time")
+            recognizable = payload.get("owner_recognizable_name")
+            if contact is not None and type(event_time) is str and type(recognizable) is str:
+                alert = {
+                    "owner_recognizable_name": recognizable,
+                    "event_time": event_time,
+                    "fixed_urgent_help_request": "请尽快联系并协助主人获得紧急帮助。",
+                }
+                identity = stable_digest(
+                    {
+                        "contract": "ticket116-contact-alert-v1",
+                        "source_causal_id": payload["source_causal_id"],
+                        "alert": alert,
+                        "contact_binding": contact.expected_authority_binding(),
+                    }
+                ).removeprefix("sha256:")
+                effect_id = "effect:ticket116-contact:" + identity
+                formed_at_utc = datetime.fromisoformat(event_time).astimezone(
+                    timezone.utc
+                ).isoformat()
+                outbox_intent = OwnerDeliveryEngine.form_ticket116_contact_intent(
+                    owner_id=settings.owner_id,
+                    installation_id=settings.installation_id,
+                    effect_request_id=effect_id,
+                    business_fact_ref=command.causal_id,
+                    business_revision_digest=command.command_digest,
+                    source_ref=payload["source_causal_id"],  # type: ignore[arg-type]
+                    recipient_ref=contact.contact_id,
+                    route_id=contact.route_id,
+                    route_generation=contact.route_generation,
+                    payload_ref=effect_id + ":payload",
+                    payload_digest=stable_digest(alert),
+                    formed_at_utc=formed_at_utc,
+                    approval_binding_digest=contact.expected_authority_binding(),
+                )
+                submitted = OwnerDeliveryEngine.submit(
+                    self._ticket115_outbox_state_open(settings),
+                    outbox_intent,
+                    submitted_at_utc=formed_at_utc,
+                )
+                delivery_state = submitted.state
+                effect = EffectIntent(
+                    effect_id=effect_id,
+                    effect_kind="owner-delivery",
+                    intent_digest=outbox_intent.semantic_digest,
+                    authority=head,
+                    business_source_causal_id=outbox_intent.intent_id,
+                )
+                contact_wire = {
+                    "intent_id": effect.effect_id,
+                    "effect_intent": effect.to_wire_metadata(),
+                }
+                contact_internal = {
+                    "contact_alert": alert,
+                    "destination": {
+                        "contact_id": contact.contact_id,
+                        "identity_label": contact.identity_label,
+                        "method_kind": contact.method_kind,
+                        "method_value": contact.method_value,
+                        "route_id": contact.route_id,
+                        "route_generation": contact.route_generation,
+                    },
+                    "contact_binding": contact.expected_authority_binding(),
+                    "outbox_intent_id": outbox_intent.intent_id,
+                }
+            result: dict[str, object] = {
+                "_ticket116_action": "safety.evaluate",
+                "branch": branch,
+                "owner_result": owner,
+                "contact_alert": contact_wire,
+                "_contact": contact_internal,
+                "_persist_safety_event": not settings.recording_stopped,
+                "_source_causal_id": payload["source_causal_id"],
+            }
+        return self._commit_ticket116_result(
+            command,
+            result,
+            effect_intent=effect,
+            delivery_state=delivery_state,
+        )
+
+    def _ticket116_evidence_current(
+        self,
+        evidence: Mapping[str, object],
+    ) -> bool:
+        ref = evidence.get("evidence_ref")
+        digest = evidence.get("evidence_revision_digest")
+        return any(
+            card.evidence_id == ref and card.revision_digest == digest
+            for card in self.daily_state().current_evidence_cards
+        )
+
+    def _ticket116_route_current(self, settings: OwnerSettingsState) -> bool:
+        provider = self._route_configuration_provider
+        if not callable(provider):
+            return False
+        try:
+            route = provider()
+        except Exception:
+            return False
+        authority = (
+            None
+            if self._model_authority_digest is None
+            else StrictHealthLLM.authority_for_digest(
+                self._model_authority_digest
+            )
+        )
+        governed_route = None if authority is None else authority[0]
+        return (
+            type(route) is RouteConfigurationUpdate
+            and type(governed_route) is FirstHopRoute
+            and route.route_id == settings.current_route_id
+            and route.configuration_generation
+            == settings.current_configuration_generation
+            and route.route_id == governed_route.route_id
+            and route.configuration_generation
+            == governed_route.configuration_generation
+        )
+
+    def _execute_ticket116_diagnosis_prepare(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        if type(payload) is not dict:
+            raise ProtocolViolation("invalid diagnosis preparation")
+        required = {
+            "source_causal_id", "question_ref", "event_ref", "applicable_period",
+            "scope_id", "scope_bundle_hash", "minimum_evidence", "run_receipt_ref",
+        }
+        if set(payload) != required or type(payload.get("minimum_evidence")) is not dict:
+            raise ProtocolViolation("invalid diagnosis preparation fields")
+        assets = self._ticket116_assets
+        if assets is None:
+            return self._commit_ticket116_result(
+                command,
+                {"_ticket116_action": command.action, "status": "rejected"},
+            )
+        scope = assets.get("diagnostic_scope_bundle")
+        with self._ticket115_write_authority() as (head, settings):
+            if command.generation != head.generation:
+                return {
+                    "_ticket116_action": command.action,
+                    "status": "rejected",
+                    "run_receipt_ref": payload.get("run_receipt_ref"),
+                }
+            run_ref = payload.get("run_receipt_ref")
+            staged_run = (
+                command.source == "ticket119_acceptance_runtime"
+                and run_ref not in self._ticket116_consumed_run_refs()
+                and run_ref not in self._ticket116_terminal_run_refs()
+                and self._ticket116_valid_run_fact(
+                    run_ref,
+                    head=head,
+                    settings=settings,
+                )
+                is not None
+            )
+            active = self._ticket116_scope_is_active()
+            evidence = payload["minimum_evidence"]
+            try:
+                observed_at = self._owner_settings_clock()
+            except Exception:
+                observed_at = None
+            authorized = (
+                type(scope) is dict
+                and payload["scope_id"] == scope.get("scope_id")
+                and payload["scope_bundle_hash"] == scope.get("bundle_hash")
+                and diagnostic_prerequisites_current(assets)
+                and safety_rules_current(assets)
+                and not settings.recording_stopped
+                and self._store.unresolved_daily_turn() is None
+                and self._ticket116_route_current(settings)
+                and self._ticket116_evidence_current(evidence)
+                and type(observed_at) is datetime
+                and diagnostic_measurement_eligible(
+                    evidence,
+                    scope,
+                    observed_at_utc=observed_at,
+                )
+                and (active or staged_run)
+            )
+            authority = (
+                None
+                if self._model_authority_digest is None
+                else StrictHealthLLM.authority_for_digest(
+                    self._model_authority_digest
+                )
+            )
+            if not authorized or authority is None:
+                result = {
+                    "_ticket116_action": command.action,
+                    "status": "rejected",
+                    "run_receipt_ref": run_ref,
+                }
+                effect = None
+            else:
+                route, profile, schema_name, schema_digest = authority
+                messages = (
+                    ModelMessage(
+                        "system",
+                        "Return only the governed structured diagnostic candidate.",
+                    ),
+                    ModelMessage(
+                        "user",
+                        json.dumps(
+                            {
+                                "question_ref": payload["question_ref"],
+                                "event_ref": payload["event_ref"],
+                                "applicable_period": payload["applicable_period"],
+                                "minimum_evidence": evidence,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                measured_input = len(
+                    json.dumps(
+                        [item.to_wire() for item in messages],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                request = StrictModelRequest(
+                    route=route,
+                    capability_profile=profile,
+                    messages=messages,
+                    final_input_digest=stable_digest(
+                        {"messages": [item.to_wire() for item in messages]}
+                    ),
+                    final_input_upper_bound_tokens=max(1, measured_input),
+                    output_reservation_tokens=profile.output_reservation_tokens,
+                    strict_schema_name=schema_name,
+                    strict_schema_digest=schema_digest,
+                )
+                identity = stable_digest(
+                    {
+                        "contract": "ticket116-model-intent-v1",
+                        "source_causal_id": payload["source_causal_id"],
+                        "request_digest": request.digest,
+                    }
+                ).removeprefix("sha256:")
+                effect = EffectIntent(
+                    effect_id="effect:ticket116-model:" + identity,
+                    effect_kind="model-work",
+                    intent_digest=request.digest,
+                    authority=head,
+                    business_source_causal_id=payload["source_causal_id"],  # type: ignore[arg-type]
+                )
+                result = {
+                    "_ticket116_action": command.action,
+                    "status": "model-ready",
+                    "run_receipt_ref": run_ref,
+                    "request": request.to_wire(),
+                    "model_intent": effect.to_wire_metadata(),
+                    "model_effect_id": effect.effect_id,
+                    "_preparation": payload,
+                }
+        return self._commit_ticket116_result(
+            command,
+            result,
+            effect_intent=effect,
+        )
+
+    def _ticket116_diagnoses_projection(self) -> list[dict[str, object]]:
+        diagnoses: list[dict[str, object]] = []
+        for result in self._ticket116_results():
+            action = result.get("_ticket116_action")
+            if action == "diagnosis.commit" and type(result.get("_diagnosis")) is dict:
+                diagnosis = json.loads(json.dumps(result["_diagnosis"], ensure_ascii=False))
+                if not any(item["diagnosis_ref"] == diagnosis["diagnosis_ref"] for item in diagnoses):
+                    diagnoses.append(diagnosis)
+            elif action == "diagnosis.correct" and type(result.get("_successor")) is dict:
+                successor = json.loads(json.dumps(result["_successor"], ensure_ascii=False))
+                predecessor = successor.get("predecessor_ref")
+                for item in diagnoses:
+                    if item.get("diagnosis_ref") == predecessor:
+                        item["current"] = False
+                        item["exit_reason"] = successor.get("reason")
+                if not any(item["diagnosis_ref"] == successor["diagnosis_ref"] for item in diagnoses):
+                    diagnoses.append(successor)
+        # Scope prerequisite loss is a deterministic invalidation successor.
+        assets = self._ticket116_assets
+        if assets is not None and not diagnostic_prerequisites_current(assets):
+            for item in tuple(diagnoses):
+                if item.get("current") is not True:
+                    continue
+                item["current"] = False
+                item["exit_reason"] = "diagnostic-scope-invalidated"
+                identity = stable_digest(
+                    {
+                        "contract": "ticket116-scope-invalidation-v1",
+                        "predecessor_ref": item["diagnosis_ref"],
+                        "bundle": assets.get("diagnostic_scope_bundle"),
+                    }
+                ).removeprefix("sha256:")
+                diagnoses.append(
+                    {
+                        **item,
+                        "diagnosis_ref": "diagnosis:ticket116-invalidation:" + identity,
+                        "predecessor_ref": item["diagnosis_ref"],
+                        "outcome": "withdraw",
+                        "reason": "diagnostic-scope-invalidated",
+                        "correction_ref": "scope-currentness:invalidated",
+                        "current": False,
+                    }
+                )
+        return diagnoses
+
+    def _execute_ticket116_diagnosis_commit(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        if type(payload) is not dict or not {
+            "commit_kind", "source_causal_id", "model_effect_id"
+        }.issubset(payload) or not set(payload).issubset(
+            {"commit_kind", "source_causal_id", "model_effect_id", "run_receipt_ref"}
+        ):
+            raise ProtocolViolation("invalid diagnosis commit")
+        if payload.get("commit_kind") != "diagnostic-judgment":
+            raise ProtocolViolation("invalid diagnosis commit kind")
+        source = payload["source_causal_id"]
+        effect_id = payload["model_effect_id"]
+        recovered = next(
+            (
+                item
+                for item in reversed(self._ticket116_results())
+                if item.get("_ticket116_action") == "diagnosis.commit"
+                and item.get("status") == "committed"
+                and item.get("model_effect_id") == effect_id
+                and type(item.get("_diagnosis")) is dict
+                and item["_diagnosis"].get("source_causal_id") == source
+            ),
+            None,
+        )
+        if recovered is not None:
+            return self._commit_ticket116_result(
+                command,
+                {
+                    "_ticket116_action": command.action,
+                    "status": "replayed",
+                    "diagnosis_ref": recovered.get("diagnosis_ref"),
+                    "run_receipt_ref": recovered.get("run_receipt_ref"),
+                    "model_effect_id": effect_id,
+                },
+            )
+        prepared = next(
+            (
+                item
+                for item in reversed(self._ticket116_results())
+                if item.get("_ticket116_action") == "diagnosis.prepare"
+                and item.get("status") == "model-ready"
+                and item.get("model_effect_id") == effect_id
+                and type(item.get("_preparation")) is dict
+                and item["_preparation"].get("source_causal_id") == source
+            ),
+            None,
+        )
+        candidate = (
+            None
+            if type(effect_id) is not str
+            else self._observed_diagnosis_candidates.get(effect_id)
+        )
+        assets = self._ticket116_assets
+        valid = prepared is not None and candidate is not None and assets is not None
+        candidate_wire: dict[str, object] | None = None
+        if valid:
+            try:
+                candidate_wire = json.loads(
+                    json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+                )
+            except (TypeError, ValueError):
+                valid = False
+        required_candidate = {
+            "schema_version", "question_ref", "event_ref", "applicable_period",
+            "scope_id", "scope_bundle_hash", "judgment", "support_refs",
+            "opposition_refs", "missing_refs", "uncertainties", "urgency",
+            "allowed_next_steps", "evidence_refs", "knowledge_refs",
+            "safety_bundle_ref", "template_bundle_ref", "model_capability_ref",
+        }
+        if candidate_wire is None or set(candidate_wire) != required_candidate:
+            valid = False
+        with self._ticket115_write_authority() as (head, settings):
+            preparation = None if prepared is None else prepared.get("_preparation")
+            evidence = (
+                None
+                if type(preparation) is not dict
+                else preparation.get("minimum_evidence")
+            )
+            run_ref = None if prepared is None else prepared.get("run_receipt_ref")
+            active = self._ticket116_scope_is_active()
+            staged_run_current = (
+                not active
+                and type(run_ref) is str
+                and payload.get("run_receipt_ref") == run_ref
+                and self._ticket116_valid_run_fact(
+                    run_ref,
+                    head=head,
+                    settings=settings,
+                )
+                is not None
+            )
+            if (
+                type(evidence) is not dict
+                or not self._ticket116_evidence_current(evidence)
+                or not self._ticket116_route_current(settings)
+                or settings.recording_stopped
+                or not safety_rules_current(assets or {})
+                or not diagnostic_prerequisites_current(assets or {})
+                or not (active or staged_run_current)
+            ):
+                valid = False
+            if valid and candidate_wire is not None and type(preparation) is dict:
+                scope = assets.get("diagnostic_scope_bundle")
+                judgment = candidate_wire.get("judgment")
+                if type(scope) is not dict or type(judgment) is not dict:
+                    valid = False
+                else:
+                    bmi_unrounded, bmi_display, classification = recompute_bmi(
+                        evidence,
+                        scope,
+                    )
+                    if (
+                        candidate_wire.get("question_ref") != preparation.get("question_ref")
+                        or candidate_wire.get("event_ref") != preparation.get("event_ref")
+                        or candidate_wire.get("applicable_period") != preparation.get("applicable_period")
+                        or candidate_wire.get("scope_id") != scope.get("scope_id")
+                        or candidate_wire.get("scope_bundle_hash") != scope.get("bundle_hash")
+                        or judgment.get("bmi_unrounded") != bmi_unrounded
+                        or judgment.get("bmi_display") != bmi_display
+                        or judgment.get("classification") != classification
+                        or judgment.get("unit") != "kg/m^2"
+                        or candidate_wire.get("evidence_refs") != [evidence.get("evidence_ref")]
+                    ):
+                        valid = False
+            if not valid or candidate_wire is None or type(preparation) is not dict:
+                result = {
+                    "_ticket116_action": command.action,
+                    "status": "rejected",
+                    "run_receipt_ref": run_ref,
+                }
+            else:
+                key = (
+                    candidate_wire["question_ref"],
+                    candidate_wire["event_ref"],
+                    candidate_wire["applicable_period"],
+                )
+                existing = next(
+                    (
+                        item
+                        for item in self._ticket116_diagnoses_projection()
+                        if (
+                            item.get("question_ref"),
+                            item.get("event_ref"),
+                            item.get("applicable_period"),
+                        ) == key
+                        and item.get("current") is True
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    result = {
+                        "_ticket116_action": command.action,
+                        "status": "replayed",
+                        "diagnosis_ref": existing["diagnosis_ref"],
+                        "run_receipt_ref": run_ref,
+                    }
+                else:
+                    identity = stable_digest(
+                        {
+                            "contract": "ticket116-diagnosis-v1",
+                            "source_causal_id": source,
+                            "candidate": candidate_wire,
+                        }
+                    ).removeprefix("sha256:")
+                    diagnosis_ref = "diagnosis:ticket116:" + identity
+                    diagnosis = {
+                        **candidate_wire,
+                        "diagnosis_ref": diagnosis_ref,
+                        "source_causal_id": source,
+                        "model_effect_id": effect_id,
+                        "current": True,
+                        "predecessor_ref": None,
+                        "outcome": "initial",
+                        "run_receipt_ref": run_ref,
+                    }
+                    owner_projection = {
+                        "source_causal_id": source,
+                        "diagnosis_ref": diagnosis_ref,
+                        "deterministic": True,
+                        "template_ref": candidate_wire["template_bundle_ref"],
+                    }
+                    result = {
+                        "_ticket116_action": command.action,
+                        "status": "committed",
+                        "diagnosis_ref": diagnosis_ref,
+                        "run_receipt_ref": run_ref,
+                        "model_effect_id": effect_id,
+                        "_diagnosis": diagnosis,
+                        "_owner_result": owner_projection,
+                    }
+        return self._commit_ticket116_result(command, result)
+
+    def _execute_ticket116_diagnosis_correct(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        required = {
+            "diagnosis_ref", "correction_ref", "corrected_at_utc", "outcome", "reason"
+        }
+        if type(payload) is not dict or set(payload) != required:
+            raise ProtocolViolation("invalid diagnosis correction")
+        outcome = payload["outcome"]
+        if outcome not in {"no-change", "replace", "degrade", "withdraw"}:
+            raise ProtocolViolation("invalid diagnosis correction outcome")
+        current = next(
+            (
+                item
+                for item in self._ticket116_diagnoses_projection()
+                if item.get("diagnosis_ref") == payload["diagnosis_ref"]
+                and item.get("current") is True
+            ),
+            None,
+        )
+        if current is None:
+            result = {"_ticket116_action": command.action, "status": "rejected", "outcome": outcome}
+        elif outcome == "no-change":
+            result = {"_ticket116_action": command.action, "status": "no-change", "outcome": outcome}
+        else:
+            identity = stable_digest(
+                {"contract": "ticket116-diagnosis-revision-v1", "payload": payload}
+            ).removeprefix("sha256:")
+            successor = {
+                **current,
+                "diagnosis_ref": "diagnosis:ticket116-revision:" + identity,
+                "predecessor_ref": current["diagnosis_ref"],
+                "correction_ref": payload["correction_ref"],
+                "corrected_at_utc": payload["corrected_at_utc"],
+                "outcome": outcome,
+                "reason": payload["reason"],
+                "current": outcome in {"replace", "degrade"},
+            }
+            result = {
+                "_ticket116_action": command.action,
+                "status": "revised",
+                "outcome": outcome,
+                "diagnosis_ref": successor["diagnosis_ref"],
+                "_successor": successor,
+            }
+        return self._commit_ticket116_result(command, result)
+
+    def _execute_ticket116_diagnosis_activate(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        if type(payload) is not dict or set(payload) != {
+            "run_receipt_ref", "acceptance_receipt_ref"
+        }:
+            raise ProtocolViolation("invalid diagnosis activation")
+        run_ref = payload["run_receipt_ref"]
+        acceptance_ref = payload["acceptance_receipt_ref"]
+        with self._ticket115_write_authority() as (head, settings):
+            observed_run = self._ticket116_read_acceptance_fact(run_ref)
+            run_generation = (
+                None
+                if observed_run is None
+                or type(observed_run.get("generation")) is not int
+                else observed_run["generation"]
+            )
+            # The diagnosis commit is the sole expected authority advance
+            # between consuming a staged run and activating it.  Any further
+            # generation advance is unrelated drift and invalidates the run.
+            run_fact = (
+                None
+                if run_generation is None
+                or head.generation != run_generation + 1
+                else self._ticket116_valid_run_fact(
+                    run_ref,
+                    head=replace(head, generation=run_generation),
+                    settings=settings,
+                )
+            )
+            acceptance = self._ticket116_read_acceptance_fact(acceptance_ref)
+            diagnosis = next(
+                (
+                    item
+                    for item in self._ticket116_diagnoses_projection()
+                    if item.get("run_receipt_ref") == run_ref
+                ),
+                None,
+            )
+            terminal = run_ref in self._ticket116_terminal_run_refs()
+            accepted = (
+                not terminal
+                and run_fact is not None
+                and diagnosis is not None
+                and acceptance is not None
+                and acceptance.get("receipt_kind") == "ticket119-owner-acceptance"
+                and acceptance.get("status") == "accepted"
+                and acceptance.get("run_receipt_ref") == run_ref
+                and acceptance.get("owner_id") == run_fact.get("owner_id")
+                and acceptance.get("installation_id") == run_fact.get("installation_id")
+                and acceptance.get("release_digest") == run_fact.get("release_digest")
+                and acceptance.get("bundle_hash") == run_fact.get("bundle_hash")
+                and acceptance.get("generation") == run_fact.get("generation")
+                and acceptance.get("run_id") == run_fact.get("run_id")
+                and acceptance.get("gate_id") == run_fact.get("gate_id")
+                and acceptance.get("diagnosis_ref") == diagnosis.get("diagnosis_ref")
+                and type(acceptance.get("accepted_at_utc")) is str
+            )
+            result = {
+                "_ticket116_action": command.action,
+                "status": "committed" if accepted else "rejected",
+                "run_receipt_ref": run_ref,
+                "acceptance_evidence_ref": acceptance_ref if accepted else None,
+            }
+        return self._commit_ticket116_result(command, result)
+
+    def _ticket116_contact_record(
+        self,
+        intent_id: object,
+    ) -> dict[str, object] | None:
+        if type(intent_id) is not str:
+            return None
+        return next(
+            (
+                item
+                for item in reversed(self._ticket116_results())
+                if item.get("_ticket116_action") == "safety.evaluate"
+                and type(item.get("contact_alert")) is dict
+                and item["contact_alert"].get("intent_id") == intent_id
+                and type(item.get("_contact")) is dict
+            ),
+            None,
+        )
+
+    def _execute_ticket116_safety_correct(
+        self,
+        command: TrustedHealthCommand,
+    ) -> dict[str, object]:
+        payload = command.payload
+        if type(payload) is not dict or set(payload) != {
+            "source_alert_intent_id", "basis_change_ref", "corrected_at_utc"
+        }:
+            raise ProtocolViolation("invalid safety correction")
+        source_id = payload["source_alert_intent_id"]
+        source = self._ticket116_contact_record(source_id)
+        already = any(
+            item.get("_ticket116_action") == "safety.correct"
+            and item.get("source_alert_intent_id") == source_id
+            and type(item.get("contact_correction")) is dict
+            for item in self._ticket116_results()
+        )
+        effect: EffectIntent | None = None
+        delivery_state: DeliveryOutboxState | None = None
+        with self._ticket115_write_authority() as (head, settings):
+            contact = self._ticket116_contact_current(settings, correction=True)
+            internal = None if source is None else source.get("_contact")
+            original_binding = (
+                None
+                if type(internal) is not dict
+                else internal.get("contact_binding")
+            )
+            try:
+                delivery_record = self._ticket115_outbox_state_open(settings).record(
+                    internal.get("outbox_intent_id")  # type: ignore[union-attr]
+                )
+            except (AttributeError, DeliveryContractViolation):
+                delivery_record = None
+            departed = (
+                type(delivery_record) is OutboxRecord
+                and delivery_record.current_layer
+                in {"attempted", "accepted", "unknown", "delivered", "read"}
+            )
+            current = (
+                contact is not None
+                and contact.expected_authority_binding() == original_binding
+            )
+            if source is None or not departed or already:
+                outcome = "not-required"
+                correction_wire = None
+                correction_internal = None
+            elif not current:
+                outcome = "correction-undeliverable"
+                correction_wire = None
+                correction_internal = None
+            else:
+                assert type(internal) is dict
+                alert = internal["contact_alert"]
+                assert type(alert) is dict
+                correction_payload = {
+                    "owner_recognizable_name": alert["owner_recognizable_name"],
+                    "event_time": payload["corrected_at_utc"],
+                    "fixed_urgent_help_request": "先前的紧急求助警报已被主人纠正。",
+                }
+                identity = stable_digest(
+                    {
+                        "contract": "ticket116-contact-correction-v1",
+                        "source_alert_intent_id": source_id,
+                        "basis_change_ref": payload["basis_change_ref"],
+                    }
+                ).removeprefix("sha256:")
+                effect_id = "effect:ticket116-contact-correction:" + identity
+                formed_at_utc = datetime.fromisoformat(
+                    payload["corrected_at_utc"]  # type: ignore[arg-type]
+                ).astimezone(timezone.utc).isoformat()
+                outbox_intent = OwnerDeliveryEngine.form_ticket116_contact_intent(
+                    owner_id=settings.owner_id,
+                    installation_id=settings.installation_id,
+                    effect_request_id=effect_id,
+                    business_fact_ref=command.causal_id,
+                    business_revision_digest=command.command_digest,
+                    source_ref=source_id,  # type: ignore[arg-type]
+                    recipient_ref=contact.contact_id,
+                    route_id=contact.route_id,
+                    route_generation=contact.route_generation,
+                    payload_ref=effect_id + ":payload",
+                    payload_digest=stable_digest(correction_payload),
+                    formed_at_utc=formed_at_utc,
+                    approval_binding_digest=contact.expected_authority_binding(),
+                )
+                submitted = OwnerDeliveryEngine.submit(
+                    self._ticket115_outbox_state_open(settings),
+                    outbox_intent,
+                    submitted_at_utc=formed_at_utc,
+                )
+                delivery_state = submitted.state
+                effect = EffectIntent(
+                    effect_id=effect_id,
+                    effect_kind="owner-delivery",
+                    intent_digest=outbox_intent.semantic_digest,
+                    authority=head,
+                    business_source_causal_id=outbox_intent.intent_id,
+                )
+                correction_wire = {
+                    "intent_id": effect.effect_id,
+                    "effect_intent": effect.to_wire_metadata(),
+                }
+                correction_internal = {
+                    "contact_alert": correction_payload,
+                    "destination": internal["destination"],
+                    "contact_binding": original_binding,
+                    "source_alert_intent_id": source_id,
+                    "outbox_intent_id": outbox_intent.intent_id,
+                }
+                outcome = "correction-formed"
+            result = {
+                "_ticket116_action": command.action,
+                "source_alert_intent_id": source_id,
+                "contact_outcome": outcome,
+                "contact_correction": correction_wire,
+                "_contact": correction_internal,
+            }
+        return self._commit_ticket116_result(
+            command,
+            result,
+            effect_intent=effect,
+            delivery_state=delivery_state,
+        )
+
+    def managed_safety_diagnosis_read(self) -> dict[str, object]:
+        """Return the bounded Ticket 116 managed projection."""
+
+        with self._lifecycle_lock:
+            assets = self._ticket116_assets
+            if assets is None:
+                raise AuthorityValidationError("safety-diagnosis-read-unavailable")
+            results = self._ticket116_results()
+            active_result = next(
+                (
+                    item
+                    for item in reversed(results)
+                    if item.get("_ticket116_action") == "diagnosis.activate"
+                    and item.get("status") == "committed"
+                ),
+                None,
+            )
+            acceptance_authorized = any(
+                item.get("_ticket116_action") == "diagnosis.prepare"
+                and item.get("status") == "model-ready"
+                and item.get("run_receipt_ref") is not None
+                for item in results
+            ) and active_result is None
+            state = {
+                "scope_state": "active" if active_result is not None else "staged",
+                "acceptance_evidence_ref": (
+                    None
+                    if active_result is None
+                    else active_result.get("acceptance_evidence_ref")
+                ),
+            }
+            diagnoses = self._ticket116_diagnoses_projection()
+            current_status = "current"
+            if (
+                self.probe().state is not ProbeState.HEALTHY
+                and not self._ticket116_only_unresolved_managed_effects()
+            ):
+                current_status = "cannot-confirm"
+                diagnoses = [
+                    {**item, "current": False}
+                    for item in diagnoses
+                ]
+            owner_results: list[dict[str, object]] = []
+            safety_events: list[dict[str, object]] = []
+            for item in results:
+                if type(item.get("_owner_result")) is dict:
+                    owner_results.append(item["_owner_result"])
+                if (
+                    item.get("_ticket116_action") == "safety.evaluate"
+                    and item.get("_persist_safety_event") is True
+                ):
+                    if type(item.get("owner_result")) is dict:
+                        owner_results.append(
+                            {
+                                "source_causal_id": item.get("_source_causal_id"),
+                                **item["owner_result"],
+                            }
+                        )
+                    safety_events.append(
+                        {
+                            "source_causal_id": item.get("_source_causal_id"),
+                            "branch": item.get("branch"),
+                        }
+                    )
+            return {
+                "scope": ticket116_scope_wire(
+                    state,
+                    assets,
+                    acceptance_authorized=acceptance_authorized,
+                ),
+                "diagnoses": diagnoses,
+                "owner_results": owner_results,
+                "safety_events": safety_events,
+                "current_judgment_status": current_status,
+            }
+
+    @staticmethod
+    def _ticket116_contact_transport_result(
+        record: OutboxRecord,
+    ) -> OwnerDeliveryTransportResult | None:
+        if record.current_layer not in {"accepted", "rejected", "unknown"}:
+            return None
+        fact = record.fact(record.current_layer)
+        if fact.result_ref is None:
+            return None
+        return OwnerDeliveryTransportResult(
+            status=record.current_layer,
+            result_ref=fact.result_ref,
+            evidence_ref=fact.evidence_ref,
+        )
+
+    def execute_ticket116_contact_alert(
+        self,
+        intent_id: str,
+        *,
+        attempted_at_utc: str,
+        observed_at_utc: str,
+        grant: EffectExecutionGrant,
+        transport: object,
+    ) -> dict[str, object]:
+        """Execute one exact minimal alert/correction through the effect seam."""
+
+        validate_opaque_text(intent_id, "contact alert intent identifier")
+        validate_opaque_text(attempted_at_utc, "contact alert attempt time")
+        validate_opaque_text(observed_at_utc, "contact alert observation time")
+        record = self._ticket116_contact_record(intent_id)
+        correction = False
+        if record is None:
+            record = next(
+                (
+                    item
+                    for item in reversed(self._ticket116_results())
+                    if item.get("_ticket116_action") == "safety.correct"
+                    and type(item.get("contact_correction")) is dict
+                    and item["contact_correction"].get("intent_id") == intent_id
+                    and type(item.get("_contact")) is dict
+                ),
+                None,
+            )
+            correction = record is not None
+        if record is None:
+            raise AuthorityValidationError("contact-alert-authorization-required")
+        internal = record["_contact"]
+        assert type(internal) is dict
+        outbox_intent_id = internal.get("outbox_intent_id")
+        if type(outbox_intent_id) is not str:
+            raise AuthorityValidationError("contact-alert-authorization-required")
+        stored = self._store.effect(intent_id)
+        with self._ticket115_write_authority() as (_, settings):
+            durable_record = self._ticket115_outbox_state_open(settings).record(
+                outbox_intent_id
+            )
+        durable_result = self._ticket116_contact_transport_result(durable_record)
+        if durable_result is not None and stored is not None:
+            replay_execution = (
+                stored.payload.execution
+                if stored.state in {"accepted", "rejected", "unknown"}
+                and type(stored.payload) is TerminalEffect
+                else self._validated_effect_execution(
+                    grant,
+                    stored.payload.intent.intent_digest,
+                    effect_kind="owner-delivery",
+                )
+                if stored.state == "executing"
+                and type(stored.payload) is ExecutingEffect
+                else None
+            )
+            if (
+                replay_execution is None
+                or replay_execution.intent.effect_id != intent_id
+            ):
+                raise AuthorityValidationError(
+                    "contact-alert-authorization-required"
+                )
+            replay_response = self.handle(
+                self._owner_delivery_effect_result_command(
+                    replay_execution,
+                    grant,
+                    durable_result,
+                )
+            )
+            return {
+                "transport_result": durable_result.to_wire(),
+                "effect_response": replay_response.to_wire(),
+            }
+        intent = (
+            None
+            if stored is None or stored.state not in {"intent", "executing"}
+            else stored.payload
+            if stored.state == "intent"
+            else stored.payload.intent
+        )
+        if type(intent) is not EffectIntent:
+            raise AuthorityValidationError("contact-alert-authorization-required")
+        execution = self._validated_effect_execution(
+            grant,
+            intent.intent_digest,
+            effect_kind="owner-delivery",
+        )
+        if execution is None or execution.intent.effect_id != intent_id:
+            raise AuthorityValidationError("contact-alert-authorization-required")
+        with self._ticket115_write_authority() as (_, settings):
+            current = self._ticket116_contact_current(
+                settings,
+                correction=correction,
+            )
+            if (
+                current is None
+                or current.expected_authority_binding()
+                != internal.get("contact_binding")
+            ):
+                raise AuthorityValidationError("contact-alert-authority-stale")
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (_, settings):
+                outbox = self._ticket115_outbox_state_open(settings)
+                durable_record = outbox.record(outbox_intent_id)
+                newly_attempted = durable_record.current_layer == "submitted"
+                if newly_attempted:
+                    claimed = OwnerDeliveryEngine.claim(
+                        outbox,
+                        outbox_intent_id,
+                        holder_id=grant.lease.holder_id,
+                        lease_id=grant.lease.lease_id,
+                        acquired_at_utc=attempted_at_utc,
+                    )
+                    self._store.remember_delivery_outbox(claimed.state)
+                    attempted = OwnerDeliveryEngine.mark_attempted(
+                        claimed.state,
+                        outbox_intent_id,
+                        lease_id=grant.lease.lease_id,
+                        attempt_ref=grant.lease.lease_id,
+                        attempted_at_utc=attempted_at_utc,
+                    )
+                    self._store.remember_delivery_outbox(attempted.state)
+                elif durable_record.current_layer != "attempted":
+                    raise AuthorityValidationError(
+                        "contact-alert-authorization-required"
+                    )
+        wire = {
+            "destination": internal["destination"],
+            "contact_alert": internal["contact_alert"],
+        }
+        try:
+            if not newly_attempted:
+                raise RuntimeError("contact attempt outcome was not observed")
+            send = getattr(transport, "send")
+            if not callable(send):
+                raise TypeError("contact transport send is unavailable")
+            transport_result = OwnerDeliveryTransportResult.from_wire(send(wire))
+        except Exception:
+            identity = stable_digest(
+                {
+                    "contract": "ticket116-contact-unknown-v1",
+                    "intent_id": intent_id,
+                    "attempted_at_utc": attempted_at_utc,
+                }
+            ).removeprefix("sha256:")
+            transport_result = OwnerDeliveryTransportResult(
+                status="unknown",
+                result_ref="contact-result:unknown:" + identity,
+                evidence_ref="contact-evidence:unknown:" + identity,
+            )
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (_, settings):
+                outbox = self._ticket115_outbox_state_open(settings)
+                observed = OwnerDeliveryEngine.record_transport_result(
+                    outbox,
+                    outbox_intent_id,
+                    attempt_ref=grant.lease.lease_id,
+                    result=transport_result,
+                    observed_at_utc=observed_at_utc,
+                )
+                self._store.remember_delivery_outbox(observed.state)
+        effect_response = self.handle(
+            self._owner_delivery_effect_result_command(
+                execution,
+                grant,
+                transport_result,
+            )
+        )
+        result = {
+            "transport_result": transport_result.to_wire(),
+            "effect_response": effect_response.to_wire(),
+        }
+        return json.loads(json.dumps(result, ensure_ascii=False))
+
+    def reject_malformed_ticket116_contact_claim(
+        self,
+        grant: EffectExecutionGrant,
+    ) -> None:
+        """Release an exact claimed contact lease rejected before transport."""
+
+        if type(grant) is not EffectExecutionGrant:
+            return
+        effect_id = grant.lease.effect_id
+        stored = self._store.effect(effect_id)
+        if (
+            not effect_id.startswith("effect:ticket116-contact")
+            or stored is None
+            or stored.state != "executing"
+            or type(stored.payload) is not ExecutingEffect
+        ):
+            return
+        execution = self._validated_effect_execution(
+            grant,
+            stored.payload.intent.intent_digest,
+            effect_kind="owner-delivery",
+        )
+        if execution is None or execution != stored.payload:
+            return
+        identity = stable_digest(
+            {
+                "contract": "ticket116-contact-malformed-v1",
+                "effect_id": effect_id,
+                "lease_id": execution.lease.lease_id,
+            }
+        ).removeprefix("sha256:")
+        transport = OwnerDeliveryTransportResult(
+            status="rejected",
+            result_ref="contact-result:rejected:" + identity,
+            evidence_ref="contact-evidence:rejected:" + identity,
+        )
+        self.handle(
+            self._owner_delivery_effect_result_command(
+                execution,
+                grant,
+                transport,
+            )
+        )
+
     def _execute_trusted_health_command(
         self,
         command: TrustedHealthCommand,
@@ -6343,7 +7855,11 @@ class HealthCore:
         if type(command) is not TrustedHealthCommand:
             raise ProtocolViolation("trusted health command required")
         authority = _TICKET115_HEALTH_COMMAND_AUTHORITY.get(command.action)
-        if authority is None or (command.source, command.scope) != authority:
+        ticket116 = self._ticket116_command_authorized(command)
+        if (
+            not ticket116
+            and (authority is None or (command.source, command.scope) != authority)
+        ):
             raise ProtocolViolation("health-command-authority-denied")
 
         with self._lifecycle_lock:
@@ -6360,6 +7876,42 @@ class HealthCore:
                 raise ProtocolViolation("causal-id-conflict") from exc
             if prior is not None:
                 return prior.result
+
+            if ticket116:
+                try:
+                    if command.action == "safety.evaluate":
+                        return self._execute_ticket116_safety(command)
+                    if command.action == "safety.correct":
+                        return self._execute_ticket116_safety_correct(command)
+                    if command.action == "diagnosis.prepare":
+                        return self._execute_ticket116_diagnosis_prepare(command)
+                    if command.action == "diagnosis.commit":
+                        return self._execute_ticket116_diagnosis_commit(command)
+                    if command.action == "diagnosis.correct":
+                        return self._execute_ticket116_diagnosis_correct(command)
+                    if command.action == "diagnosis.activate":
+                        return self._execute_ticket116_diagnosis_activate(command)
+                except _TrustedHealthCommandReplay:
+                    raise
+                except (AuthorityValidationError, CurrentHeadError, StoreUnavailable):
+                    prior = self._store.lookup_health_command_receipt(command)
+                    if prior is not None:
+                        return prior.result
+                    pending = self._store.pending_ticket115_mutation()
+                    stored = (
+                        None
+                        if pending is None
+                        else self._store.record(pending.prepared.target.record_id)
+                    )
+                    return {
+                        "_ticket116_action": command.action,
+                        "status": (
+                            "unknown"
+                            if stored is not None and stored.state == "unknown"
+                            else "rejected"
+                        ),
+                    }
+                raise ProtocolViolation("unsupported Ticket 116 health operation")
 
             with self._ticket115_write_authority() as (head, _settings):
                 if command.generation != head.generation:
@@ -6529,8 +8081,13 @@ class HealthCore:
         authority = _TICKET115_HEALTH_COMMAND_AUTHORITY.get(expected_action)
         if (
             command.action != expected_action
-            or authority is None
-            or (command.source, command.scope) != authority
+            or (
+                not self._ticket116_command_authorized(command)
+                and (
+                    authority is None
+                    or (command.source, command.scope) != authority
+                )
+            )
         ):
             raise ProtocolViolation("health-command-authority-denied")
         try:
@@ -8147,7 +9704,8 @@ class HealthCore:
                 orphan_attempts = tuple(
                     (record.intent, attempted)
                     for record in self._ticket115_outbox_state_open(settings).records
-                    if record.current_layer == "attempted"
+                    if record.intent.effect_kind == "owner-delivery"
+                    and record.current_layer == "attempted"
                     and not self._owner_delivery_attempt_is_active(
                         record.intent.intent_id
                     )
@@ -8874,10 +10432,18 @@ class HealthCore:
                 delivery_state = self._ticket115_outbox_state_open(settings)
                 delivery_revision = stable_digest(delivery_state.to_wire())
                 delivery_generation = max(1, delivery_state.version)
+                contact_unavailable = any(
+                    item.get("_ticket116_action") == "safety.evaluate"
+                    and item.get("branch") == "danger-escalation"
+                    and item.get("contact_alert") is None
+                    for item in self._ticket116_results()
+                )
                 seal_current(
                     "delivery",
                     state=(
-                        "unknown"
+                        "confirmed-fault"
+                        if contact_unavailable
+                        else "unknown"
                         if any(
                             record.current_layer in {"attempted", "unknown"}
                             for record in delivery_state.records
@@ -8931,6 +10497,54 @@ class HealthCore:
                         evidence_refs=(
                             "model-route-authority:"
                             + route_revision.removeprefix("sha256:"),
+                        ),
+                    )
+
+                assets = self._ticket116_assets
+                if assets is not None and minimum_help_current(assets):
+                    safety_revision = stable_digest(
+                        {
+                            "minimum_help_bundle": assets.get("minimum_help_bundle"),
+                            "safety_rule_bundle": assets.get("safety_rule_bundle"),
+                        }
+                    )
+                    seal_current(
+                        "safety",
+                        state=(
+                            "confirmed-ok"
+                            if safety_rules_current(assets)
+                            else "confirmed-fault"
+                        ),
+                        generation=max(1, authority.generation),
+                        revision_digest=safety_revision,
+                        transition_id=(
+                            "status-fact:safety:"
+                            + safety_revision.removeprefix("sha256:")
+                        ),
+                        evidence_refs=(
+                            "safety-assets:"
+                            + safety_revision.removeprefix("sha256:"),
+                        ),
+                    )
+                    scope_projection = self.managed_safety_diagnosis_read()["scope"]
+                    scope_revision = stable_digest(scope_projection)
+                    seal_current(
+                        "diagnostic_scope",
+                        state=(
+                            "confirmed-ok"
+                            if scope_projection["persistent_state"] == "active"
+                            and diagnostic_prerequisites_current(assets)
+                            else "confirmed-fault"
+                        ),
+                        generation=max(1, authority.generation),
+                        revision_digest=scope_revision,
+                        transition_id=(
+                            "status-fact:diagnostic-scope:"
+                            + scope_revision.removeprefix("sha256:")
+                        ),
+                        evidence_refs=(
+                            "diagnostic-scope:"
+                            + scope_revision.removeprefix("sha256:"),
                         ),
                     )
 
@@ -9317,7 +10931,7 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("daily-state-unavailable")
             try:
-                if self._probe_open().state is not ProbeState.HEALTHY:
+                if self.probe().state is not ProbeState.HEALTHY:
                     raise AuthorityValidationError("daily-state-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
@@ -9965,7 +11579,116 @@ class HealthCore:
         with self._lifecycle_lock:
             if self._closed:
                 return ProbeReport(ProbeState.UNAVAILABLE, "current-writer-holder-missing")
-            return self._probe_open()
+            report = self._probe_open()
+            if (
+                report.state is ProbeState.UNKNOWN
+                and report.reason_code == "effect-result-unknown"
+                and self._ticket116_only_unresolved_contact_effects()
+            ):
+                return ProbeReport(
+                    ProbeState.HEALTHY,
+                    "minimum-safety-assets-current",
+                )
+            return report
+
+    def safety_entry_report(self) -> ProbeReport:
+        """Expose only the startup verdict needed before a body is read."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return ProbeReport(
+                    ProbeState.UNAVAILABLE,
+                    "current-writer-holder-missing",
+                )
+            if (
+                self._ticket116_assets_supplied
+                and (
+                    self._ticket116_assets is None
+                    or not minimum_help_current(self._ticket116_assets)
+                )
+            ):
+                return ProbeReport(
+                    ProbeState.UNAVAILABLE,
+                    "minimum-help-bundle-unavailable",
+                )
+            report = self._probe_open()
+            if (
+                report.state is ProbeState.UNKNOWN
+                and report.reason_code == "effect-result-unknown"
+                and self._ticket116_only_unresolved_contact_effects()
+            ):
+                return ProbeReport(
+                    ProbeState.HEALTHY,
+                    "minimum-safety-assets-current",
+                )
+            return report
+
+    def _ticket116_only_unresolved_contact_effects(self) -> bool:
+        unresolved = self._store.unresolved_effects()
+        return bool(unresolved) and all(
+            effect_id.startswith("effect:ticket116-contact")
+            for effect_id in unresolved
+        )
+
+    def _ticket116_only_unresolved_managed_effects(self) -> bool:
+        unresolved = self._store.unresolved_effects()
+        return bool(unresolved) and all(
+            effect_id.startswith("effect:ticket116-contact")
+            or effect_id.startswith("effect:ticket116-model")
+            for effect_id in unresolved
+        )
+
+    def ticket116_assets_configured(self) -> bool:
+        return self._ticket116_assets_supplied
+
+    def ticket116_safety_rule_bundle_hash(self) -> str:
+        assets = self._ticket116_assets
+        bundle = None if assets is None else assets.get("safety_rule_bundle")
+        if type(bundle) is not dict or type(bundle.get("bundle_hash")) is not str:
+            raise AuthorityValidationError("safety-rule-bundle-unavailable")
+        return bundle["bundle_hash"]  # type: ignore[return-value]
+
+    def ticket116_rule_facts_for_body(
+        self,
+        body: object,
+    ) -> dict[str, str] | None:
+        """Match only an exact current deterministic rule asset."""
+
+        assets = self._ticket116_assets
+        if (
+            type(body) is not str
+            or assets is None
+            or not safety_rules_current(assets)
+        ):
+            return None
+        bundle = assets.get("safety_rule_bundle")
+        if type(bundle) is not dict or type(bundle.get("rules")) is not list:
+            return None
+        branch = next(
+            (
+                item.get("branch")
+                for item in bundle["rules"]
+                if type(item) is dict and item.get("input") == body
+            ),
+            None,
+        )
+        return {
+            "safety_capability": (
+                "unavailable"
+                if branch == "safety-capability-unavailable"
+                else "available"
+            ),
+            "danger": (
+                "confirmed"
+                if branch == "danger-escalation"
+                else "unknown"
+                if branch == "danger-unknown"
+                else "not-present"
+            ),
+            "scope": (
+                "out-of-scope" if branch == "out-of-scope" else "in-scope"
+            ),
+        } if branch is not None else None
 
     def _probe_open(self) -> ProbeReport:
         # A probe must never observe this SQLite connection between a business
@@ -9973,6 +11696,17 @@ class HealthCore:
         # so health/model/outbound gates see only committed domain snapshots.
         with self._store.serialized():
             try:
+                if (
+                    self._ticket116_assets_supplied
+                    and (
+                        self._ticket116_assets is None
+                        or not minimum_help_current(self._ticket116_assets)
+                    )
+                ):
+                    return ProbeReport(
+                        ProbeState.UNAVAILABLE,
+                        "minimum-help-bundle-unavailable",
+                    )
                 self._store.verify_key()
                 interrupted = self._store.current_head_observation_guard()
                 if interrupted is not None and interrupted.binding is not None:

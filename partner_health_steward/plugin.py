@@ -225,6 +225,17 @@ class HealthPlugin:
                 causal_id,
                 "initialization-state-unavailable",
             )
+        if (
+            initialization.phase == "enabled"
+            and self._core.ticket116_assets_configured()
+        ):
+            safety_entry = self._core.safety_entry_report()
+            if safety_entry.state is not ProbeState.HEALTHY:
+                return Response(
+                    "unavailable",
+                    causal_id,
+                    safety_entry.reason_code,
+                )
         if initialization.phase == "uninitialized":
             report = self._core.probe()
             if report.state is not ProbeState.HEALTHY:
@@ -232,6 +243,64 @@ class HealthPlugin:
         try:
             envelope = materialize_source(message)
             if initialization.phase == "enabled":
+                safety_facts = self._core.ticket116_rule_facts_for_body(
+                    envelope.body
+                )
+                if safety_facts is not None:
+                    admitted = self.invoke(
+                        CommandEnvelope(
+                            peer="plugin",
+                            action="inbound.admit",
+                            source="health_weixin",
+                            causal_id=envelope.causal_id,
+                            generation=message.generation,
+                            scope=("inbound:admit",),
+                            payload=InboundAdmitPayload(envelope, policy),
+                        ),
+                        peer_id=peer_id,
+                    )
+                    if admitted.status not in {"accepted", "replayed"}:
+                        return admitted
+                    try:
+                        safety = self.health_operation(
+                            "safety.evaluate",
+                            {
+                                "source_causal_id": envelope.causal_id,
+                                "event_time": (
+                                    envelope.protocol_timestamp
+                                    or envelope.received_at
+                                ),
+                                "owner_recognizable_name": "主人",
+                                "safety_rule_bundle_hash": (
+                                    self._core.ticket116_safety_rule_bundle_hash()
+                                ),
+                                "facts": safety_facts,
+                            },
+                            context={
+                                "source": "safety_runtime",
+                                "causal_id": (
+                                    "ticket116-inbound-safety:"
+                                    + envelope.causal_id
+                                ),
+                                "generation": message.generation,
+                                "scope": ["safety:evaluate"],
+                            },
+                            peer_id=peer_id,
+                        )
+                        return Response(
+                            "accepted",
+                            envelope.causal_id,
+                            "ticket116-safety-result",
+                            {
+                                "branch": safety["branch"],
+                                "owner_result": safety["owner_result"],
+                                "contact_alert": safety["contact_alert"],
+                            },
+                        )
+                    finally:
+                        self._core.release_recording_plaintext_if_unowned(
+                            envelope.causal_id
+                        )
                 router = self._coarse_router
                 if type(router) is not CoarseMessageRouter:
                     return Response(
@@ -797,6 +866,19 @@ class HealthPlugin:
             raise AuthorityValidationError("ticket115-read-unavailable")
         return view
 
+    def managed_safety_diagnosis_read(
+        self,
+        *,
+        peer_id: str,
+    ) -> dict[str, object]:
+        """Return the bounded Ticket 116 safety/diagnosis projection."""
+
+        self._require_ticket115_peer(peer_id)
+        view = self._core.managed_safety_diagnosis_read()
+        if type(view) is not dict:
+            raise AuthorityValidationError("safety-diagnosis-read-unavailable")
+        return view
+
     def health_operation(
         self,
         action: str,
@@ -923,6 +1005,29 @@ class HealthPlugin:
                     result.delivery_transition
                 ),
             }
+        if action == "contact-alert.execute":
+            try:
+                fields = _wire_fields(
+                    payload,
+                    frozenset(
+                        {"intent_id", "attempted_at_utc", "observed_at_utc"}
+                    ),
+                )
+            except ProtocolViolation:
+                if type(grant) is EffectExecutionGrant:
+                    self._core.reject_malformed_ticket116_contact_claim(grant)
+                raise
+            if type(grant) is not EffectExecutionGrant or transport is None:
+                raise ProtocolViolation(
+                    "controlled effect grant and transport required"
+                )
+            return self._core.execute_ticket116_contact_alert(
+                fields["intent_id"],  # type: ignore[arg-type]
+                attempted_at_utc=fields["attempted_at_utc"],  # type: ignore[arg-type]
+                observed_at_utc=fields["observed_at_utc"],  # type: ignore[arg-type]
+                grant=grant,
+                transport=transport,
+            )
         raise ProtocolViolation("unsupported Ticket 115 controlled effect")
 
     def business_status(self, *, peer_id: str) -> BusinessStatusResult:

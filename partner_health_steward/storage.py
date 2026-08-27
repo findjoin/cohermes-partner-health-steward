@@ -2609,6 +2609,18 @@ class EncryptedStateStore:
             raise CausalIdConflict("causal-id-conflict")
         return receipt
 
+    def health_command_receipts(self) -> tuple[HealthCommandReceipt, ...]:
+        """Return the append-only managed command ledger in commit order."""
+
+        rows = self._execute(
+            "SELECT causal_id, nonce, ciphertext "
+            "FROM ticket115_health_command_receipts_v1 ORDER BY rowid"
+        ).fetchall()
+        return tuple(
+            self._decode_health_command_receipt(causal_id, nonce, ciphertext)
+            for causal_id, nonce, ciphertext in rows
+        )
+
     def _write_health_command_receipt(
         self,
         connection: sqlite3.Connection,
@@ -2643,6 +2655,57 @@ class EncryptedStateStore:
         except sqlite3.IntegrityError as exc:
             raise CausalIdConflict("causal-id-conflict") from exc
         return True
+
+    def commit_managed_command_intent(
+        self,
+        receipt: HealthCommandReceipt,
+        effect_intent: EffectIntent | None = None,
+        delivery_state: DeliveryOutboxState | None = None,
+    ) -> None:
+        """Atomically append a managed receipt, effect, and delivery facts."""
+
+        if type(receipt) is not HealthCommandReceipt:
+            raise AuthorityValidationError("health command receipt required")
+        if effect_intent is not None and type(effect_intent) is not EffectIntent:
+            raise AuthorityValidationError("managed effect intent required")
+        if (
+            delivery_state is not None
+            and type(delivery_state) is not DeliveryOutboxState
+        ):
+            raise AuthorityValidationError("managed delivery state required")
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            self._write_health_command_receipt(connection, receipt)
+            if effect_intent is not None:
+                self._validate_effect_write(
+                    effect_intent.effect_id,
+                    "intent",
+                    effect_intent,
+                )
+                existing = self.effect(effect_intent.effect_id)
+                if existing is not None and (
+                    existing.state != "intent"
+                    or existing.payload != effect_intent
+                ):
+                    raise AuthorityValidationError("managed effect intent conflict")
+                if existing is None:
+                    nonce, ciphertext = self._seal(
+                        f"effect:{effect_intent.effect_id}:intent",
+                        effect_intent.to_storage(),
+                    )
+                    connection.execute(
+                        "INSERT INTO effects(effect_id, state, nonce, ciphertext) "
+                        "VALUES (?, 'intent', ?, ?)",
+                        (effect_intent.effect_id, nonce, ciphertext),
+                    )
+            if delivery_state is not None:
+                self._commit_ticket115_facts_in_transaction(
+                    connection,
+                    task_state=None,
+                    review_state=None,
+                    delivery_state=delivery_state,
+                )
+            self._refresh_integrity_manifest(connection)
 
     def save_health_command_receipt(
         self,

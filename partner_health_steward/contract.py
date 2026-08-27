@@ -622,6 +622,26 @@ class DailySourceMeta(ResponseMeta):
         return {"business_source_causal_id": self.business_source_causal_id}
 
 
+@dataclass(frozen=True)
+class Ticket116SafetyMeta(ResponseMeta):
+    branch: str
+    owner_result: Mapping[str, object] | None
+    contact_alert: Mapping[str, object] | None
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.branch, "safety branch")
+        for value in (self.owner_result, self.contact_alert):
+            if value is not None and type(value) is not dict:
+                raise ProtocolViolation("invalid safety metadata")
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "branch": self.branch,
+            "owner_result": self.owner_result,
+            "contact_alert": self.contact_alert,
+        }
+
+
 def _parse_response_meta(value: object) -> ResponseMeta:
     if type(value) in {
         EmptyMeta,
@@ -630,6 +650,7 @@ def _parse_response_meta(value: object) -> ResponseMeta:
         EffectIntentMeta,
         DailyTurnMeta,
         DailySourceMeta,
+        Ticket116SafetyMeta,
     }:
         return value
     if isinstance(value, ResponseMeta) or type(value) is not dict:
@@ -653,6 +674,18 @@ def _parse_response_meta(value: object) -> ResponseMeta:
                 value["business_source_causal_id"],
                 "business_source_causal_id",
             )
+        )
+    if keys == {"branch", "owner_result", "contact_alert"}:
+        owner_result = value["owner_result"]
+        contact_alert = value["contact_alert"]
+        if owner_result is not None and type(owner_result) is not dict:
+            raise ProtocolViolation("invalid safety owner metadata")
+        if contact_alert is not None and type(contact_alert) is not dict:
+            raise ProtocolViolation("invalid safety contact metadata")
+        return Ticket116SafetyMeta(
+            _bounded_text(value["branch"], "safety branch"),
+            owner_result,
+            contact_alert,
         )
     effect_fields = {"effect_id", "effect_kind", "intent_digest", "authority"}
     if keys in (effect_fields, effect_fields | {"business_source_causal_id"}):
