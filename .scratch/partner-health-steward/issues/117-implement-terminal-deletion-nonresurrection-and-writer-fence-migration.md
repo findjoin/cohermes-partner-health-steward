@@ -67,36 +67,23 @@ Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-est
 | 117-A8 | 状态/来源/证据/任务/控制/诊断/联系人语义在迁移前后等价，来源身份与发生时间不改写 | 仅比较文件 hash、丢失历史/unknown、重写来源为目标站点 | 语义快照逐类对比、来源连续性、投影等价和目标 current-head 绑定测试 |
 | 117-A9 | 只有明确的当前主人永久删除命令可进入 freeze；其他控制或含义模糊请求保持原状态并返回相应控制/澄清结果 | 暂停/停止记录/取消/撤回/“关闭但保留”触发 terminal delete | owner/scope/generation、命令语义、模糊关闭、旧 replay、一次站外不可召回说明和 no-state-change 测试 |
 
-每个 `117-A*` 是功能 verdict；`Required test evidence` 中以顿号、斜线、逗号或“分别/每类/全分支”列出的每个场景都是独立 Case。实现前按出现顺序登记 `117-Ax-Cyy`，每个 Case 必须映射到可单独失败、测试输出可见的 test/subTest 和独立断言；不能用一个整体断言覆盖多个 Case。purge/manifest registry 必须有“新增受管对象但未登记即失败”的守卫，完成条件是全部 Case `covered=green`。
+`117-A1`—`117-A9` 是功能 verdict 和未来冻结门的追踪单位。验证使用能杀死独立现实错误的等价类，不把矩阵中的标点、字段或故障阶段展开成隐藏 Case registry，也不提前固定测试文件、fixture 或实现 slice。受管对象完整性仍必须有“新增对象未登记即失败”的守卫。
 
-### TDD execution slices
+### 编码前冻结与预审
 
-每个 slice 固定执行：登记本 slice 全部 Case → 添加红测并确认预期失败 → 最小实现转绿 → 运行本 slice 与全部前置 slice 回归。测试按 slice 拆为 `tests/test_ticket117_delete.py`、`test_ticket117_purge.py`、`test_ticket117_manifest.py`、`test_ticket117_transfer.py` 和 `test_ticket117_integration.py`。
+以上范围、语义合同和验收矩阵是本票的冻结输入，不表示详细设计或测试门已经冻结。Ticket 116 闭合且本票被 claim 后，先由 characterization Agent 记录当前绿色行为、可复现差额、必须控制的现实故障和非目标；再由设计 Agent 形成一份唯一增量冻结设计，由独立 verification Agent 形成 verifier-owned 冻结测试门。
 
-1. **Red registries and state machines**：先建立受管对象完整性守卫、明确主人删除命令、删除阶段和迁移 manifest 严格构造测试。完成标准：117-A1—A9 的 contract Case 已登记并按预期失败，遗漏对象类别能稳定失败。
-2. **Freeze and terminal delete**：实现 owner-scoped command gate、共享 freeze、terminal CAS/readback 和 phase persistence。完成标准：117-A1、A3、A9 通过，其他控制无法进入删除，崩溃/未知后无健康入口重新开放。
-3. **Key destruction and purge**：实现 synthetic key provider destruction、全对象清除和空白重建。完成标准：117-A2、A4 通过，raw storage/索引/导出/备份 fixture 无旧内容。
-4. **Semantic manifest**：实现完整、内容寻址、无秘密的 manifest 与 target preflight。完成标准：117-A5、A8 的 manifest/语义等价测试通过。
-5. **Writer-fence transfer**：实现 source freeze、offline target validate、一次 CAS 接管、旧 fence 拒绝和 unknown 双端停止。完成标准：117-A6、A7 通过，无双写/双发窗口。
-6. **Cross-capability fault matrix**：对 Ticket 110—116 的 write/model/task/outbox/contact 入口注入 delete/migration 并发故障。完成标准：每类入口在 stale/terminal/unknown 下都有拒绝证据。
-7. **Regression and review**：运行本票及全量验证，冻结待审 diff，再启动下面规定的 fresh-context Standards/Spec 双轴审查。完成标准：所有原复选项和 117-A1—A9 有“测试 + 实现位置 + 结果”映射，真实 provider 仍明确待 Ticket 119 验证，两轴最终 verdict 均为通过。
+两份冻结产物必须绑定同一 commit/tree、预期红灯、既有绿灯和验证命令，并在生产实现修改前由 fresh-context Spec reviewer 与 Standards reviewer 对同一 checkpoint 预审通过。只有这时才能进入编码；现在不提前建立 117 的详细方案，避免上游实现变化使方案失效。
 
-### Verification and stop conditions
+### 一致性实施、核验、停止与闭票
 
-交审至少运行：
+以通过编码前预审的冻结 checkpoint 为 `review_base`。编码 Agent 只可做使已封存红灯转绿所必需的最小实现修改，并保留既有绿色行为；不得修改冻结设计、冻结验证合同或 verifier-owned 测试，不得新增测试类别、产品功能或验收门。
 
-- `python -m unittest discover -v -s tests -p "test_ticket117_*.py"`
-- `python -m unittest discover -v`
-- `python -m compileall -q partner_health_steward tests`
-- `git diff --check`
+若冻结门本身错误、冻结设计客观无法满足既有验收、需要新架构或外部决定/授权，立即停止并交回冻结阶段；不得由编码 Agent 边改门边实现。新功能必须另开 Ticket，不能扩入本票。
 
-列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。任何需要真实删除、真实密钥销毁、真实 current-head/旧 VM、真实备份或生产迁移的动作都必须停止并等待单独批准；若无法完整枚举受管对象、需要复制部分状态后“以后补齐”，或发现 writer-fence 路线不可实施，立即报告并保持关闭。
+实现后重跑同一冻结门、受影响回归，以及 `python -m unittest discover -v -s tests -p "test_ticket117_*.py"`、`python -m unittest discover -v`、`python -m compileall -q partner_health_steward tests`、`git diff --check`，再形成 `reviewed_commit`/tree。fresh-context Spec reviewer 与 Standards reviewer 只核实实施是否符合冻结设计、冻结验收和证据真实性，不重新设计本票。finding 只有同时满足以下条件才阻塞：P0/P1/P2；有可重复命令或步骤；有可定位证据；明确指出被破坏的冻结验收 ID 或不变量。P3、理论可能、另一种合理偏好和新功能建议均不阻塞。
 
-实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试名、实现 symbol、命令/结果摘要和 diff/commit identity。随后同一个顶层任务可以自行完成闭票编排，但直接编写实现的上下文不能把自评当作审查证据，必须执行以下双轴门：
+任何真实删除、真实密钥销毁、真实 current-head/旧 VM、真实备份或生产迁移动作都必须停止并等待单独批准；无法完整枚举受管对象、需要以后补齐部分状态或 writer-fence 路线不可实施时保持关闭并报告。冻结设计或测试门变化必须返回编码前重新冻结和预审；最终 verdict 后的生产变化必须形成新 checkpoint 并重新核验。全部冻结验收通过且没有 blocker 后应停止继续扩写审查。
 
-1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。完成实现证据和全部验证后创建待审 checkpoint commit，确认工作区无未提交或未跟踪实现文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整实施范围、该范围涉及文件的最终状态和测试证据，不继承实施推理或实施 Agent 的完成判断，并在最终 verdict 中共同引用同一个 base、commit 与 tree hash。
-2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、禁止替代物和每个 `117-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/行号证据、A1—A9 verdict 和总 verdict；未获准的真实删除、密钥销毁、current-head、旧 VM、备份和迁移必须继续标记为未执行并留给 Ticket 119。
-3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、不可逆操作失败关闭、受管对象完整性、writer-fence 单写边界、测试真实性、回归和可维护性，为每项 finding 标注 P0—P3，并输出文件/行号证据和总 verdict。
-4. 任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或未解决的 P0/P1/P2 finding 都阻止关闭。顶层 Agent 修复后必须形成新的 checkpoint commit、重跑受影响测试与全量验证，并让两个 reviewer 对新 commit 重新给出最终 verdict；任何生产代码、测试、配置或迁移在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响当前合同且记录为后继工作时才可保留。
-5. 两轴均对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree identity、最终 Case 映射、验证命令/结果，以及仍待 Ticket 119 的真实 provider 门。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer，本票保持 `claimed`。
+实施 Agent 记录 Gate 到实现位置、验证结果和 checkpoint identity；形成 `reviewed_commit` 前记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结或证据文件。两轴均通过后只追加 `## Answer`、状态和 Map pointer，Answer 记录两轴可定位 verdict 及共同 base/commit/tree。确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`；推送被拒绝时停止，禁止 force push 或改写历史。
 

@@ -81,36 +81,25 @@ G01—G06、G09 的测试通过不替代 G07、G08、G10—G12。G08 永远不�
 | 119-A6 | target binding、真实 capability profile、模型、Weixin、主人、联系人仅在明确授权和前置通过后执行；target-local probe/产品运行时最小处理不向验收 Agent 或仓库暴露原值，仓库只保存无内容结果 | 未授权试跑、空白/旧/未批准 profile、把完整配置/正文/运行库或可逆摘要返回 collector、真实资料/配置/凭据入库、synthetic/pinned fixture 冒充目标 Partner | approval preflight、target-local least-privilege/attestation、target artifact/dirty digest、actual lifecycle/ACL/entry、profile 全字段/计量/下界/失效/actual-model drift、collector input schema、fixture/data scan、redacted evidence 和 revocation 测试 |
 | 119-A7 | 报告分别给出技术 gate 结果、product acceptance verdict、稳定运行尚需证据和剩余硬门槛 | 一项测试通过=已部署/已验收/稳定运行 | 报告 schema、truthful claim linter 和不同 gate 组合的 verdict 测试 |
 
-每个 `119-A*` 是功能 verdict；`Required evidence` 中以顿号、斜线、逗号或“分别/每类/全分支”列出的每个场景都是独立 Case。实现前按出现顺序登记 `119-Ax-Cyy`，每个 Case 必须映射到可单独失败、输出可见的 report/ledger test 或实际 gate 证据；不能用一个整体断言覆盖多个 Case。人工批准和主人/联系人验收不能由自动测试伪造，完成条件是全部 Case 与强制 gate 对同一 digest `covered=green/passed`。
+`119-A1`—`119-A7` 是功能 verdict 和未来冻结门的追踪单位。自动验证使用能杀死独立现实错误的等价类，不把矩阵中的标点、字段或 gate 组合展开成隐藏 Case registry，也不提前固定 collector/test 文件或实现 slice。人工批准和主人/联系人验收不能由自动测试伪造。
 
-### Execution slices
+### 编码前冻结与预审
 
-每个自动化 slice 固定执行：登记本 slice 全部 Case → 添加红测并确认预期失败 → 最小实现转绿 → 运行本 slice 与全部前置 slice 回归。测试按 slice 拆为 `tests/test_ticket119_ledger.py`、`test_ticket119_collector.py`、`test_ticket119_preflight.py` 和 `test_ticket119_verdict.py`。
+以上 gate ledger、G01—G12、语义合同和验收矩阵是本票的冻结输入，不表示详细 collector 设计或自动测试门已经冻结。Ticket 118 闭合且本票被 claim 后，先 characterization 当前 release/preflight 能力与真实 frontier，再形成一份唯一增量冻结设计和独立 verifier-owned 测试门；它们必须绑定同一 commit/tree、预期红灯、既有绿灯和验证命令，并在任何实现修改或 canary 执行前由 fresh-context Spec/Standards reviewer 预审通过。
 
-1. **Red ledger/report contract**：先建立 gate schema、依赖、release digest、五种结果、claim linter 和篡改检测测试。完成标准：119-A1、A2、A7 的全部错误报告 Case 稳定失败。
-2. **Automated evidence collector**：实现只读、无秘密的 gate runner/collector，复用 Ticket 118 的单一验证入口。完成标准：G01—G06 的合成执行能生成可重复 ledger，不会越过失败层。
-3. **Fault and external preflight**：实现 G07—G12 的证据/授权/target isolation preflight、no-go 和 rollback 状态检查。完成标准：前置未过为 `blocked`；当前 frontier 缺批准为 `not-authorized`；已执行但权威不足为 `cannot-confirm`；绝不误报 passed。
-4. **Approved execution**：按顺序执行当时已经获得明确授权的 gate；每层完成即冻结证据和 digest。完成标准：每个已执行 gate 有完整 ledger，后续执行符合依赖与批准。
-5. **Fresh-context acceptance review**：冻结最终报告、原始证据引用、产品声明和待审 checkpoint，再启动下面规定的 Standards/Spec 双轴 reviewer。完成标准：119-A1—A7 全部有证据，两个 reviewer 审查同一 release/run/commit identity，任何未执行或未通过 gate 都明确阻止相应声明。
-6. **Ticket completion decision**：同一个顶层 Agent 可以编排闭票，但每次 no-go/未知/未授权尝试只冻结一份 run record，Ticket 继续保持未完成；只有同一 release digest 的全部强制 gate `passed` 且两个 fresh-context reviewer 均通过，顶层 Agent 才能写 `product acceptance: passed` 的 `## Answer` 并决定 `resolved`。
+本票当前保留既有 staged-family 状态术语作为未来冻结输入，不在上游尚未完成时预先改写。轮到本票冻结时若它与 Tickets 116—118 的已验收实现或权威 Spec 存在冲突，必须把差异和取舍交给主人确认；不得为保留旧术语重构已验收产品，也不得由 Agent 静默改写本票目标。
 
-### Verification and stop conditions
+冻结自动测试门只验证 ledger、collector、依赖、授权和 no-go 行为，不能替代 G01—G12 的真实 gate 证据。获准 gate 仍按既定顺序执行；全部强制 gate 只有对同一 release digest `passed` 才支持产品验收。digest 变化后必须建立新 run，旧证据不得继续闭票。
 
-交审至少运行：
+### 一致性实施、核验、停止与闭票
 
-- `python -m unittest discover -v -s tests -p "test_ticket119_*.py"`
-- Ticket 118 提供的当前 release/preflight 验证入口
-- `python -m unittest discover -v`
-- `python -m compileall -q partner_health_steward tests`
-- `git diff --check`
+以通过编码前预审的冻结 checkpoint 为 `review_base`。编码 Agent 只可做使已封存红灯转绿所必需的最小 ledger/collector 修改，并保留既有绿色行为；不得修改冻结设计、冻结验证合同或 verifier-owned 测试，不得新增测试类别、产品功能或验收门。119 的重点是验证真实环境和上线证据，不得借审查重构产品架构。
 
-列出并审查全部未跟踪文件，记录实际 Python/关键依赖版本。任何真实模型、微信、联系人、主人、current-head、删除、迁移、部署、许可接受或医学审核动作必须在执行前取得对应的明确批准；缺批准就记录 `not-authorized` 并停止该分支。不得把报告生成、自动测试、安装、接口接受或单次通过写成 active、产品验收或稳定运行。
+若冻结门本身错误、实现存在缺陷、需要新架构或外部决定/授权，立即停止：实现缺陷带证据退回对应 Ticket，路线存在性冲突退回 CAN，外部行动等待明确批准；不得在 119 中边改产品架构边验收。
 
-实施 Agent 先在本票末尾追加 `## Implementation evidence (unreviewed)`，逐 Case 记录测试/实际 gate、证据路径、命令/结果摘要和 release/run identity。直接编写实现或执行 canary 的上下文不能把自评当作审查证据，必须执行以下双轴门：
+实现后重跑同一冻结门、Ticket 118 的当前 release/preflight 入口、受影响回归，以及 `python -m unittest discover -v -s tests -p "test_ticket119_*.py"`、`python -m unittest discover -v`、`python -m compileall -q partner_health_steward tests`、`git diff --check`，再形成 `reviewed_commit`/tree。fresh-context Spec/Standards reviewer 只核实冻结设计、冻结自动门、真实 gate 证据和声明真实性，不重新设计产品。finding 只有同时满足 P0/P1/P2、可重复步骤、可定位证据和被破坏的冻结验收 ID/gate/不变量时才阻塞；P3、理论可能、替代偏好和新功能建议不阻塞。
 
-1. 首次实施修改前把包含本合同的当前 `HEAD` 固定为 `review_base`。同一 release digest 的全部强制 gate `passed` 后，提交无秘密的最终 ledger、证据引用和实施记录，确认工作区无未提交或未跟踪实现/证据文件，并记录 `reviewed_commit` 及其 tree hash；随后启动两个全新上下文的 reviewer Agent。reviewer 只读取权威合同、`git diff <review_base>...<reviewed_commit>` 的完整范围、相关文件最终状态、稳定证据引用和测试结果，不继承实施/canary 推理或完成判断，并在最终 verdict 中共同引用同一个 base、commit、tree、release digest 和 run identity。
-2. **Spec reviewer** 逐项核对当前 Spec、`CONTEXT.md`、ADR 0022、本票 required semantic contracts、G01—G12、禁止替代物和每个 `119-Ax-Cyy`，为每项 finding 标注 P0—P3、给出文件/证据定位、A1—A7 verdict、全部强制 gate verdict、产品验收 verdict 和总 verdict。
-3. **Standards reviewer** 独立核对适用 `AGENTS.md`、项目 agent 文档、ADR 0022、授权边界、目标隔离、最小披露、release/run 身份、证据真实性、claim linter、回滚和稳定性声明，为每项 finding 标注 P0—P3，并输出文件/证据定位和总 verdict。
-4. 任一强制 gate 为 `failed`、`cannot-confirm`、`not-authorized` 或 `blocked`，任一 A Case 非绿、验证失败、硬规范违规、任一轴非 `pass` 或存在未解决的 P0/P1/P2 finding，都阻止 `product acceptance: passed` 和闭票。顶层 Agent 修复或在新授权下执行后必须形成新的 checkpoint、重跑受影响 gate 与验证，并让两个 reviewer 对同一新身份重新给出最终 verdict；任何生产代码、测试、配置、release、ledger 或证据引用在最终 verdict 后变化都会使两份 verdict 同时失效。P3 只有在明确证明不影响本票产品验收且记录为后继工作时才可保留。
-5. 全部强制 gate 对同一 release digest `passed` 且两轴对同一个最终 checkpoint 给出 `pass` 后，顶层 Agent 只可追加 `## Answer`、把本票标为 `resolved`，并按 `docs/agents/issue-tracker.md` 在 Map 添加简明 context pointer；`## Answer` 必须记录两个 reviewer、共同的 `review_base`/`reviewed_commit`/tree/release/run identity、最终 Case/gate 映射、验证命令/结果、`product acceptance: passed` 以及仍不足以宣称长期稳定的证据。关票提交前确认相对 `reviewed_commit` 的变化只包含本票和 Map 的关票元数据，然后提交并推送。若无法启动两个 fresh-context reviewer 或任一强制 gate 未通过，本票保持 `claimed`。
+每次 no-go、unknown 或未授权尝试只冻结一份 run record 并停止后继 gate。任何真实模型、微信、联系人、主人、current-head、删除、迁移、部署、许可或医学审核动作必须预先逐项获批；缺批准记录 `not-authorized`。不得把报告、自动测试、安装、接口接受或单次通过写成 active、产品验收或稳定运行。
+
+只有 G01—G12 全部对同一 release digest `passed`、冻结验收全绿且两轴对同一 checkpoint `pass` 后，才可写 `product acceptance: passed`。形成 `reviewed_commit` 前记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结、ledger 或证据文件。随后仅追加 `## Answer`、状态和 Map pointer，记录两轴可定位 verdict、共同 base/commit/tree、release/run/digest 及长期稳定仍需的证据；确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`。推送被拒绝时停止，禁止 force push 或改写历史。
 
