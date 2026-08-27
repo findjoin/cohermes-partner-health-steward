@@ -5,9 +5,10 @@ effect, managed-read, status, and replaceable adapter seams as acceptance
 oracles.  Test setup may assemble the existing synthetic initialized product,
 but no assertion reads SQLite, private collections, or private state helpers.
 
-At the pre-implementation gate V01 is the one real FAIL for the shared managed
-asset prerequisite; V02--V12 are explicit dependency SKIPs until that seam
-exists.  Completion always requires 12 PASS and zero skips.
+The original pre-implementation gate used one shared RED and dependency SKIPs.
+The implementation-review candidate keeps the same twelve methods while adding
+only public-seam equivalence classes that reproduce gaps in existing A1/A3/A4,
+A5, and A9.  Completion always requires 12 PASS and zero skips.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import unittest
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from partner_health_steward import HealthCore, HealthPlugin
 from partner_health_steward.admission import RawWeixinMessage
@@ -25,6 +27,12 @@ from partner_health_steward.authority import (
 from partner_health_steward.contract import ProtocolViolation, Response
 from partner_health_steward.current_head import FailureMode
 from partner_health_steward.delivery import OwnerDeliveryTransportResult
+from partner_health_steward.initialization import stable_digest
+from partner_health_steward.knowledge import (
+    KnowledgePublicationInput,
+    KnowledgePublisher,
+    KnowledgeRelease,
+)
 from partner_health_steward.model_contract import (
     CapabilityProfile,
     FirstHopRoute,
@@ -45,11 +53,23 @@ _MODEL_SCHEMA_NAME = "synthetic-ticket116-diagnosis-v1"
 _MODEL_SCHEMA_DIGEST = "sha256:" + ("d" * 64)
 _RELEASE_DIGEST = "sha256:" + ("8" * 64)
 _SCOPE_ID = "synthetic-bmi-scope"
-_SCOPE_BUNDLE_HASH = "sha256:" + ("3" * 64)
+_SAFETY_BUNDLE_HASH = (
+    "sha256:5ffbf9018418e18b10a95892653922de8b3787945b4f4d5f411737dbebc015f3"
+)
+_SCOPE_BUNDLE_HASH = (
+    "sha256:1aa8d01fd5b0ef1d89e6b085d04e7f2ab23574af8c697e5da33e1cae9aefaabe"
+)
 _MINIMUM_TEMPLATE_REF = "minimum-help-template:synthetic-v1"
 _DANGER_TEMPLATE_REF = "danger-owner-template:synthetic-v1"
 _UNKNOWN_TEMPLATE_REF = "danger-unknown-template:synthetic-v1"
 _OUT_OF_SCOPE_TEMPLATE_REF = "out-of-scope-template:synthetic-v1"
+
+
+def _declared_bundle_digest(bundle: Mapping[str, object]) -> str:
+    """Build a valid synthetic content address, excluding its declaration."""
+
+    payload = {key: value for key, value in bundle.items() if key != "bundle_hash"}
+    return stable_digest(payload)
 
 
 class _RecordingModelAdapter:
@@ -150,6 +170,28 @@ class Ticket116VerificationTests(unittest.TestCase):
             strict_schema_name=_MODEL_SCHEMA_NAME,
             strict_schema_digest=_MODEL_SCHEMA_DIGEST,
         )
+        publication = KnowledgePublicationInput(
+            topic_id="synthetic-ticket116-bmi",
+            governance_schedule_id="synthetic-ticket116-fixed-v1",
+            source_id="synthetic-ticket116-source",
+            source_version="1.0.0-test",
+            rights_status="approved",
+            chinese_status="reviewed-chinese",
+            applicability=("synthetic-ticket116-bmi",),
+            professional_review_status="approved",
+            professional_review_ref="synthetic-review:ticket116",
+            content="synthetic non-medical BMI verification knowledge",
+            published_at="2026-08-24T00:00:00+00:00",
+            expires_at="2026-08-25T00:00:00+00:00",
+        )
+        knowledge_release = KnowledgePublisher().publish(
+            publication,
+            release_version="1.0.0-test",
+        )
+        if type(knowledge_release) is not KnowledgeRelease:
+            raise AssertionError("synthetic Ticket 116 knowledge did not publish")
+        self.knowledge_release = knowledge_release
+        self.knowledge_now = datetime(2026, 8, 24, 3, 30, tzinfo=timezone.utc)
 
     def tearDown(self) -> None:
         self.harness.tearDown()
@@ -196,46 +238,49 @@ class Ticket116VerificationTests(unittest.TestCase):
             if minimum_help_parse_current is None
             else minimum_help_parse_current
         )
-        return {
+        minimum_help_bundle: dict[str, object] = {
+            "bundle_id": "synthetic-minimum-help",
+            "version": "1.0.0-test",
+            "language": "zh-CN",
+            "content_rights_status": (
+                "approved-synthetic" if rights_current else "unknown"
+            ),
+            "review_status": (
+                "approved-synthetic" if review_current else "unknown"
+            ),
+            "parse_status": "valid" if parse_current else "unknown",
+            "templates": {
+                "minimum_help": {
+                    "template_ref": _MINIMUM_TEMPLATE_REF,
+                    "text": "[合成测试] 固定最低求助模板",
+                },
+                "danger_owner": {
+                    "template_ref": _DANGER_TEMPLATE_REF,
+                    "text": "[合成测试] 固定危险主人提示",
+                },
+                "danger_unknown": {
+                    "template_ref": _UNKNOWN_TEMPLATE_REF,
+                    "text": "[合成测试] 固定危险未明提示",
+                },
+                "out_of_scope": {
+                    "template_ref": _OUT_OF_SCOPE_TEMPLATE_REF,
+                    "text": "[合成测试] 固定范围外提示",
+                },
+            },
+        }
+        minimum_help_bundle["bundle_hash"] = _declared_bundle_digest(
+            minimum_help_bundle
+        )
+        assets: dict[str, object] = {
             "asset_contract": "safety-diagnostic-assets-v1",
             "synthetic": True,
             "production_approval": False,
             "release_digest": _RELEASE_DIGEST,
-            "minimum_help_bundle": {
-                "bundle_id": "synthetic-minimum-help",
-                "version": "1.0.0-test",
-                "bundle_hash": "sha256:" + ("1" * 64),
-                "language": "zh-CN",
-                "content_rights_status": (
-                    "approved-synthetic" if rights_current else "unknown"
-                ),
-                "review_status": (
-                    "approved-synthetic" if review_current else "unknown"
-                ),
-                "parse_status": "valid" if parse_current else "unknown",
-                "templates": {
-                    "minimum_help": {
-                        "template_ref": _MINIMUM_TEMPLATE_REF,
-                        "text": "[合成测试] 固定最低求助模板",
-                    },
-                    "danger_owner": {
-                        "template_ref": _DANGER_TEMPLATE_REF,
-                        "text": "[合成测试] 固定危险主人提示",
-                    },
-                    "danger_unknown": {
-                        "template_ref": _UNKNOWN_TEMPLATE_REF,
-                        "text": "[合成测试] 固定危险未明提示",
-                    },
-                    "out_of_scope": {
-                        "template_ref": _OUT_OF_SCOPE_TEMPLATE_REF,
-                        "text": "[合成测试] 固定范围外提示",
-                    },
-                },
-            },
+            "minimum_help_bundle": minimum_help_bundle,
             "safety_rule_bundle": {
                 "bundle_id": "synthetic-safety-rules",
                 "version": "1.0.0-test",
-                "bundle_hash": "sha256:" + ("2" * 64),
+                "bundle_hash": _SAFETY_BUNDLE_HASH,
                 "synthetic": True,
                 "rights_status": (
                     "approved-synthetic" if safety_rules_current else "unknown"
@@ -305,6 +350,11 @@ class Ticket116VerificationTests(unittest.TestCase):
                 ],
             },
         }
+        for name in ("safety_rule_bundle", "diagnostic_scope_bundle"):
+            bundle = assets[name]
+            assert isinstance(bundle, dict)
+            bundle["bundle_hash"] = _declared_bundle_digest(bundle)
+        return assets
 
     def _restart_with_assets(
         self,
@@ -337,6 +387,9 @@ class Ticket116VerificationTests(unittest.TestCase):
                 status_fact_authority=self.harness.status_authority,
                 business_status_clock=lambda: self.base.status_clock_value,
                 model_authority_digest=self.llm.model_authority_digest,
+                knowledge_releases=(self.knowledge_release,),
+                knowledge_valid_at=self.knowledge_now.isoformat(),
+                knowledge_clock=lambda: self.knowledge_now,
                 safety_diagnostic_assets=assets,
                 **acceptance_kwargs,
             )
@@ -690,7 +743,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "urgency": "routine",
             "allowed_next_steps": ["synthetic-professional-review"],
             "evidence_refs": [evidence.evidence_id],
-            "knowledge_refs": ["synthetic-knowledge:ticket116"],
+            "knowledge_refs": [self.knowledge_release.release_id],
             "safety_bundle_ref": "synthetic-safety-rules@1.0.0-test",
             "template_bundle_ref": _MINIMUM_TEMPLATE_REF,
             "model_capability_ref": "synthetic-ticket116-profile@1.0.0-test",
@@ -990,6 +1043,39 @@ class Ticket116VerificationTests(unittest.TestCase):
                     before_deliveries,
                 )
 
+        # The declared digest is a content address, not a formatting token.
+        # Tampering one approved template while retaining its digest must make
+        # the entry fail before the message body can be materialized.  A host
+        # may reject the Core constructor outright or expose an unavailable
+        # Plugin; both are fail-closed startup outcomes.
+        self._reset_harness()
+        mismatched_assets = self._synthetic_assets()
+        minimum = mismatched_assets["minimum_help_bundle"]
+        assert isinstance(minimum, dict)
+        templates = minimum["templates"]
+        assert isinstance(templates, dict)
+        danger_owner = templates["danger_owner"]
+        assert isinstance(danger_owner, dict)
+        danger_owner["text"] = "[合成测试] 未经内容地址批准的替换文本"
+        mismatched_body = CountingBody("SYNTHETIC:DANGER_CONFIRMED")
+        try:
+            self._restart_with_assets(mismatched_assets, root_gate=True)
+        except AuthorityValidationError:
+            pass
+        else:
+            mismatched = self.plugin.receive_weixin(
+                self._message(mismatched_body, suffix="minimum-help-hash-mismatch"),
+                peer_id=_PEER,
+            )
+            self.assertEqual(mismatched_body.reads, 0)
+            self.assertEqual(mismatched.status, "unavailable", mismatched)
+            mismatch_meta = (
+                {} if mismatched.meta is None else self._meta_wire(mismatched)
+            )
+            self.assertIsNone(mismatch_meta.get("contact_alert"))
+        self.assertEqual(mismatched_body.reads, 0)
+
+        self._reset_harness()
         self._restart_with_assets(
             self._synthetic_assets(),
             root_gate=True,
@@ -1078,7 +1164,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "safety.evaluate",
                     {
                         "source_causal_id": f"ticket116-safety:{suffix}",
-                        "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                         "facts": facts,
                     },
                     suffix=suffix,
@@ -1158,6 +1244,45 @@ class Ticket116VerificationTests(unittest.TestCase):
             _UNKNOWN_TEMPLATE_REF,
         )
         self.assertIsNone(unknown_meta["contact_alert"])
+
+        # When routing is down, both an unmatched current rule and an
+        # unavailable rule capability are the same safe observable class:
+        # return the fixed minimum-help result and never infer a contact alert.
+        for unavailable_kind in ("no-current-rule-match", "rule-capability-down"):
+            with self.subTest(route_down_fallback=unavailable_kind):
+                self._reset_harness()
+                self._restart_with_assets(
+                    self._synthetic_assets(
+                        safety_rules_current=(
+                            unavailable_kind != "rule-capability-down"
+                        )
+                    )
+                )
+                self._configure_synthetic_contact()
+                self._grant_contact_authority()
+                fallback_plugin = HealthPlugin(
+                    self.core,
+                    admission_policy=self.base.policy,
+                    health_init_runtime=self.base.init_runtime,
+                    coarse_router=None,
+                    daily_skill_runtime=None,
+                )
+                body = CountingBody(
+                    "SYNTHETIC:NO_CURRENT_RULE_MATCH"
+                    if unavailable_kind == "no-current-rule-match"
+                    else "SYNTHETIC:DANGER_CONFIRMED"
+                )
+                fallback = fallback_plugin.receive_weixin(
+                    self._message(body, suffix=unavailable_kind),
+                    peer_id=_PEER,
+                )
+                fallback_meta = self._meta_wire(fallback)
+                self.assertEqual(fallback.status, "accepted", fallback)
+                self.assertEqual(
+                    fallback_meta["owner_result"]["template_ref"],
+                    _MINIMUM_TEMPLATE_REF,
+                )
+                self.assertIsNone(fallback_meta["contact_alert"])
 
     def test_v116_04_scope_persists_only_staged_or_active(self) -> None:
         """Break caught: readiness or acceptance mode becomes durable scope state."""
@@ -1399,6 +1524,24 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "staged",
                 )
 
+        self._reset_harness()
+        mismatched_scope_assets = self._synthetic_assets(scope_state="staged")
+        scope_bundle = mismatched_scope_assets["diagnostic_scope_bundle"]
+        assert isinstance(scope_bundle, dict)
+        thresholds = scope_bundle["thresholds"]
+        assert isinstance(thresholds, list)
+        upper = thresholds[-1]
+        assert isinstance(upper, dict)
+        upper["minimum_bmi"] = "26.0"
+        try:
+            self._restart_with_assets(mismatched_scope_assets)
+        except AuthorityValidationError:
+            pass
+        else:
+            mismatched_scope = self._managed_read()["scope"]
+            self.assertEqual(mismatched_scope["persistent_state"], "staged")
+            self.assertEqual(mismatched_scope["effective_phase"], "staged")
+
     def test_v116_05_pre_model_authority_drift_forms_no_model_effect(self) -> None:
         """Break caught: one pre-check is treated as permission for all facts."""
 
@@ -1479,6 +1622,36 @@ class Ticket116VerificationTests(unittest.TestCase):
                     )
                 )
 
+        # One representative safety-rule mutation exercises the same
+        # content-addressed-asset boundary as V01/V04 without multiplying every
+        # field combination.  Keeping the declared digest while changing a rule
+        # must fail closed before a model effect can be formed.
+        self._reset_harness()
+        self._activate_synthetic_scope_through_ticket119()
+        payload = self._diagnosis_prepare_payload(
+            source_suffix="safety-content-hash-mismatch"
+        )
+        mismatched_safety_assets = self._synthetic_assets(scope_state="staged")
+        safety_bundle = mismatched_safety_assets["safety_rule_bundle"]
+        assert isinstance(safety_bundle, dict)
+        rules = safety_bundle["rules"]
+        assert isinstance(rules, list)
+        first_rule = rules[0]
+        assert isinstance(first_rule, dict)
+        first_rule["input"] = "SYNTHETIC:TAMPERED-SAFETY-INPUT"
+        try:
+            self._restart_with_assets(mismatched_safety_assets)
+        except AuthorityValidationError:
+            pass
+        else:
+            mismatched = self._health(
+                "diagnosis.prepare",
+                payload,
+                suffix="safety-content-hash-mismatch",
+            )
+            self.assertEqual(mismatched.get("status"), "rejected", mismatched)
+            self.assertNotIn("model_intent", mismatched)
+
     def test_v116_06_post_model_recomputes_unrounded_bmi(self) -> None:
         """Break caught: terminal/schema/evidence/BMI failures become records."""
 
@@ -1524,6 +1697,57 @@ class Ticket116VerificationTests(unittest.TestCase):
                     active_baseline["diagnoses"],
                 )
 
+        approved_reference_cases: tuple[tuple[str, str, object], ...] = (
+            (
+                "knowledge_refs",
+                "knowledge_refs",
+                ["knowledge-release:unapproved-ticket116"],
+            ),
+            (
+                "safety_bundle_ref",
+                "safety_bundle_ref",
+                "synthetic-safety-rules@unapproved",
+            ),
+            (
+                "template_bundle_ref",
+                "template_bundle_ref",
+                "minimum-help-template:unapproved-ticket116",
+            ),
+            (
+                "model_capability_ref",
+                "model_capability_ref",
+                "synthetic-ticket116-profile@unapproved",
+            ),
+        )
+        for label, field, unapproved_reference in approved_reference_cases:
+            with self.subTest(candidate_current_reference=label):
+                self._reset_harness()
+                before = self._activate_synthetic_scope_through_ticket119()
+                candidate = self._diagnostic_candidate()
+                candidate[field] = unapproved_reference
+                effect_id, adapter = self._prepare_and_execute_model(
+                    source_suffix=f"post-unapproved-{label}",
+                    model_result=self._completed_model_result(
+                        structured_output=candidate
+                    ),
+                )
+                committed = self._health(
+                    "diagnosis.commit",
+                    {
+                        "commit_kind": "diagnostic-judgment",
+                        "source_causal_id": (
+                            f"ticket116-diagnostic-source:post-unapproved-{label}"
+                        ),
+                        "model_effect_id": effect_id,
+                    },
+                    suffix=f"post-unapproved-{label}",
+                )
+                self.assertNotEqual(committed.get("status"), "committed", committed)
+                self.assertEqual(adapter.calls, 1)
+                after = self._managed_read()
+                self.assertEqual(after["diagnoses"], before["diagnoses"])
+                self.assertEqual(after["owner_results"], before["owner_results"])
+
         self._reset_harness()
         active_baseline = self._activate_synthetic_scope_through_ticket119()
         effect_id, _ = self._prepare_and_execute_model(source_suffix="post-positive")
@@ -1561,7 +1785,7 @@ class Ticket116VerificationTests(unittest.TestCase):
         )
         self.assertEqual(
             diagnosis["knowledge_refs"],
-            ["synthetic-knowledge:ticket116"],
+            [self.knowledge_release.release_id],
         )
         self.assertEqual(
             diagnosis["safety_bundle_ref"],
@@ -1714,6 +1938,59 @@ class Ticket116VerificationTests(unittest.TestCase):
                         1,
                     )
                 self.assertEqual(adapter.calls, 1)
+
+        # A safety decision is a durable business result, not a local cache
+        # write.  Once the first command commits, another distinct command
+        # carrying the same former generation must be rejected; otherwise two
+        # writers can publish safety results under one current-head snapshot.
+        self._reset_harness()
+        self._restart_with_assets(self._synthetic_assets())
+        stale_generation = self.base.head.read().head.generation
+        first_source = "ticket116-safety:writer-fence-first"
+        second_source = "ticket116-safety:writer-fence-stale"
+        first = self._health(
+            "safety.evaluate",
+            {
+                "source_causal_id": first_source,
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                "facts": {
+                    "safety_capability": "available",
+                    "danger": "unknown",
+                    "scope": "in-scope",
+                },
+            },
+            generation=stale_generation,
+            suffix="writer-fence-first",
+        )
+        self.assertEqual(first.get("branch"), "danger-unknown", first)
+        try:
+            stale = self.plugin.health_operation(
+                "safety.evaluate",
+                {
+                    "source_causal_id": second_source,
+                    "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                    "facts": {
+                        "safety_capability": "available",
+                        "danger": "unknown",
+                        "scope": "in-scope",
+                    },
+                },
+                context=self._health_context(
+                    "safety.evaluate",
+                    generation=stale_generation,
+                    suffix="writer-fence-stale",
+                ),
+                peer_id=_PEER,
+            )
+        except (ProtocolViolation, AuthorityValidationError):
+            stale = {"status": "rejected"}
+        self.assertEqual(stale.get("status"), "rejected", stale)
+        persisted_sources = {
+            item.get("source_causal_id")
+            for item in self._managed_read()["safety_events"]
+        }
+        self.assertIn(first_source, persisted_sources)
+        self.assertNotIn(second_source, persisted_sources)
 
     def test_v116_08_revision_chain_never_exposes_two_current_judgments(self) -> None:
         """Break caught: correction overwrites or forks the current judgment."""
@@ -1905,6 +2182,41 @@ class Ticket116VerificationTests(unittest.TestCase):
             sum(item["current"] is True for item in after_invalidation),
             1,
         )
+        invalidation_successor_ref = invalidation_successors[0]["diagnosis_ref"]
+
+        # Scope recovery is not evidence that the withdrawn judgment became
+        # current again.  The invalidation successor is a durable revision and
+        # must survive both asset restoration and process restart.
+        self._restart_with_assets(
+            self._synthetic_assets(
+                diagnostic_prerequisites_current=True,
+                scope_state="active",
+            )
+        )
+        after_restoration = [
+            item
+            for item in self._managed_read()["diagnoses"]
+            if item["question_ref"] == invalidation_question
+            and item["event_ref"] == invalidation_event
+            and item["applicable_period"] == invalidation_period
+        ]
+        restored_root = next(
+            item
+            for item in after_restoration
+            if item["diagnosis_ref"] == invalidation_root_ref
+        )
+        self.assertFalse(restored_root["current"])
+        restored_successors = [
+            item
+            for item in after_restoration
+            if item.get("predecessor_ref") == invalidation_root_ref
+        ]
+        self.assertEqual(len(restored_successors), 1)
+        self.assertEqual(
+            restored_successors[0]["diagnosis_ref"],
+            invalidation_successor_ref,
+        )
+        self.assertFalse(any(item["current"] is True for item in after_restoration))
 
     def test_v116_09_contact_failure_never_suppresses_owner_result_or_self_approves(self) -> None:
         """Break caught: the Ticket 116 consumer writes its own contact authority."""
@@ -1924,6 +2236,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     elif state == "revoke":
                         self._apply_contact_control("revoke_alert_authority")
                     elif state == "pause":
+                        self._grant_contact_authority(correction=True)
                         self._apply_contact_control("pause")
                     elif state == "generation":
                         current = self.plugin.owner_settings_state(
@@ -1940,7 +2253,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                     "safety.evaluate",
                     {
                         "source_causal_id": f"ticket116-safety:contact-{state}",
-                        "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                         "facts": {
                             "safety_capability": "available",
                             "danger": "confirmed",
@@ -1959,7 +2272,37 @@ class Ticket116VerificationTests(unittest.TestCase):
                 )
                 self.assertIsNone(result["contact_alert"])
                 self.assertEqual(after, before)
-                self.assertNotEqual(before.get("alert_authority_status"), "approved")
+                if state != "pause":
+                    self.assertNotEqual(
+                        before.get("alert_authority_status"),
+                        "approved",
+                    )
+                    continue
+                self.assertEqual(before["alert_authority_status"], "approved")
+                self.assertEqual(before["correction_authority_status"], "approved")
+                self._apply_contact_control("resume")
+                resumed = self.plugin.managed_owner_settings_read(peer_id=_PEER)[
+                    "support_contact"
+                ]
+                self.assertFalse(resumed["dedicated_paused"])
+                self.assertEqual(resumed["alert_authority_status"], "approved")
+                self.assertEqual(resumed["correction_authority_status"], "approved")
+                resumed_result = self._health(
+                    "safety.evaluate",
+                    {
+                        "source_causal_id": "ticket116-safety:dedicated-resume",
+                        "event_time": "2026-08-24T03:46:00+00:00",
+                        "owner_recognizable_name": "合成主人称呼",
+                        "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
+                        "facts": {
+                            "safety_capability": "available",
+                            "danger": "confirmed",
+                            "scope": "in-scope",
+                        },
+                    },
+                    suffix="dedicated-resume",
+                )
+                self.assertIsNotNone(resumed_result["contact_alert"])
 
     def test_v116_10_contact_unknown_freezes_retry_and_correction_stays_original(self) -> None:
         """Break caught: unknown alert retries or correction changes recipient."""
@@ -1974,7 +2317,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:contact-unknown",
                 "event_time": "2026-08-24T03:50:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2016,7 +2359,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:contact-extra-field",
                 "event_time": "2026-08-24T03:50:05+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2059,6 +2402,11 @@ class Ticket116VerificationTests(unittest.TestCase):
         self.assertEqual(replay["transport_result"]["status"], "unknown")
 
         original_destination = unknown_adapter.wires[0]["destination"]
+        # Dedicated support pause suppresses new ordinary alerts.  It cannot
+        # suppress the necessary correction for an alert that may already have
+        # left the system, and that correction remains bound to the original
+        # destination.
+        self._apply_contact_control("pause")
         correction = self._health(
             "safety.correct",
             {
@@ -2117,7 +2465,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:authority-change",
                 "event_time": "2026-08-24T04:00:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2169,7 +2517,7 @@ class Ticket116VerificationTests(unittest.TestCase):
                 "source_causal_id": "ticket116-safety:no-departure",
                 "event_time": "2026-08-24T04:10:00+00:00",
                 "owner_recognizable_name": "合成主人称呼",
-                "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
@@ -2285,7 +2633,7 @@ class Ticket116VerificationTests(unittest.TestCase):
             "safety.evaluate",
             {
                 "source_causal_id": "ticket116-safety:contact-unavailable-status",
-                "safety_rule_bundle_hash": "sha256:" + ("2" * 64),
+                "safety_rule_bundle_hash": _SAFETY_BUNDLE_HASH,
                 "facts": {
                     "safety_capability": "available",
                     "danger": "confirmed",
