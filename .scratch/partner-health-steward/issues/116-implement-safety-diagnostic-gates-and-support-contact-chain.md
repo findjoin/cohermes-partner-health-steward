@@ -110,3 +110,38 @@ Ticket 113 的 model/knowledge、Ticket 114 的 controls/status 和 Ticket 115 �
 
 实施 Agent 在本票追加 `## Implementation evidence (unreviewed)`，记录冻结 Gate 到实现位置、命令/结果、`review_base`、`reviewed_commit` 和 tree。形成 `reviewed_commit` 前必须记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结或证据文件。两个 reviewer 对同一最终 checkpoint 均为 `pass` 后，顶层 Agent 只追加 `## Answer`、标记 `resolved` 并在 Map 添加简明 pointer；Answer 必须记录两轴可定位 verdict 以及共同 base/commit/tree。确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`；推送被拒绝时停止，禁止 force push 或改写历史。
 
+## Implementation evidence (unreviewed)
+
+本次仅执行冻结门已复现缺口的有界修复；Ticket 保持 `Status: claimed`，未写 `## Answer`，未更新 Map，也未触碰 `main`。
+
+- 分支起点：`12be66cbb5c70420a58db4a0db7adfbd50e3eade`，拉取后与 `origin/codex/ticket115-bounded-recovery` 一致。
+- 冻结 `review_base`：`74b65811ae02933a9af75f02d1dfdfd622f8d9d1`；tree：`2b8171b6cc807b71ed3669f1b5d8c64fa0ab6426`。
+- 产品 `reviewed_commit`：`4775e47ebbe88cb09aa0835a06b5fc178b469aad`；tree：`7b48f91e826d940d7c1e0748225809aee1a24eb6`。
+- 冻结完整性：实施设计 blob `849663048b86d60d908ceb82506f062b7ee7bea2`、验证合同 blob `3699cc2f3ff778956bb430abd4e623039f4bf7ff`、测试 blob `a54c44c5eb195584b6e8368234a6a82605b61bc5`，测试 SHA-256 `608C1A58B848190CB774DCD2FFE3A6990DCCA1FD044085D91C51D895600B7EB4`；三项均未修改。
+- 形成 `reviewed_commit` 前，`git status --porcelain=v1 --untracked-files=all` 仅列出五个已暂存产品文件，未跟踪文件为 0；提交后输出为空。
+
+冻结 Gate 与实现位置：
+
+| 失败机制 | 有界实现位置 |
+|---|---|
+| 三类 bundle 内容地址绑定 | `safety_diagnosis._content_addressed_bundle` 复用现有 `stable_digest`，校验去除声明字段后的完整 bundle 内容 |
+| route-down 最低提示 | `HealthPlugin.invoke` 在既有准入后复用 `safety.evaluate` 的 capability-unavailable 分支，不形成联系人警报 |
+| 四类候选 current 引用 | `HealthCore._execute_ticket116_diagnosis_prepare` 冻结 knowledge/safety/template/model 引用；`_execute_ticket116_diagnosis_commit` 精确重验；`_ticket116_knowledge_current` 在模型前和提交前复用既有知识时效校验 |
+| current-head 与原子恢复 | `HealthCore._prepare_ticket115_facts_open` / `_complete_ticket115_mutation` 与 `storage.Ticket115PreparedMutation` / `finalize_ticket115_mutation` 复用现有 prepare→CAS→finalize；仅为既有 mutation 增加可选受管 effect intent，无新表、迁移、ledger、状态机、Provider 或投递通道 |
+| 持久失效后继 | `HealthCore._reconcile_ticket116_scope_invalidation` 通过现有 `diagnosis.correct` 与同一 CAS 路径提交确定性 withdraw 后继；projection 不再合成临时后继 |
+| pause 与必要纠正 | `OwnerSettingsEngine._apply_support_contact` 的 pause 只改变专门暂停状态；`HealthCore._ticket116_contact_current` 阻断新 alert，但仍按原接收者、方法、route 和独立 correction authority 校验必要纠正 |
+
+验证证据：
+
+- 冻结 RED：`python -m unittest -v tests.test_ticket116_integration` → 12 个 Gate、13 failures、0 errors、0 skips；失败分布与冻结合同一致。
+- 分组定向回归：bundle/route 4/4、候选引用/current-head 2/2、失效后继/pause 3/3、知识时效修复 V05/V06/V07 3/3，均为 `OK`、0 errors、0 skips。
+- 知识过期公开 seam 复验：prepare 前过期 → rejected、无 model intent、adapter 0 次；模型后而 commit 前过期 → rejected、adapter 1 次且 durable diagnoses 0。
+- Ticket 116：`python -m unittest -v tests.test_ticket116_integration` → `Ran 12 tests in 45.225s`，`OK`，0 errors、0 skips。
+- Ticket 113：`python -m unittest discover -v -s tests -p "test_ticket113*.py"` → `Ran 99 tests in 8.864s`，`OK`。
+- Ticket 114：`python -m unittest discover -v -s tests -p "test_ticket114*.py"` → `Ran 210 tests in 56.064s`，`OK`。
+- Ticket 115：`python -m unittest discover -v -s tests -p "test_ticket115*.py"` → `Ran 135 tests in 86.884s`，`OK`。
+- 项目全量：`python -m unittest discover -v` → `Ran 720 tests in 219.758s`，`OK`。
+- `python -m compileall -q partner_health_steward tests` 与 `git diff --cached --check` 均退出 0。
+
+最终同树复审：Spec reviewer 与 Standards reviewer 均对 `review_base=74b65811ae02933a9af75f02d1dfdfd622f8d9d1`、`reviewed_commit=4775e47ebbe88cb09aa0835a06b5fc178b469aad`、tree `7b48f91e826d940d7c1e0748225809aee1a24eb6` 给出 `PASS`，无 P0/P1/P2；Standards reviewer 独立确认知识过期 P1 已关闭。真实医学权利/审核、真实模型、Weixin、联系人执行、主人验收、部署与 Tickets 117—119 不在本地合成 verdict 内，未作已完成声明。
+
