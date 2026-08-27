@@ -140,6 +140,7 @@ from .delivery import (
     OwnerDeliverySendIntent,
     OwnerDeliveryTransportResult,
     OwnerWeixinDestination,
+    is_status_transition_intent,
 )
 from .probe import ProbeReport, ProbeState
 from .owner_authority import (
@@ -6161,6 +6162,8 @@ class HealthCore:
         review_state: DailyReviewLedger | None = None,
         delivery_state: DeliveryOutboxState | None = None,
         health_command_receipt: HealthCommandReceipt | None = None,
+        current_status_projection: StatusProjection | None = None,
+        status_projection: StatusProjection | None = None,
     ) -> Ticket115PreparedMutation | None:
         """Persist one complete invisible aggregate revision before remote CAS."""
 
@@ -6177,6 +6180,7 @@ class HealthCore:
             and next_review == current_review
             and next_delivery == current_delivery
             and health_command_receipt is None
+            and status_projection is None
         ):
             return None
         mutation = Ticket115PreparedMutation.prepare(
@@ -6188,6 +6192,8 @@ class HealthCore:
             review_state=next_review,
             delivery_state=next_delivery,
             health_command_receipt=health_command_receipt,
+            current_status_projection=current_status_projection,
+            status_projection=status_projection,
         )
         self._store.prepare_ticket115_mutation(mutation)
         return mutation
@@ -7591,16 +7597,18 @@ class HealthCore:
                 != "owner-decision-status-payload:" + transition_id
             ):
                 return None
+            if not is_status_transition_intent(intent):
+                return None
             projection = self._store.business_status_projection()
             if projection is None:
                 return None
+            try:
+                leaves = outbox.status_transition_leaf_intent_ids()
+            except DeliveryContractViolation:
+                return None
+            if len(leaves) != 1 or intent.intent_id not in leaves:
+                return None
             if intent.authorization_kind == "status-transition":
-                try:
-                    leaves = outbox.status_transition_leaf_intent_ids()
-                except DeliveryContractViolation:
-                    return None
-                if len(leaves) != 1 or intent.intent_id not in leaves:
-                    return None
                 if (projection.state == "active") != intent.status_target_active:
                     return None
             elif intent.business_revision_digest != projection.fact_set_digest:
@@ -8948,11 +8956,12 @@ class HealthCore:
         previous: object,
         *,
         observed_at_utc: str,
-    ) -> None:
+        status_projection: StatusProjection,
+    ) -> bool:
         if (transition.previous_state == "active") == (
             transition.current_state == "active"
         ):
-            return
+            return False
         relevant_domains = (
             transition.affected_core_domains
             if transition.current_state != "active"
@@ -8966,8 +8975,11 @@ class HealthCore:
             set(relevant_domains)
             & {"tasks", "daily_review", "delivery"}
         ):
-            return
+            return False
         with self._ticket115_write_authority() as (head, settings):
+            recovered_projection = self._store.business_status_projection()
+            if recovered_projection == status_projection:
+                return True
             try:
                 destination = self._owner_weixin_destination_open(settings)
             except AuthorityValidationError:
@@ -9008,9 +9020,14 @@ class HealthCore:
             mutation = self._prepare_ticket115_facts_open(
                 head,
                 settings,
+                current_status_projection=(
+                    previous if type(previous) is StatusProjection else None
+                ),
                 delivery_state=submitted.state,
+                status_projection=status_projection,
             )
         self._complete_ticket115_mutation(mutation)
+        return True
 
     def business_status(self) -> BusinessStatusResult:
         """Return the business tri-state and one durable state-change fact."""
@@ -9052,12 +9069,16 @@ class HealthCore:
                     else projector.transition(previous, projection)
                 )
                 if transition is not None:
-                    self._submit_status_transition_owner_decision(
+                    status_persisted = self._submit_status_transition_owner_decision(
                         transition,
                         previous,
                         observed_at_utc=evaluated_at_utc,
+                        status_projection=projection,
                     )
-                self._store.remember_business_status(projection)
+                else:
+                    status_persisted = False
+                if not status_persisted:
+                    self._store.remember_business_status(projection)
                 return BusinessStatusResult(projection, transition)
             except (
                 KeyUnavailable,
@@ -9068,6 +9089,12 @@ class HealthCore:
                 raise AuthorityValidationError(
                     "business-status-unavailable"
                 ) from exc
+            except AuthorityValidationError as exc:
+                if str(exc) == "health-state-unavailable":
+                    raise AuthorityValidationError(
+                        "business-status-unavailable"
+                    ) from exc
+                raise
 
     def _managed_rights_projection(self) -> ManagedRightsProjection:
         """Form the private core projection; never expose its raw objects."""

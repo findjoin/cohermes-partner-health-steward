@@ -450,6 +450,26 @@ class OutboxIntent:
         return cls(**fields)  # type: ignore[arg-type]
 
 
+def is_status_transition_intent(intent: OutboxIntent) -> bool:
+    """Recognize status requests, including structurally verifiable v1 wire."""
+
+    if type(intent) is not OutboxIntent:
+        return False
+    if intent.authorization_kind == "status-transition":
+        return True
+    if intent.authorization_kind != "legacy":
+        return False
+    prefix = "owner-decision:status-transition:"
+    if not intent.effect_request_id.startswith(prefix):
+        return False
+    transition_id = intent.effect_request_id.removeprefix(prefix)
+    return bool(transition_id) and (
+        intent.business_fact_ref == transition_id
+        and intent.source_ref == transition_id
+        and intent.payload_ref == "owner-decision-status-payload:" + transition_id
+    )
+
+
 @dataclass(frozen=True)
 class OwnerWeixinDestination:
     """The exact configured private Weixin owner route for one send."""
@@ -1122,7 +1142,7 @@ class DeliveryOutboxState:
                 if (
                     target.intent.owner_id != intent.owner_id
                     or target.intent.installation_id != intent.installation_id
-                    or target.intent.authorization_kind != "status-transition"
+                    or not is_status_transition_intent(target.intent)
                 ):
                     raise DeliveryContractViolation(
                         "status supersession target authority mismatch"
@@ -1158,14 +1178,14 @@ class DeliveryOutboxState:
         superseded_ids = {
             ref
             for record in self.records
-            if record.intent.authorization_kind == "status-transition"
+            if is_status_transition_intent(record.intent)
             and record.intent.status_supersedes_refs is not None
             for ref in record.intent.status_supersedes_refs
         }
         return tuple(
             record.intent.intent_id
             for record in self.records
-            if record.intent.authorization_kind == "status-transition"
+            if is_status_transition_intent(record.intent)
             and record.intent.intent_id not in superseded_ids
         )
 

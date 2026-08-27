@@ -92,6 +92,8 @@ class Ticket115PreparedMutation:
     review_state: DailyReviewLedger
     delivery_state: DeliveryOutboxState
     health_command_receipt: HealthCommandReceipt | None = None
+    base_status_digest: str | None = None
+    status_projection: StatusProjection | None = None
 
     def __post_init__(self) -> None:
         if type(self.prepared) is not PreparedTransition:
@@ -117,6 +119,21 @@ class Ticket115PreparedMutation:
             type(self.health_command_receipt) is not HealthCommandReceipt
         ):
             raise AuthorityValidationError("invalid ticket115 health command receipt")
+        if self.status_projection is None:
+            if self.base_status_digest is not None:
+                raise AuthorityValidationError(
+                    "ticket115 status base without projection"
+                )
+        else:
+            if type(self.status_projection) is not StatusProjection:
+                raise AuthorityValidationError(
+                    "invalid ticket115 status projection"
+                )
+            if self.base_status_digest is not None:
+                _owner_recovery_digest(
+                    self.base_status_digest,
+                    "ticket115 base status digest",
+                )
         authorities = {
             (self.task_state.owner_id, self.task_state.installation_id),
             (self.review_state.owner_id, self.review_state.installation_id),
@@ -137,15 +154,17 @@ class Ticket115PreparedMutation:
         task_state: TaskRuntimeState,
         review_state: DailyReviewLedger,
         delivery_state: DeliveryOutboxState,
+        status_projection: StatusProjection | None = None,
     ) -> str:
-        return stable_digest(
-            {
-                "kind": "ticket115-authoritative-state-v1",
-                "task_state": task_state.to_storage(),
-                "review_state": review_state.to_storage(),
-                "delivery_state": delivery_state.to_wire(),
-            }
-        )
+        value: dict[str, object] = {
+            "kind": "ticket115-authoritative-state-v1",
+            "task_state": task_state.to_storage(),
+            "review_state": review_state.to_storage(),
+            "delivery_state": delivery_state.to_wire(),
+        }
+        if status_projection is not None:
+            value["status_projection"] = status_projection.to_storage()
+        return stable_digest(value)
 
     @property
     def next_state_digest(self) -> str:
@@ -153,6 +172,7 @@ class Ticket115PreparedMutation:
             self.task_state,
             self.review_state,
             self.delivery_state,
+            self.status_projection,
         )
 
     @property
@@ -163,6 +183,8 @@ class Ticket115PreparedMutation:
             base_delivery_digest=self.base_delivery_digest,
             next_state_digest=self.next_state_digest,
             health_command_receipt=self.health_command_receipt,
+            base_status_digest=self.base_status_digest,
+            includes_status=self.status_projection is not None,
         )
 
     @staticmethod
@@ -173,6 +195,8 @@ class Ticket115PreparedMutation:
         base_delivery_digest: str,
         next_state_digest: str,
         health_command_receipt: HealthCommandReceipt | None,
+        base_status_digest: str | None = None,
+        includes_status: bool = False,
     ) -> str:
         value: dict[str, object] = {
             "kind": "ticket115-prepared-mutation-v1",
@@ -187,6 +211,8 @@ class Ticket115PreparedMutation:
             value["health_command_receipt"] = (
                 health_command_receipt.to_storage()
             )
+        if includes_status:
+            value["base"]["status"] = base_status_digest  # type: ignore[index]
         return stable_digest(value)
 
     @classmethod
@@ -201,6 +227,8 @@ class Ticket115PreparedMutation:
         review_state: DailyReviewLedger,
         delivery_state: DeliveryOutboxState,
         health_command_receipt: HealthCommandReceipt | None = None,
+        current_status_projection: StatusProjection | None = None,
+        status_projection: StatusProjection | None = None,
     ) -> "Ticket115PreparedMutation":
         base_digests = (
             stable_digest(current_task_state.to_storage()),
@@ -211,6 +239,12 @@ class Ticket115PreparedMutation:
             task_state,
             review_state,
             delivery_state,
+            status_projection,
+        )
+        base_status_digest = (
+            None
+            if current_status_projection is None
+            else stable_digest(current_status_projection.to_storage())
         )
         mutation_digest = cls._mutation_digest(
             base_task_digest=base_digests[0],
@@ -218,6 +252,8 @@ class Ticket115PreparedMutation:
             base_delivery_digest=base_digests[2],
             next_state_digest=next_state_digest,
             health_command_receipt=health_command_receipt,
+            base_status_digest=base_status_digest,
+            includes_status=status_projection is not None,
         )
         identity = stable_digest(
             {
@@ -246,10 +282,12 @@ class Ticket115PreparedMutation:
             review_state=review_state,
             delivery_state=delivery_state,
             health_command_receipt=health_command_receipt,
+            base_status_digest=base_status_digest,
+            status_projection=status_projection,
         )
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "prepared": self.prepared.to_storage(),
             "owner_id": self.owner_id,
             "installation_id": self.installation_id,
@@ -265,6 +303,10 @@ class Ticket115PreparedMutation:
                 else self.health_command_receipt.to_storage()
             ),
         }
+        if self.status_projection is not None:
+            value["base_status_digest"] = self.base_status_digest
+            value["status_projection"] = self.status_projection.to_storage()
+        return value
 
     @classmethod
     def from_storage(cls, value: object) -> "Ticket115PreparedMutation":
@@ -281,11 +323,16 @@ class Ticket115PreparedMutation:
                 "delivery_state",
             }
         )
-        if (
-            type(value) is not dict
-            or frozenset(value)
-            not in {legacy_fields, legacy_fields | {"health_command_receipt"}}
-        ):
+        status_fields = frozenset(
+            {"base_status_digest", "status_projection"}
+        )
+        allowed_fields = {
+            legacy_fields,
+            legacy_fields | {"health_command_receipt"},
+            legacy_fields | status_fields,
+            legacy_fields | {"health_command_receipt"} | status_fields,
+        }
+        if type(value) is not dict or frozenset(value) not in allowed_fields:
             raise KeyUnavailable("invalid ticket115 prepared mutation")
         stored = value
         try:
@@ -306,6 +353,14 @@ class Ticket115PreparedMutation:
                     None
                     if receipt_wire is None
                     else HealthCommandReceipt.from_storage(receipt_wire)
+                ),
+                base_status_digest=stored.get("base_status_digest"),  # type: ignore[arg-type]
+                status_projection=(
+                    None
+                    if stored.get("status_projection") is None
+                    else StatusProjection.from_storage(
+                        stored["status_projection"]
+                    )
                 ),
             )
         except (TypeError, ValueError) as exc:
@@ -3493,6 +3548,48 @@ class EncryptedStateStore:
         except StatusContractViolation as exc:
             raise KeyUnavailable("invalid business status projection") from exc
 
+    def _business_status_projection_in_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> StatusProjection | None:
+        row = connection.execute(
+            "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return StatusProjection.from_storage(
+                self._open("business-status", row[0], row[1])
+            )
+        except StatusContractViolation as exc:
+            raise KeyUnavailable("invalid business status projection") from exc
+
+    def _write_business_status_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        projection: StatusProjection,
+    ) -> StatusProjection | None:
+        if type(projection) is not StatusProjection:
+            raise AuthorityValidationError("invalid business status projection")
+        previous = self._business_status_projection_in_connection(connection)
+        if previous == projection:
+            return previous
+        nonce, ciphertext = self._seal(
+            "business-status",
+            projection.to_storage(),
+        )
+        connection.execute(
+            """
+            INSERT INTO business_status_v1(slot, nonce, ciphertext)
+            VALUES (1, ?, ?)
+            ON CONFLICT(slot) DO UPDATE SET
+                nonce=excluded.nonce,
+                ciphertext=excluded.ciphertext
+            """,
+            (nonce, ciphertext),
+        )
+        return previous
+
     def remember_business_status(
         self,
         projection: StatusProjection,
@@ -3509,35 +3606,9 @@ class EncryptedStateStore:
             raise AuthorityValidationError("invalid business status projection")
         with self.transaction() as connection:
             self._assert_integrity_manifest_before_mutation()
-            row = connection.execute(
-                "SELECT nonce, ciphertext FROM business_status_v1 WHERE slot = 1"
-            ).fetchone()
-            if row is None:
-                previous = None
-            else:
-                try:
-                    previous = StatusProjection.from_storage(
-                        self._open("business-status", row[0], row[1])
-                    )
-                except StatusContractViolation as exc:
-                    raise KeyUnavailable(
-                        "invalid business status projection"
-                    ) from exc
-            if previous == projection:
-                return previous
-            nonce, ciphertext = self._seal(
-                "business-status",
-                projection.to_storage(),
-            )
-            connection.execute(
-                """
-                INSERT INTO business_status_v1(slot, nonce, ciphertext)
-                VALUES (1, ?, ?)
-                ON CONFLICT(slot) DO UPDATE SET
-                    nonce=excluded.nonce,
-                    ciphertext=excluded.ciphertext
-                """,
-                (nonce, ciphertext),
+            previous = self._write_business_status_in_transaction(
+                connection,
+                projection,
             )
             self._refresh_integrity_manifest(connection)
             return previous
@@ -3885,11 +3956,21 @@ class EncryptedStateStore:
             mutation.owner_id,
             mutation.installation_id,
         )
-        return self._ticket115_state_digests(current) == (
+        if self._ticket115_state_digests(current) != (
             mutation.base_task_digest,
             mutation.base_review_digest,
             mutation.base_delivery_digest,
+        ):
+            return False
+        if mutation.status_projection is None:
+            return True
+        current_status = self.business_status_projection()
+        current_status_digest = (
+            None
+            if current_status is None
+            else stable_digest(current_status.to_storage())
         )
+        return current_status_digest == mutation.base_status_digest
 
     def prepare_ticket115_mutation(
         self,
@@ -4126,6 +4207,7 @@ class EncryptedStateStore:
         task_state: TaskRuntimeState | None,
         review_state: DailyReviewLedger | None,
         delivery_state: DeliveryOutboxState | None,
+        status_projection: StatusProjection | None = None,
     ) -> None:
         notifying_reviews = (
             ()
@@ -4171,6 +4253,11 @@ class EncryptedStateStore:
             self._write_daily_review_ledger(connection, review_state)
         if delivery_state is not None:
             self._write_delivery_outbox(connection, delivery_state)
+        if status_projection is not None:
+            self._write_business_status_in_transaction(
+                connection,
+                status_projection,
+            )
 
     def commit_ticket115_facts(
         self,
@@ -4266,6 +4353,7 @@ class EncryptedStateStore:
                 task_state=mutation.task_state,
                 review_state=mutation.review_state,
                 delivery_state=mutation.delivery_state,
+                status_projection=mutation.status_projection,
             )
             if mutation.health_command_receipt is not None:
                 self._write_health_command_receipt(
