@@ -1,7 +1,7 @@
 # 116 - 实现安全诊断门禁与支持联系人链
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-implement-strict-health-llm-governed-knowledge-and-nondiagnostic-answer.md), [114 - 实现主人设置数据权利与业务状态](114-implement-owner-settings-data-rights-and-business-status.md), [115 - 实现任务当地日复盘与分层主人投递](115-implement-tasks-local-day-review-and-layered-owner-delivery.md)
 
@@ -88,6 +88,14 @@ Ticket 113 的 model/knowledge、Ticket 114 的 controls/status 和 Ticket 115 �
 - characterization：Ticket 113 `99/99`、Ticket 114 `210/210`、Ticket 115 `135/135` 全绿；`compileall`、`git diff --check` 与本地 Markdown 链接检查通过。
 - 编码前 reviewer：`ticket116_architecture`（Spec/architecture）、`ticket115_gate_spec`（test executability/quality）、`future_ticket_contracts`（Standards/governance）均对最终稳定快照给出 `PASS`，无 P0/P1/P2；`ticket116_verification` 独立编写并封存测试门。
 - 该 frozen commit 只包含合同、设计和测试门，没有修改产品代码或 `main`。编码 Agent 必须以此 commit 为 `review_base`；若上述三个 blob 任一变化，立即停止并返回冻结阶段。
+
+#### 实施复审退回与有界修复门
+
+- 首次实现提交 `70e507408add13273b651d15d9bf73b03b5592a7` 虽通过旧十二门，但 fresh Spec/Standards 复审以公开 Seam 复现了既有 A1/A2/A3/A4/A5/A6/A9 的假绿：三类 bundle 内容与声明 hash 脱钩、两类 route-down 吞最低提示、四类模型候选当前引用可伪造、旧 generation 可形成第二决定、scope 失效后重启复活旧 current、专门暂停误撤销独立批准并吞掉必要纠正。它们是原验收未被旧测试杀死的实现缺口，不是新功能或新架构。
+- 修复验证门仍保持 12 个 Gate；内容检查点为 `195d8139e8bcfb2dfde7a210c186c90e655fb35c`、tree `65e1e79b8360014e26d6de3076a42dd45cdc0137`。实跑为 `12 tests / 13 failures / 0 errors / 0 skips`，失败分布为 V01×1、V03×2、V04×1、V05×1、V06×4、V07×1、V08×1、V09×1、V10×1；V02、V11、V12 保持绿色。
+- `ticket116_gate_final_spec`、`ticket116_gate_final_standards`、`ticket116_gate_final_exec` 对同一内容检查点均给出 PASS，0 个 P0/P1/P2。测试从本次实际配置资产读取声明 hash，不固定内部 codec、摘要常量、恢复算法、SQL 或文件布局。
+- 编码 Agent 只能在现有冻结设计内修复上述 13 个公开结果。允许的产品范围为 `safety_diagnosis.py`、`plugin.py`、`core.py`、`settings.py`，只有现有 CAS 持久化确有需要时才可涉及 `storage.py`；禁止新增 ledger、状态机、Provider、第二投递通道或大面积改写 HealthCore。
+- 编码 Agent 不得修改冻结实施设计、冻结验证合同或 `tests/test_ticket116_integration.py`。若认为门错误、需要新架构或需要外部医学/模型/Weixin/联系人授权，必须停止返回冻结阶段。修复完成后必须让十二门 `12/12 PASS / 0 SKIP / 0 ERROR`，再运行 Ticket 113—115、全量、`compileall` 和 `git diff --check`；随后普通推送当前分支并报告远端完整 SHA，不得 force push、修改 `main`、更新 Map 或自行标记 `resolved`。
 
 ### 一致性实施、核验、停止与闭票
 

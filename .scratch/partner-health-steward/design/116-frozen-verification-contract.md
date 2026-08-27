@@ -1,6 +1,6 @@
 # Ticket 116 冻结验证合同
 
-> 状态：verification-repair-candidate，尚未重新冻结。原 characterization 基线为 `1249734ef7aa10205b3852ad21a049a88a5e19a3`，tree 为 `eacf11a1ee3c7297368afa676cebe1e57ba031da`；原 pre-code 合同和十二门历史保留。当前候选只把实现审查在 `70e507408add13273b651d15d9bf73b03b5592a7` 上以公开 Seam 复现的既有 A1/A2/A3/A4/A5/A6/A9 漏洞收回原十二门，不新增产品功能、架构或 Gate 数量；经 fresh Spec/Standards 预审形成新 checkpoint 后方可再次标记 frozen。
+> 状态：frozen。原 characterization 基线为 `1249734ef7aa10205b3852ad21a049a88a5e19a3`，tree 为 `eacf11a1ee3c7297368afa676cebe1e57ba031da`；原 pre-code 合同和十二门历史保留。修复门只把实现审查在 `70e507408add13273b651d15d9bf73b03b5592a7` 上以公开 Seam 复现的既有 A1/A2/A3/A4/A5/A6/A9 漏洞收回原十二门，不新增产品功能、架构或 Gate 数量。修复内容检查点 `195d8139e8bcfb2dfde7a210c186c90e655fb35c`、tree `65e1e79b8360014e26d6de3076a42dd45cdc0137` 已由 `ticket116_gate_final_spec`、`ticket116_gate_final_standards` 和 `ticket116_gate_final_exec` 分别从产品语义、治理质量和可执行性给出 PASS，均无 P0/P1/P2。
 
 ## 测试权威、可观察面与既有绿灯
 
@@ -50,7 +50,7 @@ characterization 基线保持：Ticket 113 `99/99`、Ticket 114 `210/210`、Tick
 - `python -m unittest discover -v -s tests -p "test_ticket115*.py"`：预期保持全绿；
 - `python -m compileall -q partner_health_steward tests` 与 `git diff --check`：预期通过。
 
-### 当前 verification-repair 候选的红灯证据
+### 已冻结 verification-repair 的红灯证据
 
 - 产品基线：`70e507408add13273b651d15d9bf73b03b5592a7`。修改验证资产前原十二门实跑为 `Ran 12 tests ... OK`。
 - 只修改本合同与 verifier-owned `tests/test_ticket116_integration.py` 后完整执行十二门：`Ran 12 tests`，`failures=13`、`errors=0`。V01/V03/V04/V05/V06/V07/V08/V09/V10 九个方法均只在新增等价类处红：V01 minimum-help 内容/hash 脱钩 1 项；V03 route-down 的无匹配/规则能力不可用 2 项；V04 scope 内容/hash 脱钩仍进入 activation-ready 1 项；V05 safety-rule 内容/hash 脱钩仍形成 model intent 1 项；V06 四类未批准引用 4 项；V07 stale-generation 第二写 1 项；V08 scope 恢复复活旧 current 1 项；V09 pause 撤销独立 authority 1 项；V10 pause 吞掉 unknown 后必要纠正 1 项。
