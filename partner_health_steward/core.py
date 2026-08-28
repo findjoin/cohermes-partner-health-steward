@@ -6988,7 +6988,7 @@ class HealthCore:
         }
         if set(payload) != required or type(payload.get("minimum_evidence")) is not dict:
             raise ProtocolViolation("invalid diagnosis preparation fields")
-        self._reconcile_ticket116_diagnostic_basis()
+        knowledge_currentness = self._reconcile_ticket116_diagnostic_basis()
         assets = self._ticket116_assets
         if assets is None:
             return self._commit_ticket116_result(
@@ -7031,7 +7031,7 @@ class HealthCore:
                 and not settings.recording_stopped
                 and self._store.unresolved_daily_turn() is None
                 and self._ticket116_route_current(settings)
-                and self._ticket116_knowledge_current()
+                and knowledge_currentness == "current"
                 and self._ticket116_evidence_current(evidence)
                 and type(observed_at) is datetime
                 and diagnostic_measurement_eligible(
@@ -7164,23 +7164,45 @@ class HealthCore:
                     diagnoses.append(successor)
         return diagnoses
 
-    def _ticket116_currentness_is_unknown(self) -> bool:
-        latest: dict[str, object] | None = None
+    @staticmethod
+    def _ticket116_diagnosis_chain_key(
+        diagnosis: Mapping[str, object],
+    ) -> tuple[str, str, str] | None:
+        key = (
+            diagnosis.get("question_ref"),
+            diagnosis.get("event_ref"),
+            diagnosis.get("applicable_period"),
+        )
+        return key if all(type(value) is str for value in key) else None
+
+    def _ticket116_currentness_unknown_keys(
+        self,
+    ) -> frozenset[tuple[str, str, str]]:
+        unknown_keys: set[tuple[str, str, str]] = set()
         for result in self._ticket116_results():
             action = result.get("_ticket116_action")
             if action == "diagnosis.commit" and result.get("status") == "committed":
                 diagnosis = result.get("_diagnosis")
                 if type(diagnosis) is dict:
-                    latest = diagnosis
+                    key = self._ticket116_diagnosis_chain_key(diagnosis)
+                    if key is not None:
+                        unknown_keys.discard(key)
             elif action == "diagnosis.correct" and result.get("status") == "revised":
                 successor = result.get("_successor")
                 if type(successor) is dict:
-                    latest = successor
-        return (
-            type(latest) is dict
-            and latest.get("correction_ref") == "knowledge-currentness:unknown"
-            and latest.get("reason") == "diagnostic-knowledge-currentness-unknown"
-        )
+                    key = self._ticket116_diagnosis_chain_key(successor)
+                    if key is None:
+                        continue
+                    if (
+                        successor.get("correction_ref")
+                        == "knowledge-currentness:unknown"
+                        and successor.get("reason")
+                        == "diagnostic-knowledge-currentness-unknown"
+                    ):
+                        unknown_keys.add(key)
+                    else:
+                        unknown_keys.discard(key)
+        return frozenset(unknown_keys)
 
     def _ticket116_pending_reconciliation_mutation(
         self,
@@ -7205,7 +7227,7 @@ class HealthCore:
             )
         )
 
-    def _reconcile_ticket116_diagnostic_basis(self) -> None:
+    def _reconcile_ticket116_diagnostic_basis(self) -> str:
         """Persist diagnostic-basis successors through the existing CAS."""
 
         pending = self._store.pending_ticket115_mutation()
@@ -7213,11 +7235,11 @@ class HealthCore:
             self._recover_ticket115_mutation()
         assets = self._ticket116_assets
         if assets is None:
-            return
+            return "knowledge-unknown"
         scope_current = diagnostic_prerequisites_current(assets)
         knowledge_currentness = self._ticket116_knowledge_currentness()
         if scope_current and knowledge_currentness == "current":
-            return
+            return knowledge_currentness
         if not scope_current:
             correction_contract = "ticket116-scope-invalidation-v1"
             correction_prefix = "ticket116-scope-invalidation:"
@@ -7243,7 +7265,7 @@ class HealthCore:
                 None,
             )
             if current is None:
-                return
+                return knowledge_currentness
             predecessor_ref = current.get("diagnosis_ref")
             if type(predecessor_ref) is not str:
                 raise AuthorityValidationError(
@@ -7302,7 +7324,7 @@ class HealthCore:
             raise ProtocolViolation("invalid diagnosis commit")
         if payload.get("commit_kind") != "diagnostic-judgment":
             raise ProtocolViolation("invalid diagnosis commit kind")
-        self._reconcile_ticket116_diagnostic_basis()
+        knowledge_currentness = self._reconcile_ticket116_diagnostic_basis()
         source = payload["source_causal_id"]
         effect_id = payload["model_effect_id"]
         recovered = next(
@@ -7397,7 +7419,7 @@ class HealthCore:
                 type(evidence) is not dict
                 or not self._ticket116_evidence_current(evidence)
                 or not self._ticket116_route_current(settings)
-                or not self._ticket116_knowledge_current()
+                or knowledge_currentness != "current"
                 or settings.recording_stopped
                 or not safety_rules_current(assets or {})
                 or not diagnostic_prerequisites_current(assets or {})
@@ -7796,7 +7818,19 @@ class HealthCore:
             }
             diagnoses = self._ticket116_diagnoses_projection()
             current_status = "current"
-            if self._ticket116_currentness_is_unknown() or (
+            unknown_keys = self._ticket116_currentness_unknown_keys()
+            if unknown_keys:
+                current_status = "cannot-confirm"
+                diagnoses = [
+                    (
+                        {**item, "current": False}
+                        if self._ticket116_diagnosis_chain_key(item)
+                        in unknown_keys
+                        else item
+                    )
+                    for item in diagnoses
+                ]
+            elif (
                 self.probe().state is not ProbeState.HEALTHY
                 and not self._ticket116_only_unresolved_managed_effects()
             ):
