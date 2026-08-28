@@ -6948,23 +6948,32 @@ class HealthCore:
             == governed_route.configuration_generation
         )
 
-    def _ticket116_knowledge_current(self) -> bool:
-        """Revalidate the constructor-bound releases at the current clock."""
+    def _ticket116_knowledge_currentness(self) -> str:
+        """Classify current knowledge as valid, invalid, or unconfirmable."""
 
         pipeline = self._non_diagnostic_pipeline
         if type(pipeline) is not NonDiagnosticReplyPipeline:
-            return False
+            return "knowledge-unknown"
         try:
             valid_at = self._knowledge_clock()
-            if type(valid_at) is not datetime:
-                return False
+            if (
+                type(valid_at) is not datetime
+                or valid_at.tzinfo is None
+                or valid_at.utcoffset() is None
+            ):
+                return "knowledge-unknown"
             pipeline.with_current_owner_cards(
                 (),
                 knowledge_valid_at=valid_at.isoformat(),
             )
+        except NonDiagnosticContractViolation:
+            return "knowledge-invalid"
         except Exception:
-            return False
-        return True
+            return "knowledge-unknown"
+        return "current"
+
+    def _ticket116_knowledge_current(self) -> bool:
+        return self._ticket116_knowledge_currentness() == "current"
 
     def _execute_ticket116_diagnosis_prepare(
         self,
@@ -6979,7 +6988,7 @@ class HealthCore:
         }
         if set(payload) != required or type(payload.get("minimum_evidence")) is not dict:
             raise ProtocolViolation("invalid diagnosis preparation fields")
-        self._reconcile_ticket116_scope_invalidation()
+        self._reconcile_ticket116_diagnostic_basis()
         assets = self._ticket116_assets
         if assets is None:
             return self._commit_ticket116_result(
@@ -7155,16 +7164,75 @@ class HealthCore:
                     diagnoses.append(successor)
         return diagnoses
 
-    def _reconcile_ticket116_scope_invalidation(self) -> None:
-        """Persist diagnostic-basis-loss successors through the existing CAS."""
+    def _ticket116_currentness_is_unknown(self) -> bool:
+        latest: dict[str, object] | None = None
+        for result in self._ticket116_results():
+            action = result.get("_ticket116_action")
+            if action == "diagnosis.commit" and result.get("status") == "committed":
+                diagnosis = result.get("_diagnosis")
+                if type(diagnosis) is dict:
+                    latest = diagnosis
+            elif action == "diagnosis.correct" and result.get("status") == "revised":
+                successor = result.get("_successor")
+                if type(successor) is dict:
+                    latest = successor
+        return (
+            type(latest) is dict
+            and latest.get("correction_ref") == "knowledge-currentness:unknown"
+            and latest.get("reason") == "diagnostic-knowledge-currentness-unknown"
+        )
 
+    def _ticket116_pending_reconciliation_mutation(
+        self,
+        mutation: Ticket115PreparedMutation | None,
+    ) -> bool:
+        if mutation is None:
+            return False
+        receipt = mutation.health_command_receipt
+        if type(receipt) is not HealthCommandReceipt:
+            return False
+        result = receipt.result
+        return (
+            type(result) is dict
+            and result.get("_ticket116_action") == "diagnosis.correct"
+            and type(result.get("_successor")) is dict
+            and receipt.causal_id.startswith(
+                (
+                    "ticket116-scope-invalidation:",
+                    "ticket116-knowledge-invalidation:",
+                    "ticket116-knowledge-unknown:",
+                )
+            )
+        )
+
+    def _reconcile_ticket116_diagnostic_basis(self) -> None:
+        """Persist diagnostic-basis successors through the existing CAS."""
+
+        pending = self._store.pending_ticket115_mutation()
+        if self._ticket116_pending_reconciliation_mutation(pending):
+            self._recover_ticket115_mutation()
         assets = self._ticket116_assets
-        if assets is None or (
-            diagnostic_prerequisites_current(assets)
-            and self._ticket116_knowledge_current()
-        ):
+        if assets is None:
             return
-        self._recover_ticket115_mutation()
+        scope_current = diagnostic_prerequisites_current(assets)
+        knowledge_currentness = self._ticket116_knowledge_currentness()
+        if scope_current and knowledge_currentness == "current":
+            return
+        if not scope_current:
+            correction_contract = "ticket116-scope-invalidation-v1"
+            correction_prefix = "ticket116-scope-invalidation:"
+            correction_ref = "scope-currentness:invalidated"
+            correction_reason = "diagnostic-scope-invalidated"
+        elif knowledge_currentness == "knowledge-invalid":
+            correction_contract = "ticket116-knowledge-invalidation-v1"
+            correction_prefix = "ticket116-knowledge-invalidation:"
+            correction_ref = "knowledge-currentness:invalidated"
+            correction_reason = "diagnostic-knowledge-invalidated"
+        else:
+            correction_contract = "ticket116-knowledge-unknown-v1"
+            correction_prefix = "ticket116-knowledge-unknown:"
+            correction_ref = "knowledge-currentness:unknown"
+            correction_reason = "diagnostic-knowledge-currentness-unknown"
         while True:
             current = next(
                 (
@@ -7181,13 +7249,15 @@ class HealthCore:
                 raise AuthorityValidationError(
                     "invalid current diagnosis reference"
                 )
-            identity = stable_digest(
-                {
-                    "contract": "ticket116-scope-invalidation-v1",
-                    "predecessor_ref": predecessor_ref,
-                    "bundle": assets.get("diagnostic_scope_bundle"),
-                }
-            ).removeprefix("sha256:")
+            identity_basis = {
+                "contract": correction_contract,
+                "predecessor_ref": predecessor_ref,
+                "bundle": assets.get("diagnostic_scope_bundle"),
+            }
+            if scope_current:
+                identity_basis["knowledge_currentness"] = knowledge_currentness
+                identity_basis["knowledge_refs"] = list(self._ticket116_knowledge_refs)
+            identity = stable_digest(identity_basis).removeprefix("sha256:")
             with self._ticket115_write_authority() as (head, _settings):
                 corrected_at = self._owner_settings_clock()
                 if (
@@ -7195,28 +7265,28 @@ class HealthCore:
                     or corrected_at.tzinfo is None
                 ):
                     raise AuthorityValidationError(
-                        "scope invalidation clock unavailable"
+                        "diagnostic-basis clock unavailable"
                     )
             command = TrustedHealthCommand(
                 action="diagnosis.correct",
                 source="diagnostic_runtime",
-                causal_id="ticket116-scope-invalidation:" + identity,
+                causal_id=correction_prefix + identity,
                 generation=head.generation,
                 scope=("diagnosis:correct",),
                 payload={
                     "diagnosis_ref": predecessor_ref,
-                    "correction_ref": "scope-currentness:invalidated",
+                    "correction_ref": correction_ref,
                     "corrected_at_utc": corrected_at.astimezone(
                         timezone.utc
                     ).isoformat(),
                     "outcome": "withdraw",
-                    "reason": "diagnostic-scope-invalidated",
+                    "reason": correction_reason,
                 },
             )
             result = self._execute_ticket116_diagnosis_correct(command)
             if result.get("status") not in {"revised", "replayed"}:
                 raise AuthorityValidationError(
-                    "scope invalidation successor unavailable"
+                    "diagnostic-basis successor unavailable"
                 )
 
     def _execute_ticket116_diagnosis_commit(
@@ -7232,7 +7302,7 @@ class HealthCore:
             raise ProtocolViolation("invalid diagnosis commit")
         if payload.get("commit_kind") != "diagnostic-judgment":
             raise ProtocolViolation("invalid diagnosis commit kind")
-        self._reconcile_ticket116_scope_invalidation()
+        self._reconcile_ticket116_diagnostic_basis()
         source = payload["source_causal_id"]
         effect_id = payload["model_effect_id"]
         recovered = next(
@@ -7490,7 +7560,7 @@ class HealthCore:
             "run_receipt_ref", "acceptance_receipt_ref"
         }:
             raise ProtocolViolation("invalid diagnosis activation")
-        self._reconcile_ticket116_scope_invalidation()
+        self._reconcile_ticket116_diagnostic_basis()
         run_ref = payload["run_receipt_ref"]
         acceptance_ref = payload["acceptance_receipt_ref"]
         with self._ticket115_write_authority() as (head, settings):
@@ -7699,7 +7769,7 @@ class HealthCore:
             assets = self._ticket116_assets
             if assets is None:
                 raise AuthorityValidationError("safety-diagnosis-read-unavailable")
-            self._reconcile_ticket116_scope_invalidation()
+            self._reconcile_ticket116_diagnostic_basis()
             results = self._ticket116_results()
             active_result = next(
                 (
@@ -7726,7 +7796,7 @@ class HealthCore:
             }
             diagnoses = self._ticket116_diagnoses_projection()
             current_status = "current"
-            if (
+            if self._ticket116_currentness_is_unknown() or (
                 self.probe().state is not ProbeState.HEALTHY
                 and not self._ticket116_only_unresolved_managed_effects()
             ):
