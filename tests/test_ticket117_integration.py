@@ -1742,9 +1742,23 @@ class Ticket117VerificationTests(unittest.TestCase):
         before_ticket = before["ticket115_tasks_review_delivery"]
         assert isinstance(before_ticket, Mapping)
         self.assertIn(unknown_ref, before_ticket["delivery_unknown_refs"])
+        before_unknown_deliveries = [
+            delivery
+            for delivery in before_ticket["owner_deliveries"]
+            if delivery["intent"]["intent_id"] == unknown_ref
+        ]
+        self.assertEqual(len(before_unknown_deliveries), 1)
+        before_unknown_facts = [
+            fact
+            for fact in before_unknown_deliveries[0]["facts"]
+            if fact["kind"] == "unknown"
+        ]
+        self.assertEqual(len(before_unknown_facts), 1)
+        unknown_occurred_at_utc = before_unknown_facts[0]["occurred_at_utc"]
+        self.assertIsInstance(unknown_occurred_at_utc, str)
         self.assertIn(task_id, repr(before))
         self.assertIn("ticket117-semantic-source-continuity", repr(before))
-        self.assertIn("2026-08-24T04:20:00+00:00", repr(before))
+        self.assertIn(unknown_occurred_at_utc, repr(before))
         self._restart_lifecycle(root=False)
         ready = self._prepare_migration("migration-semantic-round-trip")
         target = self._offline_target()
@@ -1769,7 +1783,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertIn(task_id, rendered)
         self.assertIn(unknown_ref, rendered)
         self.assertIn("ticket117-semantic-source-continuity", rendered)
-        self.assertIn("2026-08-24T04:20:00+00:00", rendered)
+        self.assertIn(unknown_occurred_at_utc, rendered)
         self.assertNotIn("synthetic-target-site-rewritten-source", rendered)
         self.assertNotIn("migration-time-rewritten-event-time", rendered)
 
