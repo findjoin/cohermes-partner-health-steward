@@ -1,6 +1,6 @@
 # Ticket 117 冻结验证合同
 
-> 状态：frozen。当前冻结内容 checkpoint 为 `d671d7b5440e58168698a71f9314d05fdbbac7c8`，tree 为 `4ae2eda4ad13218c595649f0c3905312a9b9a924`；fresh-context Spec 与 Standards 编码前预审均 PASS。该 checkpoint 只修正 V01 在 staged scope 强求普通诊断运行的错误前置；其余 Gate、架构与验收不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
+> 状态：frozen。当前冻结内容 checkpoint 为 `d6057ee49629318a69baa9a1fd7944c4051d6555`，tree 为 `ef10350a7580619eb01a9b9dde14a0fd052651de`；fresh-context Spec 与 Standards 编码前预审均 PASS。该 checkpoint 只修正 verifier fixture 的数据库隔离、合法 active-scope 前置、关闭存储 teardown 与公开发生时间取证；其余 Gate、架构与验收不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
 
 ## 测试权威、公开 Seam 与依赖展开
 
@@ -57,9 +57,9 @@ pre-code checkpoint 必须运行并记录：
 
 ## 编码前预审证据
 
-- 当前冻结内容 checkpoint：`d671d7b5440e58168698a71f9314d05fdbbac7c8`；tree：`4ae2eda4ad13218c595649f0c3905312a9b9a924`。V01 先经 Ticket 116 已冻结的 synthetic Ticket 119 acceptance fixture 合法激活 scope，再验证 lifecycle freeze 撤销真实 strict grant；未放宽 Ticket 116 产品门禁。
+- 当前冻结内容 checkpoint：`d6057ee49629318a69baa9a1fd7944c4051d6555`；tree：`ef10350a7580619eb01a9b9dde14a0fd052651de`。source、offline target、blank 与嵌套 harness 使用彼此隔离的 SQLite identity；V01/V06 先经 Ticket 116 已冻结的 synthetic Ticket 119 acceptance fixture 合法激活 scope；V02 关闭存储后不做无效 teardown；V08 从 Ticket 115 public managed view 读取真实 unknown ref 与公开发生时间。未放宽 Ticket 116 产品门禁，也未增加产品 Interface。
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；旧全量测试：`720/720 PASS`。
 - 编码前冻结门：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚无 `managed_lifecycle_read` / `lifecycle.execute` 公共 Seam；其余八门只因共同前置而 skip。
-- Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或过度约束。
-- Standards reviewer：PASS，P1/P2/P3 均为 0；一个深 Module、最少 Interface、9 门上限、实施自由和 Ticket 117/119 边界成立。
+- Spec reviewer：PASS；夹具修正保持 A2/A5/A6/A8 原始风险目标，无剩余阻塞 finding。
+- Standards reviewer：PASS，P0/P1/P2/P3 均为 0；patch 生命周期、teardown 与 public API 取证符合项目规则。
 - `compileall` 与 `git diff --check` 通过；冻结时无产品代码修改。
