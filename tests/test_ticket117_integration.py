@@ -817,6 +817,11 @@ class Ticket117VerificationTests(unittest.TestCase):
         """A1: freeze cannot leave task/model/outbound work admitted."""
 
         self._require_lifecycle(root=True)
+        # A normal diagnostic grant is legal only after the already-frozen
+        # Ticket 119 acceptance workflow has made Ticket 116 scope active.
+        # Establish that real precondition before testing that lifecycle
+        # freeze revokes an otherwise runnable grant.
+        self.v116._activate_synthetic_scope_through_ticket119()
         self._restart_lifecycle(root=True)
         admitted: dict[str, object] = {}
 
