@@ -15,6 +15,7 @@ from unittest.mock import patch
 from partner_health_steward import HealthCore, HealthPlugin, settings
 from partner_health_steward.authority import (
     AuthorityValidationError,
+    EffectIntent,
     WriterHolderClaim,
 )
 from partner_health_steward.contract import ProtocolViolation, Response
@@ -25,6 +26,7 @@ from partner_health_steward.current_head import (
     InMemoryCurrentHead,
 )
 from partner_health_steward.delivery import OwnerDeliveryTransportResult
+from partner_health_steward.model_contract import StrictModelRequest
 from partner_health_steward.storage import EncryptedStateStore
 from tests import test_ticket114_authority_integration as ticket114_integration
 from tests import test_ticket116_integration as ticket116_integration
@@ -286,7 +288,7 @@ class Ticket117VerificationTests(unittest.TestCase):
             ],
             "release": {
                 "product_release": "ticket117-synthetic-release-v1",
-                "adr": "ADR-0014",
+                "adr": "ADR-0022",
                 "skills": [
                     "health-init",
                     "health-steward",
@@ -650,6 +652,28 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertIsNotNone(grant)
         return task_id, intent, grant
 
+    def _form_strict_model_grant(
+        self,
+        *,
+        source_suffix: str,
+    ) -> tuple[StrictModelRequest, str, object]:
+        """Create one real strict request/intent and unstarted execution grant."""
+
+        payload = self.v116._diagnosis_prepare_payload(source_suffix=source_suffix)
+        prepared = self.v116._health(
+            "diagnosis.prepare",
+            payload,
+            suffix=source_suffix,
+        )
+        self.assertEqual(prepared.get("status"), "model-ready", prepared)
+        intent = EffectIntent.from_wire_metadata(prepared.get("model_intent"))
+        request = StrictModelRequest.from_wire(prepared.get("request"))
+        grant = self.plugin.claim_effect_execution(intent)
+        self.assertIsNotNone(grant)
+        source_causal_id = payload["source_causal_id"]
+        self.assertIsInstance(source_causal_id, str)
+        return request, source_causal_id, grant  # type: ignore[return-value]
+
     def _seed_unknown_owner_delivery(self) -> tuple[str, object, object]:
         task_id, intent, grant = self._form_owner_delivery_grant()
         adapter = _RaisingDeliveryAdapter()
@@ -786,7 +810,17 @@ class Ticket117VerificationTests(unittest.TestCase):
 
         def form_real_inflight_work() -> None:
             task_id, intent, grant = self._form_owner_delivery_grant()
-            admitted.update(task_id=task_id, intent=intent, grant=grant)
+            model_request, model_source, model_grant = self._form_strict_model_grant(
+                source_suffix="ticket117-model-before-freeze"
+            )
+            admitted.update(
+                task_id=task_id,
+                intent=intent,
+                grant=grant,
+                model_request=model_request,
+                model_source=model_source,
+                model_grant=model_grant,
+            )
 
         self.head.failure = "conflict"
         lifecycle = self._start_delete(
@@ -818,6 +852,20 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertEqual(blocked_transport.calls, 0)
         self.assertIsNone(self.plugin.claim_effect_execution(intent))  # type: ignore[arg-type]
 
+        never_model = _NeverModelAdapter()
+        model_outcome = self.plugin.execute_strict_health_model(
+            self.v116.llm,
+            admitted["model_request"],  # type: ignore[arg-type]
+            admitted["model_source"],  # type: ignore[arg-type]
+            admitted["model_grant"],  # type: ignore[arg-type]
+            never_model,
+        )
+        self.assertEqual(
+            (model_outcome.disposition, model_outcome.model_effect),
+            ("failed-closed", "not-started"),
+        )
+        self.assertEqual(never_model.calls, 0)
+
         task_context = {
             "source": "health_tasks",
             "causal_id": "ticket117-task-after-freeze",
@@ -839,7 +887,6 @@ class Ticket117VerificationTests(unittest.TestCase):
             task_result = {"status": "rejected"}
         self.assertEqual(task_result.get("status"), "rejected", task_result)
 
-        never_model = _NeverModelAdapter()
         try:
             model_prepare = self.plugin.health_operation(
                 "diagnosis.prepare",
@@ -907,6 +954,23 @@ class Ticket117VerificationTests(unittest.TestCase):
             lifecycle.get("remains_unproven"),
             list(self.replicas.unproven),
         )
+        # Storage-system-boundary absence oracle: enumerate generic local
+        # SQLite tables and count rows only.  It never reads columns, payloads,
+        # or hard-coded product table names.
+        connection = getattr(self.v116.base.store, "_connection")
+        table_rows = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        self.assertTrue(table_rows)
+        for (table_name,) in table_rows:
+            self.assertIsInstance(table_name, str)
+            quoted_name = '"' + table_name.replace('"', '""') + '"'
+            count_row = connection.execute(
+                f"SELECT COUNT(*) FROM {quoted_name}"
+            ).fetchone()
+            self.assertIsNotNone(count_row)
+            self.assertEqual(count_row[0], 0, table_name)
         self.assertFalse(self.plugin.health_writes_allowed())
         self.assertFalse(self.plugin.model_effects_allowed())
         self.assertFalse(self.plugin.outbound_effects_allowed())
@@ -1267,6 +1331,11 @@ class Ticket117VerificationTests(unittest.TestCase):
             task_id,
             effect_request_id,
         )
+        old_model_request, old_model_source, old_model_grant = (
+            self._form_strict_model_grant(
+                source_suffix="ticket117-model-before-transfer"
+            )
+        )
         ready = self._prepare_migration("migration-one-cas")
         self.assertEqual(ready.get("status"), "manifest-ready", ready)
         before_cas = self._read("migration-one-cas")
@@ -1298,6 +1367,20 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertTrue(target.model_effects_allowed())
         self.assertTrue(target.outbound_effects_allowed())
         self.assertFalse(self.head.validate_writer_fence(old_proof))
+
+        old_model_adapter = _NeverModelAdapter()
+        old_model_outcome = old_vm.execute_strict_health_model(
+            self.v116.llm,
+            old_model_request,
+            old_model_source,
+            old_model_grant,  # type: ignore[arg-type]
+            old_model_adapter,
+        )
+        self.assertEqual(
+            (old_model_outcome.disposition, old_model_outcome.model_effect),
+            ("failed-closed", "not-started"),
+        )
+        self.assertEqual(old_model_adapter.calls, 0)
 
         old_context = {
             "source": "health_tasks",
