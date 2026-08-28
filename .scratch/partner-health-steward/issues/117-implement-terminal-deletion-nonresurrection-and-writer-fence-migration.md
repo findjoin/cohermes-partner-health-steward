@@ -81,7 +81,10 @@ Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修�
 
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；tree：`b90a610efa7fc4597c90dd95193ca694d0998573`；全量测试：`720/720 PASS`。
 - 双轴审查的当前冻结内容 checkpoint：`d6057ee49629318a69baa9a1fd7944c4051d6555`；tree：`ef10350a7580619eb01a9b9dde14a0fd052651de`。
-- 当前冻结元数据 commit/tree 与三份冻结 blob 由紧随本提交的 handoff 元数据提交记录。
+- 当前冻结元数据 commit：`7b1fcd4180a3e4a22bee3f7bd4e548157c70f5c6`；tree：`03114b8d6edaf9473bb818332df1ebbaca457a4c`。
+- 冻结设计 blob：`58d94b85b6b6bc7631cf773be55062f6f07c6bc0`。
+- 冻结验证合同 blob：`4f7642c6080512c2e7ca01e0c99966dabc10ffc8`。
+- verifier-owned `tests/test_ticket117_integration.py` blob：`0f198c8ced43b66bc26226d13a33b884cb006223`。
 - 本次重新冻结只修正 verifier fixture：隔离兄弟 harness 的 SQLite identity、为 V06 合法激活 Ticket 116 scope、关闭存储后有界 teardown，以及从 Ticket 115 public managed view 取得真实 unknown ref 与公开发生时间。双轴复审确认不放宽 Ticket 116 门禁、不改变 Ticket 117 架构或 A1—A9。
 - 对当前 WIP 的门实跑：V01—V05、V09 PASS；V06—V08 统一真实失败于 `migration-manifest-missing`。Gate 总数仍固定为 9；`compileall` 与 `git diff --check` 通过。
 - fresh-context Spec reviewer：PASS，无 P0/P1/P2；A2/A5/A6/A8 风险目标保持不变。
