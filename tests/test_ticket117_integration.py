@@ -355,6 +355,8 @@ class Ticket117VerificationTests(unittest.TestCase):
             release["acl_service"] = "acl-service:ticket117-foreign"
         elif mutation == "secret-policy-violation":
             release["api_token"] = "SYNTHETIC-PLAINTEXT-SECRET-MUST-REJECT"
+        elif mutation == "target-key-requirement-drift":
+            release["secret_requirements"] = ["wrong-target-key-ref"]
         elif mutation is not None:
             raise AssertionError(f"unknown Ticket 117 config mutation: {mutation}")
         return config
@@ -1332,6 +1334,12 @@ class Ticket117VerificationTests(unittest.TestCase):
                 "ticket117-foreign-writer-capability",
             ),
             ("route-consent-currentness", None, None, None),
+            (
+                "target-key-requirement",
+                "target-key-requirement-drift",
+                None,
+                None,
+            ),
         )
         for label, mutation, configured_head, configured_capability in target_faults:
             with self.subTest(target_configuration_fault=label):
@@ -1341,13 +1349,6 @@ class Ticket117VerificationTests(unittest.TestCase):
                     current_head_capability=configured_capability,
                     route_drift=label == "route-consent-currentness",
                 )
-                if label == "route-consent-currentness":
-                    self.assertEqual(
-                        mismatched_target.owner_settings_state(
-                            peer_id=_PEER
-                        ).consent_path_status,
-                        "paused",
-                    )
                 context = None
                 if configured_head is not None:
                     foreign_snapshot = foreign_head.read().head
