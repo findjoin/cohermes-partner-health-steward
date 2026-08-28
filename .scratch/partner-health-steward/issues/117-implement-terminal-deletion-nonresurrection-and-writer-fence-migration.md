@@ -80,11 +80,12 @@ Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-est
 Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修改前冻结，可交给编码 Agent：
 
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；tree：`b90a610efa7fc4597c90dd95193ca694d0998573`；全量测试：`720/720 PASS`。
-- 双轴审查的冻结内容 checkpoint：`3e13c48179032f9b565d40abeaa8b433dc26ff8c`；tree：`aa21cf6c0bde3d1cbec85471054218cf6235aefd`。
-- 冻结元数据 commit：`d48d0b1a2b61ddc2b62023328fc88974c773dfeb`；tree：`3f85db328b741c6ceb2c56dcaa821f070a31dbc3`。
-- 冻结设计 blob：`db21731d052d221d5c61447bbbe05425bd1d889d`。
-- 冻结验证合同 blob：`e380da85dd11f284666ff529a18a7c071b20a29e`。
-- verifier-owned `tests/test_ticket117_integration.py` blob：`17f43fdd90b56ae95359497564c0dc263bfa7fa8`。
+- 双轴审查的当前冻结内容 checkpoint：`d671d7b5440e58168698a71f9314d05fdbbac7c8`；tree：`4ae2eda4ad13218c595649f0c3905312a9b9a924`。
+- 当前冻结元数据 commit：`9d261bca873e4049ebc0918d6724717e22883384`；tree：`3414cd49f561ba378d7614963c4f8ccddb956401`。
+- 冻结设计 blob：`e5c0cfbaa7ef02703545bd5b0585a92cca56eaa1`。
+- 冻结验证合同 blob：`bd8abcc5b3de41f6bd0e9ba8dc9be1036108af93`。
+- verifier-owned `tests/test_ticket117_integration.py` blob：`fab7b457baddc983dcc77628c56aa403c3d40d8b`。
+- V01 冻结门曾错误地在 staged scope 要求普通诊断返回 `model-ready`；当前 checkpoint 只补充 Ticket 116 已冻结的 synthetic acceptance 前置。双轴复审确认这是测试场景修复，不放宽 Ticket 116 门禁、不改变 Ticket 117 架构或 A1 验收。
 - 编码前门实跑：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚未实现 lifecycle 公共 Seam，Gate 总数固定为 9；`compileall` 与 `git diff --check` 通过。
 - fresh-context Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或新增过度约束。
 - fresh-context Standards reviewer：PASS，P1/P2/P3 均为 0；最少 Interface、一个深 Module、实施自由和 Ticket 117/119 边界成立。
