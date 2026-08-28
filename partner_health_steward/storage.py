@@ -2524,6 +2524,45 @@ class EncryptedStateStore:
         with self._transaction_lock:
             yield
 
+    def _export_lifecycle_snapshot(self) -> str:
+        """Encode the committed encrypted domain for the migration package."""
+
+        with self.serialized():
+            self._ensure_available()
+            try:
+                snapshot = self._connection.serialize()
+            except (AttributeError, sqlite3.Error) as exc:
+                raise StoreUnavailable("health state snapshot unavailable") from exc
+        if not snapshot:
+            raise StoreUnavailable("health state snapshot empty")
+        return snapshot.hex()
+
+    def _import_lifecycle_snapshot(self, snapshot: object) -> None:
+        """Install a previously authenticated encrypted domain snapshot."""
+
+        if type(snapshot) is not str or not snapshot:
+            raise StoreUnavailable("health state snapshot invalid")
+        try:
+            encoded = bytes.fromhex(snapshot)
+        except ValueError as exc:
+            raise StoreUnavailable("health state snapshot invalid") from exc
+        if not encoded:
+            raise StoreUnavailable("health state snapshot empty")
+        with self.serialized():
+            self._ensure_available()
+            if self._transaction_depth != 0:
+                raise StoreUnavailable("health state snapshot transaction active")
+            try:
+                if self._connection.in_transaction:
+                    raise StoreUnavailable("health state snapshot transaction active")
+                self._connection.deserialize(encoded)
+                self._connection.execute("PRAGMA foreign_keys = ON")
+            except StoreUnavailable:
+                raise
+            except (AttributeError, sqlite3.Error) as exc:
+                self._poisoned = True
+                raise StoreUnavailable("health state snapshot unavailable") from exc
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """One re-entrant transaction for a domain mutation and its receipt."""
@@ -5645,7 +5684,11 @@ class EncryptedStateStore:
         proof = self._finalized_proof()
         if proof is None:
             raise AuthorityValidationError("local finalized authority missing")
-        record_id = proof[1]
+        # A lifecycle handoff changes the live generation/site; it is not a
+        # new business finalization of the source record.  Keep that record
+        # in the encrypted domain history but detach the local authority
+        # anchor so integrity validation does not equate the two generations.
+        record_id = None
         nonce, ciphertext = self._seal_finalized_authority(authority, record_id)
         with self.transaction() as connection:
             self._assert_integrity_manifest_before_mutation()
@@ -5871,6 +5914,57 @@ class EncryptedStateStore:
 
     def count_effects(self) -> int:
         return int(self._execute("SELECT COUNT(*) FROM effects").fetchone()[0])
+
+    def _freeze_live_execution_effects_for_lifecycle(self) -> None:
+        """Close unattempted local leases before forming a migration package."""
+
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            rows = connection.execute(
+                "SELECT effect_id, nonce, ciphertext FROM effects "
+                "WHERE state = 'executing' ORDER BY effect_id"
+            ).fetchall()
+            changed = False
+            for effect_id, nonce, ciphertext in rows:
+                payload = self._decode_effect_payload(
+                    "executing",
+                    self._open(f"effect:{effect_id}:executing", nonce, ciphertext),
+                )
+                if type(payload) is not ExecutingEffect:
+                    raise KeyUnavailable("invalid live execution effect")
+                pending = self.pending_effect_result(effect_id)
+                if pending is not None and pending.remote_attempted:
+                    continue
+                terminal = TerminalEffect(
+                    execution=payload,
+                    status="rejected",
+                    result_digest=stable_digest(
+                        {
+                            "contract": "ticket117-stale-effect-v1",
+                            "effect_id": effect_id,
+                            "intent_digest": payload.intent.intent_digest,
+                            "reason": "lifecycle-writer-transfer",
+                        }
+                    ),
+                )
+                self._validate_effect_write(effect_id, "rejected", terminal)
+                terminal_nonce, terminal_ciphertext = self._seal(
+                    f"effect:{effect_id}:rejected",
+                    terminal.to_storage(),
+                )
+                connection.execute(
+                    "UPDATE effects SET state = ?, nonce = ?, ciphertext = ? "
+                    "WHERE effect_id = ?",
+                    ("rejected", terminal_nonce, terminal_ciphertext, effect_id),
+                )
+                if pending is not None:
+                    connection.execute(
+                        "DELETE FROM pending_effect_results_v1 WHERE effect_id = ?",
+                        (effect_id,),
+                    )
+                changed = True
+            if changed:
+                self._refresh_integrity_manifest(connection)
 
     def _verify_ticket115_aggregates(
         self,

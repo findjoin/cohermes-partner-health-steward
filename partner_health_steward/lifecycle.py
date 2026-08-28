@@ -170,6 +170,7 @@ class LifecycleCoordinator:
             state = None
         if state is not None:
             self._states[operation_ref] = state
+            self._reconcile_target_activation(state)
             return state
         return cached
 
@@ -324,6 +325,132 @@ class LifecycleCoordinator:
     def _transition_id(kind: str, operation_ref: str) -> str:
         prefix = "terminal-delete" if kind == "delete-all" else "writer-transfer"
         return f"lifecycle:{prefix}:{operation_ref}"
+
+    @staticmethod
+    def _target_acceptance_ref(package_ref: str) -> str:
+        return package_ref + ":target-acceptance"
+
+    @staticmethod
+    def _target_transfer_ref(package_ref: str) -> str:
+        return package_ref + ":target-transfer"
+
+    def _target_acceptance_matches(self, state: Mapping[str, object]) -> bool:
+        package_ref = state.get("package_ref")
+        if type(package_ref) is not str:
+            return False
+        try:
+            artifact = self._config["migration_artifact_adapter"]  # type: ignore[index]
+            receipt = artifact.get(self._target_acceptance_ref(package_ref))
+        except Exception:
+            return False
+        return receipt == {
+            "contract": "ticket117-migration-acceptance-v1",
+            "operation_ref": state.get("operation_ref"),
+            "package_ref": package_ref,
+            "manifest_digest": state.get("manifest_digest"),
+            "target_site": state.get("target_site"),
+            "target_writer_fence_ref": state.get("target_writer_fence_ref"),
+        }
+
+    def _target_transfer_matches(self, state: Mapping[str, object]) -> bool:
+        package_ref = state.get("package_ref")
+        if type(package_ref) is not str:
+            return False
+        try:
+            artifact = self._config["migration_artifact_adapter"]  # type: ignore[index]
+            receipt = artifact.get(self._target_transfer_ref(package_ref))
+        except Exception:
+            return False
+        if not isinstance(receipt, dict) or {
+            "contract",
+            "operation_ref",
+            "package_ref",
+            "manifest_digest",
+            "authority_binding",
+        } != set(receipt):
+            return False
+        authority = receipt["authority_binding"]
+        return (
+            receipt["contract"] == "ticket117-migration-transfer-v1"
+            and receipt["operation_ref"] == state.get("operation_ref")
+            and receipt["package_ref"] == package_ref
+            and receipt["manifest_digest"] == state.get("manifest_digest")
+            and isinstance(authority, dict)
+            and authority.get("transition_id") == state.get("transition_id")
+            and authority.get("site") == state.get("target_site")
+        )
+
+    def _publish_target_transfer(
+        self,
+        state: Mapping[str, object],
+        authority: AuthoritySnapshot,
+    ) -> bool:
+        package_ref = state.get("package_ref")
+        operation_ref = state.get("operation_ref")
+        manifest_digest = state.get("manifest_digest")
+        if not all(
+            type(value) is str and bool(value)
+            for value in (package_ref, operation_ref, manifest_digest)
+        ):
+            return False
+        try:
+            artifact = self._config["migration_artifact_adapter"]  # type: ignore[index]
+            stored = artifact.put(
+                self._target_transfer_ref(package_ref),
+                {
+                    "contract": "ticket117-migration-transfer-v1",
+                    "operation_ref": operation_ref,
+                    "package_ref": package_ref,
+                    "manifest_digest": manifest_digest,
+                    "authority_binding": _authority_wire(authority),
+                },
+            )
+            return type(stored) is dict and stored.get("status") == "confirmed"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _semantic_snapshot_valid(
+        package: Mapping[str, object],
+        manifest: Mapping[str, object],
+    ) -> bool:
+        snapshot = package.get("semantic_state")
+        return (
+            type(snapshot) is str
+            and bool(snapshot)
+            and manifest.get("semantic_state_digest") == stable_digest(snapshot)
+        )
+
+    def _reconcile_target_activation(self, state: dict[str, object]) -> None:
+        """Reflect the exact shared-head receipt in an offline target copy."""
+
+        if (
+            state.get("kind") != "prepare-migration"
+            or state.get("target_accepted") is not True
+            or state.get("target_active") is True
+            or not self._target_transfer_matches(state)
+        ):
+            return
+        try:
+            receipt = self._lookup(self._lifecycle_identity(state))
+            if not isinstance(receipt, AppliedLifecycleTransition):
+                return
+            applied = receipt.applied
+            if (
+                applied.transition_id != state.get("transition_id")
+                or applied.terminal
+                or applied.site != state.get("target_site")
+            ):
+                return
+            self._replace_authority(applied.as_authority())
+            state["phase"] = "transferred"
+            state["authority_binding"] = _authority_wire(applied.as_authority())
+            state["source_active"] = False
+            state["target_active"] = True
+            state["reason_code"] = None
+            self._save(state)
+        except Exception:
+            return
 
     def _new_state(
         self,
@@ -521,6 +648,26 @@ class LifecycleCoordinator:
             return False
         return self._valid_configuration()
 
+    def semantic_status_projection_stable(self) -> bool:
+        """Keep the source status projection through the immediate handoff."""
+
+        if not (
+            type(self._config) is dict
+            and self._config.get("mode") == "offline-staging"
+        ):
+            return False
+        state = self._latest_operational_state()
+        if state is None or state.get("target_active") is not True:
+            return False
+        try:
+            authority = self._current_head()
+        except Exception:
+            return False
+        return (
+            authority.transition_id == state.get("transition_id")
+            and authority.site == state.get("target_site")
+        )
+
     def blocks_normal_operations(self) -> bool:
         if self._read_derived_terminal(None) is not None:
             return True
@@ -568,6 +715,8 @@ class LifecycleCoordinator:
         states = self._all_states()
         if not states:
             return None
+        for state in states:
+            self._reconcile_target_activation(state)
         # A terminal/frozen state is the only safe winner if more than one
         # lifecycle record is present in a copied domain.
         for state in states:
@@ -815,6 +964,13 @@ class LifecycleCoordinator:
         if state is not None:
             if state.get("kind") != "prepare-migration" or state.get("payload_digest") != payload_digest:
                 return {"status": "rejected", "reason_code": "lifecycle-operation-conflict"}
+            if state.get("target_accepted") is not True and self._target_acceptance_matches(state):
+                state["target_accepted"] = True
+                state["source_active"] = False
+                state["target_active"] = False
+                state["phase"] = "target-staged"
+                state["reason_code"] = None
+                self._save(state)
             if state.get("target_accepted") is True and state.get("phase") in {
                 "manifest-ready",
                 "target-staged",
@@ -833,6 +989,8 @@ class LifecycleCoordinator:
             registry = copy.deepcopy(self._config["semantic_registry"])  # type: ignore[index]
             release = copy.deepcopy(self._config["release"])  # type: ignore[index]
             package_ref = f"lifecycle-package:{operation_ref}"
+            self._store._freeze_live_execution_effects_for_lifecycle()
+            semantic_state = self._store._export_lifecycle_snapshot()
             manifest = {
                 "contract": "ticket117-semantic-manifest-v1",
                 "operation_ref": operation_ref,
@@ -842,17 +1000,12 @@ class LifecycleCoordinator:
                 "target_site": target_site,
                 "target_writer_fence_ref": target_fence,
                 "artifact_sink_ref": sink_ref,
-                "semantic_state_digest": stable_digest(
-                    {
-                        "contract": "ticket117-semantic-continuity-v1",
-                        "source_authority": _authority_wire(authority),
-                        "source_continuity": "preserve",
-                    }
-                ),
+                "semantic_state_digest": stable_digest(semantic_state),
             }
             package: dict[str, object] = {
                 "contract": "ticket117-opaque-migration-package-v1",
                 "manifest": manifest,
+                "semantic_state": semantic_state,
             }
             manifest_digest = stable_digest(package)
             artifact = self._config["migration_artifact_adapter"]  # type: ignore[index]
@@ -865,7 +1018,7 @@ class LifecycleCoordinator:
                 payload_digest=payload_digest,
                 authority=authority,
                 phase="manifest-ready",
-                source_active=True,
+                source_active=False,
                 target_active=False,
             )
             state.update(
@@ -906,7 +1059,123 @@ class LifecycleCoordinator:
             return {"status": "rejected", "reason_code": "invalid-manifest-digest"}
         state = self._load(operation_ref)  # type: ignore[arg-type]
         if state is None or state.get("kind") != "prepare-migration":
-            return {"status": "rejected", "reason_code": "migration-manifest-missing"}
+            if not self._valid_configuration():
+                return {
+                    "status": "rejected",
+                    "reason_code": self._configuration_error,
+                }
+            if not self._route_and_consent_current():
+                return {
+                    "status": "rejected",
+                    "reason_code": "route-consent-not-current",
+                }
+            try:
+                authority = self._current_head()
+                if authority.terminal or not self._new_command_authority_ok(
+                    command, authority
+                ):
+                    return {"status": "rejected", "reason_code": "generation-mismatch"}
+                artifact = self._config["migration_artifact_adapter"]  # type: ignore[index]
+                package = artifact.get(package_ref)
+                if type(package) is not dict or stable_digest(package) != manifest_digest:
+                    return {
+                        "status": "rejected",
+                        "reason_code": "migration-artifact-integrity",
+                    }
+                manifest = package.get("manifest")
+                if (
+                    type(manifest) is not dict
+                    or package.get("contract")
+                    != "ticket117-opaque-migration-package-v1"
+                ):
+                    return {
+                        "status": "rejected",
+                        "reason_code": "migration-manifest-invalid",
+                    }
+                source_authority = _authority(manifest.get("source_authority"))
+                if authority.installation_id != source_authority.installation_id or authority != source_authority:
+                    return {
+                        "status": "rejected",
+                        "reason_code": "source-authority-mismatch",
+                    }
+                if (
+                    manifest.get("operation_ref") != operation_ref
+                    or manifest.get("semantic_registry")
+                    != self._config["semantic_registry"]  # type: ignore[index]
+                    or manifest.get("release") != self._config["release"]  # type: ignore[index]
+                    or type(manifest.get("target_site")) is not str
+                    or type(manifest.get("target_writer_fence_ref")) is not str
+                    or type(manifest.get("artifact_sink_ref")) is not str
+                ):
+                    return {
+                        "status": "rejected",
+                        "reason_code": "migration-manifest-configuration",
+                    }
+                if not self._semantic_snapshot_valid(package, manifest):
+                    return {
+                        "status": "rejected",
+                        "reason_code": "migration-manifest-invalid",
+                    }
+                self._store._import_lifecycle_snapshot(package["semantic_state"])
+                reconstructed_payload = {
+                    "kind": "prepare-migration",
+                    "operation_ref": operation_ref,
+                    "target_site": manifest["target_site"],
+                    "target_writer_fence_ref": manifest["target_writer_fence_ref"],
+                    "artifact_sink_ref": manifest["artifact_sink_ref"],
+                }
+                state = self._new_state(
+                    operation_ref=operation_ref,  # type: ignore[arg-type]
+                    kind="prepare-migration",
+                    payload_digest=self._payload_digest(reconstructed_payload),
+                    authority=source_authority,
+                    phase="target-staged",
+                    source_active=False,
+                    target_active=False,
+                )
+                state.update(
+                    {
+                        "target_site": manifest["target_site"],
+                        "target_writer_fence_ref": manifest[
+                            "target_writer_fence_ref"
+                        ],
+                        "artifact_sink_ref": manifest["artifact_sink_ref"],
+                        "package_ref": package_ref,
+                        "manifest_digest": manifest_digest,
+                        "manifest": manifest,
+                        "target_accepted": True,
+                    }
+                )
+                self._save(state)
+                accepted = {
+                    "contract": "ticket117-migration-acceptance-v1",
+                    "operation_ref": operation_ref,
+                    "package_ref": package_ref,
+                    "manifest_digest": manifest_digest,
+                    "target_site": manifest["target_site"],
+                    "target_writer_fence_ref": manifest[
+                        "target_writer_fence_ref"
+                    ],
+                }
+                stored = artifact.put(
+                    self._target_acceptance_ref(package_ref),
+                    accepted,
+                )
+                if type(stored) is not dict or stored.get("status") != "confirmed":
+                    return {
+                        "status": "rejected",
+                        "reason_code": "migration-artifact-unavailable",
+                    }
+                return self._state_result(
+                    state,
+                    status="manifest-ready",
+                    authority=authority,
+                )
+            except Exception:
+                return {
+                    "status": "rejected",
+                    "reason_code": "migration-acceptance-unavailable",
+                }
         if state.get("package_ref") != package_ref or state.get("manifest_digest") != manifest_digest:
             return self._state_result(state, status="rejected", reason_code="migration-manifest-mismatch")
         if state.get("target_accepted") is True:
@@ -998,6 +1267,11 @@ class LifecycleCoordinator:
                 state["reason_code"] = "local-authority-handoff-unavailable"
                 self._save(state)
                 return self._state_result(state, status="unknown", authority=applied)
+            if not self._publish_target_transfer(state, applied):
+                state["phase"] = "transfer-unknown"
+                state["reason_code"] = "migration-transfer-confirmation-unavailable"
+                self._save(state)
+                return self._state_result(state, status="unknown", authority=applied)
             state["phase"] = "transferred"
             state["authority_binding"] = _authority_wire(applied)
             state["source_active"] = False
@@ -1031,6 +1305,8 @@ class LifecycleCoordinator:
                 try:
                     self._replace_authority(applied)
                 except Exception:
+                    continue
+                if not self._publish_target_transfer(state, applied):
                     continue
                 state["phase"] = "transferred"
                 state["source_active"] = False

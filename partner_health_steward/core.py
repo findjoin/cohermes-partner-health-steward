@@ -11165,6 +11165,13 @@ class HealthCore:
                     evaluated_at + timedelta(minutes=5)
                 ).isoformat()
                 probe = self._probe_open()
+                previous = self._store.business_status_projection()
+                if (
+                    previous is not None
+                    and self._lifecycle is not None
+                    and self._lifecycle.semantic_status_projection_stable()
+                ):
+                    return BusinessStatusResult(previous, None)
                 requirements, facts = self._production_status_inputs(
                     probe=probe,
                     valid_until_utc=valid_until_utc,
@@ -11177,7 +11184,6 @@ class HealthCore:
                     facts,
                     evaluated_at_utc=evaluated_at_utc,
                 )
-                previous = self._store.business_status_projection()
                 transition = (
                     None
                     if previous is None
@@ -13212,6 +13218,24 @@ class HealthCore:
         return canonical
 
     def _replace_lifecycle_authority(self, authority: AuthoritySnapshot) -> None:
+        previous = self._store.finalized_authority()
+        vault = self._writer_fence_vault
+        binder = None if vault is None else getattr(vault, "bind", None)
+        if (
+            isinstance(previous, AuthoritySnapshot)
+            and callable(binder)
+            and isinstance(authority, AuthoritySnapshot)
+        ):
+            session = self._writer_holder_session(previous)
+            try:
+                proof = None if session is None else session.proof_for(previous)
+                if type(proof) is WriterFenceProof:
+                    binder(authority, proof.capability)
+            except Exception:
+                # A production vault provisions the target holder through its
+                # own host boundary.  The optional synthetic binder is only a
+                # local handoff aid and must never weaken the store update.
+                pass
         self._store.replace_finalized_authority(authority)
 
     def _lifecycle_route_and_consent_current(self) -> bool:
@@ -13233,6 +13257,7 @@ class HealthCore:
                 and route.configuration_generation
                 == settings.current_configuration_generation
                 and route.disclosure_version == settings.current_disclosure_version
+                and settings.consent_path_status == "active"
             )
         except Exception:
             return False

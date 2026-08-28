@@ -623,7 +623,7 @@ class InMemoryCurrentHead:
             )
             if not lose_response:
                 self._raise_if_failed("lifecycle")
-            if self._active_execution_effect_ids:
+            if request.kind == "terminal-delete" and self._active_execution_effect_ids:
                 raise HeadConflict("active execution lease")
             if self._head.terminal:
                 raise HeadTerminal("terminal current head")
@@ -652,6 +652,13 @@ class InMemoryCurrentHead:
                     request.operation_digest,
                 )
             ] = applied
+            if request.kind == "writer-transfer":
+                # A generation transfer makes every pre-transfer execution
+                # lease stale.  Keep the historical receipts for exact old
+                # grant lookups, but remove their live hold before the new
+                # writer can acquire work.
+                self._active_execution_effect_ids.clear()
+                self._sync_active_execution_effect_id()
             if lose_response:
                 raise HeadUnknown("synthetic lifecycle response lost")
             return next_head
