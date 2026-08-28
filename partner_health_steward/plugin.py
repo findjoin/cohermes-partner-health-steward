@@ -914,6 +914,20 @@ class HealthPlugin:
             raise AuthorityValidationError("ticket115-read-unavailable")
         return view
 
+    def managed_lifecycle_read(
+        self,
+        operation_ref: str | None = None,
+        *,
+        peer_id: str,
+    ) -> dict[str, object]:
+        """Return the body-free lifecycle state projection."""
+
+        self._require_ticket115_peer(peer_id)
+        view = self._core.managed_lifecycle_read(operation_ref)
+        if type(view) is not dict:
+            raise AuthorityValidationError("lifecycle-read-unavailable")
+        return view
+
     def managed_safety_diagnosis_read(
         self,
         *,

@@ -171,6 +171,143 @@ class AppliedTransition:
 
 
 @dataclass(frozen=True)
+class LifecycleTransitionRequest:
+    """The typed current-head write used only by the lifecycle coordinator."""
+
+    kind: str
+    expected: AuthoritySnapshot
+    operation_ref: str
+    transition_id: str
+    revision_digest: str
+    writer_fence: str
+    operation_digest: str
+    writer_proof: WriterFenceProof
+    target_site: str | None = None
+    target_writer_fence_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"terminal-delete", "writer-transfer"}:
+            raise AuthorityValidationError("invalid lifecycle transition kind")
+        if type(self.expected) is not AuthoritySnapshot or self.expected.terminal:
+            raise AuthorityValidationError("invalid lifecycle expected authority")
+        for value, name in (
+            (self.operation_ref, "lifecycle operation reference"),
+            (self.transition_id, "lifecycle transition identifier"),
+            (self.revision_digest, "lifecycle revision digest"),
+            (self.writer_fence, "lifecycle writer fence"),
+            (self.operation_digest, "lifecycle operation digest"),
+        ):
+            validate_opaque_text(value, name)
+        if self.writer_fence != self.expected.writer_fence:
+            raise AuthorityValidationError(
+                "lifecycle request does not hold expected writer fence"
+            )
+        if type(self.writer_proof) is not WriterFenceProof:
+            raise AuthorityValidationError("invalid lifecycle writer proof")
+        if self.writer_proof.authority != self.expected:
+            raise AuthorityValidationError("lifecycle writer proof mismatch")
+        if self.kind == "terminal-delete":
+            if self.target_site is not None or self.target_writer_fence_ref is not None:
+                raise AuthorityValidationError(
+                    "terminal lifecycle transition cannot carry target authority"
+                )
+        else:
+            validate_opaque_text(self.target_site, "lifecycle target site")
+            validate_opaque_text(
+                self.target_writer_fence_ref,
+                "lifecycle target writer fence reference",
+            )
+
+    def identity(self) -> "LifecycleTransitionIdentity":
+        return LifecycleTransitionIdentity(
+            kind=self.kind,
+            expected=self.expected,
+            operation_ref=self.operation_ref,
+            transition_id=self.transition_id,
+            revision_digest=self.revision_digest,
+            writer_fence=self.writer_fence,
+            operation_digest=self.operation_digest,
+            target_site=self.target_site,
+            target_writer_fence_ref=self.target_writer_fence_ref,
+        )
+
+
+@dataclass(frozen=True)
+class LifecycleTransitionIdentity:
+    """Exact, non-secret identity used for lifecycle lookup recovery."""
+
+    kind: str
+    expected: AuthoritySnapshot
+    operation_ref: str
+    transition_id: str
+    revision_digest: str
+    writer_fence: str
+    operation_digest: str
+    target_site: str | None = None
+    target_writer_fence_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"terminal-delete", "writer-transfer"}:
+            raise AuthorityValidationError("invalid lifecycle transition kind")
+        if type(self.expected) is not AuthoritySnapshot or self.expected.terminal:
+            raise AuthorityValidationError("invalid lifecycle expected authority")
+        for value, name in (
+            (self.operation_ref, "lifecycle operation reference"),
+            (self.transition_id, "lifecycle transition identifier"),
+            (self.revision_digest, "lifecycle revision digest"),
+            (self.writer_fence, "lifecycle writer fence"),
+            (self.operation_digest, "lifecycle operation digest"),
+        ):
+            validate_opaque_text(value, name)
+        if self.writer_fence != self.expected.writer_fence:
+            raise AuthorityValidationError(
+                "lifecycle identity does not hold expected writer fence"
+            )
+        if self.kind == "terminal-delete":
+            if self.target_site is not None or self.target_writer_fence_ref is not None:
+                raise AuthorityValidationError(
+                    "terminal lifecycle identity cannot carry target authority"
+                )
+        else:
+            validate_opaque_text(self.target_site, "lifecycle target site")
+            validate_opaque_text(
+                self.target_writer_fence_ref,
+                "lifecycle target writer fence reference",
+            )
+
+
+@dataclass(frozen=True)
+class AppliedLifecycleTransition:
+    """Durable current-head proof for one lifecycle transition."""
+
+    request: LifecycleTransitionIdentity
+    applied: HeadSnapshot
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not LifecycleTransitionIdentity:
+            raise AuthorityValidationError("invalid lifecycle transition request")
+        if type(self.applied) is not HeadSnapshot:
+            raise AuthorityValidationError("invalid lifecycle applied authority")
+        if self.applied.installation_id != self.request.expected.installation_id:
+            raise AuthorityValidationError("lifecycle applied installation mismatch")
+        if self.applied.generation != self.request.expected.generation + 1:
+            raise AuthorityValidationError("lifecycle applied generation mismatch")
+        if self.applied.revision_digest != self.request.revision_digest:
+            raise AuthorityValidationError("lifecycle applied revision mismatch")
+        if self.applied.transition_id != self.request.transition_id:
+            raise AuthorityValidationError("lifecycle applied transition mismatch")
+        if self.applied.writer_fence != self.request.writer_fence:
+            raise AuthorityValidationError("lifecycle applied writer fence mismatch")
+        expected_site = self.request.target_site or self.request.expected.site
+        if self.applied.site != expected_site:
+            raise AuthorityValidationError("lifecycle applied site mismatch")
+        if self.request.kind == "terminal-delete" and not self.applied.terminal:
+            raise AuthorityValidationError("terminal lifecycle proof is not terminal")
+        if self.request.kind == "writer-transfer" and self.applied.terminal:
+            raise AuthorityValidationError("writer transfer cannot be terminal")
+
+
+@dataclass(frozen=True)
 class ExecutionLeaseIdentity:
     """The non-secret remote identity for one controlled effect lease."""
 
@@ -285,6 +422,16 @@ class CurrentHeadPort(Protocol):
 
     def lookup_transition(self, request: AdvanceIdentity) -> AppliedTransition: ...
 
+    def conditional_lifecycle_transition(
+        self,
+        request: LifecycleTransitionRequest,
+    ) -> HeadSnapshot: ...
+
+    def lookup_lifecycle_transition(
+        self,
+        identity: LifecycleTransitionIdentity,
+    ) -> AppliedLifecycleTransition: ...
+
     def validate_writer_fence(self, proof: WriterFenceProof) -> bool: ...
 
     def acquire_execution_lease(self, request: ExecutionLeaseRequest) -> ExecutionLeaseReceipt: ...
@@ -318,6 +465,9 @@ class InMemoryCurrentHead:
             site,
         )
         self._transitions: dict[tuple[str, str, str], AppliedTransition] = {}
+        self._lifecycle_transitions: dict[
+            tuple[str, str, str], AppliedLifecycleTransition
+        ] = {}
         self._execution_leases: dict[str, ExecutionLeaseReceipt] = {}
         self._active_execution_effect_id: str | None = None
         self._failure = FailureMode.NONE
@@ -325,7 +475,16 @@ class InMemoryCurrentHead:
         self._lock = threading.RLock()
 
     def set_failure(self, failure: FailureMode, *, operation: str = "all") -> None:
-        if operation not in {"all", "read", "advance", "lookup", "lease", "lease-lookup", "lease-release"}:
+        if operation not in {
+            "all",
+            "read",
+            "advance",
+            "lookup",
+            "lifecycle",
+            "lease",
+            "lease-lookup",
+            "lease-release",
+        }:
             raise ValueError("invalid failure operation")
         with self._lock:
             self._failure = failure
@@ -417,6 +576,76 @@ class InMemoryCurrentHead:
             )
             if found is None:
                 raise TransitionNotFound("transition not found")
+            return found
+
+    def conditional_lifecycle_transition(
+        self,
+        request: LifecycleTransitionRequest,
+    ) -> HeadSnapshot:
+        """Apply one terminal delete or writer-transfer CAS."""
+
+        if type(request) is not LifecycleTransitionRequest:
+            raise AuthorityValidationError("invalid lifecycle transition request")
+        with self._lock:
+            lose_response = self._is_failure(
+                FailureMode.UNKNOWN_AFTER_ADVANCE,
+                "lifecycle",
+            ) or self._is_failure(
+                FailureMode.UNKNOWN_AFTER_ADVANCE,
+                "advance",
+            )
+            if not lose_response:
+                self._raise_if_failed("lifecycle")
+            if self._active_execution_effect_id is not None:
+                raise HeadConflict("active execution lease")
+            if self._head.terminal:
+                raise HeadTerminal("terminal current head")
+            if not self._valid_writer_proof(request.writer_proof, request.expected):
+                raise HeadConflict("current writer fence capability conflict")
+            if request.expected != self._head.as_authority():
+                raise HeadConflict("current-head lifecycle compare-and-set conflict")
+            next_head = HeadSnapshot(
+                self._head.installation_id,
+                self._head.generation + 1,
+                request.revision_digest,
+                request.transition_id,
+                self._head.writer_fence,
+                request.kind == "terminal-delete",
+                request.target_site or self._head.site,
+            )
+            applied = AppliedLifecycleTransition(
+                request=request.identity(),
+                applied=next_head,
+            )
+            self._head = next_head
+            self._lifecycle_transitions[
+                (
+                    request.expected.installation_id,
+                    request.operation_ref,
+                    request.operation_digest,
+                )
+            ] = applied
+            if lose_response:
+                raise HeadUnknown("synthetic lifecycle response lost")
+            return next_head
+
+    def lookup_lifecycle_transition(
+        self,
+        identity: LifecycleTransitionIdentity,
+    ) -> AppliedLifecycleTransition:
+        if type(identity) is not LifecycleTransitionIdentity:
+            raise AuthorityValidationError("invalid lifecycle transition lookup")
+        with self._lock:
+            self._raise_if_failed("lookup")
+            found = self._lifecycle_transitions.get(
+                (
+                    identity.expected.installation_id,
+                    identity.operation_ref,
+                    identity.operation_digest,
+                )
+            )
+            if found is None or found.request != identity:
+                raise TransitionNotFound("lifecycle transition not found")
             return found
 
     def acquire_execution_lease(self, request: ExecutionLeaseRequest) -> ExecutionLeaseReceipt:

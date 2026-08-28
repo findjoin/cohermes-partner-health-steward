@@ -128,6 +128,7 @@ from .current_head import (
     AdvanceRequest,
     AdvanceIdentity,
     AppliedTransition,
+    AppliedLifecycleTransition,
     CurrentHeadError,
     CurrentHeadPort,
     ExecutionLeaseIdentity,
@@ -141,6 +142,8 @@ from .current_head import (
     HeadTerminal,
     HeadTimeout,
     HeadUnknown,
+    LifecycleTransitionIdentity,
+    LifecycleTransitionRequest,
     TransitionNotFound,
 )
 from .delivery import (
@@ -197,6 +200,7 @@ from .status import (
     StatusProjector,
     StatusTransition,
 )
+from .lifecycle import LifecycleCoordinator
 from .storage import (
     CausalIdConflict,
     CurrentHeadRecoveryBinding,
@@ -287,6 +291,12 @@ _TICKET116_HEALTH_COMMAND_AUTHORITY = {
     "diagnosis.activate": frozenset(
         {("ticket119_acceptance_runtime", ("diagnosis:activate",))}
     ),
+}
+
+_LIFECYCLE_HEALTH_COMMAND_AUTHORITY = {
+    ("owner_rights_runtime", ("lifecycle:delete",)),
+    ("migration_runtime", ("lifecycle:prepare-migration",)),
+    ("migration_runtime", ("lifecycle:accept-migration",)),
 }
 
 # A process-local marker only protects the short hand-off between authorization
@@ -1002,6 +1012,7 @@ class HealthCore:
         approved_templates: tuple[ApprovedReplyTemplate, ...] = (),
         safety_diagnostic_assets: Mapping[str, object] | None = None,
         acceptance_evidence_provider: object | None = None,
+        lifecycle_config: Mapping[str, object] | None = None,
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -1152,6 +1163,22 @@ class HealthCore:
         # recovered store can clear it; a restarted core has no such proof and
         # therefore remains fail-closed.
         self._current_head_guard_owned = False
+        self._lifecycle: LifecycleCoordinator | None = (
+            None
+            if lifecycle_config is None
+            else LifecycleCoordinator(
+                self._store,
+                current_head_read=self._lifecycle_read_head,
+                writer_proof=self._current_writer_proof,
+                transition=self._lifecycle_transition,
+                lookup=self._lookup_lifecycle_transition,
+                replace_authority=self._replace_lifecycle_authority,
+                form_notice=self._lifecycle_form_notice,
+                notice_layer=self._lifecycle_notice_layer,
+                route_and_consent_current=self._lifecycle_route_and_consent_current,
+                config=lifecycle_config,
+            )
+        )
 
     def close(self) -> CloseReport:
         """Disable this core and report whether host authority really handed off.
@@ -1647,6 +1674,8 @@ class HealthCore:
                 # after orderly shutdown; the core no longer owns a writer
                 # namespace and must not reopen it just to replay a receipt.
                 return Response("unavailable", reason_code="current-writer-holder-missing")
+            if self._lifecycle_blocks_normal_operations():
+                return Response("rejected", reason_code="lifecycle-frozen")
             return self._handle_open(command)
 
     def _handle_open(self, command: CommandEnvelope) -> Response:
@@ -5647,6 +5676,8 @@ class HealthCore:
         with self._lifecycle_lock:
             if self._closed:
                 return self._model_authorization_failure()
+            if self._lifecycle_blocks_normal_operations():
+                return self._model_authorization_failure()
             try:
                 with self._store.serialized():
                     self._store.verify_key()
@@ -5797,6 +5828,8 @@ class HealthCore:
     def _claim_effect_execution_open(self, intent: EffectIntent) -> EffectExecutionGrant | None:
         """Run an admitted effect claim while its writer holder remains live."""
 
+        if self._lifecycle_blocks_normal_operations():
+            return None
         requested_intent = self._canonical_effect_intent_from_caller(intent)
         if requested_intent is None:
             return None
@@ -5965,7 +5998,12 @@ class HealthCore:
                         ):
                             return None
                     elif unresolved_effects != (intent.effect_id,):
-                        return None
+                        if not self._lifecycle_model_overlap_allowed(
+                            candidate_intent,
+                            unresolved_effects,
+                            head,
+                        ):
+                            return None
                     if stored.state == "intent" and type(stored.payload) is EffectIntent:
                         issued_intent = stored.payload
                         if (
@@ -6500,6 +6538,8 @@ class HealthCore:
 
         if self._closed:
             raise AuthorityValidationError("ticket115-authority-unavailable")
+        if self._lifecycle_blocks_normal_operations():
+            raise AuthorityValidationError("lifecycle-frozen")
         self._recover_ticket115_mutation()
         with self._store.serialized():
             self._store.verify_key()
@@ -6606,6 +6646,14 @@ class HealthCore:
     def _ticket116_command_authorized(command: TrustedHealthCommand) -> bool:
         allowed = _TICKET116_HEALTH_COMMAND_AUTHORITY.get(command.action)
         return allowed is not None and (command.source, command.scope) in allowed
+
+    @staticmethod
+    def _lifecycle_command_authorized(command: TrustedHealthCommand) -> bool:
+        return (
+            command.action == "lifecycle.execute"
+            and (command.source, command.scope)
+            in _LIFECYCLE_HEALTH_COMMAND_AUTHORITY
+        )
 
     def _ticket116_results(self) -> tuple[dict[str, object], ...]:
         results: list[dict[str, object]] = []
@@ -6916,9 +6964,23 @@ class HealthCore:
     ) -> bool:
         ref = evidence.get("evidence_ref")
         digest = evidence.get("evidence_revision_digest")
+        try:
+            state = self.daily_state()
+        except AuthorityValidationError:
+            lifecycle = self._lifecycle
+            if lifecycle is None or not lifecycle.allows_pre_freeze_effect_overlap():
+                return False
+            try:
+                # The caller already holds the single writer authority.  The
+                # lifecycle notice window permits an existing owner-delivery
+                # execution to coexist with formation of the next managed
+                # model effect; do not broaden the public daily-state seam.
+                state = self._store.daily_state()
+            except (KeyUnavailable, StoreUnavailable):
+                return False
         return any(
             card.evidence_id == ref and card.revision_digest == digest
-            for card in self.daily_state().current_evidence_cards
+            for card in state.current_evidence_cards
         )
 
     def _ticket116_route_current(self, settings: OwnerSettingsState) -> bool:
@@ -8115,6 +8177,21 @@ class HealthCore:
 
         if type(command) is not TrustedHealthCommand:
             raise ProtocolViolation("trusted health command required")
+        if command.action == "lifecycle.execute":
+            if not self._lifecycle_command_authorized(command):
+                raise ProtocolViolation("health-command-authority-denied")
+            lifecycle = self._lifecycle
+            if lifecycle is None:
+                return {
+                    "status": "rejected",
+                    "reason_code": "lifecycle-unavailable",
+                }
+            with self._lifecycle_lock:
+                if self._closed:
+                    raise AuthorityValidationError(
+                        self._closed_reason or "ticket115-entry-unavailable"
+                    )
+                return lifecycle.execute(command)
         authority = _TICKET115_HEALTH_COMMAND_AUTHORITY.get(command.action)
         ticket116 = self._ticket116_command_authorized(command)
         if (
@@ -9135,7 +9212,22 @@ class HealthCore:
 
         with self._lifecycle_lock:
             with self._ticket115_write_authority() as (_, settings):
-                return self._ticket115_outbox_state_open(settings)
+                state = self._ticket115_outbox_state_open(settings)
+                if self._lifecycle is None:
+                    return state
+                # Lifecycle notices use the same controlled-effect machinery,
+                # but are not ordinary review outbox work.  Keep the legacy
+                # Ticket 115 helper's ordinary-outbox projection stable while
+                # managed_ticket115_read still exposes the notice for its
+                # exact public hand-off.
+                records = tuple(
+                    record
+                    for record in state.records
+                    if not record.intent.payload_ref.startswith(
+                        "lifecycle-notice:"
+                    )
+                )
+                return replace(state, records=records)
 
     def managed_ticket115_read(self) -> dict[str, object]:
         """Project tasks, reviews, and delivery facts from one authority read."""
@@ -9265,6 +9357,20 @@ class HealthCore:
             outbox = self._ticket115_outbox_state_open(settings)
             outbox_record = outbox.record(intent.intent_id)
             task_state = self._ticket115_task_state_open(settings)
+            if intent.payload_ref.startswith("lifecycle-notice:"):
+                operation_ref = intent.payload_ref.removeprefix(
+                    "lifecycle-notice:"
+                )
+                if (
+                    not operation_ref
+                    or intent.effect_request_id != operation_ref
+                    or intent.source_ref != operation_ref
+                    or intent.business_fact_ref
+                    != "lifecycle-notice-fact:" + operation_ref
+                    or intent.authorization_kind != "legacy"
+                ):
+                    return None
+                return (outbox, outbox_record, task_state, None)
             decision_kind = self._owner_decision_request_kind_open(
                 intent,
                 outbox,
@@ -9528,6 +9634,40 @@ class HealthCore:
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
+        if intent.payload_ref.startswith("lifecycle-notice:"):
+            try:
+                destination = self._owner_weixin_destination_open(settings)
+            except AuthorityValidationError:
+                return None
+            if (
+                not self._owner_delivery_global_controls_allow_open(
+                    settings,
+                    observed_at_utc=observed_at_utc,
+                    mandatory=True,
+                )
+                or intent.route_id != destination.route_id
+                or intent.route_generation
+                != settings.current_configuration_generation
+                or intent.recipient_ref != destination.owner_sender_id
+                or outbox_record.unknown_frozen
+            ):
+                return None
+            attempted = outbox_record.optional_fact("attempted")
+            if expected_attempt_ref is None:
+                if attempted is not None:
+                    return None
+            elif (
+                attempted is None
+                or attempted.attempt_ref != expected_attempt_ref
+                or outbox_record.current_layer != "attempted"
+            ):
+                return None
+            if (
+                required_lease is not None
+                and required_lease.intent_digest != intent.semantic_digest
+            ):
+                return None
+            return binding
         decision_kind = self._owner_decision_request_kind_open(intent, outbox)
         if decision_kind is not None:
             try:
@@ -11840,6 +11980,15 @@ class HealthCore:
         with self._lifecycle_lock:
             if self._closed:
                 return ProbeReport(ProbeState.UNAVAILABLE, "current-writer-holder-missing")
+            if self._lifecycle is not None:
+                allowed, reason = self._lifecycle.probe_allowed()
+                if not allowed:
+                    state = (
+                        ProbeState.UNKNOWN
+                        if reason in {"current-head-unknown", "route-consent-not-current"}
+                        else ProbeState.UNAVAILABLE
+                    )
+                    return ProbeReport(state, reason)
             report = self._probe_open()
             if (
                 report.state is ProbeState.UNKNOWN
@@ -11861,6 +12010,10 @@ class HealthCore:
                     ProbeState.UNAVAILABLE,
                     "current-writer-holder-missing",
                 )
+            if self._lifecycle is not None:
+                allowed, reason = self._lifecycle.probe_allowed()
+                if not allowed:
+                    return ProbeReport(ProbeState.UNAVAILABLE, reason)
             if (
                 self._ticket116_assets_supplied
                 and (
@@ -12671,6 +12824,55 @@ class HealthCore:
             raise MalformedCurrentHeadResponse("invalid current-head transition receipt") from exc
 
     @classmethod
+    def _canonical_lifecycle_identity_from_port(
+        cls,
+        value: object,
+    ) -> LifecycleTransitionIdentity:
+        if type(value) is not LifecycleTransitionIdentity:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition identity"
+            )
+        try:
+            return LifecycleTransitionIdentity(
+                kind=value.kind,
+                expected=cls._canonical_authority_value_from_port(value.expected),
+                operation_ref=value.operation_ref,
+                transition_id=value.transition_id,
+                revision_digest=value.revision_digest,
+                writer_fence=value.writer_fence,
+                operation_digest=value.operation_digest,
+                target_site=value.target_site,
+                target_writer_fence_ref=value.target_writer_fence_ref,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition identity"
+            ) from exc
+
+    @classmethod
+    def _canonical_lifecycle_receipt_from_port(
+        cls,
+        value: object,
+    ) -> AppliedLifecycleTransition:
+        if type(value) is not AppliedLifecycleTransition:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition receipt"
+            )
+        try:
+            return AppliedLifecycleTransition(
+                request=cls._canonical_lifecycle_identity_from_port(value.request),
+                applied=cls._canonical_head_snapshot_from_port(value.applied),
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition receipt"
+            ) from exc
+
+    @classmethod
     def _canonical_writer_proof_for_port(cls, value: object) -> WriterFenceProof:
         """Copy a host proof before an untrusted port can mutate its fields."""
 
@@ -12707,6 +12909,37 @@ class HealthCore:
             raise
         except Exception as exc:
             raise MalformedCurrentHeadResponse("invalid current-head advance request") from exc
+
+    @classmethod
+    def _canonical_lifecycle_request_for_port(
+        cls,
+        value: object,
+    ) -> LifecycleTransitionRequest:
+        if type(value) is not LifecycleTransitionRequest:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition request"
+            )
+        try:
+            return LifecycleTransitionRequest(
+                kind=value.kind,
+                expected=cls._canonical_authority_value_from_port(value.expected),
+                operation_ref=value.operation_ref,
+                transition_id=value.transition_id,
+                revision_digest=value.revision_digest,
+                writer_fence=value.writer_fence,
+                operation_digest=value.operation_digest,
+                writer_proof=cls._canonical_writer_proof_for_port(
+                    value.writer_proof
+                ),
+                target_site=value.target_site,
+                target_writer_fence_ref=value.target_writer_fence_ref,
+            )
+        except MalformedCurrentHeadResponse:
+            raise
+        except Exception as exc:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition request"
+            ) from exc
 
     @classmethod
     def _canonical_execution_lease_identity_for_port(
@@ -12777,6 +13010,245 @@ class HealthCore:
             raise
         except Exception as exc:
             raise MalformedCurrentHeadResponse("invalid current-head execution lease release") from exc
+
+    def _lifecycle_read_head(self) -> AuthoritySnapshot:
+        """Read current-head authority for lifecycle recovery, including terminal."""
+
+        try:
+            read = self._current_head.read()
+        except CurrentHeadError:
+            raise
+        except AuthorityValidationError as exc:
+            raise MalformedCurrentHeadResponse("invalid current-head read") from exc
+        except Exception as exc:
+            raise CurrentHeadError("current-head read unavailable") from exc
+        if type(read) is not HeadRead:
+            raise MalformedCurrentHeadResponse("invalid current-head read")
+        return self._canonical_head_snapshot_from_port(read.head).as_authority()
+
+    def _lifecycle_transition(
+        self,
+        request: LifecycleTransitionRequest,
+    ) -> AuthoritySnapshot:
+        """Call and exact-lookup the lifecycle-only current-head CAS."""
+
+        retained = self._canonical_lifecycle_request_for_port(request)
+        expected_identity = retained.identity()
+        outbound = self._canonical_lifecycle_request_for_port(request)
+        try:
+            updated = self._current_head.conditional_lifecycle_transition(outbound)
+        except CurrentHeadError:
+            raise
+        except AuthorityValidationError as exc:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle transition"
+            ) from exc
+        except Exception as exc:
+            raise CurrentHeadError(
+                "current-head lifecycle transition unavailable"
+            ) from exc
+        applied_wire = self._canonical_head_snapshot_from_port(updated)
+        receipt = self._lookup_lifecycle_transition(expected_identity)
+        if receipt.request != expected_identity:
+            raise MalformedCurrentHeadResponse(
+                "current-head lifecycle lookup identity mismatch"
+            )
+        confirmed = receipt.applied.as_authority()
+        if applied_wire.as_authority().mismatch_reason(confirmed) is not None:
+            raise MalformedCurrentHeadResponse(
+                "current-head lifecycle transition mismatch"
+            )
+        return confirmed
+
+    def _lookup_lifecycle_transition(
+        self,
+        identity: LifecycleTransitionIdentity,
+    ) -> AppliedLifecycleTransition:
+        expected = self._canonical_lifecycle_identity_from_port(identity)
+        outbound = self._canonical_lifecycle_identity_from_port(identity)
+        try:
+            receipt = self._current_head.lookup_lifecycle_transition(outbound)
+        except CurrentHeadError:
+            raise
+        except AuthorityValidationError as exc:
+            raise MalformedCurrentHeadResponse(
+                "invalid current-head lifecycle lookup"
+            ) from exc
+        except Exception as exc:
+            raise CurrentHeadError(
+                "current-head lifecycle lookup unavailable"
+            ) from exc
+        canonical = self._canonical_lifecycle_receipt_from_port(receipt)
+        if canonical.request != expected:
+            raise CurrentHeadError(
+                "current-head lifecycle lookup request mismatch"
+            )
+        return canonical
+
+    def _replace_lifecycle_authority(self, authority: AuthoritySnapshot) -> None:
+        self._store.replace_finalized_authority(authority)
+
+    def _lifecycle_route_and_consent_current(self) -> bool:
+        try:
+            authority = self._store.finalized_authority()
+            if authority is None:
+                return False
+            settings = self._current_owner_settings(authority)
+            route = (
+                None
+                if self._route_configuration_provider is None
+                else self._route_configuration_provider()
+            )
+            return (
+                type(route) is RouteConfigurationUpdate
+                and route.route_id == settings.current_route_id
+                and route.first_hop_recipient
+                == settings.current_first_hop_recipient
+                and route.configuration_generation
+                == settings.current_configuration_generation
+                and route.disclosure_version == settings.current_disclosure_version
+            )
+        except Exception:
+            return False
+
+    def _lifecycle_form_notice(
+        self,
+        operation_ref: str,
+        payload: Mapping[str, object],
+    ) -> str:
+        """Form the single mandatory notice through the existing outbox seam."""
+
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority() as (head, settings):
+                outbox = self._ticket115_outbox_state_open(settings)
+                payload_ref = f"lifecycle-notice:{operation_ref}"
+                existing = tuple(
+                    record
+                    for record in outbox.records
+                    if record.intent.payload_ref == payload_ref
+                )
+                if len(existing) > 1:
+                    raise AuthorityValidationError(
+                        "duplicate lifecycle notice intent"
+                    )
+                if existing:
+                    return existing[0].intent.intent_id
+                formed_at_utc = self._owner_delivery_clock_utc_open()
+                if formed_at_utc is None:
+                    raise AuthorityValidationError("lifecycle notice clock unavailable")
+                destination = self._owner_weixin_destination_open(settings)
+                payload_digest = stable_digest(dict(payload))
+                intent = OwnerDeliveryEngine.form_intent(
+                    effect_kind="owner-delivery",
+                    owner_id=settings.owner_id,
+                    installation_id=settings.installation_id,
+                    effect_request_id=operation_ref,
+                    business_fact_ref=f"lifecycle-notice-fact:{operation_ref}",
+                    business_revision_digest=payload_digest,
+                    source_ref=operation_ref,
+                    recipient_ref=destination.owner_sender_id,
+                    route_id=destination.route_id,
+                    route_generation=settings.current_configuration_generation,
+                    payload_ref=payload_ref,
+                    payload_digest=stable_digest(
+                        {
+                            "contract": "ticket117-lifecycle-notice-payload-v1",
+                            "operation_ref": operation_ref,
+                        }
+                    ),
+                    formed_at_utc=formed_at_utc,
+                )
+                submitted = OwnerDeliveryEngine.submit(
+                    outbox,
+                    intent,
+                    submitted_at_utc=formed_at_utc,
+                )
+                mutation = self._prepare_ticket115_facts_open(
+                    head,
+                    settings,
+                    delivery_state=submitted.state,
+                )
+            self._complete_ticket115_mutation(mutation)
+            return intent.intent_id
+
+    def _lifecycle_notice_layer(self, operation_ref: str) -> str | None:
+        try:
+            with self._ticket115_write_authority() as (_, settings):
+                outbox = self._ticket115_outbox_state_open(settings)
+                for record in outbox.records:
+                    if (
+                        record.intent.payload_ref == f"lifecycle-notice:{operation_ref}"
+                    ):
+                        return record.current_layer
+        except Exception:
+            return None
+        return None
+
+    def _lifecycle_blocks_normal_operations(self) -> bool:
+        lifecycle = self._lifecycle
+        return lifecycle is not None and lifecycle.blocks_normal_operations()
+
+    def _lifecycle_allows_pre_freeze_effect_overlap(self) -> bool:
+        lifecycle = self._lifecycle
+        return lifecycle is not None and lifecycle.allows_pre_freeze_effect_overlap()
+
+    def _lifecycle_model_overlap_allowed(
+        self,
+        candidate_intent: EffectIntent | None,
+        unresolved_effects: tuple[str, ...],
+        head: AuthoritySnapshot,
+    ) -> bool:
+        """Keep the notice window bounded to one existing owner delivery."""
+
+        if (
+            not self._lifecycle_allows_pre_freeze_effect_overlap()
+            or type(candidate_intent) is not EffectIntent
+            or candidate_intent.effect_kind != "model-work"
+            or len(unresolved_effects) != 2
+            or candidate_intent.effect_id not in unresolved_effects
+            or candidate_intent.authority.mismatch_reason(head) is not None
+        ):
+            return False
+        other_effect_id = next(
+            effect_id
+            for effect_id in unresolved_effects
+            if effect_id != candidate_intent.effect_id
+        )
+        stored = self._store.effect(other_effect_id)
+        if stored is None:
+            return False
+        other_intent = (
+            stored.payload.intent
+            if stored.state in {"claiming", "executing"}
+            and type(stored.payload) in {ClaimingEffect, ExecutingEffect}
+            else stored.payload
+            if stored.state == "intent" and type(stored.payload) is EffectIntent
+            else None
+        )
+        if (
+            type(other_intent) is not EffectIntent
+            or other_intent.effect_kind != "owner-delivery"
+            or other_intent.payload_ref.startswith("lifecycle-notice:")
+            or other_intent.authority.mismatch_reason(head) is not None
+        ):
+            return False
+        try:
+            settings = self._current_owner_settings(head)
+            return self._owner_delivery_binding_open(other_intent, settings) is not None
+        except (
+            AuthorityValidationError,
+            DeliveryContractViolation,
+            SettingsContractViolation,
+            TaskContractViolation,
+        ):
+            return False
+
+    def managed_lifecycle_read(self, operation_ref: str | None) -> dict[str, object]:
+        lifecycle = self._lifecycle
+        if lifecycle is None:
+            raise AuthorityValidationError("lifecycle-read-unavailable")
+        with self._lifecycle_lock:
+            return lifecycle.read(operation_ref)
 
     def _read_head(self) -> AuthoritySnapshot:
         def read_authority() -> AuthoritySnapshot:

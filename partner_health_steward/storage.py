@@ -1679,6 +1679,15 @@ class EncryptedStateStore:
         )
         self._execute(
             """
+            CREATE TABLE IF NOT EXISTS lifecycle_state_v1 (
+                operation_ref TEXT PRIMARY KEY,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+            """
+        )
+        self._execute(
+            """
             CREATE TABLE IF NOT EXISTS source_envelopes_v1 (
                 causal_id TEXT PRIMARY KEY,
                 nonce BLOB NOT NULL,
@@ -2123,6 +2132,7 @@ class EncryptedStateStore:
             "pending_effect_results_v1",
             "terminal_observation_v1",
             "current_head_observation_guard_v1",
+            "lifecycle_state_v1",
             "source_envelopes_v1",
             "initialization_disclosure_challenges_v1",
             "owner_initialization_v1",
@@ -2211,6 +2221,10 @@ class EncryptedStateStore:
             ).fetchall(),
             "current_head_observation_guard": self._execute(
                 "SELECT slot, nonce, ciphertext FROM current_head_observation_guard_v1 ORDER BY slot"
+            ).fetchall(),
+            "lifecycle_state": self._execute(
+                "SELECT operation_ref, nonce, ciphertext "
+                "FROM lifecycle_state_v1 ORDER BY operation_ref"
             ).fetchall(),
         }
         if include_ticket111:
@@ -5622,6 +5636,113 @@ class EncryptedStateStore:
     def finalized_authority(self) -> AuthoritySnapshot | None:
         proof = self._finalized_proof()
         return None if proof is None else proof[0]
+
+    def replace_finalized_authority(self, authority: AuthoritySnapshot) -> None:
+        """Move the local authority anchor after an authenticated handoff."""
+
+        if type(authority) is not AuthoritySnapshot or authority.terminal:
+            raise AuthorityValidationError("invalid transferred authority")
+        proof = self._finalized_proof()
+        if proof is None:
+            raise AuthorityValidationError("local finalized authority missing")
+        record_id = proof[1]
+        nonce, ciphertext = self._seal_finalized_authority(authority, record_id)
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            current = self._finalized_proof()
+            if current != proof:
+                raise AuthorityValidationError("local finalized authority changed")
+            self._write_finalized_authority_row(connection, nonce, ciphertext)
+            self._refresh_integrity_manifest(connection)
+
+    @staticmethod
+    def _lifecycle_state_aad(operation_ref: str) -> str:
+        return "lifecycle-state:" + operation_ref
+
+    def lifecycle_state(self, operation_ref: str) -> dict[str, object] | None:
+        """Read one encrypted, body-free lifecycle coordination record."""
+
+        validate_opaque_text(operation_ref, "lifecycle operation reference")
+        row = self._execute(
+            "SELECT nonce, ciphertext FROM lifecycle_state_v1 "
+            "WHERE operation_ref = ?",
+            (operation_ref,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = self._open(self._lifecycle_state_aad(operation_ref), row[0], row[1])
+        if type(value) is not dict or value.get("operation_ref") != operation_ref:
+            raise KeyUnavailable("invalid lifecycle state")
+        return value
+
+    def lifecycle_states(self) -> tuple[dict[str, object], ...]:
+        rows = self._execute(
+            "SELECT operation_ref, nonce, ciphertext "
+            "FROM lifecycle_state_v1 ORDER BY operation_ref"
+        ).fetchall()
+        values: list[dict[str, object]] = []
+        for operation_ref, nonce, ciphertext in rows:
+            value = self._open(
+                self._lifecycle_state_aad(operation_ref),
+                nonce,
+                ciphertext,
+            )
+            if type(value) is not dict or value.get("operation_ref") != operation_ref:
+                raise KeyUnavailable("invalid lifecycle state")
+            values.append(value)
+        return tuple(values)
+
+    def save_lifecycle_state(self, state: Mapping[str, object]) -> None:
+        if type(state) is not dict:
+            raise AuthorityValidationError("invalid lifecycle state")
+        operation_ref = state.get("operation_ref")
+        validate_opaque_text(operation_ref, "lifecycle operation reference")
+        nonce, ciphertext = self._seal(
+            self._lifecycle_state_aad(operation_ref),
+            state,
+        )
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            connection.execute(
+                """
+                INSERT INTO lifecycle_state_v1(operation_ref, nonce, ciphertext)
+                VALUES (?, ?, ?)
+                ON CONFLICT(operation_ref) DO UPDATE SET
+                    nonce=excluded.nonce,
+                    ciphertext=excluded.ciphertext
+                """,
+                (operation_ref, nonce, ciphertext),
+            )
+            self._refresh_integrity_manifest(connection)
+
+    def lifecycle_table_names(self) -> tuple[str, ...]:
+        rows = self._execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        ).fetchall()
+        return tuple(name for (name,) in rows if isinstance(name, str))
+
+    def purge_all_local_state(self) -> None:
+        """Permanently empty every local SQLite table after key confirmation."""
+
+        with self._transaction_lock:
+            self._ensure_available()
+            try:
+                tables = self.lifecycle_table_names()
+                self._connection.execute("PRAGMA foreign_keys = OFF")
+                for table in tables:
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    self._connection.execute("DELETE FROM " + quoted)
+                self._connection.commit()
+                self._connection.execute("PRAGMA foreign_keys = ON")
+            except sqlite3.Error as exc:
+                try:
+                    self._connection.rollback()
+                    self._connection.execute("PRAGMA foreign_keys = ON")
+                except sqlite3.Error:
+                    self._poisoned = True
+                raise StoreUnavailable("health state purge unavailable") from exc
 
     def _finalized_proof(self) -> tuple[AuthoritySnapshot, str | None] | None:
         row = self._execute(
