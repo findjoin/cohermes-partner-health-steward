@@ -1,6 +1,6 @@
 # Ticket 117 冻结验证合同
 
-> 状态：frozen。冻结内容 checkpoint 为 `3e13c48179032f9b565d40abeaa8b433dc26ff8c`，tree 为 `aa21cf6c0bde3d1cbec85471054218cf6235aefd`；fresh-context Spec 与 Standards 编码前预审均 PASS。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
+> 状态：frozen。当前冻结内容 checkpoint 为 `d671d7b5440e58168698a71f9314d05fdbbac7c8`，tree 为 `4ae2eda4ad13218c595649f0c3905312a9b9a924`；fresh-context Spec 与 Standards 编码前预审均 PASS。该 checkpoint 只修正 V01 在 staged scope 强求普通诊断运行的错误前置；其余 Gate、架构与验收不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
 
 ## 测试权威、公开 Seam 与依赖展开
 
@@ -55,7 +55,7 @@ pre-code checkpoint 必须运行并记录：
 
 ## 编码前预审证据
 
-- 冻结内容 checkpoint：`3e13c48179032f9b565d40abeaa8b433dc26ff8c`；tree：`aa21cf6c0bde3d1cbec85471054218cf6235aefd`。
+- 当前冻结内容 checkpoint：`d671d7b5440e58168698a71f9314d05fdbbac7c8`；tree：`4ae2eda4ad13218c595649f0c3905312a9b9a924`。V01 先经 Ticket 116 已冻结的 synthetic Ticket 119 acceptance fixture 合法激活 scope，再验证 lifecycle freeze 撤销真实 strict grant；未放宽 Ticket 116 产品门禁。
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；旧全量测试：`720/720 PASS`。
 - 编码前冻结门：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚无 `managed_lifecycle_read` / `lifecycle.execute` 公共 Seam；其余八门只因共同前置而 skip。
 - Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或过度约束。

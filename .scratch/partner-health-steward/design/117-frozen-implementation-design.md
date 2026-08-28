@@ -1,6 +1,6 @@
 # Ticket 117 增量架构冻结设计
 
-> 状态：frozen。冻结内容 checkpoint 为 `3e13c48179032f9b565d40abeaa8b433dc26ff8c`，tree 为 `aa21cf6c0bde3d1cbec85471054218cf6235aefd`；fresh-context Spec 与 Standards 编码前预审均 PASS。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本设计只冻结 Ticket 117 的难逆增量决定，适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
+> 状态：frozen。当前冻结内容 checkpoint 为 `d671d7b5440e58168698a71f9314d05fdbbac7c8`，tree 为 `4ae2eda4ad13218c595649f0c3905312a9b9a924`；fresh-context Spec 与 Standards 编码前预审均 PASS。该 checkpoint 只修正 V01 的合法 active-scope 测试前置，架构内容相对首次冻结点不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本设计只冻结 Ticket 117 的难逆增量决定，适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
 
 ## 目标与非目标
 
