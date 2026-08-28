@@ -11,6 +11,7 @@ import copy
 import unittest
 from collections.abc import Mapping
 from dataclasses import replace
+from itertools import count
 from unittest.mock import patch
 
 from partner_health_steward import HealthCore, HealthPlugin, settings
@@ -67,6 +68,35 @@ _CONFIGURED_REPLICA_BINDINGS = (
     "purge:outbox-delivery-unknown:v1",
     "purge:lifecycle-migration-staging:v1",
 )
+_TICKET117_DATABASE_IDS = count()
+
+
+def _set_up_isolated_ticket116(
+    harness: ticket116_integration.Ticket116VerificationTests,
+    *,
+    role: str,
+) -> None:
+    """Keep one shared DB per harness while isolating sibling scenarios."""
+
+    store_type = ticket114_integration._OwnerAuthorityFailureStore
+    database = (
+        f"file:ticket117-{role}-{next(_TICKET117_DATABASE_IDS)}"
+        "?mode=memory&cache=shared"
+    )
+
+    def isolated_store(
+        _database: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        return store_type(database, *args, **kwargs)
+
+    with patch.object(
+        ticket114_integration,
+        "_OwnerAuthorityFailureStore",
+        new=isolated_store,
+    ):
+        harness.setUp()
 
 
 class _BoundaryEvents:
@@ -238,7 +268,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.v116 = ticket116_integration.Ticket116VerificationTests(
             "test_v116_12_status_uses_typed_safety_and_diagnostic_scope_facts"
         )
-        self.v116.setUp()
+        _set_up_isolated_ticket116(self.v116, role="source")
         self.v116._restart_with_assets(self.v116._synthetic_assets())
         self.events = _BoundaryEvents()
         self.keys = _DestroyableKeyAdapter(self.events)
@@ -503,7 +533,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         target = ticket116_integration.Ticket116VerificationTests(
             "test_v116_12_status_uses_typed_safety_and_diagnostic_scope_facts"
         )
-        target.setUp()
+        _set_up_isolated_ticket116(target, role="offline-target")
         self._extra_harnesses.append(target)
         target._restart_with_assets(target._synthetic_assets())
         if route_drift:
@@ -586,7 +616,7 @@ class Ticket117VerificationTests(unittest.TestCase):
             blank = ticket116_integration.Ticket116VerificationTests(
                 "test_v116_12_status_uses_typed_safety_and_diagnostic_scope_facts"
             )
-            blank.setUp()
+            _set_up_isolated_ticket116(blank, role="blank-installation")
             blank._restart_with_assets(blank._synthetic_assets())
         self._extra_harnesses.append(blank)
         projection = blank.plugin.initialization_status(peer_id=_PEER)
