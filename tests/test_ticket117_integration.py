@@ -277,11 +277,16 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.head = _LifecycleHeadBoundary(self.v116.base.head)
         self._command_index = 0
         self._extra_harnesses: list[unittest.TestCase] = []
+        self._root_store_closed = False
 
     def tearDown(self) -> None:
         for harness in reversed(self._extra_harnesses):
             harness.tearDown()
-        self.v116.tearDown()
+        if self._root_store_closed:
+            self.v116.base.head.clear_failure()
+            self.v116.base.core.close()
+        else:
+            self.v116.tearDown()
 
     @property
     def plugin(self) -> HealthPlugin:
@@ -1026,6 +1031,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         # before the body-free lifecycle runner is reconstructed.
         self.assertTrue(self.v116.base.core.close().complete)
         self.v116.base.store.close()
+        self._root_store_closed = True
         self._restart_lifecycle(root=False, close_existing=False)
         restarted = self._read("delete-key-first-purge")
         self.assertEqual(restarted.get("phase"), "completed", restarted)
@@ -1417,6 +1423,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         """A6: target validation cannot create a dual-writer window."""
 
         self._require_lifecycle(root=False)
+        self.v116._activate_synthetic_scope_through_ticket119()
         self._restart_lifecycle(root=False)
         old_vm = self.plugin
         old_snapshot = self.head.read().head
@@ -1703,8 +1710,20 @@ class Ticket117VerificationTests(unittest.TestCase):
 
         self._require_lifecycle(root=False)
         self.v116._activate_synthetic_scope_through_ticket119()
-        task_id, unknown_intent, _ = self._seed_unknown_owner_delivery()
-        unknown_ref = unknown_intent.effect_id  # type: ignore[attr-defined]
+        unknown_refs_before = set(
+            self.plugin.managed_ticket115_read(peer_id=_PEER)[
+                "delivery_unknown_refs"
+            ]
+        )
+        task_id, _, _ = self._seed_unknown_owner_delivery()
+        unknown_refs_after = set(
+            self.plugin.managed_ticket115_read(peer_id=_PEER)[
+                "delivery_unknown_refs"
+            ]
+        )
+        created_unknown_refs = unknown_refs_after - unknown_refs_before
+        self.assertEqual(len(created_unknown_refs), 1)
+        unknown_ref = created_unknown_refs.pop()
         self.v116._health(
             "safety.evaluate",
             {
