@@ -75,6 +75,22 @@ Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-est
 
 两份冻结产物必须绑定同一 commit/tree、预期红灯、既有绿灯和验证命令，并在生产实现修改前由 fresh-context Spec reviewer 与 Standards reviewer 对同一 checkpoint 预审通过。只有这时才能进入编码；现在不提前建立 117 的详细方案，避免上游实现变化使方案失效。
 
+## 编码前冻结 checkpoint
+
+Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修改前冻结，可交给编码 Agent：
+
+- characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；tree：`b90a610efa7fc4597c90dd95193ca694d0998573`；全量测试：`720/720 PASS`。
+- 双轴审查的冻结内容 checkpoint：`3e13c48179032f9b565d40abeaa8b433dc26ff8c`；tree：`aa21cf6c0bde3d1cbec85471054218cf6235aefd`。
+- 冻结元数据 commit：`d48d0b1a2b61ddc2b62023328fc88974c773dfeb`；tree：`3f85db328b741c6ceb2c56dcaa821f070a31dbc3`。
+- 冻结设计 blob：`db21731d052d221d5c61447bbbe05425bd1d889d`。
+- 冻结验证合同 blob：`e380da85dd11f284666ff529a18a7c071b20a29e`。
+- verifier-owned `tests/test_ticket117_integration.py` blob：`17f43fdd90b56ae95359497564c0dc263bfa7fa8`。
+- 编码前门实跑：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚未实现 lifecycle 公共 Seam，Gate 总数固定为 9；`compileall` 与 `git diff --check` 通过。
+- fresh-context Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或新增过度约束。
+- fresh-context Standards reviewer：PASS，P1/P2/P3 均为 0；最少 Interface、一个深 Module、实施自由和 Ticket 117/119 边界成立。
+
+编码 Agent 只能修改产品实现及必要 export，使上述同一 9 门从冻结红灯转为 `9/9 PASS`；不得修改冻结设计、冻结验证合同、verifier-owned 测试、本 Ticket、Map 或 Tickets 110—116。若必须改门、改架构、增加产品决定、接入真实 Provider，或无法用现有有界 Seam 实现，应立即停止并返回冻结阶段。完成后必须提交并普通推送自己的实现分支，报告 commit/tree、冻结 blob 零变化、117 专项、113—116 回归、全量测试、compileall 与 diff-check 结果；不得自行标记 `resolved` 或更新 Map。
+
 ### 一致性实施、核验、停止与闭票
 
 以通过编码前预审的冻结 checkpoint 为 `review_base`。编码 Agent 只可做使已封存红灯转绿所必需的最小实现修改，并保留既有绿色行为；不得修改冻结设计、冻结验证合同或 verifier-owned 测试，不得新增测试类别、产品功能或验收门。
