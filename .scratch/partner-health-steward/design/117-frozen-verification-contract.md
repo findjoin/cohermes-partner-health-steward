@@ -15,6 +15,8 @@
 
 测试不得把私有 SQL、表、helper、内部阶段对象、私有 runner 名称或清理算法作为通过 oracle。仅有三个窄例外：V02 terminal completed 后用 SQLite connection 通用枚举全部非 `sqlite_` 表并只做 `COUNT(*)` absence scan；V04 用 serialize/deserialize 复制真实 pre-terminal DB；V05 `CREATE` 一个未登记 managed object。V02 不读字段/正文且不硬编码表名；V04/V05 私有访问只制造故障，最终判定仍只看构造拒绝、public probe/gates、managed read 与 Adapter 零形成。terminal confirmed 后，普通 HealthCore 健康 Interface 必须永久关闭；后续观察只允许 `managed_lifecycle_read` 和 fake Adapter 的无正文 readback。目标 Core 只以 `offline-staging` 模式构造；CAS 确认前除精确 `accept-migration` 与 bounded lifecycle read 外，所有健康读取、写入、任务、模型与外发均关闭。一个 fake 可以同时承担 artifact 与 replica 角色，但两个角色的调用记录和权限断言保持分离。
 
+每个 source、offline target、blank installation 和嵌套故障场景拥有独立的合成 shared-memory SQLite identity；同一 harness 的重启继续复用其自身数据库，兄弟场景不得共享数据库。该隔离只防测试 fixture 把前一场景的 local generation 带入新 current head，不改变产品 generation authority 或迁移语义。
+
 为让冻结门可执行且不建立第四类业务 Interface，测试只冻结一个构造期 Mapping `lifecycle_config`，用于注入 immutable release/semantic registry、`DestroyableKeyAdapter`、`ManagedReplicaAdapter`、`MigrationArtifactAdapter` 和 `source` / `offline-staging` 模式；它没有业务方法，也不能返回健康正文。fake SDK 只需提供幂等 destroy/purge/absence 与 artifact put/get/remove 边界；migration package 对 verifier 完全 opaque，具体产品类型、manifest 内部字段、digest 算法、codec 和 runner 名称均不冻结。
 
 公开 `lifecycle.execute` payload 采用严格 `kind` tagged union，字段来自冻结设计；caller 不能提交 phase、terminal、active site、generation 或 writer-fence 成功事实。bounded lifecycle read 只允许无正文的 `mode`、`phase`、authority binding、manifest ref/digest、target offline/active、`reason_code`、`remains_unproven`。公开结果状态只允许 `notice-pending`、`manifest-ready`、`completed`、`replayed`、`rejected`、`unknown`。
