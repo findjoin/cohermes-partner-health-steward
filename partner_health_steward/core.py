@@ -145,6 +145,7 @@ from .current_head import (
     LifecycleTransitionIdentity,
     LifecycleTransitionRequest,
     TransitionNotFound,
+    _ExecutionOverlapPermit,
 )
 from .delivery import (
     DeliveryContractViolation,
@@ -1911,6 +1912,10 @@ class HealthCore:
         writer_proof = self._current_writer_proof(prepared.base)
         if writer_proof is None:
             return Response("unavailable", command.causal_id, "current-writer-holder-missing")
+        execution_overlap = self._ticket115_model_overlap_permit(
+            prepared,
+            head,
+        )
         request = AdvanceRequest(
             expected=prepared.base,
             transition_id=prepared.target.transition_id,
@@ -1918,6 +1923,7 @@ class HealthCore:
             writer_fence=prepared.base.writer_fence,
             operation_digest=binding.command_digest,
             writer_proof=writer_proof,
+            _execution_overlap=execution_overlap,
         )
         try:
             updated = self._advance_head(request, recovery_binding=binding)
@@ -3051,6 +3057,7 @@ class HealthCore:
             command,
             head,
         )
+        lifecycle_notice = self._is_current_lifecycle_notice_open(command, head)
         ticket116_safety_admission = (
             command.action == "inbound.admit"
             and isinstance(command.payload, InboundAdmitPayload)
@@ -3080,6 +3087,7 @@ class HealthCore:
         if (
             command.action not in _PROBE_BYPASS_ACTIONS
             and not mandatory_owner_decision
+            and not lifecycle_notice
             and not ticket116_safety_admission
             and not ticket116_contact_authority_change
         ):
@@ -3158,6 +3166,40 @@ class HealthCore:
             and payload.business_source_causal_id == intent.intent_id
             and payload.request_digest == intent.semantic_digest
             and self._owner_decision_request_kind_open(intent, outbox) is not None
+        )
+
+    def _is_current_lifecycle_notice_open(
+        self,
+        command: CommandEnvelope,
+        head: AuthoritySnapshot,
+    ) -> bool:
+        """Recognize only the one notice allowed before lifecycle freeze."""
+
+        if command.action != "effect.request":
+            return False
+        payload = command.payload
+        if (
+            not isinstance(payload, EffectRequestPayload)
+            or payload.effect_kind != "owner-delivery"
+            or payload.business_source_causal_id is None
+            or not self._lifecycle_allows_pre_freeze_effect_overlap()
+        ):
+            return False
+        try:
+            settings = self._current_owner_settings(head)
+            outbox = self._ticket115_outbox_state_open(settings)
+            intent = outbox.record(payload.business_source_causal_id).intent
+        except (
+            AuthorityValidationError,
+            DeliveryContractViolation,
+            SettingsContractViolation,
+        ):
+            return False
+        return (
+            command.causal_id == intent.effect_request_id
+            and payload.business_source_causal_id == intent.intent_id
+            and payload.request_digest == intent.semantic_digest
+            and self._lifecycle_notice_effect_open(intent, head)
         )
 
     def _is_confirmed_daily_source_alias_replay(
@@ -5883,6 +5925,7 @@ class HealthCore:
                 capability: str | None = None
                 claim: ClaimingEffect | None = None
                 issued_intent: EffectIntent | None = None
+                execution_overlap: _ExecutionOverlapPermit | None = None
                 with self._store.transaction():
                     head = self._read_head()
                     if head.terminal:
@@ -5939,14 +5982,30 @@ class HealthCore:
                                 != outbox_intent.semantic_digest
                             ):
                                 return None
-                            if unresolved_effects != (intent.effect_id,) and not (
+                            mandatory_overlap = (
                                 self._mandatory_owner_delivery_unresolved_effects_allow_open(
                                     outbox_intent,
                                     outbox,
                                     unresolved_effects,
                                 )
+                            )
+                            lifecycle_notice_overlap, overlap_effect_id = (
+                                self._lifecycle_notice_overlap(
+                                    candidate_intent,
+                                    unresolved_effects,
+                                    head,
+                                )
+                            )
+                            if (
+                                unresolved_effects != (intent.effect_id,)
+                                and not mandatory_overlap
+                                and not lifecycle_notice_overlap
                             ):
                                 return None
+                            if overlap_effect_id is not None:
+                                execution_overlap = _ExecutionOverlapPermit(
+                                    overlap_effect_id
+                                )
                             if self._owner_delivery_sendable_open(
                                 outbox_intent,
                                 settings,
@@ -5998,12 +6057,14 @@ class HealthCore:
                         ):
                             return None
                     elif unresolved_effects != (intent.effect_id,):
-                        if not self._lifecycle_model_overlap_allowed(
+                        overlap_effect_id = self._lifecycle_model_overlap_effect_id(
                             candidate_intent,
                             unresolved_effects,
                             head,
-                        ):
+                        )
+                        if overlap_effect_id is None:
                             return None
+                        execution_overlap = _ExecutionOverlapPermit(overlap_effect_id)
                     if stored.state == "intent" and type(stored.payload) is EffectIntent:
                         issued_intent = stored.payload
                         if (
@@ -6081,6 +6142,7 @@ class HealthCore:
                     writer_fence=head.writer_fence,
                     holder_id=claim.holder_id,
                     writer_proof=writer_proof,
+                    _execution_overlap=execution_overlap,
                 )
                 acquired = self._acquire_execution_lease(request)
                 observed = self._lookup_execution_lease(request.identity())
@@ -6290,7 +6352,7 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("owner-settings-unavailable")
             try:
-                if self.probe().state is not ProbeState.HEALTHY:
+                if not self._managed_read_probe_allowed():
                     raise AuthorityValidationError("owner-settings-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
@@ -7850,6 +7912,8 @@ class HealthCore:
         """Return the bounded Ticket 116 managed projection."""
 
         with self._lifecycle_lock:
+            if self._lifecycle_blocks_normal_operations():
+                raise AuthorityValidationError("safety-diagnosis-read-unavailable")
             assets = self._ticket116_assets
             if assets is None:
                 raise AuthorityValidationError("safety-diagnosis-read-unavailable")
@@ -9238,6 +9302,18 @@ class HealthCore:
                 tasks = self._ticket115_task_state_open(settings)
                 reviews = self._ticket115_review_ledger_open(settings)
                 outbox = self._ticket115_outbox_state_open(settings)
+                owner_deliveries: list[dict[str, object]] = []
+                for record in outbox.records:
+                    delivery: dict[str, object] = {
+                        "intent": record.intent.to_wire(),
+                        "facts": [fact.to_wire() for fact in record.facts],
+                        "current_layer": record.current_layer,
+                        "unknown_frozen": record.unknown_frozen,
+                    }
+                    effect_id = self._effect_id(record.intent.effect_request_id)
+                    if self._store.effect(effect_id) is not None:
+                        delivery["effect_id"] = effect_id
+                    owner_deliveries.append(delivery)
                 return {
                     "tasks": [task.to_storage() for task in tasks.tasks],
                     "delivery_unknown_refs": list(tasks.delivery_unknown_refs),
@@ -9257,15 +9333,7 @@ class HealthCore:
                             ),
                         }
                     ),
-                    "owner_deliveries": [
-                        {
-                            "intent": record.intent.to_wire(),
-                            "facts": [fact.to_wire() for fact in record.facts],
-                            "current_layer": record.current_layer,
-                            "unknown_frozen": record.unknown_frozen,
-                        }
-                        for record in outbox.records
-                    ],
+                    "owner_deliveries": owner_deliveries,
                 }
 
     def _owner_delivery_clock_utc_open(self) -> str | None:
@@ -9340,6 +9408,8 @@ class HealthCore:
         self,
         intent: OutboxIntent,
         settings: OwnerSettingsState,
+        *,
+        allow_unknown_effect: bool = False,
     ) -> tuple[
         DeliveryOutboxState,
         OutboxRecord,
@@ -9433,7 +9503,14 @@ class HealthCore:
                     )
                 )
                 and self._task_evidence_bindings_are_current(task, daily_state)
-                and review.state_digest == current_review_state_digest
+                and (
+                    review.state_digest == current_review_state_digest
+                    or (
+                        allow_unknown_effect
+                        and outbox_record.current_layer == "unknown"
+                        and outbox_record.unknown_frozen
+                    )
+                )
             )
             else None
         )
@@ -9820,6 +9897,28 @@ class HealthCore:
             }
         ).removeprefix("sha256:")
         return f"owner-delivery-{kind}:" + digest
+
+    def _owner_delivery_outbox_id_for_reference(self, reference: str) -> str:
+        """Canonicalize an issued effect reference to its bound outbox intent."""
+
+        stored = self._store.effect(reference)
+        if stored is None:
+            return reference
+        effect_intent = (
+            stored.payload
+            if stored.state == "intent" and type(stored.payload) is EffectIntent
+            else stored.payload.intent
+            if stored.state in {"claiming", "executing"}
+            and type(stored.payload) in {ClaimingEffect, ExecutingEffect}
+            else None
+        )
+        if (
+            type(effect_intent) is EffectIntent
+            and effect_intent.effect_kind == "owner-delivery"
+            and type(effect_intent.business_source_causal_id) is str
+        ):
+            return effect_intent.business_source_causal_id
+        return reference
 
     def _mark_owner_delivery_attempt_started(
         self,
@@ -10285,15 +10384,16 @@ class HealthCore:
         *,
         attempted_at_utc: str,
     ) -> OwnerDeliverySendIntent:
+        normalized_intent_id = self._owner_delivery_outbox_id_for_reference(intent_id)
         try:
             return self._authorize_owner_delivery_attempt_impl(
-                intent_id,
+                normalized_intent_id,
                 grant,
                 attempted_at_utc=attempted_at_utc,
             )
         except Exception:
             self._clear_owner_delivery_attempt_started(
-                intent_id,
+                normalized_intent_id,
                 expected_phase=_OWNER_DELIVERY_ATTEMPT_PREPARED,
             )
             raise
@@ -11332,7 +11432,7 @@ class HealthCore:
             if self._closed:
                 raise AuthorityValidationError("daily-state-unavailable")
             try:
-                if self.probe().state is not ProbeState.HEALTHY:
+                if not self._managed_read_probe_allowed():
                     raise AuthorityValidationError("daily-state-unavailable")
                 self._store.verify_key()
                 authority = self._store.finalized_authority()
@@ -12050,6 +12150,30 @@ class HealthCore:
             effect_id.startswith("effect:ticket116-contact")
             or effect_id.startswith("effect:ticket116-model")
             for effect_id in unresolved
+        )
+
+    def _ticket115_only_unresolved_owner_delivery_effects(self) -> bool:
+        unresolved = self._store.unresolved_effects()
+        if not unresolved:
+            return False
+        for effect_id in unresolved:
+            stored = self._store.effect(effect_id)
+            if (
+                stored is None
+                or stored.state != "unknown"
+                or type(stored.payload) is not TerminalEffect
+                or type(stored.payload.execution) is not ExecutingEffect
+                or stored.payload.execution.intent.effect_kind != "owner-delivery"
+            ):
+                return False
+        return True
+
+    def _managed_read_probe_allowed(self) -> bool:
+        report = self.probe()
+        return report.state is ProbeState.HEALTHY or (
+            report.state is ProbeState.UNKNOWN
+            and report.reason_code == "effect-result-unknown"
+            and self._ticket115_only_unresolved_owner_delivery_effects()
         )
 
     def ticket116_assets_configured(self) -> bool:
@@ -12904,6 +13028,7 @@ class HealthCore:
                 writer_fence=value.writer_fence,
                 operation_digest=value.operation_digest,
                 writer_proof=proof,
+                _execution_overlap=value._execution_overlap,
             )
         except MalformedCurrentHeadResponse:
             raise
@@ -12990,6 +13115,7 @@ class HealthCore:
                 writer_fence=value.writer_fence,
                 holder_id=value.holder_id,
                 writer_proof=cls._canonical_writer_proof_for_port(value.writer_proof),
+                _execution_overlap=value._execution_overlap,
             )
         except MalformedCurrentHeadResponse:
             raise
@@ -13200,6 +13326,113 @@ class HealthCore:
     ) -> bool:
         """Keep the notice window bounded to one existing owner delivery."""
 
+        return (
+            self._lifecycle_model_overlap_effect_id(
+                candidate_intent,
+                unresolved_effects,
+                head,
+            )
+            is not None
+        )
+
+    def _lifecycle_notice_effect_open(
+        self,
+        effect_intent: EffectIntent | OutboxIntent | None,
+        head: AuthoritySnapshot,
+    ) -> bool:
+        if (
+            not self._lifecycle_allows_pre_freeze_effect_overlap()
+            or type(effect_intent) not in {EffectIntent, OutboxIntent}
+        ):
+            return False
+        if type(effect_intent) is EffectIntent:
+            if (
+                effect_intent.effect_kind != "owner-delivery"
+                or type(effect_intent.business_source_causal_id) is not str
+            ):
+                return False
+            source_ref = effect_intent.business_source_causal_id
+        else:
+            if effect_intent.effect_kind != "owner-delivery":
+                return False
+            source_ref = effect_intent.intent_id
+        try:
+            settings = self._current_owner_settings(head)
+            outbox = self._ticket115_outbox_state_open(settings)
+            record = outbox.record(source_ref)
+            intent = record.intent
+            return (
+                intent.payload_ref.startswith("lifecycle-notice:")
+                and (
+                    record.intent == effect_intent
+                    if type(effect_intent) is OutboxIntent
+                    else intent.semantic_digest == effect_intent.intent_digest
+                )
+                and self._owner_delivery_binding_open(intent, settings)
+                is not None
+            )
+        except (
+            AuthorityValidationError,
+            DeliveryContractViolation,
+            SettingsContractViolation,
+            TaskContractViolation,
+        ):
+            return False
+
+    def _lifecycle_notice_overlap(
+        self,
+        candidate_intent: EffectIntent | None,
+        unresolved_effects: tuple[str, ...],
+        head: AuthoritySnapshot,
+    ) -> tuple[bool, str | None]:
+        """Allow one notice alongside one already-admitted owner effect."""
+
+        if (
+            type(candidate_intent) is not EffectIntent
+            or len(unresolved_effects) != 2
+            or candidate_intent.effect_id not in unresolved_effects
+            or not self._lifecycle_notice_effect_open(candidate_intent, head)
+        ):
+            return False, None
+        other_effect_id = next(
+            effect_id
+            for effect_id in unresolved_effects
+            if effect_id != candidate_intent.effect_id
+        )
+        stored = self._store.effect(other_effect_id)
+        if stored is None or stored.state not in {"unknown", "claiming", "executing"}:
+            return False, None
+        other_intent = (
+            stored.payload.intent
+            if stored.state in {"claiming", "executing"}
+            and type(stored.payload) in {ClaimingEffect, ExecutingEffect}
+            else stored.payload.execution.intent
+            if stored.state == "unknown"
+            and type(stored.payload) is TerminalEffect
+            and type(stored.payload.execution) is ExecutingEffect
+            else None
+        )
+        if (
+            type(other_intent) is not EffectIntent
+            or other_intent.effect_kind != "owner-delivery"
+            or not self._owner_effect_overlap_open(other_intent, head)
+        ):
+            return False, None
+        return (
+            True,
+            other_effect_id
+            if stored.state in {"claiming", "executing"}
+            else None,
+        )
+
+    def _lifecycle_model_overlap_effect_id(
+        self,
+        candidate_intent: EffectIntent | None,
+        unresolved_effects: tuple[str, ...],
+        head: AuthoritySnapshot,
+    ) -> str | None:
+        """Return the sole existing owner effect permitted to overlap model work."""
+
         if (
             not self._lifecycle_allows_pre_freeze_effect_overlap()
             or type(candidate_intent) is not EffectIntent
@@ -13208,7 +13441,7 @@ class HealthCore:
             or candidate_intent.effect_id not in unresolved_effects
             or candidate_intent.authority.mismatch_reason(head) is not None
         ):
-            return False
+            return None
         other_effect_id = next(
             effect_id
             for effect_id in unresolved_effects
@@ -13216,7 +13449,7 @@ class HealthCore:
         )
         stored = self._store.effect(other_effect_id)
         if stored is None:
-            return False
+            return None
         other_intent = (
             stored.payload.intent
             if stored.state in {"claiming", "executing"}
@@ -13228,13 +13461,38 @@ class HealthCore:
         if (
             type(other_intent) is not EffectIntent
             or other_intent.effect_kind != "owner-delivery"
-            or other_intent.payload_ref.startswith("lifecycle-notice:")
-            or other_intent.authority.mismatch_reason(head) is not None
         ):
+            return None
+        if not self._owner_effect_overlap_open(other_intent, head):
+            return None
+        return other_effect_id
+
+    def _owner_effect_overlap_open(
+        self,
+        effect_intent: EffectIntent,
+        head: AuthoritySnapshot,
+    ) -> bool:
+        """Validate one ordinary owner-delivery effect behind its outbox record."""
+
+        source_ref = effect_intent.business_source_causal_id
+        if type(source_ref) is not str:
             return False
         try:
             settings = self._current_owner_settings(head)
-            return self._owner_delivery_binding_open(other_intent, settings) is not None
+            outbox = self._ticket115_outbox_state_open(settings)
+            record = outbox.record(source_ref)
+            if record.intent.semantic_digest != effect_intent.intent_digest:
+                return False
+            if record.intent.payload_ref.startswith("lifecycle-notice:"):
+                return False
+            return (
+                self._owner_delivery_binding_open(
+                    record.intent,
+                    settings,
+                    allow_unknown_effect=True,
+                )
+                is not None
+            )
         except (
             AuthorityValidationError,
             DeliveryContractViolation,
@@ -13242,6 +13500,38 @@ class HealthCore:
             TaskContractViolation,
         ):
             return False
+
+    def _ticket115_model_overlap_permit(
+        self,
+        prepared: PreparedTransition,
+        head: AuthoritySnapshot,
+    ) -> _ExecutionOverlapPermit | None:
+        """Authorize only the model CAS that follows one live owner delivery."""
+
+        if not self._lifecycle_allows_pre_freeze_effect_overlap() or prepared.base != head:
+            return None
+        mutation = self._store.pending_ticket115_mutation()
+        if (
+            mutation is None
+            or mutation.prepared != prepared
+            or type(mutation.managed_effect_intent) is not EffectIntent
+            or mutation.managed_effect_intent.effect_kind != "model-work"
+        ):
+            return None
+        unresolved = self._store.unresolved_effects()
+        if len(unresolved) != 1:
+            return None
+        stored = self._store.effect(unresolved[0])
+        if stored is None or stored.state != "executing" or type(stored.payload) is not ExecutingEffect:
+            return None
+        owner_intent = stored.payload.intent
+        if (
+            owner_intent.effect_kind != "owner-delivery"
+        ):
+            return None
+        if not self._owner_effect_overlap_open(owner_intent, head):
+            return None
+        return _ExecutionOverlapPermit(unresolved[0])
 
     def managed_lifecycle_read(self, operation_ref: str | None) -> dict[str, object]:
         lifecycle = self._lifecycle

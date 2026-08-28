@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -84,6 +84,16 @@ class HeadRead:
 
 
 @dataclass(frozen=True)
+class _ExecutionOverlapPermit:
+    """Internal proof for one bounded pre-freeze effect overlap."""
+
+    active_effect_id: str
+
+    def __post_init__(self) -> None:
+        validate_opaque_text(self.active_effect_id, "overlap active effect identifier")
+
+
+@dataclass(frozen=True)
 class AdvanceRequest:
     """The only core-to-current-head write shape."""
 
@@ -93,6 +103,11 @@ class AdvanceRequest:
     writer_fence: str
     operation_digest: str
     writer_proof: WriterFenceProof
+    _execution_overlap: _ExecutionOverlapPermit | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if type(self.expected) is not AuthoritySnapshot:
@@ -107,6 +122,8 @@ class AdvanceRequest:
             raise AuthorityValidationError("advance request does not hold expected writer fence")
         if self.writer_proof.authority != self.expected:
             raise AuthorityValidationError("advance request writer proof mismatch")
+        if self._execution_overlap is not None and type(self._execution_overlap) is not _ExecutionOverlapPermit:
+            raise AuthorityValidationError("invalid execution overlap permit")
 
     def identity(self) -> "AdvanceIdentity":
         return AdvanceIdentity(
@@ -342,6 +359,11 @@ class ExecutionLeaseRequest:
     writer_fence: str
     holder_id: str
     writer_proof: WriterFenceProof
+    _execution_overlap: _ExecutionOverlapPermit | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if type(self.writer_proof) is not WriterFenceProof:
@@ -355,6 +377,8 @@ class ExecutionLeaseRequest:
         )
         if self.writer_proof.authority != self.expected:
             raise AuthorityValidationError("execution lease writer proof mismatch")
+        if self._execution_overlap is not None and type(self._execution_overlap) is not _ExecutionOverlapPermit:
+            raise AuthorityValidationError("invalid execution overlap permit")
 
     def identity(self) -> ExecutionLeaseIdentity:
         return ExecutionLeaseIdentity(
@@ -469,6 +493,7 @@ class InMemoryCurrentHead:
             tuple[str, str, str], AppliedLifecycleTransition
         ] = {}
         self._execution_leases: dict[str, ExecutionLeaseReceipt] = {}
+        self._active_execution_effect_ids: set[str] = set()
         self._active_execution_effect_id: str | None = None
         self._failure = FailureMode.NONE
         self._failure_operation = "all"
@@ -516,7 +541,9 @@ class InMemoryCurrentHead:
         if type(request) is not AdvanceRequest:
             raise AuthorityValidationError("invalid advance request")
         with self._lock:
-            if self._active_execution_effect_id is not None:
+            if self._active_execution_effect_ids and not self._overlap_permits_advance(
+                request._execution_overlap
+            ):
                 raise HeadConflict("active execution lease")
             lose_response = self._is_failure(FailureMode.UNKNOWN_AFTER_ADVANCE, "advance")
             if not lose_response:
@@ -596,7 +623,7 @@ class InMemoryCurrentHead:
             )
             if not lose_response:
                 self._raise_if_failed("lifecycle")
-            if self._active_execution_effect_id is not None:
+            if self._active_execution_effect_ids:
                 raise HeadConflict("active execution lease")
             if self._head.terminal:
                 raise HeadTerminal("terminal current head")
@@ -666,7 +693,10 @@ class InMemoryCurrentHead:
                 if existing.request != request.identity():
                     raise HeadConflict("execution lease effect conflict")
                 return existing
-            if self._active_execution_effect_id is not None:
+            if self._active_execution_effect_ids and (
+                len(self._active_execution_effect_ids) >= 2
+                or not self._overlap_permits_acquire(request._execution_overlap)
+            ):
                 raise HeadConflict("another execution lease is active")
             lease = ExecutionLease(
                 lease_id="lease:" + secrets.token_urlsafe(32),
@@ -677,7 +707,8 @@ class InMemoryCurrentHead:
             )
             receipt = ExecutionLeaseReceipt(request=request.identity(), lease=lease, released=False)
             self._execution_leases[request.effect_id] = receipt
-            self._active_execution_effect_id = request.effect_id
+            self._active_execution_effect_ids.add(request.effect_id)
+            self._sync_active_execution_effect_id()
             return receipt
 
     def lookup_execution_lease(self, identity: ExecutionLeaseIdentity) -> ExecutionLeaseReceipt:
@@ -714,14 +745,15 @@ class InMemoryCurrentHead:
                     released_operation_digest=release.operation_digest,
                 )
                 self._execution_leases[lease.effect_id] = receipt
-                self._active_execution_effect_id = None
+                self._active_execution_effect_ids.discard(lease.effect_id)
+                self._sync_active_execution_effect_id()
             elif receipt.released_operation_digest != release.operation_digest:
                 raise HeadConflict("execution lease release ownership conflict")
             return receipt
 
     def mark_terminal(self) -> HeadSnapshot:
         with self._lock:
-            if self._active_execution_effect_id is not None:
+            if self._active_execution_effect_ids:
                 raise HeadConflict("active execution lease")
             self._raise_if_failed("advance")
             next_generation = self._head.generation + 1
@@ -735,6 +767,29 @@ class InMemoryCurrentHead:
                 self._head.site,
             )
             return self._head
+
+    def _overlap_permits_advance(
+        self,
+        permit: _ExecutionOverlapPermit | None,
+    ) -> bool:
+        return (
+            len(self._active_execution_effect_ids) == 1
+            and type(permit) is _ExecutionOverlapPermit
+            and permit.active_effect_id in self._active_execution_effect_ids
+        )
+
+    def _overlap_permits_acquire(
+        self,
+        permit: _ExecutionOverlapPermit | None,
+    ) -> bool:
+        return self._overlap_permits_advance(permit)
+
+    def _sync_active_execution_effect_id(self) -> None:
+        self._active_execution_effect_id = (
+            next(iter(self._active_execution_effect_ids))
+            if len(self._active_execution_effect_ids) == 1
+            else None
+        )
 
     def _is_failure(self, failure: FailureMode, operation: str) -> bool:
         return self._failure is failure and self._failure_operation in {"all", operation}
