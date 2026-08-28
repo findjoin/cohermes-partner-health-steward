@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import unittest
 from collections.abc import Mapping
+from dataclasses import replace
 from unittest.mock import patch
 
 from partner_health_steward import HealthCore, HealthPlugin, settings
@@ -493,6 +494,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         config_mutation: str | None = None,
         current_head: object | None = None,
         current_head_capability: str | None = None,
+        route_drift: bool = False,
     ) -> HealthPlugin:
         """Build a second Core whose only admitted command is accept-migration."""
 
@@ -502,6 +504,14 @@ class Ticket117VerificationTests(unittest.TestCase):
         target.setUp()
         self._extra_harnesses.append(target)
         target._restart_with_assets(target._synthetic_assets())
+        if route_drift:
+            target.harness.route_fact = replace(
+                target.harness.route_fact,
+                configuration_generation=(
+                    target.harness.route_fact.configuration_generation + 1
+                ),
+                generation=target.harness.route_fact.generation + 1,
+            )
         self.assertTrue(target.base.core.close().complete)
         target_head = self.head if current_head is None else current_head
         if current_head_capability is not None:
@@ -1004,6 +1014,31 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertEqual(mismatch.keys.calls, 0)
         self.assertEqual(mismatch.replicas.calls, 0)
 
+        # A confirmed terminal is not enough to call cleanup complete when the
+        # first irreversible boundary cannot confirm key destruction.  This is
+        # a separate instance so the completed path above remains observable.
+        cleanup_unknown = type(self)(self._testMethodName)
+        cleanup_unknown.setUp()
+        self._extra_harnesses.append(cleanup_unknown)
+        cleanup_unknown._require_lifecycle(root=False)
+        cleanup_unknown._restart_lifecycle(root=False)
+        cleanup_unknown.keys.unknown = True
+        unknown_cleanup = cleanup_unknown._start_delete(
+            "delete-key-destruction-unknown"
+        )
+        self.assertNotEqual(unknown_cleanup.get("phase"), "completed")
+        self.assertIn(
+            unknown_cleanup.get("phase"),
+            {"unknown", "terminal-confirmed-cleanup-pending", "cleanup-pending"},
+            unknown_cleanup,
+        )
+        self.assertEqual(cleanup_unknown.keys.calls, 1)
+        self.assertTrue(cleanup_unknown.keys.present)
+        self.assertEqual(cleanup_unknown.replicas.calls, 0)
+        self.assertFalse(cleanup_unknown.plugin.health_writes_allowed())
+        self.assertFalse(cleanup_unknown.plugin.model_effects_allowed())
+        self.assertFalse(cleanup_unknown.plugin.outbound_effects_allowed())
+
     def test_v117_03_terminal_unknown_only_exactly_looks_up_original_transition(self) -> None:
         """A3: response loss cannot become a second terminal CAS or early purge."""
 
@@ -1191,6 +1226,32 @@ class Ticket117VerificationTests(unittest.TestCase):
             False,
         )
 
+        # Keep the advertised digest correct while replacing the opaque
+        # package at its Adapter boundary.  The verifier never parses or
+        # manufactures a product manifest.
+        original_package = copy.deepcopy(package)
+        self.artifacts.packages[package_ref] = {
+            "opaque-corruption": "ticket117-package-content-replaced"
+        }
+        tampered_target = self._offline_target()
+        tampered = self._execute(
+            {
+                "kind": "accept-migration",
+                "operation_ref": "migration-manifest-exact-set",
+                "package_ref": package_ref,
+                "manifest_digest": manifest_digest,
+            },
+            plugin=tampered_target,
+        )
+        self.assertEqual(tampered.get("status"), "rejected", tampered)
+        self.assertIs(
+            self._read(
+                "migration-manifest-exact-set", plugin=tampered_target
+            ).get("target_active"),
+            False,
+        )
+        self.artifacts.packages[package_ref] = original_package
+
         def assert_source_config_fails_closed(
             label: str,
             *,
@@ -1270,6 +1331,7 @@ class Ticket117VerificationTests(unittest.TestCase):
                 foreign_head,
                 "ticket117-foreign-writer-capability",
             ),
+            ("route-consent-currentness", None, None, None),
         )
         for label, mutation, configured_head, configured_capability in target_faults:
             with self.subTest(target_configuration_fault=label):
@@ -1277,7 +1339,15 @@ class Ticket117VerificationTests(unittest.TestCase):
                     config_mutation=mutation,
                     current_head=configured_head,
                     current_head_capability=configured_capability,
+                    route_drift=label == "route-consent-currentness",
                 )
+                if label == "route-consent-currentness":
+                    self.assertEqual(
+                        mismatched_target.owner_settings_state(
+                            peer_id=_PEER
+                        ).consent_path_status,
+                        "paused",
+                    )
                 context = None
                 if configured_head is not None:
                     foreign_snapshot = foreign_head.read().head
@@ -1531,11 +1601,66 @@ class Ticket117VerificationTests(unittest.TestCase):
         )
         self.assertIn(replay_status, {"unknown", "rejected"}, replay)
         self.assertEqual(self.head.mutable_calls, 1)
+        lookups_before_restart = self.head.lookup_calls
         self._restart_lifecycle(root=False)
         self.assertEqual(self.head.mutable_calls, 1)
+        self.assertGreater(self.head.lookup_calls, lookups_before_restart)
+        resolved_source = self._read("migration-transfer-unknown")
+        resolved_target = self._read(
+            "migration-transfer-unknown", plugin=target
+        )
+        self.assertIs(resolved_source.get("source_active"), False)
+        self.assertIs(resolved_target.get("target_active"), True)
         retained_after_restart = self.artifacts.get(ready["package_ref"])
         self.assertIsNotNone(retained_after_restart)
         self.assertEqual(retained_after_restart, opaque_package_before)
+
+        # If exact readback is itself unavailable, neither side may infer the
+        # winner.  Recovery must still call lookup and never make a second CAS.
+        unavailable = type(self)(self._testMethodName)
+        unavailable.setUp()
+        self._extra_harnesses.append(unavailable)
+        unavailable._require_lifecycle(root=False)
+        unavailable._restart_lifecycle(root=False)
+        unavailable_ready = unavailable._prepare_migration(
+            "migration-transfer-lookup-unavailable"
+        )
+        unavailable_target = unavailable._offline_target()
+        unavailable.head.failure = "unknown-after-apply"
+        staged = unavailable._execute(
+            {
+                "kind": "accept-migration",
+                "operation_ref": "migration-transfer-lookup-unavailable",
+                "package_ref": unavailable_ready["package_ref"],
+                "manifest_digest": unavailable_ready["manifest_digest"],
+            },
+            plugin=unavailable_target,
+        )
+        self.assertIn(staged.get("status"), {"manifest-ready", "replayed"})
+        unresolved = unavailable._prepare_migration(
+            "migration-transfer-lookup-unavailable"
+        )
+        self.assertEqual(unresolved.get("status"), "unknown", unresolved)
+        unavailable.head.failure = "lookup-unavailable"
+        unavailable_lookups = unavailable.head.lookup_calls
+        unavailable._restart_lifecycle(root=False)
+        self.assertEqual(unavailable.head.mutable_calls, 1)
+        self.assertGreater(unavailable.head.lookup_calls, unavailable_lookups)
+        unavailable_source = unavailable._read(
+            "migration-transfer-lookup-unavailable"
+        )
+        unavailable_target_view = unavailable._read(
+            "migration-transfer-lookup-unavailable",
+            plugin=unavailable_target,
+        )
+        self.assertIs(unavailable_source.get("source_active"), False)
+        self.assertIs(unavailable_target_view.get("target_active"), False)
+        self.assertFalse(unavailable.plugin.health_writes_allowed())
+        self.assertFalse(unavailable.plugin.model_effects_allowed())
+        self.assertFalse(unavailable.plugin.outbound_effects_allowed())
+        self.assertFalse(unavailable_target.health_writes_allowed())
+        self.assertFalse(unavailable_target.model_effects_allowed())
+        self.assertFalse(unavailable_target.outbound_effects_allowed())
 
     def test_v117_08_semantic_round_trip_preserves_source_time_and_relationships(self) -> None:
         """A8: file-level equality cannot hide semantic loss or source rewrite."""
