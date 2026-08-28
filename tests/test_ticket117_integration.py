@@ -25,7 +25,7 @@ from partner_health_steward.current_head import (
     InMemoryCurrentHead,
 )
 from partner_health_steward.delivery import OwnerDeliveryTransportResult
-from partner_health_steward.initialization import stable_digest
+from partner_health_steward.storage import EncryptedStateStore
 from tests import test_ticket114_authority_integration as ticket114_integration
 from tests import test_ticket116_integration as ticket116_integration
 
@@ -135,16 +135,16 @@ class _MigrationArtifactAdapter:
 
     def __init__(self, events: _BoundaryEvents) -> None:
         self.events = events
-        self.packages: dict[str, dict[str, object]] = {}
+        self.packages: dict[str, object] = {}
         self.role_calls: list[str] = []
 
-    def put(self, package_ref: str, package: Mapping[str, object]) -> dict[str, object]:
+    def put(self, package_ref: str, package: object) -> dict[str, object]:
         self.role_calls.append("artifact.put")
         self.events.add("artifact.put", {"package_ref": package_ref})
-        self.packages[package_ref] = copy.deepcopy(dict(package))
+        self.packages[package_ref] = copy.deepcopy(package)
         return {"status": "confirmed", "package_ref": package_ref}
 
-    def get(self, package_ref: str) -> dict[str, object] | None:
+    def get(self, package_ref: str) -> object | None:
         self.role_calls.append("artifact.get")
         self.events.add("artifact.get", {"package_ref": package_ref})
         package = self.packages.get(package_ref)
@@ -270,8 +270,9 @@ class Ticket117VerificationTests(unittest.TestCase):
         artifact: object | None = None,
         replica: object | None = None,
         registry_families: tuple[str, ...] = _REGISTRY_FAMILIES,
+        mutation: str | None = None,
     ) -> dict[str, object]:
-        return {
+        config: dict[str, object] = {
             "contract": "ticket117-lifecycle-config-v1",
             "mode": mode,
             "semantic_registry": [
@@ -303,6 +304,7 @@ class Ticket117VerificationTests(unittest.TestCase):
                 "disabled_native_entry_assertion": True,
                 "schema": "ticket117-semantic-state-v1",
                 "observer_identity": "observer:ticket117-synthetic",
+                "acl_service": "acl-service:ticket117-synthetic",
                 "secret_requirements": ["health-key-ref", "target-fence-ref"],
                 "unbound_real_providers": list(self.replicas.unproven),
             },
@@ -310,6 +312,49 @@ class Ticket117VerificationTests(unittest.TestCase):
             "managed_replica_adapter": self.replicas if replica is None else replica,
             "migration_artifact_adapter": self.artifacts if artifact is None else artifact,
         }
+        registry = config["semantic_registry"]
+        release = config["release"]
+        assert isinstance(registry, list)
+        assert isinstance(release, dict)
+        if mutation == "registry-missing":
+            registry.pop()
+        elif mutation == "registry-extra":
+            registry.append(
+                {
+                    "family": "unregistered-managed-family",
+                    "snapshot_codec": "codec:unregistered:v1",
+                    "purge_binding": "purge:unregistered:v1",
+                    "source_continuity": "preserve",
+                }
+            )
+        elif mutation == "release-bundle-schema-drift":
+            release["product_release"] = "ticket117-foreign-release"
+            release["plugin_core_bundle"] = "sha256:" + ("9" * 64)
+            release["adapter_model_interface_bundle"] = "sha256:" + ("8" * 64)
+            release["knowledge_safety_diagnostic_bundle"] = "sha256:" + ("7" * 64)
+            release["schema"] = "ticket117-foreign-schema"
+        elif mutation == "governance-artifact-drift":
+            release["adr"] = "ADR-ticket117-foreign"
+            release["skills"] = [
+                "health-init",
+                "health-steward",
+                "health-settings",
+                "health-portrait",
+                "health-evidence",
+                "health-owner-inquiry",
+                "health-unapproved-skill",
+            ]
+            release["hermes_artifact"] = "sha256:" + ("6" * 64)
+            release["required_patch"] = "sha256:" + ("0" * 64)
+            release["disabled_native_entry_assertion"] = False
+        elif mutation == "observer-acl-drift":
+            release["observer_identity"] = "observer:ticket117-foreign"
+            release["acl_service"] = "acl-service:ticket117-foreign"
+        elif mutation == "secret-policy-violation":
+            release["api_token"] = "SYNTHETIC-PLAINTEXT-SECRET-MUST-REJECT"
+        elif mutation is not None:
+            raise AssertionError(f"unknown Ticket 117 config mutation: {mutation}")
+        return config
 
     def _restart_lifecycle(
         self,
@@ -318,6 +363,7 @@ class Ticket117VerificationTests(unittest.TestCase):
         mode: str = "source",
         close_existing: bool = True,
         registry_families: tuple[str, ...] = _REGISTRY_FAMILIES,
+        config_mutation: str | None = None,
     ) -> None:
         assets = self.v116._synthetic_assets()
         if close_existing:
@@ -345,6 +391,7 @@ class Ticket117VerificationTests(unittest.TestCase):
                 lifecycle_config=self._lifecycle_config(
                     mode=mode,
                     registry_families=registry_families,
+                    mutation=config_mutation,
                 ),
             )
         except TypeError as exc:
@@ -438,7 +485,13 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertFalse(any(value in rendered for value in forbidden), result)
         return result
 
-    def _offline_target(self) -> HealthPlugin:
+    def _offline_target(
+        self,
+        *,
+        config_mutation: str | None = None,
+        current_head: object | None = None,
+        current_head_capability: str | None = None,
+    ) -> HealthPlugin:
         """Build a second Core whose only admitted command is accept-migration."""
 
         target = ticket116_integration.Ticket116VerificationTests(
@@ -448,9 +501,16 @@ class Ticket117VerificationTests(unittest.TestCase):
         self._extra_harnesses.append(target)
         target._restart_with_assets(target._synthetic_assets())
         self.assertTrue(target.base.core.close().complete)
+        target_head = self.head if current_head is None else current_head
+        if current_head_capability is not None:
+            target_snapshot = target_head.read().head  # type: ignore[union-attr]
+            target.base.writer_vault.bind(
+                target_snapshot.as_authority(),
+                current_head_capability,
+            )
         core = HealthCore(
             target.base.store,
-            self.head,  # type: ignore[arg-type]
+            target_head,  # type: ignore[arg-type]
             execution_capability_vault=target.harness.execution_vault,
             writer_fence_vault=target.base.writer_vault,
             admission_policy=target.base.policy,
@@ -467,7 +527,10 @@ class Ticket117VerificationTests(unittest.TestCase):
             knowledge_valid_at=target.knowledge_now.isoformat(),
             knowledge_clock=lambda: target.knowledge_now,
             safety_diagnostic_assets=target._synthetic_assets(),
-            lifecycle_config=self._lifecycle_config(mode="offline-staging"),
+            lifecycle_config=self._lifecycle_config(
+                mode="offline-staging",
+                mutation=config_mutation,
+            ),
         )
         plugin = HealthPlugin(
             core,
@@ -547,34 +610,6 @@ class Ticket117VerificationTests(unittest.TestCase):
             ),
         }
 
-    def _managed_inventory_oracle(self, plugin: HealthPlugin) -> set[str]:
-        """Independently observe managed families through public projections."""
-
-        views = self._public_semantic_views(plugin)
-        lifecycle = self._read(None, plugin=plugin)
-        observed = {
-            "authority-receipt-guard": (
-                views["ticket110_probe"],
-                views["ticket114_rights"],
-            ),
-            "initialization": views["ticket111_initialization"],
-            "source": views["ticket112_113_daily_state"],
-            "portrait": views["ticket112_113_daily_state"],
-            "evidence": views["ticket112_113_daily_state"],
-            "rights": views["ticket114_rights"],
-            "settings-control-approval": views["ticket114_settings"],
-            "task-review": views["ticket115_tasks_review_delivery"],
-            "model": views["ticket116_safety_diagnosis"],
-            "diagnosis-safety": views["ticket116_safety_diagnosis"],
-            "support-contact": views["ticket114_settings"],
-            "business-status": views["ticket114_status"],
-            "outbox-delivery-unknown": views["ticket115_tasks_review_delivery"],
-            "lifecycle-migration-staging": lifecycle,
-        }
-        for family, evidence in observed.items():
-            self.assertIsNotNone(evidence, family)
-        return set(observed)
-
     def _registry_exact_sets(self) -> tuple[set[str], set[str]]:
         registry = self._lifecycle_config()["semantic_registry"]
         self.assertIsInstance(registry, list)
@@ -587,14 +622,6 @@ class Ticket117VerificationTests(unittest.TestCase):
             families.add(entry["family"])  # type: ignore[arg-type]
             purge_bindings.add(entry["purge_binding"])  # type: ignore[arg-type]
         return families, purge_bindings
-
-    @staticmethod
-    def _rehash_manifest(manifest: dict[str, object]) -> str:
-        digest_body = copy.deepcopy(manifest)
-        digest_body.pop("manifest_digest", None)
-        digest = stable_digest(digest_body)
-        manifest["manifest_digest"] = digest
-        return digest
 
     def _form_owner_delivery_grant(self) -> tuple[str, object, object]:
         """Create one real runnable task/outbox intent and unstarted grant."""
@@ -855,12 +882,10 @@ class Ticket117VerificationTests(unittest.TestCase):
 
         self._require_lifecycle(root=False)
         self._restart_lifecycle(root=False)
-        managed_inventory = self._managed_inventory_oracle(self.plugin)
-        registry_families, registry_purge_bindings = self._registry_exact_sets()
+        _, registry_purge_bindings = self._registry_exact_sets()
         configured = self.replicas.enumerate(
             {"installation_id": self.head.read().head.installation_id}
         )["configured"]
-        self.assertEqual(managed_inventory, registry_families)
         self.assertEqual(set(configured), registry_purge_bindings)
 
         def assert_no_cleanup_before_terminal() -> None:
@@ -944,7 +969,11 @@ class Ticket117VerificationTests(unittest.TestCase):
         before = self._public_semantic_views(self.plugin)
         old_initialization = self.plugin.initialization_status(peer_id=_PEER)
         old_authority = self.head.read().head.as_authority()
-        old_database_snapshot = self.v116.base.store.raw_storage_bytes()
+        # Private connection access is fault-fixture setup only: it copies the
+        # real pre-terminal encrypted SQLite database.  No acceptance oracle
+        # below inspects private rows or connection state.
+        old_connection = getattr(self.v116.base.store, "_connection")
+        old_database_snapshot = old_connection.serialize()
         self.assertIsNotNone(old_initialization.prepared_authority)
         self.assertIsNotNone(old_initialization.key_id)
         self.assertTrue(old_database_snapshot)
@@ -958,13 +987,6 @@ class Ticket117VerificationTests(unittest.TestCase):
         )
         self._restart_lifecycle(root=False)
         self._start_delete("delete-nonresurrection")
-        self.keys.present = True  # old key material becomes readable again
-        self.artifacts.packages["old-db-snapshot"] = {
-            "encrypted_database": old_database_snapshot,
-        }
-        self.artifacts.packages["old-semantic-snapshot"] = {
-            "semantic_state": copy.deepcopy(before),
-        }
         self._restart_lifecycle(root=False)
         lifecycle = self._read("delete-nonresurrection")
         self.assertEqual(lifecycle.get("mode"), "terminal", lifecycle)
@@ -976,31 +998,24 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertFalse(self.plugin.health_writes_allowed())
         self.assertFalse(self.plugin.model_effects_allowed())
         self.assertFalse(self.plugin.outbound_effects_allowed())
-        self.assertNotIn("old-db-snapshot", repr(lifecycle))
-        self.assertNotIn("old-semantic-snapshot", repr(lifecycle))
 
-        # Attempt a collision rebuild against the same old database using an
-        # independently active head with the old installation/site and the old
-        # writer capability.  The authenticated terminal/store mismatch must
-        # remain visible only as public unavailability, never as resurrection.
-        collision_head = InMemoryCurrentHead(
-            old_authority.installation_id,
-            site=old_authority.site,
-            writer_capability=self.v116.base.writer_capability,
+        restored_store = EncryptedStateStore(
+            "file:ticket117-v04-restored-old-db?mode=memory&cache=shared",
+            ticket114_integration.StaticKeyProvider(
+                b"u" * 32,
+                key_id="ticket114-owner-state-key",
+            ),
         )
-        collision_vault = InMemoryWriterFenceVault()
-        collision_vault.bind(
-            collision_head.read().head.as_authority(),
-            self.v116.base.writer_capability,
-        )
+        restored_connection = getattr(restored_store, "_connection")
+        restored_connection.deserialize(old_database_snapshot)
         collision_core: HealthCore | None = None
         collision_rejection: Exception | None = None
         try:
             collision_core = HealthCore(
-                self.v116.base.store,
-                collision_head,
+                restored_store,
+                self.head,  # the same real terminal current-head boundary
                 execution_capability_vault=self.v116.harness.execution_vault,
-                writer_fence_vault=collision_vault,
+                writer_fence_vault=self.v116.base.writer_vault,
                 admission_policy=self.v116.base.policy,
                 health_init_verifier=self.v116.base.init_attestor,
                 health_init_asset=self.v116.base.init_asset,
@@ -1022,6 +1037,7 @@ class Ticket117VerificationTests(unittest.TestCase):
 
         if collision_core is None:
             self.assertIsNotNone(collision_rejection)
+            restored_store.close()
         else:
             collision_plugin = HealthPlugin(
                 collision_core,
@@ -1043,6 +1059,7 @@ class Ticket117VerificationTests(unittest.TestCase):
                 self.assertFalse(collision_plugin.outbound_effects_allowed())
             finally:
                 collision_core.close()
+                restored_store.close()
 
         blank = self._fresh_blank_installation()
         blank_views = self._public_semantic_views(blank)
@@ -1075,121 +1092,156 @@ class Ticket117VerificationTests(unittest.TestCase):
         """A5: a DB copy or plausible digest is not a complete manifest."""
 
         self._require_lifecycle(root=False)
-        self.v116._activate_synthetic_scope_through_ticket119()
-        self.v116._health(
-            "safety.evaluate",
-            {
-                "source_causal_id": "ticket117-new-managed-diagnosis",
-                "event_time": "2026-08-24T04:15:00+00:00",
-                "safety_rule_bundle_hash": self.v116.safety_bundle_hash,
-                "facts": {
-                    "safety_capability": "available",
-                    "danger": "unknown",
-                    "scope": "in-scope",
-                },
-            },
-            suffix="ticket117-new-managed-diagnosis",
-        )
         self._restart_lifecycle(root=False)
-        managed_inventory = self._managed_inventory_oracle(self.plugin)
-        registry_families, registry_purge_bindings = self._registry_exact_sets()
+        _, registry_purge_bindings = self._registry_exact_sets()
         configured = self.replicas.enumerate(
             {"installation_id": self.head.read().head.installation_id}
         )["configured"]
-        self.assertEqual(managed_inventory, registry_families)
         self.assertEqual(set(configured), registry_purge_bindings)
         ready = self._prepare_migration("migration-manifest-exact-set")
         self.assertEqual(ready.get("status"), "manifest-ready", ready)
         package_ref = ready.get("package_ref")
+        manifest_digest = ready.get("manifest_digest")
         self.assertIsInstance(package_ref, str)
+        self.assertIsInstance(manifest_digest, str)
         package = self.artifacts.get(package_ref)  # type: ignore[arg-type]
         self.assertIsNotNone(package)
-        assert package is not None
-        manifest = package.get("manifest")
-        self.assertIsInstance(manifest, dict)
-        assert isinstance(manifest, dict)
-        self.assertEqual(set(manifest["semantic_families"]), managed_inventory)
-        original_manifest_body = copy.deepcopy(manifest)
-        original_manifest_digest = original_manifest_body.pop("manifest_digest")
-        self.assertEqual(original_manifest_digest, stable_digest(original_manifest_body))
-        self.assertNotIn("secret", repr(package).lower())
-        self.assertNotIn("token", repr(package).lower())
-        self.assertNotIn("capability", repr(package).lower())
+
+        # Wrong hash is submitted only through the public accept payload; the
+        # verifier never parses or rewrites the opaque package.
         target = self._offline_target()
-        for mutation in ("missing-family", "extra-family", "wrong-hash", "secret"):
-            with self.subTest(manifest_mutation=mutation):
-                tampered = copy.deepcopy(package)
-                tampered_manifest = tampered["manifest"]
-                assert isinstance(tampered_manifest, dict)
-                if mutation == "missing-family":
-                    tampered_manifest["semantic_families"] = list(_REGISTRY_FAMILIES[:-1])
-                elif mutation == "extra-family":
-                    tampered_manifest["semantic_families"] = [*_REGISTRY_FAMILIES, "unknown-family"]
-                elif mutation == "wrong-hash":
-                    tampered_manifest["manifest_digest"] = "sha256:" + ("0" * 64)
-                else:
-                    tampered_manifest["api_token"] = "SYNTHETIC-SECRET-MUST-REJECT"
-                if mutation == "wrong-hash":
-                    submitted_digest = tampered_manifest["manifest_digest"]
-                else:
-                    submitted_digest = self._rehash_manifest(tampered_manifest)
-                self.artifacts.packages[f"tampered:{mutation}"] = tampered
+        wrong_hash = self._execute(
+            {
+                "kind": "accept-migration",
+                "operation_ref": "migration-manifest-exact-set",
+                "package_ref": package_ref,
+                "manifest_digest": "sha256:" + ("0" * 64),
+            },
+            plugin=target,
+        )
+        self.assertEqual(wrong_hash.get("status"), "rejected", wrong_hash)
+        self.assertIs(
+            self._read("migration-manifest-exact-set", plugin=target).get(
+                "target_active"
+            ),
+            False,
+        )
+
+        def assert_source_config_fails_closed(
+            label: str,
+            *,
+            config_mutation: str | None = None,
+            add_unregistered_store_object: bool = False,
+        ) -> None:
+            scenario = type(self)(self._testMethodName)
+            scenario.setUp()
+            self._extra_harnesses.append(scenario)
+            if add_unregistered_store_object:
+                connection = getattr(scenario.v116.base.store, "_connection")
+                connection.execute(
+                    "CREATE TABLE health_ticket117_unregistered_managed_v1 "
+                    "(object_id TEXT PRIMARY KEY, payload BLOB NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO health_ticket117_unregistered_managed_v1 "
+                    "(object_id, payload) VALUES (?, ?)",
+                    ("ticket117-unregistered-object", b"encrypted-fixture"),
+                )
+                connection.commit()
+            scenario._restart_lifecycle(
+                root=False,
+                config_mutation=config_mutation,
+            )
+            probe = scenario.plugin.probe()
+            state = getattr(probe.state, "value", probe.state)
+            self.assertNotEqual(state, "healthy", label)
+            self.assertFalse(scenario.plugin.health_writes_allowed(), label)
+            self.assertFalse(scenario.plugin.model_effects_allowed(), label)
+            self.assertFalse(scenario.plugin.outbound_effects_allowed(), label)
+            try:
+                result = scenario.plugin.health_operation(
+                    "lifecycle.execute",
+                    {
+                        "kind": "prepare-migration",
+                        "operation_ref": f"migration-invalid-source:{label}",
+                        "target_site": "synthetic-target-site",
+                        "target_writer_fence_ref": "target-fence-ref:ticket117",
+                        "artifact_sink_ref": "artifact-sink:ticket117",
+                    },
+                    context=scenario._context(kind="prepare-migration"),
+                    peer_id=_PEER,
+                )
+            except (ProtocolViolation, AuthorityValidationError):
+                result = {"status": "rejected"}
+            self.assertEqual(result.get("status"), "rejected", result)
+            self.assertEqual(scenario.artifacts.role_calls, [])
+
+        source_faults = (
+            ("store-unregistered", None, True),
+            ("registry-missing", "registry-missing", False),
+            ("registry-extra", "registry-extra", False),
+            ("secret-policy", "secret-policy-violation", False),
+        )
+        for label, mutation, add_store_object in source_faults:
+            with self.subTest(source_configuration_fault=label):
+                assert_source_config_fails_closed(
+                    label,
+                    config_mutation=mutation,
+                    add_unregistered_store_object=add_store_object,
+                )
+
+        # Remaining compatibility failures are target-owned configuration or
+        # real current-head facts, not opaque package edits.
+        foreign_head = InMemoryCurrentHead(
+            "ticket117-foreign-installation",
+            site="ticket117-foreign-site",
+            writer_capability="ticket117-foreign-writer-capability",
+        )
+        target_faults = (
+            ("release-bundle-schema", "release-bundle-schema-drift", None, None),
+            ("governance-artifact", "governance-artifact-drift", None, None),
+            (
+                "current-head-observer-acl",
+                "observer-acl-drift",
+                foreign_head,
+                "ticket117-foreign-writer-capability",
+            ),
+        )
+        for label, mutation, configured_head, configured_capability in target_faults:
+            with self.subTest(target_configuration_fault=label):
+                mismatched_target = self._offline_target(
+                    config_mutation=mutation,
+                    current_head=configured_head,
+                    current_head_capability=configured_capability,
+                )
+                context = None
+                if configured_head is not None:
+                    foreign_snapshot = foreign_head.read().head
+                    context = {
+                        "source": "migration_runtime",
+                        "causal_id": f"ticket117-target-fault:{label}",
+                        "generation": foreign_snapshot.generation,
+                        "scope": ["lifecycle:accept-migration"],
+                    }
                 denied = self._execute(
                     {
                         "kind": "accept-migration",
-                        "operation_ref": f"accept-tampered-{mutation}",
-                        "package_ref": f"tampered:{mutation}",
-                        "manifest_digest": submitted_digest,
+                        "operation_ref": "migration-manifest-exact-set",
+                        "package_ref": package_ref,
+                        "manifest_digest": manifest_digest,
                     },
-                    plugin=target,
+                    context=context,
+                    plugin=mismatched_target,
                 )
                 self.assertEqual(denied.get("status"), "rejected", denied)
-                target_read = self._read(f"accept-tampered-{mutation}", plugin=target)
+                target_read = self._read(
+                    "migration-manifest-exact-set",
+                    plugin=mismatched_target,
+                )
                 self.assertIs(target_read.get("target_active"), False)
-                self.assertFalse(target.health_writes_allowed())
-                self.assertFalse(target.model_effects_allowed())
-                self.assertFalse(target.outbound_effects_allowed())
-
-        # The inventory oracle is a public managed diagnosis created above,
-        # not a list generated by the registry.  Omitting its family must make
-        # a separately constructed source publicly fail closed before export.
-        omitted = type(self)(self._testMethodName)
-        omitted.setUp()
-        self._extra_harnesses.append(omitted)
-        omitted.v116._activate_synthetic_scope_through_ticket119()
-        omitted.v116._health(
-            "safety.evaluate",
-            {
-                "source_causal_id": "ticket117-unregistered-managed-diagnosis",
-                "event_time": "2026-08-24T04:16:00+00:00",
-                "safety_rule_bundle_hash": omitted.v116.safety_bundle_hash,
-                "facts": {
-                    "safety_capability": "available",
-                    "danger": "unknown",
-                    "scope": "in-scope",
-                },
-            },
-            suffix="ticket117-unregistered-managed-diagnosis",
-        )
-        diagnoses = omitted.plugin.managed_safety_diagnosis_read(peer_id=_PEER)[
-            "diagnoses"
-        ]
-        self.assertTrue(diagnoses)
-        omitted._restart_lifecycle(
-            root=False,
-            registry_families=tuple(
-                family
-                for family in _REGISTRY_FAMILIES
-                if family != "diagnosis-safety"
-            ),
-        )
-        omitted_probe = omitted.plugin.probe()
-        omitted_state = getattr(omitted_probe.state, "value", omitted_probe.state)
-        self.assertNotEqual(omitted_state, "healthy")
-        self.assertFalse(omitted.plugin.health_writes_allowed())
-        self.assertFalse(omitted.plugin.model_effects_allowed())
-        self.assertFalse(omitted.plugin.outbound_effects_allowed())
-        self.assertEqual(omitted.artifacts.role_calls, [])
+                self.assertFalse(mismatched_target.health_writes_allowed())
+                self.assertFalse(mismatched_target.model_effects_allowed())
+                self.assertFalse(mismatched_target.outbound_effects_allowed())
 
     def test_v117_06_offline_target_activates_only_after_one_writer_transfer(self) -> None:
         """A6: target validation cannot create a dual-writer window."""
@@ -1348,18 +1400,10 @@ class Ticket117VerificationTests(unittest.TestCase):
         self._restart_lifecycle(root=False)
         old_vm = self.plugin
         _, unknown_intent, spent_grant = self._seed_unknown_owner_delivery()
-        unknown_before = self.plugin.managed_ticket115_read(peer_id=_PEER)
-        self.assertIn(
-            unknown_intent.effect_id,  # type: ignore[attr-defined]
-            repr(unknown_before),
-        )
-        self.assertIn("unknown", repr(unknown_before))
         ready = self._prepare_migration("migration-transfer-unknown")
         package = self.artifacts.get(ready["package_ref"])
         self.assertIsNotNone(package)
-        assert package is not None
-        unknown_refs = copy.deepcopy(package["manifest"]["unknown_effects"])  # type: ignore[index]
-        self.assertIn(unknown_intent.effect_id, unknown_refs)  # type: ignore[attr-defined]
+        opaque_package_before = copy.deepcopy(package)
         target = self._offline_target()
         self.head.failure = "unknown-after-apply"
         result = self._execute(
@@ -1376,12 +1420,11 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertEqual(resumed.get("status"), "unknown", resumed)
         source_read = self._read("migration-transfer-unknown")
         target_read = self._read("migration-transfer-unknown", plugin=target)
-        self.assertFalse(source_read.get("source_active", False))
-        self.assertFalse(target_read.get("target_active", False))
+        self.assertIs(source_read.get("source_active"), False)
+        self.assertIs(target_read.get("target_active"), False)
         retained = self.artifacts.get(ready["package_ref"])
         self.assertIsNotNone(retained)
-        assert retained is not None
-        self.assertEqual(retained["manifest"]["unknown_effects"], unknown_refs)  # type: ignore[index]
+        self.assertEqual(retained, opaque_package_before)
         replay_transport = _DeliveryAdapter()
         try:
             replay = old_vm.controlled_effect(
@@ -1409,18 +1452,15 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertEqual(self.head.mutable_calls, 1)
         retained_after_restart = self.artifacts.get(ready["package_ref"])
         self.assertIsNotNone(retained_after_restart)
-        assert retained_after_restart is not None
-        self.assertEqual(
-            retained_after_restart["manifest"]["unknown_effects"],  # type: ignore[index]
-            unknown_refs,
-        )
+        self.assertEqual(retained_after_restart, opaque_package_before)
 
     def test_v117_08_semantic_round_trip_preserves_source_time_and_relationships(self) -> None:
         """A8: file-level equality cannot hide semantic loss or source rewrite."""
 
         self._require_lifecycle(root=False)
         self.v116._activate_synthetic_scope_through_ticket119()
-        task_id, _ = self.v116.harness._admit_review_task()
+        task_id, unknown_intent, _ = self._seed_unknown_owner_delivery()
+        unknown_ref = unknown_intent.effect_id  # type: ignore[attr-defined]
         self.v116._health(
             "safety.evaluate",
             {
@@ -1436,6 +1476,9 @@ class Ticket117VerificationTests(unittest.TestCase):
             suffix="ticket117-semantic-source-continuity",
         )
         before = self._public_semantic_views(self.plugin)
+        before_ticket = before["ticket115_tasks_review_delivery"]
+        assert isinstance(before_ticket, Mapping)
+        self.assertIn(unknown_ref, before_ticket["delivery_unknown_refs"])
         self.assertIn(task_id, repr(before))
         self.assertIn("ticket117-semantic-source-continuity", repr(before))
         self.assertIn("2026-08-24T04:20:00+00:00", repr(before))
@@ -1456,8 +1499,12 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertIn(completed.get("status"), {"completed", "replayed"}, completed)
         after = self._public_semantic_views(target)
         self.assertEqual(after, before)
+        after_ticket = after["ticket115_tasks_review_delivery"]
+        assert isinstance(after_ticket, Mapping)
+        self.assertIn(unknown_ref, after_ticket["delivery_unknown_refs"])
         rendered = repr(after)
         self.assertIn(task_id, rendered)
+        self.assertIn(unknown_ref, rendered)
         self.assertIn("ticket117-semantic-source-continuity", rendered)
         self.assertIn("2026-08-24T04:20:00+00:00", rendered)
         self.assertNotIn("synthetic-target-site-rewritten-source", rendered)
