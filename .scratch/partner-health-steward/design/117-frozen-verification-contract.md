@@ -1,6 +1,6 @@
 # Ticket 117 冻结验证合同
 
-> 状态：frozen candidate，等待同一 pre-code checkpoint 的 Spec / Standards 预审。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
+> 状态：frozen。冻结内容 checkpoint 为 `3e13c48179032f9b565d40abeaa8b433dc26ff8c`，tree 为 `aa21cf6c0bde3d1cbec85471054218cf6235aefd`；fresh-context Spec 与 Standards 编码前预审均 PASS。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
 
 ## 测试权威、公开 Seam 与依赖展开
 
@@ -52,3 +52,12 @@ pre-code checkpoint 必须运行并记录：
 - `git diff --check`：通过。
 
 实现完成后还需同一冻结文件 `9/9 PASS`、Tickets 113—116 受影响回归、`python -m unittest discover -v -s tests -p "test_ticket117_*.py"`、全量 discovery、compileall 与 diff check 全绿，且冻结设计、合同和 verifier-owned test blob 相对 test-gate checkpoint 零变化。若 public Seam 无法表达某项 Gate、registry 无法 exact enumerate、offline target 需要普通健康入口、terminal cleanup 必须重开健康 DB，或需要新授权/产品决定，立即停止并返回冻结阶段。
+
+## 编码前预审证据
+
+- 冻结内容 checkpoint：`3e13c48179032f9b565d40abeaa8b433dc26ff8c`；tree：`aa21cf6c0bde3d1cbec85471054218cf6235aefd`。
+- characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；旧全量测试：`720/720 PASS`。
+- 编码前冻结门：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚无 `managed_lifecycle_read` / `lifecycle.execute` 公共 Seam；其余八门只因共同前置而 skip。
+- Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或过度约束。
+- Standards reviewer：PASS，P1/P2/P3 均为 0；一个深 Module、最少 Interface、9 门上限、实施自由和 Ticket 117/119 边界成立。
+- `compileall` 与 `git diff --check` 通过；冻结时无产品代码修改。
