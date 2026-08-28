@@ -80,15 +80,12 @@ Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-est
 Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修改前冻结，可交给编码 Agent：
 
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；tree：`b90a610efa7fc4597c90dd95193ca694d0998573`；全量测试：`720/720 PASS`。
-- 双轴审查的当前冻结内容 checkpoint：`d671d7b5440e58168698a71f9314d05fdbbac7c8`；tree：`4ae2eda4ad13218c595649f0c3905312a9b9a924`。
-- 当前冻结元数据 commit：`9d261bca873e4049ebc0918d6724717e22883384`；tree：`3414cd49f561ba378d7614963c4f8ccddb956401`。
-- 冻结设计 blob：`e5c0cfbaa7ef02703545bd5b0585a92cca56eaa1`。
-- 冻结验证合同 blob：`bd8abcc5b3de41f6bd0e9ba8dc9be1036108af93`。
-- verifier-owned `tests/test_ticket117_integration.py` blob：`fab7b457baddc983dcc77628c56aa403c3d40d8b`。
-- V01 冻结门曾错误地在 staged scope 要求普通诊断返回 `model-ready`；当前 checkpoint 只补充 Ticket 116 已冻结的 synthetic acceptance 前置。双轴复审确认这是测试场景修复，不放宽 Ticket 116 门禁、不改变 Ticket 117 架构或 A1 验收。
-- 编码前门实跑：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚未实现 lifecycle 公共 Seam，Gate 总数固定为 9；`compileall` 与 `git diff --check` 通过。
-- fresh-context Spec reviewer：PASS，A1—A9 无剩余产品级 P1/P2、伪绿或新增过度约束。
-- fresh-context Standards reviewer：PASS，P1/P2/P3 均为 0；最少 Interface、一个深 Module、实施自由和 Ticket 117/119 边界成立。
+- 双轴审查的当前冻结内容 checkpoint：`d6057ee49629318a69baa9a1fd7944c4051d6555`；tree：`ef10350a7580619eb01a9b9dde14a0fd052651de`。
+- 当前冻结元数据 commit/tree 与三份冻结 blob 由紧随本提交的 handoff 元数据提交记录。
+- 本次重新冻结只修正 verifier fixture：隔离兄弟 harness 的 SQLite identity、为 V06 合法激活 Ticket 116 scope、关闭存储后有界 teardown，以及从 Ticket 115 public managed view 取得真实 unknown ref 与公开发生时间。双轴复审确认不放宽 Ticket 116 门禁、不改变 Ticket 117 架构或 A1—A9。
+- 对当前 WIP 的门实跑：V01—V05、V09 PASS；V06—V08 统一真实失败于 `migration-manifest-missing`。Gate 总数仍固定为 9；`compileall` 与 `git diff --check` 通过。
+- fresh-context Spec reviewer：PASS，无 P0/P1/P2；A2/A5/A6/A8 风险目标保持不变。
+- fresh-context Standards reviewer：PASS，P0/P1/P2/P3 均为 0；fixture 隔离、patch 生命周期、teardown 与 public API 取证符合项目规则。
 
 编码 Agent 只能修改产品实现及必要 export，使上述同一 9 门从冻结红灯转为 `9/9 PASS`；不得修改冻结设计、冻结验证合同、verifier-owned 测试、本 Ticket、Map 或 Tickets 110—116。若必须改门、改架构、增加产品决定、接入真实 Provider，或无法用现有有界 Seam 实现，应立即停止并返回冻结阶段。完成后必须提交并普通推送自己的实现分支，报告 commit/tree、冻结 blob 零变化、117 专项、113—116 回归、全量测试、compileall 与 diff-check 结果；不得自行标记 `resolved` 或更新 Map。
 
