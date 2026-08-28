@@ -57,3 +57,7 @@
 ### Architecture governance
 
 实施 Ticket 选择架构或审查要求重开架构时，使用 `docs/agents/architecture-governance.md` 的风险分类、复杂度举证与停止规则；Ticket 只保留经证据说明且经用户确认的本票增量门禁。
+
+### SOL implementation review
+
+实施 Agent 报告冻结 Ticket 完成、准备实施后双轴审查或闭票时，使用 `docs/agents/sol-implementation-review.md`；先通过执行门，再由两名只读 Reviewer 做有界 Spec/Standards 审查。
