@@ -9,17 +9,29 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
+import inspect
+import json
 import os
+import shutil
+import socket
+import struct
 import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import partner_health_steward as health_package
 
 
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_COMMIT = "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
 _PINNED_FILES = {
     "hermes_cli/plugins.py": (
@@ -70,18 +82,23 @@ _SECRET_CLASSES = (
 
 
 class _SyntheticEffectAdapter:
-    """External-effect boundary used only to prove a forged effect is not run."""
+    """External-effect Adapter whose call record is the independent oracle."""
 
-    def __init__(self) -> None:
+    def __init__(self, result: Mapping[str, object] | None = None) -> None:
         self.calls: list[object] = []
+        self._result = dict(
+            {
+                "status": "accepted",
+                "terminal": True,
+                "result_ref": "synthetic-result:ticket118",
+            }
+            if result is None
+            else result
+        )
 
     def execute(self, intent: object) -> Mapping[str, object]:
         self.calls.append(copy.deepcopy(intent))
-        return {
-            "status": "completed",
-            "terminal": True,
-            "result_ref": "synthetic-result:ticket118",
-        }
+        return copy.deepcopy(self._result)
 
 
 class _SyntheticCredentialAdapter:
@@ -99,19 +116,93 @@ class _SyntheticCredentialAdapter:
         }
 
 
-class _SyntheticCorePortAdapter:
-    """Three-interface Adapter; a callback failure must close the host entry."""
+class _RealSocketCorePortAdapter:
+    """Real local socket transport into the existing strict HealthPlugin frame seam."""
 
-    def __init__(self, *, callback_fails: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        callback_fails: bool = False,
+        frame_fault: str | None = None,
+        terminal: bool = True,
+    ) -> None:
         self.callback_fails = callback_fails
+        self.frame_fault = frame_fault
+        self.terminal = terminal
         self.calls: list[str] = []
+        self.frames: list[bytes] = []
+        self.responses: list[bytes] = []
+        self._harness: object | None = None
 
-    def command(self, value: object) -> Mapping[str, object]:
-        del value
+    def close(self) -> None:
+        harness, self._harness = self._harness, None
+        if harness is not None:
+            harness.tearDown()
+
+    def _plugin(self) -> object:
+        if self._harness is None:
+            from tests.test_ticket110_boundary import Ticket110BoundaryTests
+
+            harness = Ticket110BoundaryTests("test_probe_is_read_only")
+            harness.setUp()
+            self._harness = harness
+        return self._harness.plugin
+
+    def _mutate_frame(self, frame: bytes) -> bytes:
+        if self.frame_fault == "truncated":
+            return frame[:-1]
+        if self.frame_fault == "trailing":
+            return frame + b"x"
+        if self.frame_fault == "unknown-kind":
+            value = json.loads(frame[4:].decode("utf-8"))
+            value["action"] = "unknown.kind"
+            body = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+            return struct.pack(">I", len(body)) + body
+        return frame
+
+    @staticmethod
+    def _socket_pair() -> tuple[socket.socket, socket.socket]:
+        if hasattr(socket, "AF_UNIX"):
+            return socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        # This Python build lacks AF_UNIX.  The same real byte-stream framing
+        # Seam is exercised locally; Linux peer credentials remain Ticket 119.
+        return socket.socketpair()
+
+    def command(self, value: object) -> bytes:
         self.calls.append("command")
         if self.callback_fails:
             raise RuntimeError("synthetic core callback unavailable")
-        return {"status": "accepted", "terminal": True}
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise TypeError("CorePort.command requires one encoded frame")
+        frame = self._mutate_frame(bytes(value))
+        self.frames.append(frame)
+        client, server = self._socket_pair()
+        try:
+            client.sendall(frame)
+            client.shutdown(socket.SHUT_WR)
+            received = bytearray()
+            while True:
+                chunk = server.recv(65536)
+                if not chunk:
+                    break
+                received.extend(chunk)
+            response = self._plugin().handle_frame(bytes(received), peer_id="plugin")
+            server.sendall(response)
+            server.shutdown(socket.SHUT_WR)
+            returned = bytearray()
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                returned.extend(chunk)
+            response_frame = bytes(returned)
+            self.responses.append(response_frame)
+            return response_frame
+        finally:
+            client.close()
+            server.close()
 
     def managed_read(self, value: object) -> Mapping[str, object]:
         del value
@@ -121,7 +212,56 @@ class _SyntheticCorePortAdapter:
     def execute_effect(self, value: object) -> Mapping[str, object]:
         del value
         self.calls.append("controlled-effect")
-        return {"status": "accepted", "terminal": True}
+        return {"status": "accepted", "terminal": self.terminal}
+
+
+class _PinnedHermesObserver:
+    """Independent observation of calls into the real pinned host classes."""
+
+    def __init__(self, registry: object) -> None:
+        self.registry = registry
+        self.register_calls: list[dict[str, object]] = []
+        self.manager_types: list[type[object]] = []
+        self.factory_instances: list[object] = []
+        self.lifecycle_calls: list[str] = []
+
+    def observe_registration(
+        self,
+        context: object,
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> None:
+        name = kwargs.get("name", args[0] if args else None)
+        factory = kwargs.get("adapter_factory", args[2] if len(args) > 2 else None)
+        self.register_calls.append({"name": name, "factory": factory})
+        self.manager_types.append(type(getattr(context, "_manager", None)))
+
+    def exercise_factory(self, entry: object, core_port: object) -> None:
+        factory = getattr(entry, "adapter_factory", None)
+        if not callable(factory):
+            raise AssertionError("health_weixin registration has no factory")
+        adapter = factory(
+            SimpleNamespace(
+                enabled=True,
+                extra={
+                    "ticket118_offline_verification": True,
+                    "core_port_adapter": core_port,
+                },
+            )
+        )
+        self.factory_instances.append(adapter)
+        for method_name in ("start", "stop"):
+            method = getattr(adapter, method_name, None)
+            if not callable(method):
+                raise AssertionError(
+                    f"health_weixin Adapter has no {method_name} lifecycle Interface"
+                )
+            result = method()
+            if inspect.isawaitable(result):
+                import asyncio
+
+                asyncio.run(result)
+            self.lifecycle_calls.append(method_name)
 
 
 def _wire(value: object, name: str) -> dict[str, object]:
@@ -144,6 +284,65 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+@contextmanager
+def _observe_pinned_hermes(root: Path):
+    """Patch only observation points while retaining real pinned behavior."""
+
+    root_text = str(root.resolve())
+    inserted = root_text not in sys.path
+    if inserted:
+        sys.path.insert(0, root_text)
+    try:
+        plugins = importlib.import_module("hermes_cli.plugins")
+        registry_module = importlib.import_module("gateway.platform_registry")
+        for module in (plugins, registry_module):
+            module_path = Path(inspect.getsourcefile(module) or "").resolve()
+            if root.resolve() not in module_path.parents:
+                raise AssertionError(f"pinned Hermes module loaded outside checkout: {module_path}")
+        registry = registry_module.PlatformRegistry()
+        observer = _PinnedHermesObserver(registry)
+        original = plugins.PluginContext.register_platform
+
+        def observed_register(context: object, *args: object, **kwargs: object) -> None:
+            observer.observe_registration(context, args, kwargs)
+            original(context, *args, **kwargs)
+
+        with patch.object(registry_module, "platform_registry", registry), patch.object(
+            plugins.PluginContext, "register_platform", observed_register
+        ):
+            yield observer
+    finally:
+        if inserted:
+            sys.path.remove(root_text)
+
+
+@contextmanager
+def _core_issued_effect_probe():
+    """Yield one real current core intent/grant and close its local authority store."""
+
+    from tests.test_ticket110_boundary import Ticket110BoundaryTests
+
+    harness = Ticket110BoundaryTests("test_probe_is_read_only")
+    harness.setUp()
+    try:
+        issued = harness.send(
+            harness.command(
+                "effect.request",
+                "ticket118-effect",
+                harness.effect_request_payload(request_digest="sha256:ticket118-effect"),
+            )
+        )
+        if issued.status != "accepted":
+            raise AssertionError(f"core failed to issue controlled effect: {issued.status}")
+        intent = issued.meta.intent
+        grant = harness.plugin.claim_effect_execution(intent)
+        if grant is None:
+            raise AssertionError("core failed to grant controlled effect execution")
+        yield harness, intent, grant
+    finally:
+        harness.tearDown()
+
+
 class Ticket118VerificationTests(unittest.TestCase):
     """Seven public-seam gates, one for each Ticket 118 acceptance ID."""
 
@@ -156,8 +355,11 @@ class Ticket118VerificationTests(unittest.TestCase):
         pinned_source = os.environ.get("TICKET118_PINNED_HERMES_SOURCE")
         self.pinned_root = None if pinned_source is None else Path(pinned_source)
         self.contract: object | None = None
+        self._core_port_adapters: list[_RealSocketCorePortAdapter] = []
 
     def tearDown(self) -> None:
+        for adapter in self._core_port_adapters:
+            adapter.close()
         self._temporary.cleanup()
 
     def _require_contract(self, *, root: bool) -> None:
@@ -237,6 +439,11 @@ class Ticket118VerificationTests(unittest.TestCase):
                 "migration-semantic-registry",
                 "{\"families\":[\"synthetic\"]}\n",
             ),
+            (
+                "migration/ticket117-synthetic-fixture.py",
+                "migration-synthetic-fixture",
+                "REPLACED-BY-CURRENT-TICKET117-FIXTURE\n",
+            ),
             ("environment/python.txt", "python-constraint", ">=3.11,<3.12\n"),
             ("environment/dependencies.lock", "dependency-constraint", "synthetic==1\n"),
             (
@@ -257,6 +464,35 @@ class Ticket118VerificationTests(unittest.TestCase):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body, encoding="utf-8", newline="\n")
+        # These are the real current plugin/host/adapter artifacts.  Positive
+        # host evidence must load them into the pinned Hermes checkout; marker
+        # files are not allowed to stand in for current integration code.
+        current_sources = {
+            "host/required.patch": (
+                _REPOSITORY_ROOT
+                / "ops/partner-health-steward/plugin/health-steward/__init__.py"
+            ),
+            "host/disabled-native-entry.assertion": (
+                _REPOSITORY_ROOT / "ops/partner-health-steward/deployment.py"
+            ),
+            "product/plugin.py": _REPOSITORY_ROOT / "partner_health_steward/plugin.py",
+            "product/core.py": _REPOSITORY_ROOT / "partner_health_steward/core.py",
+            "adapters/health_weixin.py": (
+                _REPOSITORY_ROOT
+                / "ops/partner-health-steward/plugin/health-steward/weixin_adapter.py"
+            ),
+            "adapters/model.py": (
+                _REPOSITORY_ROOT / "partner_health_steward/model_contract.py"
+            ),
+            "adapters/delivery.py": (
+                _REPOSITORY_ROOT / "partner_health_steward/delivery.py"
+            ),
+            "migration/ticket117-synthetic-fixture.py": (
+                _REPOSITORY_ROOT / "tests/test_ticket117_integration.py"
+            ),
+        }
+        for relative, source in current_sources.items():
+            shutil.copyfile(source, root / relative)
         runtime = root / "runtime" / "instance-manifest.json"
         runtime.parent.mkdir(parents=True, exist_ok=True)
         runtime.write_text('{"generation":1,"site":"synthetic-a"}\n', encoding="utf-8")
@@ -300,7 +536,7 @@ class Ticket118VerificationTests(unittest.TestCase):
         self,
         *,
         credential_adapter: _SyntheticCredentialAdapter | None = None,
-        core_port_adapter: _SyntheticCorePortAdapter | None = None,
+        core_port_adapter: _RealSocketCorePortAdapter | None = None,
         effect_adapter: _SyntheticEffectAdapter | None = None,
         controlled_effect_probe: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
@@ -308,6 +544,12 @@ class Ticket118VerificationTests(unittest.TestCase):
             raise AssertionError(
                 "TICKET118_PINNED_HERMES_SOURCE must name the local pinned checkout"
             )
+        selected_core_port = (
+            _RealSocketCorePortAdapter()
+            if core_port_adapter is None
+            else core_port_adapter
+        )
+        self._core_port_adapters.append(selected_core_port)
         source: dict[str, object] = {
             "contract": "ticket118-pinned-hermes-source-v1",
             "root": str(self.pinned_root),
@@ -321,18 +563,12 @@ class Ticket118VerificationTests(unittest.TestCase):
                 if credential_adapter is None
                 else credential_adapter
             ),
-            "core_port_adapter": (
-                _SyntheticCorePortAdapter()
-                if core_port_adapter is None
-                else core_port_adapter
-            ),
+            "core_port_adapter": selected_core_port,
         }
         if effect_adapter is not None:
             source["effect_adapter"] = effect_adapter
         if controlled_effect_probe is not None:
-            source["controlled_effect_probe"] = copy.deepcopy(
-                dict(controlled_effect_probe)
-            )
+            source["controlled_effect_probe"] = dict(controlled_effect_probe)
         return source
 
     def _verify(
@@ -368,12 +604,23 @@ class Ticket118VerificationTests(unittest.TestCase):
 
         verified = first_wire.get("repository_verified")
         self.assertIsInstance(verified, list)
-        verified_roles = {
-            item.get("role")
-            for item in verified  # type: ignore[union-attr]
-            if type(item) is dict
-        }
-        self.assertEqual(verified_roles, {item["role"] for item in self.artifacts})
+        expected_verified = sorted(
+            (
+                {
+                    "path": item["path"],
+                    "role": item["role"],
+                    "sha256": "sha256:" + _sha256(self.release_root / item["path"]),
+                }
+                for item in self.artifacts
+            ),
+            key=lambda item: item["path"],
+        )
+        self.assertTrue(all(type(item) is dict for item in verified), verified)
+        actual_verified = sorted(
+            (copy.deepcopy(item) for item in verified),  # type: ignore[union-attr]
+            key=lambda item: item.get("path", ""),
+        )
+        self.assertEqual(actual_verified, expected_verified)
         self.assertNotIn(str(self.release_root), repr(first_wire))
         self.assertNotIn("synthetic-a", repr(first_wire))
 
@@ -382,11 +629,19 @@ class Ticket118VerificationTests(unittest.TestCase):
         _outside_manifest, outside_wire = self._build()
         self.assertEqual(outside_wire, first_wire)
 
-        minimum = self.release_root / "bundles" / "minimum-help.json"
-        minimum.write_text('{"bundle":"minimum-help-v2"}\n', encoding="utf-8")
-        _changed, changed_wire = self._build()
-        self.assertNotEqual(changed_wire.get("release_digest"), digest)
-        self.assertNotEqual(_wire(first, "release manifest"), changed_wire)
+        # One equivalence loop proves every managed artifact participates in
+        # the release digest; it is not a field/artifact Cartesian matrix.
+        for artifact in self.artifacts:
+            with self.subTest(managed_artifact=artifact["path"]):
+                path = self.release_root / artifact["path"]
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(original + b"\nTICKET118-MANAGED-DRIFT\n")
+                    _changed, changed_wire = self._build()
+                    self.assertNotEqual(changed_wire.get("release_digest"), digest)
+                    self.assertNotEqual(_wire(first, "release manifest"), changed_wire)
+                finally:
+                    path.write_bytes(original)
 
     def test_v118_02_real_pinned_lifecycle_registers_only_health_weixin(self) -> None:
         """A2: a hand-written host stub cannot satisfy positive evidence."""
@@ -410,114 +665,215 @@ class Ticket118VerificationTests(unittest.TestCase):
                 self.assertEqual(_sha256(self.pinned_root / relative), expected)
 
         manifest, _wire_manifest = self._build()
-        report = self._verify(manifest)
+        positive_source = self._pinned_source()
+        with _observe_pinned_hermes(self.pinned_root) as observer:
+            report = self._verify(manifest, positive_source)
+            entries = observer.registry.all_entries()
+            self.assertEqual([entry.name for entry in entries], ["health_weixin"])
+            self.assertEqual(
+                [call["name"] for call in observer.register_calls],
+                ["health_weixin"],
+            )
+            plugins = importlib.import_module("hermes_cli.plugins")
+            self.assertEqual(observer.manager_types, [plugins.PluginManager])
+            entry = observer.registry.get("health_weixin")
+            self.assertIsNotNone(entry)
+            observer.exercise_factory(entry, positive_source["core_port_adapter"])
+
         self.assertEqual(report.get("verdict"), "pass", report)
         self.assertIsInstance(report.get("activation_proof"), str)
-        lifecycle = report.get("pinned_lifecycle")
-        self.assertIsInstance(lifecycle, dict)
-        self.assertTrue(lifecycle.get("actual_interface_loaded"))  # type: ignore[union-attr]
-        self.assertEqual(lifecycle.get("commit"), _PINNED_COMMIT)  # type: ignore[union-attr]
-        self.assertEqual(lifecycle.get("registered_platforms"), ["health_weixin"])  # type: ignore[union-attr]
+        self.assertEqual(observer.lifecycle_calls, ["start", "stop"])
+        self.assertEqual(len(observer.factory_instances), 1)
+        adapter_source = Path(
+            inspect.getsourcefile(type(observer.factory_instances[0])) or ""
+        ).resolve()
         self.assertEqual(
-            lifecycle.get("lifecycle_results"),  # type: ignore[union-attr]
-            {"register": "pass", "factory": "pass", "start": "pass", "stop": "pass"},
+            adapter_source,
+            (self.release_root / "adapters/health_weixin.py").resolve(),
+            "factory must load the allowlisted release artifact, not the source tree",
         )
-        self.assertEqual(lifecycle.get("entry_order"), "pre-native")  # type: ignore[union-attr]
+        self.assertEqual(
+            _sha256(adapter_source),
+            _sha256(self.release_root / "adapters/health_weixin.py"),
+            "factory must instantiate the current release Adapter artifact",
+        )
 
         wrong = self._pinned_source()
         wrong_files = copy.deepcopy(wrong["allowlisted_files"])
         assert type(wrong_files) is list and type(wrong_files[0]) is dict
         wrong_files[0]["sha256"] = "0" * 64
         wrong["allowlisted_files"] = wrong_files
-        rejected = self._verify(manifest, wrong)
+        with _observe_pinned_hermes(self.pinned_root) as rejected_observer:
+            rejected = self._verify(manifest, wrong)
         self.assertEqual(rejected.get("verdict"), "fail")
         self.assertIsNone(rejected.get("activation_proof"))
+        self.assertEqual(rejected_observer.register_calls, [])
 
     def test_v118_03_core_port_is_three_strict_fail_closed_interfaces(self) -> None:
         """A3: a socket shell cannot hide direct or incomplete core effects."""
 
         self._require_contract(root=False)
         manifest, _manifest_wire = self._build()
-        report = self._verify(manifest)
-        port = report.get("core_port")
-        self.assertIsInstance(port, dict)
-        self.assertEqual(
-            port.get("interfaces"),  # type: ignore[union-attr]
-            ["command", "managed-read", "controlled-effect"],
-        )
-        self.assertFalse(port.get("generic_rpc"))  # type: ignore[union-attr]
-        self.assertEqual(port.get("frame"), "protocol-v1-length-canonical-json-64k")  # type: ignore[union-attr]
-
-        failed = self._verify(
+        positive_adapter = _RealSocketCorePortAdapter()
+        report = self._verify(
             manifest,
-            self._pinned_source(
-                credential_adapter=_SyntheticCredentialAdapter(peer="ordinary-agent")
+            self._pinned_source(core_port_adapter=positive_adapter),
+        )
+        self.assertEqual(report.get("verdict"), "pass", report)
+        self.assertGreaterEqual(len(positive_adapter.frames), 1)
+        self.assertEqual(len(positive_adapter.responses), len(positive_adapter.frames))
+        from partner_health_steward.contract import decode_frame, decode_response_frame
+
+        for frame, response in zip(
+            positive_adapter.frames, positive_adapter.responses, strict=True
+        ):
+            self.assertEqual(decode_frame(frame).peer, "plugin")
+            self.assertIn(
+                decode_response_frame(response).status,
+                {"accepted", "replayed"},
+            )
+
+        variants = (
+            (
+                "wrong-peer",
+                _SyntheticCredentialAdapter(peer="ordinary-agent"),
+                _RealSocketCorePortAdapter(),
+            ),
+            (
+                "truncated-frame",
+                _SyntheticCredentialAdapter(),
+                _RealSocketCorePortAdapter(frame_fault="truncated"),
+            ),
+            (
+                "trailing-frame",
+                _SyntheticCredentialAdapter(),
+                _RealSocketCorePortAdapter(frame_fault="trailing"),
+            ),
+            (
+                "unknown-kind",
+                _SyntheticCredentialAdapter(),
+                _RealSocketCorePortAdapter(frame_fault="unknown-kind"),
+            ),
+            (
+                "incomplete-terminal",
+                _SyntheticCredentialAdapter(),
+                _RealSocketCorePortAdapter(terminal=False),
             ),
         )
-        self.assertEqual(failed.get("verdict"), "fail")
-        self.assertIsNone(failed.get("activation_proof"))
+        for label, credential, core_port in variants:
+            with self.subTest(representative_fault=label):
+                failed = self._verify(
+                    manifest,
+                    self._pinned_source(
+                        credential_adapter=credential,
+                        core_port_adapter=core_port,
+                    ),
+                )
+                self.assertIn(failed.get("verdict"), {"fail", "cannot-confirm"})
+                self.assertIsNone(failed.get("activation_proof"))
 
     def test_v118_04_adapters_cannot_forge_intent_terminal_or_state(self) -> None:
         """A4: a transport cannot turn its own observation into health truth."""
 
         self._require_contract(root=False)
         manifest, _manifest_wire = self._build()
-        adapter = _SyntheticEffectAdapter()
-        report = self._verify(
-            manifest,
-            self._pinned_source(
-                effect_adapter=adapter,
-                controlled_effect_probe={
-                    "intent_id": "synthetic-forged-intent",
-                    "authority": "adapter-self-issued",
-                    "terminal": {"status": "completed", "terminal": True},
-                },
-            ),
-        )
-        self.assertEqual(report.get("verdict"), "fail")
-        self.assertEqual(adapter.calls, [])
-        self.assertIsNone(report.get("activation_proof"))
-        positive = self._verify(manifest)
-        authority = positive.get("controlled_effect")
-        self.assertIsInstance(authority, dict)
-        self.assertTrue(authority.get("core_issued_intent_required"))  # type: ignore[union-attr]
-        self.assertTrue(authority.get("complete_terminal_required"))  # type: ignore[union-attr]
-        self.assertEqual(
-            authority.get("forbidden_write_interfaces"),  # type: ignore[union-attr]
-            ["session", "memory", "observer", "generic-state-rpc"],
-        )
+        with _core_issued_effect_probe() as (_harness, intent, grant):
+            legal_adapter = _SyntheticEffectAdapter()
+            legal = self._verify(
+                manifest,
+                self._pinned_source(
+                    effect_adapter=legal_adapter,
+                    controlled_effect_probe={"intent": intent, "grant": grant},
+                ),
+            )
+            self.assertEqual(legal.get("verdict"), "pass", legal)
+            self.assertEqual(len(legal_adapter.calls), 1)
+
+            stale_authority = replace(
+                intent.authority,
+                writer_fence="fence:ticket118-stale",
+            )
+            stale_intent = replace(intent, authority=stale_authority)
+            faults = (
+                (
+                    "forged-intent",
+                    {
+                        "intent": {
+                            "effect_id": "effect:forged",
+                            "effect_kind": "model-work",
+                            "intent_digest": "sha256:forged",
+                            "authority": "adapter-self-issued",
+                        },
+                        "grant": grant,
+                    },
+                    _SyntheticEffectAdapter(),
+                    0,
+                ),
+                (
+                    "stale-writer-fence",
+                    {"intent": stale_intent, "grant": grant},
+                    _SyntheticEffectAdapter(),
+                    0,
+                ),
+                (
+                    "missing-terminal",
+                    {"intent": intent, "grant": grant},
+                    _SyntheticEffectAdapter(
+                        {"status": "accepted", "result_ref": "synthetic:missing"}
+                    ),
+                    1,
+                ),
+            )
+            for label, probe, adapter, expected_calls in faults:
+                with self.subTest(representative_fault=label):
+                    rejected = self._verify(
+                        manifest,
+                        self._pinned_source(
+                            effect_adapter=adapter,
+                            controlled_effect_probe=probe,
+                        ),
+                    )
+                    self.assertIn(
+                        rejected.get("verdict"), {"fail", "cannot-confirm"}
+                    )
+                    self.assertEqual(len(adapter.calls), expected_calls)
+                    self.assertIsNone(rejected.get("activation_proof"))
+
+        self.assertNotIn("session", repr(legal_adapter.calls).lower())
+        self.assertNotIn("memory", repr(legal_adapter.calls).lower())
+        self.assertNotIn("observer", repr(legal_adapter.calls).lower())
+        self.assertNotIn("generic-state-rpc", repr(legal_adapter.calls).lower())
 
     def test_v118_05_old_health_entries_never_return_on_host_failure(self) -> None:
         """A5: a disabled assertion cannot replace actual reachability proof."""
 
         self._require_contract(root=False)
         manifest, _manifest_wire = self._build()
-        report = self._verify(manifest)
-        entry = report.get("entrypoints")
-        self.assertIsInstance(entry, dict)
-        self.assertEqual(entry.get("reachable_health_entries"), ["health_weixin"])  # type: ignore[union-attr]
-        self.assertEqual(entry.get("blocked_entries"), [  # type: ignore[union-attr]
-            "medical",
-            "health-autonomy",
-            "health-guard",
-            "native-health",
-            "ordinary-agent-health",
-        ])
-        self.assertTrue(entry.get("required_patch_hash_bound"))  # type: ignore[union-attr]
-        self.assertTrue(entry.get("native_disable_hash_bound"))  # type: ignore[union-attr]
-
-        failed = self._verify(
-            manifest,
-            self._pinned_source(
-                core_port_adapter=_SyntheticCorePortAdapter(callback_fails=True)
-            ),
-        )
+        failing_core = _RealSocketCorePortAdapter(callback_fails=True)
+        assert self.pinned_root is not None
+        with _observe_pinned_hermes(self.pinned_root) as observer:
+            failed = self._verify(
+                manifest,
+                self._pinned_source(core_port_adapter=failing_core),
+            )
+            self.assertTrue(
+                all(call["name"] == "health_weixin" for call in observer.register_calls),
+                observer.register_calls,
+            )
+            self.assertEqual(observer.registry.all_entries(), [])
+            for obsolete in (
+                "medical",
+                "health-autonomy",
+                "health-guard",
+                "native-health",
+                "ordinary-agent-health",
+                "weixin",
+            ):
+                with self.subTest(obsolete_health_entry=obsolete):
+                    self.assertIsNone(observer.registry.get(obsolete))
         self.assertEqual(failed.get("verdict"), "fail")
-        self.assertEqual(
-            failed.get("reachable_health_entries"),
-            [],
-        )
         self.assertIsNone(failed.get("activation_proof"))
+        self.assertEqual(failing_core.calls, ["command"])
 
     def test_v118_06_readiness_preserves_unknown_and_rejects_unsafe_rollback(self) -> None:
         """A6: missing target facts cannot be skipped or replaced by old files."""
@@ -538,6 +894,46 @@ class Ticket118VerificationTests(unittest.TestCase):
         self.assertEqual(install.get("verdict"), "cannot-confirm")
         self.assertEqual(set(install.get("missing_requirements", [])), set(_TARGET_REQUIREMENTS))
 
+        synthetic_install = self._assess(
+            {
+                "contract": "ticket118-transition-assessment-v1",
+                "mode": "install",
+                "release_manifest": manifest_wire,
+                "host_report": host_report,
+                "target_observations": {
+                    requirement: {
+                        "status": "verified",
+                        "evidence_class": "synthetic",
+                    }
+                    for requirement in _TARGET_REQUIREMENTS
+                },
+            }
+        )
+        self.assertEqual(synthetic_install.get("verdict"), "cannot-confirm")
+
+        offline_upgrade = self._assess(
+            {
+                "contract": "ticket118-transition-assessment-v1",
+                "mode": "upgrade",
+                "assessment_scope": "offline-release-compatibility",
+                "release_manifest": manifest_wire,
+                "host_report": host_report,
+                "target_binding_required": [],
+                "target_observations": {},
+                "compatibility": {
+                    "artifact_graph": "compatible",
+                    "schema": "compatible",
+                    "migration": "compatible",
+                },
+            }
+        )
+        self.assertEqual(offline_upgrade.get("verdict"), "pass", offline_upgrade)
+        self.assertEqual(
+            offline_upgrade.get("assessment_scope"),
+            "offline-release-compatibility",
+        )
+        self.assertIsNone(offline_upgrade.get("activation_proof"))
+
         upgrade = self._assess(
             {
                 "contract": "ticket118-transition-assessment-v1",
@@ -545,12 +941,40 @@ class Ticket118VerificationTests(unittest.TestCase):
                 "release_manifest": manifest_wire,
                 "host_report": host_report,
                 "target_observations": {
-                    requirement: "verified" for requirement in _TARGET_REQUIREMENTS
+                    requirement: {
+                        "status": "verified",
+                        "evidence_class": "synthetic",
+                    }
+                    for requirement in _TARGET_REQUIREMENTS
                 },
                 "compatibility": {"schema": "drift"},
             }
         )
         self.assertEqual(upgrade.get("verdict"), "fail")
+
+        offline_rollback = self._assess(
+            {
+                "contract": "ticket118-transition-assessment-v1",
+                "mode": "rollback",
+                "assessment_scope": "offline-release-compatibility",
+                "release_manifest": manifest_wire,
+                "host_report": host_report,
+                "target_binding_required": [],
+                "target_observations": {},
+                "compatibility": {
+                    "semantic_manifest": "compatible",
+                    "generation": "current",
+                    "writer_fence": "current",
+                },
+            }
+        )
+        self.assertEqual(offline_rollback.get("verdict"), "pass", offline_rollback)
+        self.assertEqual(
+            offline_rollback.get("assessment_scope"),
+            "offline-release-compatibility",
+        )
+        self.assertIsNone(offline_rollback.get("activation_proof"))
+        self.assertFalse(offline_rollback.get("restore_instance_state", True))
 
         rollback = self._assess(
             {
@@ -559,7 +983,11 @@ class Ticket118VerificationTests(unittest.TestCase):
                 "release_manifest": manifest_wire,
                 "host_report": host_report,
                 "target_observations": {
-                    requirement: "verified" for requirement in _TARGET_REQUIREMENTS
+                    requirement: {
+                        "status": "verified",
+                        "evidence_class": "synthetic",
+                    }
+                    for requirement in _TARGET_REQUIREMENTS
                 },
                 "compatibility": {
                     "semantic_manifest": "compatible",
@@ -575,7 +1003,7 @@ class Ticket118VerificationTests(unittest.TestCase):
         """A7: synthetic or secret values cannot become release/Partner proof."""
 
         self._require_contract(root=False)
-        _manifest, wire = self._build()
+        manifest, wire = self._build()
         target = set(wire.get("target_binding_required", []))
         external = set(wire.get("external_approval_required", []))
         forbidden = set(wire.get("forbidden_secret_classes", []))
@@ -585,6 +1013,32 @@ class Ticket118VerificationTests(unittest.TestCase):
         self.assertFalse(target & external)
         self.assertFalse(target & forbidden)
         self.assertFalse(external & forbidden)
+
+        host_report = self._verify(manifest)
+        synthetic_partner = self._assess(
+            {
+                "contract": "ticket118-transition-assessment-v1",
+                "mode": "install",
+                "release_manifest": wire,
+                "host_report": host_report,
+                "target_observations": {
+                    requirement: {
+                        "status": "verified",
+                        "compatible": True,
+                        "evidence_class": "synthetic",
+                    }
+                    for requirement in _TARGET_REQUIREMENTS
+                },
+                "compatibility": {
+                    "artifact_graph": "compatible",
+                    "schema": "compatible",
+                    "semantic_manifest": "compatible",
+                },
+            }
+        )
+        self.assertEqual(synthetic_partner.get("verdict"), "cannot-confirm")
+        self.assertIsNone(synthetic_partner.get("activation_proof"))
+        self.assertNotEqual(synthetic_partner.get("partner_verdict"), "pass")
         for marker in ("TICKET118_SYNTHETIC_TOKEN_SHOULD_NOT_LEAK", r"C:\owner\health.db"):
             with self.subTest(marker=marker):
                 path = self.release_root / "bundles" / "knowledge.json"

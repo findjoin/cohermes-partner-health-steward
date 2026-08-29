@@ -60,20 +60,20 @@ manifest 固定区分四种事实：
 3. `external_approval_required`：权利、医学审核、许可和主人批准，只能是未证明要求；
 4. `forbidden_secret_classes`：只声明禁止保存的秘密类别，不保存值。
 
-release 至少内容绑定：固定 Hermes 来源与 required patch/native-disable assertion；Plugin/core；七 Skill bundle；health_weixin、模型和投递 Adapter Interface；三类 CorePort Interface；schema；capability-profile schema/builder/validator；MinimumHelpBundle；知识／危险规则／诊断 bundle；Ticket 117 migration protocol/schema/builder/semantic registry；Python 与依赖约束；服务身份／ACL requirement。实例 migration manifest、owner/profile/current-head 值、联系人、服务资源 ID、时间戳和开发机路径不参与 release digest。
+release 至少内容绑定：固定 Hermes 来源与 required patch/native-disable assertion；Plugin/core；七 Skill bundle；health_weixin、模型和投递 Adapter Interface；三类 CorePort Interface；schema；capability-profile schema/builder/validator；MinimumHelpBundle；知识／危险规则／诊断 bundle；Ticket 117 migration protocol/schema/builder/semantic registry 及其 synthetic fixture；Python 与依赖约束；服务身份／ACL requirement。实例 migration manifest、owner/profile/current-head 值、联系人、服务资源 ID、时间戳和开发机路径不参与 release digest。每个 `repository_verified` 项必须公开仓库相对路径、语义角色和内容 hash；验证者逐项重算，而不是相信实现自报的摘要闭包。
 
 ### `HostReleaseContract.verify`
 
 顺序固定：
 
 1. 离线验证 upstream commit、allowlisted 原始文件逐项 SHA-256、extractor 版本、required patch hash、生成物 hash 和 native-disable assertion；
-2. 在该来源生成的 pinned artifact 上运行真实 `register`、platform registry、factory、start/stop 形状；
+2. 将当前 release 中的真实 Plugin／host patch／Adapter artifact 接入该来源生成的 pinned artifact，运行真实 `register`、platform registry、factory、start/stop 形状；测试必须从宿主调用记录和 registry reachability 独立观察，不得以实现自报字段代替；
 3. 证明 `health_weixin` 是唯一 pre-native 健康入口；
 4. 证明 CorePort socket peer／service identity、ACL、frame、timeout 和完整终态；
 5. 证明模型／Weixin／联系人 Adapter 只能执行 core 已授权 intent 并完整回交；
 6. Plugin、Gateway、core、入口或 probe 任一不可信时先关闭入口，再返回 verdict。
 
-返回只允许 `pass | fail | cannot-confirm`。`fail` 表示已有证据证明不匹配；`cannot-confirm` 表示来源、超时或必要证据不能确认。后两者均不产生 activation proof。activation proof 只在本次进程、当前 manifest 和当前 host verification session 内有效，不持久化，不成为第二权威。
+返回只允许 `pass | fail | cannot-confirm`。`fail` 表示已有证据证明不匹配；`cannot-confirm` 表示来源、超时或必要证据不能确认。后两者均不产生 activation proof。activation proof 只在本次进程、当前 manifest 和当前 host verification session 内有效，不持久化，不成为第二权威。纯离线、无需真实目标绑定的兼容性判断必须存在可达 `pass` 路径；只要判断依赖 Partner、Linux 服务身份或目标资源，即使合成 observation 自称 verified 也最多为 `cannot-confirm`。
 
 ### `CorePort`
 
@@ -81,7 +81,7 @@ release 至少内容绑定：固定 Hermes 来源与 required patch/native-disab
 
 - command 承载现有入站、设置、任务、诊断和 lifecycle semantic command；caller 不能提交业务成功、current head 或终态事实。
 - managed read 只返回现有无正文、受限投影；不返回表、密钥、凭据或内部阶段。
-- execute effect 由 core 先形成并授权 model／delivery intent，Plugin 侧 Adapter 执行后必须回交完整 terminal。execution grant 只绑定受认证会话，不作为可持久或可由 Adapter 构造的权威值。外部调用后 socket 中断必须进入既有 `unknown`，不能盲目重发。
+- execute effect 由 core 先形成并授权 model／delivery intent，Plugin 侧 Adapter 执行后必须回交完整 terminal。execution grant 只绑定受认证会话，不作为可持久或可由 Adapter 构造的权威值。验证必须同时证明合法 core-issued effect 的完整回交，以及 forged intent、stale fence、缺项 terminal 和外部调用后 socket 中断的失败关闭；后者必须进入既有 `unknown`，不能盲目重发。
 
 `InProcessCoreAdapter` 与 `UnixCoreAdapter` 是同一 Seam 的两个真实 Adapter。HealthPlugin 宿主可达路径必须只依赖 CorePort，不能一部分走 socket、一部分继续直接调用 concrete HealthCore。
 
