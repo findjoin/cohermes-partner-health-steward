@@ -81,10 +81,10 @@ Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修�
 
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；tree：`b90a610efa7fc4597c90dd95193ca694d0998573`；全量测试：`720/720 PASS`。
 - 双轴审查的当前冻结内容 checkpoint：`3c843ef37f3c11731af159f4c39130910bf49dab`；tree：`07eac3c57ffeab14758ea61fcb25549ce04f6515`。
-- 当前冻结元数据 commit/tree 与最终冻结 blob 由紧随本提交的只改 Ticket 元数据提交记录。
-- 冻结设计 blob：`58d94b85b6b6bc7631cf773be55062f6f07c6bc0`。
-- 内容 checkpoint 的冻结验证合同 blob：`d87d42bbdefcd8bccb4f42039b65c731d6d1738b`。
-- 内容 checkpoint 的 verifier-owned `tests/test_ticket117_integration.py` blob：`3157978683d4aa92e70a4f98ef1127d9258bb642`。
+- 当前冻结元数据 commit：`5d8fe28952094cc6c2802655110a15442882a4b2`；tree：`34b36bc49263cf97331d79a69fafe6315076e801`。
+- 冻结设计 blob：`a6359b794c4bcf546a56c32f36054cb80383a7db`。
+- 冻结验证合同 blob：`d9382381a5c72e0f4b428d9efb1102e5e0329426`。
+- verifier-owned `tests/test_ticket117_integration.py` blob：`3157978683d4aa92e70a4f98ef1127d9258bb642`。
 - 本次重新冻结只把独立复现的三个既有 A2/A3/A6 反例补入原 V02/V03/V06：删除说明 unknown 不得进入 TaskEngine 或重发；terminal exact lookup 确认后必须继续既有清理；writer transfer 必须轮换 fence 并使旧 source capability 无法形成有效 proof。Gate 总数仍固定为 9，架构和 A1—A9 不变。
 - 对当前实施 checkpoint `4e05fdc5db377de8b6a38b00f510e264b3528cdd` 的门实跑：V02 `ERROR`、V03/V06 `FAIL`、其余六门 PASS；每项只对应上述一个已知错误。编码前产品基线仍保持 `1 failure / 8 skips / 0 errors`。
 - fresh-context Spec reviewer：PASS，无 P0/P1/P2；三项均为既有 A2/A3/A6 的直接反例，未新增需求、架构或 Gate。
