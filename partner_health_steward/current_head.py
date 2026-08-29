@@ -313,8 +313,14 @@ class AppliedLifecycleTransition:
             raise AuthorityValidationError("lifecycle applied revision mismatch")
         if self.applied.transition_id != self.request.transition_id:
             raise AuthorityValidationError("lifecycle applied transition mismatch")
-        if self.applied.writer_fence != self.request.writer_fence:
+        if self.request.kind == "terminal-delete" and (
+            self.applied.writer_fence != self.request.writer_fence
+        ):
             raise AuthorityValidationError("lifecycle applied writer fence mismatch")
+        if self.request.kind == "writer-transfer" and (
+            self.applied.writer_fence == self.request.writer_fence
+        ):
+            raise AuthorityValidationError("writer transfer did not rotate fence")
         expected_site = self.request.target_site or self.request.expected.site
         if self.applied.site != expected_site:
             raise AuthorityValidationError("lifecycle applied site mismatch")
@@ -631,12 +637,15 @@ class InMemoryCurrentHead:
                 raise HeadConflict("current writer fence capability conflict")
             if request.expected != self._head.as_authority():
                 raise HeadConflict("current-head lifecycle compare-and-set conflict")
+            next_writer_fence = self._head.writer_fence
+            if request.kind == "writer-transfer":
+                next_writer_fence = "fence:" + secrets.token_urlsafe(32)
             next_head = HeadSnapshot(
                 self._head.installation_id,
                 self._head.generation + 1,
                 request.revision_digest,
                 request.transition_id,
-                self._head.writer_fence,
+                next_writer_fence,
                 request.kind == "terminal-delete",
                 request.target_site or self._head.site,
             )

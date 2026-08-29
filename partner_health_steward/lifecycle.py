@@ -775,13 +775,8 @@ class LifecycleCoordinator:
                 return {"status": "rejected", "reason_code": "lifecycle-operation-conflict"}
             if state.get("phase") == "notice-pending":
                 layer = self._notice_layer(operation_ref)
-                if layer in {"accepted", "delivered", "read"}:
+                if layer in {"accepted", "delivered", "read", "unknown"}:
                     return self._complete_delete(state)
-                if layer == "unknown":
-                    state["phase"] = "terminal-unknown"
-                    state["reason_code"] = "lifecycle-notice-unknown"
-                    self._save(state)
-                    return self._state_result(state, status="unknown")
                 return self._state_result(state, status="notice-pending")
             return self._state_result(state)
         if not self._valid_configuration():
@@ -1312,7 +1307,19 @@ class LifecycleCoordinator:
                 state["source_active"] = False
                 state["target_active"] = True
                 state["reason_code"] = None
-            state["authority_binding"] = _authority_wire(applied)
+                state["authority_binding"] = _authority_wire(applied)
+            else:
+                state["phase"] = "terminal-confirmed-cleanup-pending"
+                state["source_active"] = False
+                state["target_active"] = False
+                state["reason_code"] = None
+                state["authority_binding"] = _authority_wire(applied)
+                try:
+                    self._save(state)
+                except Exception:
+                    continue
+                self._cleanup_delete(state, applied)
+                continue
             try:
                 self._save(state)
             except Exception:

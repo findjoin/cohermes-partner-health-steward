@@ -10105,6 +10105,7 @@ class HealthCore:
                 None
                 if (
                     decision_kind is not None
+                    or current.intent.payload_ref.startswith("lifecycle-notice:")
                     or completion.intent_id in task_state.delivery_unknown_refs
                 )
                 else TaskEngine.mark_delivery_unknown(
@@ -10576,7 +10577,11 @@ class HealthCore:
                     intent,
                     outbox,
                 )
-                if transport.status == "unknown" and decision_kind is None:
+                if (
+                    transport.status == "unknown"
+                    and decision_kind is None
+                    and not intent.payload_ref.startswith("lifecycle-notice:")
+                ):
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
@@ -10648,7 +10653,12 @@ class HealthCore:
                     outbox,
                 )
                 unresolved = intent.intent_id in task_state.delivery_unknown_refs
-                if kind == "unknown" and decision_kind is None and not unresolved:
+                if (
+                    kind == "unknown"
+                    and decision_kind is None
+                    and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not unresolved
+                ):
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
                         intent.source_ref,
@@ -10657,6 +10667,7 @@ class HealthCore:
                     )
                 elif (
                     decision_kind is None
+                    and not intent.payload_ref.startswith("lifecycle-notice:")
                     and unresolved
                     and kind in {"delivered", "read", "rejected"}
                 ):
@@ -13221,10 +13232,17 @@ class HealthCore:
         previous = self._store.finalized_authority()
         vault = self._writer_fence_vault
         binder = None if vault is None else getattr(vault, "bind", None)
+        lifecycle = getattr(self, "_lifecycle", None)
+        target_handoff = (
+            lifecycle is not None
+            and isinstance(lifecycle.config, Mapping)
+            and lifecycle.config.get("mode") == "offline-staging"
+        )
         if (
             isinstance(previous, AuthoritySnapshot)
             and callable(binder)
             and isinstance(authority, AuthoritySnapshot)
+            and target_handoff
         ):
             session = self._writer_holder_session(previous)
             try:
