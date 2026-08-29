@@ -83,9 +83,9 @@ release 至少内容绑定：固定 Hermes commit、逐文件来源 hash、extra
 - managed read 只返回现有无正文、受限投影；不返回表、密钥、凭据或内部阶段。
 - execute effect 由 core 先形成并授权 model／delivery intent，Plugin 侧 Adapter 执行后必须回交完整 terminal。execution grant 只绑定受认证会话，不作为可持久或可由 Adapter 构造的权威值。验证必须同时证明合法 core-issued effect 的完整回交，以及 forged intent、stale fence、缺项 terminal 和外部调用后 socket 中断的失败关闭；后者必须进入既有 `unknown`，不能盲目重发。
 
-`InProcessCoreAdapter` 与 `UnixCoreAdapter` 是同一 Seam 的两个真实 Adapter。HealthPlugin 宿主可达路径必须只依赖 CorePort，不能一部分走 socket、一部分继续直接调用 concrete HealthCore。宿主合同验证必须让 command、managed-read、controlled-effect 三类请求都真实穿过 byte-stream framing，并由远端 runtime 的接收记录和终态接收记录作为独立 oracle；只发一个 probe command 不足以证明 Seam。
+`InProcessCoreAdapter` 与 `UnixCoreAdapter` 是同一 Seam 的两个真实 Adapter。HealthPlugin 宿主可达路径必须只依赖 CorePort，不能一部分走 socket、一部分继续直接调用 concrete HealthCore。宿主合同验证必须让 command、managed-read、controlled-effect 三类请求都真实穿过 byte-stream framing，并由远端 runtime 的接收记录和终态接收记录作为独立 oracle；只发一个 probe command 不足以证明 Seam。`connect`／`disconnect` 必须遵守 pinned Hermes 的异步 lifecycle，返回非 awaitable 或 `verify` 返回时尚未完成均不合格。
 
-socket 复用 protocol v1 的 4-byte big-endian length + canonical JSON、64 KiB 上限和 strict exact-field 语义；新增 wire 只能是三类 tagged union。错误 peer、ACL、截断、尾随、重复字段、超长、未知 kind、超时或不完整 terminal 全部失败关闭。118 在本地合成环境验证 peer／service identity 与 ACL policy 的严格 Adapter 合同及真实 AF_UNIX framing；Linux `SO_PEERCRED`、systemd UID／mode 和目标 socket 路径的现场 enforcement 证据明确留给 119，Windows 上的合成身份 Adapter 不得冒充该现场证明。
+socket 复用 protocol v1 的 4-byte big-endian length + canonical JSON、64 KiB 上限和 strict exact-field 语义；新增 wire 只能是三类 tagged union。错误 peer、ACL、截断、尾随、重复字段、超长、未知 kind、超时或不完整 terminal 全部失败关闭。118 在本地合成环境验证 peer／service identity 与 ACL policy 的严格 Adapter 合同及真实 byte-stream framing：运行环境提供 `AF_UNIX` 时必须使用 AF_UNIX；当前 Windows Python 不提供时使用真实 TCP loopback 仅替代传输原语，并在报告中明确 `tcp-loopback`，不得冒充 AF_UNIX。Linux `SO_PEERCRED`、systemd UID／mode、目标 socket 路径和 AF_UNIX 现场 enforcement 证据明确留给 119。
 
 ### `HostReleaseContract.assess`
 

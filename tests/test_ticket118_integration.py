@@ -151,32 +151,56 @@ class _SocketRuntimeOracle:
         self.issued_claim: dict[str, object] | None = None
         self.errors: list[str] = []
         self._stop = threading.Event()
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        self._socket_directory: tempfile.TemporaryDirectory[str] | None = None
+        if hasattr(socket, "AF_UNIX"):
+            self._socket_directory = tempfile.TemporaryDirectory(
+                prefix="ticket118-core-port-"
+            )
+            socket_path = str(Path(self._socket_directory.name) / "core.sock")
+            self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._listener.bind(socket_path)
+            self._connect_address: object = socket_path
+            self.endpoint = {
+                "transport": "af-unix",
+                "path": socket_path,
+                "protocol": "ticket118-core-port-v1",
+            }
+        else:
+            self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._listener.bind(("127.0.0.1", 0))
+            host, port = self._listener.getsockname()
+            self._connect_address = (host, port)
+            self.endpoint = {
+                "transport": "tcp-loopback",
+                "host": host,
+                "port": port,
+                "protocol": "ticket118-core-port-v1",
+            }
         self._listener.listen()
         self._listener.settimeout(0.1)
-        host, port = self._listener.getsockname()
-        self.endpoint = {
-            "transport": "local-byte-stream",
-            "host": host,
-            "port": port,
-            "protocol": "ticket118-core-port-v1",
-        }
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
     def close(self) -> None:
         self._stop.set()
         try:
-            with socket.create_connection(
-                (self.endpoint["host"], self.endpoint["port"]), timeout=0.2
-            ):
-                pass
+            if self.endpoint["transport"] == "af-unix":
+                wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                wake.settimeout(0.2)
+                wake.connect(self._connect_address)  # type: ignore[arg-type]
+                wake.close()
+            else:
+                with socket.create_connection(
+                    self._connect_address, timeout=0.2  # type: ignore[arg-type]
+                ):
+                    pass
         except OSError:
             pass
         self._thread.join(timeout=2)
         self._listener.close()
+        if self._socket_directory is not None:
+            self._socket_directory.cleanup()
 
     @staticmethod
     def _read_frame(connection: socket.socket) -> bytes:
@@ -360,15 +384,17 @@ class _PinnedHermesObserver:
                     **call_kwargs: object,
                 ) -> object:
                     result = __method(*call_args, **call_kwargs)  # type: ignore[operator]
-                    if inspect.isawaitable(result):
-                        async def await_completion() -> object:
-                            value = await result  # type: ignore[misc]
-                            self.lifecycle_completed.append(__name)
-                            return value
+                    if not inspect.isawaitable(result):
+                        raise AssertionError(
+                            f"health_weixin {__name} must return an awaitable"
+                        )
 
-                        return await_completion()
-                    self.lifecycle_completed.append(__name)
-                    return result
+                    async def await_completion() -> object:
+                        value = await result  # type: ignore[misc]
+                        self.lifecycle_completed.append(__name)
+                        return value
+
+                    return await_completion()
 
                 setattr(adapter, method_name, observed_lifecycle)
             return adapter
@@ -422,7 +448,7 @@ def _assert_public_wire_clean(
     *,
     forbidden_values: tuple[str, ...],
 ) -> None:
-    encoded = json.dumps(dict(wire), ensure_ascii=False, sort_keys=True)
+    encoded = repr(dict(wire))
     for forbidden in forbidden_values:
         case.assertNotIn(forbidden, encoded)
 
@@ -431,7 +457,7 @@ def _assert_public_wire_clean(
             for key, item in value.items():
                 walk(key)
                 walk(item)
-        elif type(value) is list:
+        elif isinstance(value, (list, tuple, set, frozenset)):
             for item in value:
                 walk(item)
         elif type(value) is str:
@@ -706,17 +732,43 @@ def _fresh_host_worker(input_path: str, output_path: str) -> None:
     original_pinned_root = Path(source["root"])
     staged_pinned_root = _stage_pinned_checkout(original_pinned_root, release_root)
     _apply_release_patch(release_root, manifest_wire, staged_pinned_root)
+    if request.get("actual_source_drift"):
+        drifted_source = staged_pinned_root / "hermes_cli/plugins.py"
+        drifted_source.write_bytes(
+            drifted_source.read_bytes() + b"\n# ticket118-actual-source-drift\n"
+        )
     hermes_home, host_artifact_hash = _hermes_home_from_manifest(
         release_root, manifest_wire
     )
+    assertion_entry = _manifest_entry(
+        manifest_wire, role="disabled-native-entry"
+    )
+    assertion_relative = assertion_entry.get("path")
+    assertion_declared_hash = assertion_entry.get("sha256")
+    if type(assertion_relative) is not str or type(assertion_declared_hash) is not str:
+        raise AssertionError("native-disabled assertion manifest entry is incomplete")
+    assertion_path = release_root / assertion_relative
+    original_assertion = assertion_path.read_bytes()
+    if request.get("mutate_assertion_after_build"):
+        assertion_path.write_bytes(original_assertion + b"\nTAMPERED-AFTER-BUILD\n")
+    actual_assertion = assertion_path.read_bytes()
+    source["native_disabled_assertion"] = {
+        "path": assertion_relative,
+        "declared_sha256": assertion_declared_hash,
+        "actual_sha256": "sha256:" + hashlib.sha256(actual_assertion).hexdigest(),
+        "bytes": actual_assertion,
+    }
     source["staged_root"] = str(staged_pinned_root)
     source["hermes_home"] = str(hermes_home)
-    with _observe_pinned_hermes(
-        staged_pinned_root,
-        Path(source["hermes_home"]),
-        preload_old=bool(request.get("preload_old")),
-    ) as observer:
-        report = contract.verify(manifest, source)
+    try:
+        with _observe_pinned_hermes(
+            staged_pinned_root,
+            Path(source["hermes_home"]),
+            preload_old=bool(request.get("preload_old")),
+        ) as observer:
+            report = contract.verify(manifest, source)
+    finally:
+        assertion_path.write_bytes(original_assertion)
     probe = source.get("host_entry_probe", {})
     before_count = (
         len(probe.get("before_failure", [])) if type(probe) is dict else 0
@@ -741,6 +793,9 @@ def _fresh_host_worker(input_path: str, output_path: str) -> None:
                 "sha256:" + _sha256(path) for path in observer.loaded_plugin_sources
             ],
             "manifest_host_artifact_hash": host_artifact_hash,
+            "assertion_declared_hash": assertion_declared_hash,
+            "assertion_actual_hash": "sha256:"
+            + hashlib.sha256(actual_assertion).hexdigest(),
             "pinned_module_sources": {
                 name: str(path) for name, path in observer.pinned_module_sources.items()
             },
@@ -969,6 +1024,8 @@ class Ticket118VerificationTests(unittest.TestCase):
         preload_old: bool = False,
         credential_peer: str = "plugin",
         effect_result: Mapping[str, object] | None = None,
+        actual_source_drift: bool = False,
+        mutate_assertion_after_build: bool = False,
     ) -> dict[str, object]:
         if self.pinned_root is None:
             raise AssertionError(
@@ -1013,6 +1070,8 @@ class Ticket118VerificationTests(unittest.TestCase):
                     "effect_result": (
                         None if effect_result is None else dict(effect_result)
                     ),
+                    "actual_source_drift": actual_source_drift,
+                    "mutate_assertion_after_build": mutate_assertion_after_build,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1168,6 +1227,18 @@ class Ticket118VerificationTests(unittest.TestCase):
             )
             core_port_drift["environment_constraints"]["core_port"][index] += "-drift"  # type: ignore[index]
             declaration_variants.append((f"core-port:{kind}", core_port_drift))
+        for field in (
+            "target_binding_required",
+            "external_approval_required",
+            "forbidden_secret_classes",
+        ):
+            classification_drift = copy.deepcopy(self._release_sources())
+            classification_drift[field].append(  # type: ignore[union-attr]
+                f"ticket118-{field}-drift"
+            )
+            declaration_variants.append(
+                (f"release-classification:{field}", classification_drift)
+            )
         for label, variant in declaration_variants:
             with self.subTest(release_declaration=label):
                 _variant_manifest, variant_wire = self._build(variant)
@@ -1228,6 +1299,9 @@ class Ticket118VerificationTests(unittest.TestCase):
         self.assertEqual(observer["loaded_plugin_sources"], [expected_plugin])
         self.assertEqual(observer["loaded_plugin_errors"], [None])
         self.assertEqual(
+            observer["assertion_actual_hash"], observer["assertion_declared_hash"]
+        )
+        self.assertEqual(
             observer["loaded_plugin_hashes"],
             [observer["manifest_host_artifact_hash"]],
         )
@@ -1274,11 +1348,31 @@ class Ticket118VerificationTests(unittest.TestCase):
         self.assertEqual(rejected_observer["factory_calls"], [])
         self.assertEqual(rejected_observer["lifecycle_completed"], [])
 
+        actual_drift = self._verify_fresh_host(
+            _SocketRuntimeOracle(), actual_source_drift=True
+        )
+        drift_report = actual_drift["report"]
+        drift_observer = actual_drift["observation"]
+        self.assertEqual(drift_report.get("verdict"), "fail")
+        self.assertIsNone(drift_report.get("activation_proof"))
+        self.assertEqual(drift_observer["discovery_count"], 0)
+        self.assertEqual(drift_observer["register_names"], [])
+        self.assertEqual(drift_observer["factory_calls"], [])
+        self.assertEqual(drift_observer["lifecycle_completed"], [])
+
     def test_v118_03_core_port_is_three_strict_fail_closed_interfaces(self) -> None:
         """A3: a socket shell cannot hide direct or incomplete core effects."""
 
         self._require_contract(root=False)
         runtime = _SocketRuntimeOracle()
+        expected_transport = (
+            "af-unix" if hasattr(socket, "AF_UNIX") else "tcp-loopback"
+        )
+        self.assertEqual(runtime.endpoint["transport"], expected_transport)
+        if expected_transport == "tcp-loopback":
+            self.assertNotIn("path", runtime.endpoint)
+        else:
+            self.assertNotIn("host", runtime.endpoint)
         result = self._verify_fresh_host(runtime)
         report = result["report"]
         self.assertEqual(report.get("verdict"), "pass", report)
@@ -1459,6 +1553,24 @@ class Ticket118VerificationTests(unittest.TestCase):
         self.assertIsNone(failed.get("activation_proof"))
         self.assertGreaterEqual(len(failing_runtime.frames), 1)
 
+        assertion_drift = self._verify_fresh_host(
+            _SocketRuntimeOracle(),
+            preload_old=True,
+            mutate_assertion_after_build=True,
+        )
+        assertion_report = assertion_drift["report"]
+        assertion_observer = assertion_drift["observation"]
+        self.assertEqual(assertion_report.get("verdict"), "fail")
+        self.assertIsNone(assertion_report.get("activation_proof"))
+        self.assertEqual(assertion_observer["discovery_count"], 0)
+        self.assertEqual(assertion_observer["register_names"], [])
+        self.assertEqual(assertion_observer["factory_calls"], [])
+        self.assertEqual(assertion_observer["lifecycle_completed"], [])
+        self.assertNotEqual(
+            assertion_observer["assertion_actual_hash"],
+            assertion_observer["assertion_declared_hash"],
+        )
+
     def test_v118_06_readiness_preserves_unknown_and_rejects_unsafe_rollback(self) -> None:
         """A6: missing target facts cannot be skipped or replaced by old files."""
 
@@ -1620,6 +1732,22 @@ class Ticket118VerificationTests(unittest.TestCase):
                     public_wire,
                     forbidden_values=forbidden_wire_values,
                 )
+        for container in (tuple, set, frozenset):
+            for marker in (
+                injected_environment_secret,
+                r"C:\owner\health.db",
+                "/home/owner/health.db",
+                r"\\server\owner\health.db",
+            ):
+                with self.subTest(
+                    nested_wire_container=container.__name__, marker=marker
+                ):
+                    with self.assertRaises(AssertionError):
+                        _assert_public_wire_clean(
+                            self,
+                            {"nested": container((marker,))},
+                            forbidden_values=(injected_environment_secret,),
+                        )
         for marker in (
             "TICKET118_SYNTHETIC_TOKEN_SHOULD_NOT_LEAK",
             "synthetic health正文 blood pressure 180/120",
