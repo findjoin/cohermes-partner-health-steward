@@ -987,6 +987,76 @@ class Ticket117VerificationTests(unittest.TestCase):
         )["configured"]
         self.assertEqual(set(configured), registry_purge_bindings)
 
+        # The one pre-freeze owner notice is a lifecycle effect, not a task
+        # delivery.  A possibly-sent result ends the notice attempt and must
+        # not strand permanent deletion behind a nonexistent task.
+        notice_unknown = type(self)(self._testMethodName)
+        notice_unknown.setUp()
+        self._extra_harnesses.append(notice_unknown)
+        notice_unknown._require_lifecycle(root=False)
+        notice_unknown._restart_lifecycle(root=False)
+        notice_operation = "delete-notice-unknown-still-continues"
+        notice_payload = notice_unknown._delete_payload(notice_operation)
+        notice_context = notice_unknown._context(
+            kind="delete-all",
+            causal_id=f"ticket117-delete-causal:{notice_operation}",
+        )
+        notice_started = notice_unknown._execute(
+            notice_payload,
+            context=notice_context,
+        )
+        self.assertEqual(notice_started.get("status"), "notice-pending")
+        notice_view = notice_unknown.plugin.managed_ticket115_read(peer_id=_PEER)
+        notice_records = [
+            item
+            for item in notice_view["owner_deliveries"]
+            if item["intent"].get("payload_ref")
+            == f"lifecycle-notice:{notice_operation}"
+        ]
+        self.assertEqual(len(notice_records), 1, notice_view)
+        notice_intent_id = notice_records[0]["intent"]["intent_id"]
+        notice_attempted = "2026-08-29T00:00:00+00:00"
+        notice_unknown.plugin.controlled_effect(
+            "owner-delivery.prepare",
+            {
+                "intent_id": notice_intent_id,
+                "attempted_at_utc": notice_attempted,
+            },
+            peer_id=_PEER,
+        )
+        notice_issued = notice_unknown.plugin.controlled_effect(
+            "owner-delivery.issue",
+            {"intent_id": notice_intent_id},
+            peer_id=_PEER,
+        )
+        notice_response = Response.from_wire(notice_issued["response"])
+        self.assertEqual(notice_response.status, "accepted", notice_response)
+        assert notice_response.meta is not None
+        notice_grant = notice_unknown.plugin.claim_effect_execution(
+            notice_response.meta.intent
+        )
+        self.assertIsNotNone(notice_grant)
+        notice_adapter = _RaisingDeliveryAdapter()
+        notice_result = notice_unknown.plugin.controlled_effect(
+            "owner-delivery.execute",
+            {
+                "intent_id": notice_intent_id,
+                "attempted_at_utc": notice_attempted,
+                "observed_at_utc": "2026-08-29T00:00:01+00:00",
+            },
+            grant=notice_grant,
+            transport=notice_adapter,
+            peer_id=_PEER,
+        )
+        self.assertEqual(notice_adapter.calls, 1)
+        self.assertEqual(notice_result["transport_result"]["status"], "unknown")
+        notice_completed = notice_unknown._execute(
+            notice_payload,
+            context=notice_context,
+        )
+        self.assertEqual(notice_completed.get("phase"), "completed")
+        self.assertEqual(notice_unknown.head.mutable_calls, 1)
+
         def assert_no_cleanup_before_terminal() -> None:
             self.assertEqual(self.keys.calls, 0)
             self.assertEqual(self.replicas.calls, 0)
