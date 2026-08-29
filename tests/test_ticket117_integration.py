@@ -1172,6 +1172,23 @@ class Ticket117VerificationTests(unittest.TestCase):
         self.assertEqual(self.keys.calls, 0)
         self.assertEqual(self.replicas.calls, 0)
 
+        # Once the original transition becomes readable, recovery must use
+        # that exact receipt to continue the already-confirmed terminal
+        # deletion.  It must not issue a second mutable transition or leave
+        # cleanup permanently stranded after a transient lookup outage.
+        lookup_calls_before_confirmation = self.head.lookup_calls
+        self.head.failure = "none"
+        self._restart_lifecycle(root=False)
+        confirmed = self._read("delete-terminal-response-loss")
+        self.assertEqual(confirmed.get("phase"), "completed", confirmed)
+        self.assertEqual(self.head.mutable_calls, 1)
+        self.assertGreater(
+            self.head.lookup_calls,
+            lookup_calls_before_confirmation,
+        )
+        self.assertEqual(self.keys.calls, 1)
+        self.assertEqual(self.replicas.calls, 1)
+
     def test_v117_04_terminal_snapshot_and_old_key_cannot_resurrect_state(self) -> None:
         """A4: an old readable snapshot is never current after terminal delete."""
 
