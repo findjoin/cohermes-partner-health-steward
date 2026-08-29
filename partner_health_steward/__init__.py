@@ -5,6 +5,7 @@ It exposes only the synthetic Plugin -> health-core seam needed by Ticket 110.
 """
 
 from .core import HealthCore
+from .host_contract import HostReleaseContract
 from .plugin import HealthPlugin
 
-__all__ = ["HealthCore", "HealthPlugin"]
+__all__ = ["HealthCore", "HealthPlugin", "HostReleaseContract"]
