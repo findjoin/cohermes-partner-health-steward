@@ -390,10 +390,20 @@ class HermesReleasePublisher:
             _write_bytes(staging, "release-manifest.json", _canonical_bytes(wire))
             destination = output / release_digest.removeprefix("sha256:")
             if destination.exists():
-                _validate_release(str(destination))
-                shutil.rmtree(staging)
-            else:
-                os.replace(staging, destination)
+                details = destination.lstat()
+                if destination.is_symlink() or not stat.S_ISDIR(details.st_mode):
+                    raise ValueError("content-addressed release destination is unsafe")
+                try:
+                    _validate_release(str(destination))
+                except ValueError:
+                    # The fixed digest names content, not a mutable cache
+                    # slot.  A damaged prior output is rejected and replaced
+                    # solely by the newly verified staging tree.
+                    shutil.rmtree(destination)
+                else:
+                    shutil.rmtree(staging)
+                    return PublishedRelease(wire)
+            os.replace(staging, destination)
             return PublishedRelease(wire)
         except Exception:
             if staging.exists():
