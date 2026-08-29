@@ -10116,7 +10116,10 @@ class HealthCore:
                 )
             )
             delivery_state = transition.state
-            if completion.status == "unknown":
+            if (
+                completion.status == "unknown"
+                and not current.intent.payload_ref.startswith("lifecycle-notice:")
+            ):
                 delivery_state = self._owner_decision_delivery_request_state_open(
                     delivery_state,
                     current.intent,
@@ -10589,7 +10592,10 @@ class HealthCore:
                         observed_at_utc=completion.observed_at_utc,
                     )
                 delivery_state = delivery_transition.state
-                if transport.status == "unknown":
+                if (
+                    transport.status == "unknown"
+                    and not intent.payload_ref.startswith("lifecycle-notice:")
+                ):
                     delivery_state = self._owner_decision_delivery_request_state_open(
                         delivery_state,
                         intent,
@@ -10682,7 +10688,10 @@ class HealthCore:
                         resolved_at_utc=observed_at_utc,
                     )
                 delivery_state = transition.state
-                if kind == "unknown":
+                if (
+                    kind == "unknown"
+                    and not intent.payload_ref.startswith("lifecycle-notice:")
+                ):
                     delivery_state = self._owner_decision_delivery_request_state_open(
                         delivery_state,
                         intent,
