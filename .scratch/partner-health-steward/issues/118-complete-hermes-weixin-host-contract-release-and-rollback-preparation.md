@@ -86,3 +86,16 @@ release 只绑定 Ticket 117 migration 协议、schema、builder、semantic-regi
 
 实施 Agent 记录 Gate 到实现位置、验证结果和 checkpoint identity；形成 `reviewed_commit` 前记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结或证据文件。两轴均通过后只追加 `## Answer`、状态和 Map pointer，Answer 记录两轴可定位 verdict 及共同 base/commit/tree。确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`；推送被拒绝时停止，禁止 force push 或改写历史。
 
+## Pre-code freeze evidence
+
+Ticket 118 已完成编码前架构与验证冻结；本节不是实施证据，不构成 `resolved`，Map 未更新。
+
+- characterization 基线：commit `169cf6cdba421cc628de435cea8cb284e2d8ec94`，tree `64334c675cf32eb950c5b19779d4a1965c863304`；全量 `729/729 PASS`。
+- 经审冻结 checkpoint：commit `5f5cc383416401b82419db90fac2ba36b9f76bda`，tree `9dc75c783ae9e910ce4adc6fbaa4de25a651d481`。
+- 冻结实施设计 blob：`995d99a0e6e9da6d02463ef4779758629697cf3f`；冻结验证合同 blob：`b4f579d600965861d54ba60b5ba10b159f45ea22`；verifier-owned test blob：`55a2c94373548f240934d6c201a4b5a5338748ee`。
+- `tests/test_ticket118_integration.py` SHA-256：`c31095d92fcd2f4c9e159babd261a6f50f6aa87fcedd7c767e61102fbef95189`。
+- 编码前 Gate：`1 failure / 6 skips / 0 errors`；唯一红灯为公共 `HostReleaseContract` 尚未实现。Ticket 117 回归：`9/9 PASS`；`compileall` 与差异检查通过。
+- fresh-context Spec reviewer：PASS；fresh-context Standards reviewer：PASS；最后一个 public-wire `Mapping` 假绿 mutation 已由两轴独立复核关闭，无 P0/P1/P2。
+
+编码 Agent 只能在上述 checkpoint 上实现一个深 `HostReleaseContract`、当前 `partner_health_steward.hermes_host` 宿主边界、三类 CorePort 及必要薄入口，使同一 7 门从 `1 failure / 6 skips` 变为 `7/7 PASS`。不得修改冻结设计、冻结验证合同或 verifier-owned test，不得引用历史 `ops/` 作为当前 release，不得提前获取 Ticket 119 的真实 Partner／Linux／部署证据。若冻结门错误、必须新增架构或需要真实外部决定，立即停止并返回冻结阶段。
+

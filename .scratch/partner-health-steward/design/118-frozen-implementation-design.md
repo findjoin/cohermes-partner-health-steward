@@ -1,6 +1,6 @@
 # Ticket 118 增量架构冻结设计
 
-> 状态：candidate，等待 verifier-owned 门与 fresh-context 双轴预审。characterization 基线为 `169cf6cdba421cc628de435cea8cb284e2d8ec94`，tree `64334c675cf32eb950c5b19779d4a1965c863304`。本设计只冻结 Ticket 118 难以逆转的增量决定；内部字段、helper、文件布局和测试组织保持可逆。
+> 状态：frozen。经审内容 checkpoint 为 `5f5cc383416401b82419db90fac2ba36b9f76bda`，tree `9dc75c783ae9e910ce4adc6fbaa4de25a651d481`，本文件 blob `995d99a0e6e9da6d02463ef4779758629697cf3f`；fresh-context Spec 与 Standards 均 PASS。characterization 基线为 `169cf6cdba421cc628de435cea8cb284e2d8ec94`，tree `64334c675cf32eb950c5b19779d4a1965c863304`。本设计只冻结 Ticket 118 难以逆转的增量决定；内部字段、helper、文件布局和测试组织保持可逆。
 
 ## 目标与非目标
 

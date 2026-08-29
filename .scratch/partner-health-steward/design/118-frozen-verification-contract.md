@@ -1,6 +1,6 @@
 # Ticket 118 冻结验证合同
 
-> 状态：candidate，等待当前 verifier-owned 门运行、测试文件 hash 和 fresh-context 双轴预审后冻结。characterization 产品基线为 `169cf6cdba421cc628de435cea8cb284e2d8ec94`，tree 为 `64334c675cf32eb950c5b19779d4a1965c863304`；旧全量基线为 `729/729 PASS`。本合同与 [`118-frozen-implementation-design.md`](118-frozen-implementation-design.md) 共同约束编码 Agent，二者任一变化都必须返回冻结阶段。
+> 状态：frozen。经审内容 checkpoint 为 `5f5cc383416401b82419db90fac2ba36b9f76bda`，tree `9dc75c783ae9e910ce4adc6fbaa4de25a651d481`；本合同 blob `b4f579d600965861d54ba60b5ba10b159f45ea22`，verifier-owned test blob `55a2c94373548f240934d6c201a4b5a5338748ee`，测试 SHA-256 `c31095d92fcd2f4c9e159babd261a6f50f6aa87fcedd7c767e61102fbef95189`；fresh-context Spec 与 Standards 均 PASS。characterization 产品基线为 `169cf6cdba421cc628de435cea8cb284e2d8ec94`，tree 为 `64334c675cf32eb950c5b19779d4a1965c863304`；旧全量基线为 `729/729 PASS`。本合同与 [`118-frozen-implementation-design.md`](118-frozen-implementation-design.md) 共同约束编码 Agent，二者任一变化都必须返回冻结阶段。
 
 ## 测试权威、公开 Seam 与依赖展开
 
