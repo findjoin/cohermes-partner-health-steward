@@ -1050,11 +1050,37 @@ class Ticket117VerificationTests(unittest.TestCase):
         )
         self.assertEqual(notice_adapter.calls, 1)
         self.assertEqual(notice_result["transport_result"]["status"], "unknown")
+        notice_unknown_view = notice_unknown.plugin.managed_ticket115_read(
+            peer_id=_PEER
+        )
+        notice_unknown_records = [
+            item
+            for item in notice_unknown_view["owner_deliveries"]
+            if item["intent"].get("payload_ref")
+            == f"lifecycle-notice:{notice_operation}"
+        ]
+        self.assertEqual(len(notice_unknown_records), 1, notice_unknown_view)
+        self.assertEqual(
+            notice_unknown_records[0]["intent"]["intent_id"],
+            notice_intent_id,
+        )
+        self.assertEqual(
+            len(
+                [
+                    fact
+                    for fact in notice_unknown_records[0]["facts"]
+                    if fact["kind"] == "unknown"
+                ]
+            ),
+            1,
+            notice_unknown_records[0],
+        )
         notice_completed = notice_unknown._execute(
             notice_payload,
             context=notice_context,
         )
         self.assertEqual(notice_completed.get("phase"), "completed")
+        self.assertEqual(notice_adapter.calls, 1)
         self.assertEqual(notice_unknown.head.mutable_calls, 1)
 
         def assert_no_cleanup_before_terminal() -> None:
