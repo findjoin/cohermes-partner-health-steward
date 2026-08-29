@@ -1556,6 +1556,25 @@ class Ticket117VerificationTests(unittest.TestCase):
         completed = self._prepare_migration("migration-one-cas")
         self.assertIn(completed.get("status"), {"completed", "replayed"}, completed)
         self.assertEqual(self.head.mutable_calls, 1)
+        new_authority = self.head.read().head.as_authority()
+        self.assertNotEqual(
+            new_authority.writer_fence,
+            old_authority.writer_fence,
+        )
+        stale_source_session = self.v116.base.writer_vault.acquire_or_resume(
+            new_authority.installation_id,
+            new_authority.site,
+            WriterHolderClaim("writer-holder:ticket117-stale-source-vault"),
+        )
+        stale_source_proof = (
+            None
+            if stale_source_session is None
+            else stale_source_session.proof_for(new_authority)
+        )
+        self.assertFalse(
+            stale_source_proof is not None
+            and self.head.validate_writer_fence(stale_source_proof)
+        )
         source_final = self._read("migration-one-cas")
         target_final = self._read("migration-one-cas", plugin=target)
         self.assertFalse(source_final.get("source_active"), source_final)
