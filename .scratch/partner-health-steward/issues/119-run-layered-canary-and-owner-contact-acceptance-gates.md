@@ -1,7 +1,7 @@
 # 119 - 执行分层 canary 与主人联系人验收门槛
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [118 - 完成 Hermes/Weixin 宿主合同发布与回滚准备](118-complete-hermes-weixin-host-contract-release-and-rollback-preparation.md)
 
@@ -102,4 +102,18 @@ G01—G06、G09 的测试通过不替代 G07、G08、G10—G12。G08 永远不�
 每次 no-go、unknown 或未授权尝试只冻结一份 run record 并停止后继 gate。任何真实模型、微信、联系人、主人、current-head、删除、迁移、部署、许可或医学审核动作必须预先逐项获批；缺批准记录 `not-authorized`。不得把报告、自动测试、安装、接口接受或单次通过写成 active、产品验收或稳定运行。
 
 只有 G01—G12 全部对同一 release digest `passed`、冻结验收全绿且两轴对同一 checkpoint `pass` 后，才可写 `product acceptance: passed`。形成 `reviewed_commit` 前记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结、ledger 或证据文件。随后仅追加 `## Answer`、状态和 Map pointer，记录两轴可定位 verdict、共同 base/commit/tree、release/run/digest 及长期稳定仍需的证据；确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`。推送被拒绝时停止，禁止 force push 或改写历史。
+
+## Pre-code freeze evidence
+
+Ticket 119 已完成当前产品 characterization，并形成候选冻结实施设计和独立 verifier-owned 自动门；本节不是实施或真实 gate 证据，不构成 `resolved`，Map 未更新，也没有执行任何真实部署、模型、Weixin、联系人、删除、迁移或主人验收。
+
+- 产品基线：commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`；Ticket 118 `7/7 PASS`，Ticket 117 `9/9 PASS`，项目全量 `736/736 PASS`。
+- 当前可复现差额：包未公开 `AcceptanceRunContract`，不存在 Ticket 119 自动门或工具入口；`hasattr(partner_health_steward, "AcceptanceRunContract") == False`。
+- 候选冻结实施设计：`design/119-frozen-implementation-design.md`，SHA-256 `dcd21713ae85285f922f8fa11bd01575ddcc7ffd2d8f58c34cfb0e1683a3268c`。
+- 候选冻结验证合同：`design/119-frozen-verification-contract.md`，SHA-256 `abee8304eff4fd7bc94549e82c4550064ec5f709c0afca28122f3a41c3bae6e8`。
+- verifier-owned test：`tests/test_ticket119_integration.py`，SHA-256 `b4c45d8265819e21fed3d614243ae89d4a76783d498836b530d28524b64f14ec`。
+- 编码前 Gate：`1 failure / 6 skips / 0 errors`；唯一红灯是公共 Module 缺失，后六门只因同一前置缺失 skip。`compileall` 与差异检查通过。
+- 当前真实 frontier 未执行。G03 的目标 Linux peer/ACL、G07 的权利与医学审核、G08/G10—G12 的 disposable/Partner/真实接口/主人联系人动作仍需各自事实或明确批准；候选自动门不能替代这些证据。
+
+编码 Agent 只能在预审通过的冻结 checkpoint 上实现一个深 `AcceptanceRunContract`、严格 `GateExecutor` Seam、不可变 report/value objects 和薄工具入口，使同一七门从 `1 failure / 6 skips` 变为 `7/7 PASS`。不得修改冻结三件套，不得改 HealthCore、HostReleaseContract、current-head、诊断激活或投递权威，不得执行未获批真实 gate。若冻结门错误或需要产品架构变化，立即返回冻结阶段。
 
