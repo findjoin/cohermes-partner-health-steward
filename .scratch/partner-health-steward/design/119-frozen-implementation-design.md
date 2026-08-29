@@ -21,23 +21,23 @@ AcceptanceRunContract.run(
 ```
 
 - `current_release_manifest` 必须是当前 `HostReleaseContract.build()` 返回的 `ReleaseManifest`，不能用普通 Mapping、旧摘要或自报字符串替代。
-- `run_context` 只含显式 `run_id`、固定执行时间、环境分类、目标的 opaque ref、逐 gate 的 opaque approval refs，以及可选的同 run 既有不可变 report。caller 不能提交 gate 顺序、pass 条件、产品 verdict 或稳定声明。
-- `GateExecutor` 是唯一外部 Seam。其 Adapter 以稳定 `(release_digest, run_id, gate_id)` execution key 执行或回查一个 gate，只接收该 gate 所需的 opaque approval ref，只返回严格 GateObservation。合成 Adapter 与目标本地 Adapter 证明该 Seam 真实存在。
+- `run_context` 只含显式 `run_id`、固定执行时间、环境分类、目标的 opaque ref、逐 gate 的 opaque approval refs，以及可选的同 run 既有不可变 report wire。caller 不能提交 gate 顺序、pass 条件、产品 verdict 或稳定声明。
+- `GateExecutor` 是唯一外部 Seam。其 Adapter 以稳定 `(release_digest, run_id, gate_id)` execution key 执行或回查一个 gate；每个 request 必须精确携带当前 target ref 和本 gate approval ref（不需要批准的 gate 为 `None`），只返回严格 GateObservation。合成 Adapter 与目标本地 Adapter 证明该 Seam 真实存在。
 - `AcceptanceRunReport.to_wire()` 返回无正文、可 hash 的不可变报告；调用者修改返回 Mapping 不得改变原报告。
 
 固定顺序由 Module 内部独占：`119-G01` 至 `119-G12`。每次遇到第一个非 `passed` 结果，Module 立即停止调用 executor，并把所有后继记录为 `blocked`，精确指向 `blocked_by_gate`。caller、executor 和报告输入均不能改序、跳层或补写后继。
 
 ## 重放、崩溃和未知
 
-同一 run／release 带有 hash 有效的既有 report 时，`run()` 原样返回该不可变 report，executor 零调用；已经停止的 run 不恢复执行，新证据必须建立新 run。
+同一 run／release 带有内容 hash 有效的既有 report wire 时，`run()` 原样返回等价不可变 report，executor 零调用；跨 run、跨 release、report digest 错误或任一嵌套内容被改写都失败关闭且零调用。`report_digest` 是对移除自身字段后的 canonical JSON 完整 wire 计算的 SHA-256，不是格式占位符。已经停止的 run 不恢复执行，新证据必须建立新 run。
 
 若先前 gate 可能已经触发但报告尚未形成，executor 只能用原 execution key 回查或完成自身幂等终态，不能换 key 重新产生副作用。executor 不能证明原终态时必须返回 `cannot-confirm`；Module 冻结该 run 并阻断后继。真实模型、Weixin、联系人、删除、迁移和主人动作的幂等／unknown 仍由各自既有 Adapter 或目标执行边界承担，119 不复制它们的业务 ledger。
 
 ## GateObservation、授权与报告
 
-GateObservation 只允许：当前 release/run/gate identity、`passed | failed | cannot-confirm`、环境分类、执行时间、executor/step/fixture digest、opaque evidence refs、rollback ref/status、影响和下一步。它不能携带原始正文、身份、凭据、配置值、运行数据库内容、模型 transcript、可逆摘要、绝对路径或任意嵌套 payload。
+GateObservation 只允许：当前 release/run/gate/execution-key/target/approval identity、`passed | failed | cannot-confirm | not-authorized`、环境分类、执行时间、executor/step/fixture digest、opaque evidence/no-go/rollback/impact/next refs，以及 G11/G12 的严格无正文 effect-stage refs。effect-stage refs 分别表达业务形成、提交、尝试、接口接受、送达、已读或行动、纠正和 unknown；非适用项为 `None`，不得用同一 ref 折叠不同事实。它不能携带原始正文、身份、凭据、配置值、运行数据库内容、模型 transcript、可逆摘要、绝对路径或任意其他嵌套 payload。
 
-G08、G10、G11、G12 在调用 executor 前必须各自提供 opaque approval ref；缺失或借用另一 gate 的 ref 时 Module 自行记录 `not-authorized`，executor 零调用。ref 是否真实签发、绑定当前 release/run/gate/target、当前有效且未撤回，由获准 target-local executor 在任何外部动作前验证；验证失败必须返回 `not-authorized` 且零外部动作。Module 不凭一个字符串伪造审批权威，也不建立第二审批 ledger。G07 只核验已存在的权利、冻结 bundle 和审核 attestation，不授权 collector 去实施医学审核。
+G08、G10、G11、G12 在调用 executor 前必须各自提供 opaque approval ref；缺失时 Module 自行记录 `not-authorized`，executor 零调用。ref 是否真实签发、绑定当前 release/run/gate/target、当前有效且未撤回，由获准 target-local executor 在任何外部动作前验证；借用、过期、撤回或绑定错误时 executor 返回 `not-authorized`，其外部动作计数必须为零。Module 在 report 中保存本 gate 的 opaque ref 和验证结果，但不凭字符串伪造审批权威，也不建立第二审批 ledger。G07 只核验已存在的权利、冻结 bundle 和审核 attestation，不授权 collector 去实施医学审核。
 
 G08 只允许预先解析的 disposable namespace；任一 current-head、旧 fence、terminal delete、purge provider、迁移、transfer unknown 或 rollback no-go 都使整个 G08 非 passed。G09 只能由 deny-network synthetic Adapter 执行。G10—G12 的 executor 必须在目标边界内最小处理，collector 只取得无值 attestation。
 
@@ -45,8 +45,8 @@ G08 只允许预先解析的 disposable namespace；任一 current-head、旧 fe
 
 - Ticket 118 的 `HostReleaseContract` 独占 release、宿主和 readiness；119 只消费当前 `ReleaseManifest` 和可定位前置证据。
 - HealthCore/current-head 继续独占健康业务、诊断、staged→active 和 writer authority；119 不写 active。
-- Ticket 116 已有只读 `AcceptanceEvidenceProvider` Seam。G12 executor 在目标私有边界形成 canonical run／owner-acceptance receipts，119 报告只保存 `run_receipt_ref`、`owner_acceptance_receipt_ref`、`contact_acceptance_receipt_ref` 和 `active_path_receipt_ref`；collector 不解引用、不保存 owner/contact identity。Core 仍按既有 Interface 独立验证并原子激活。
-- Ticket 115 继续独占形成、提交、尝试、accepted、送达、已读／行动和 unknown 的业务事实。119 只验证 gate observation 中这些层级没有被折叠。
+- Ticket 116 已有只读 `AcceptanceEvidenceProvider` Seam。G12 executor 在目标私有边界形成 canonical run／owner-acceptance receipts，119 报告只保存 `run_receipt_ref`、`owner_acceptance_receipt_ref`、`contact_acceptance_receipt_ref`、`contact_correction_receipt_ref` 和 `active_path_receipt_ref`；collector 不解引用、不保存 owner/contact identity。Core 仍按既有 Interface 独立验证并原子激活。
+- Ticket 115 继续独占形成、提交、尝试、accepted、送达、已读／行动、纠正和 unknown 的业务事实。119 只保存这些事实的 opaque stage refs并验证没有被折叠，不重建业务 ledger。
 - 验收报告是一份 release/run-bound 审计产物，不是业务状态、activation ledger、current-head、delivery ledger 或稳定运行权威。
 
 ## 产品声明
@@ -54,7 +54,8 @@ G08 只允许预先解析的 disposable namespace；任一 current-head、旧 fe
 - G01—G06 或 G09 的局部通过只表示对应技术 gate 通过。
 - G07 passed 最多支持当前 scope `activation-ready`，不表示 active。
 - G10/G11 passed 才能分别说明 target binding／获准真实接口 gate 通过，不等于主人已验收。
-- 只有同一 release/run 的 G01—G12 全部 passed，且 G12 返回可由目标 Provider 读取的四项 opaque receipts，报告才允许 `product_acceptance = passed`；Module 本身仍不写 active。
+- 自动测试、synthetic/deny-network Adapter、pinned fixture 或 `test-fixture` environment 无论返回什么，都必须标记 `evidence_scope = contract-fixture`，不能生成任何真实 technical/target/real-interface/deployment/product-acceptance verdict、`activation-ready` 或 active 声明；只能验证决策合同并报告外部证据仍缺。详细 gate 的合成 `passed` 只是 decision fixture，不是当前 release 的 gate evidence。
+- 只有真实 target-local executor 在获准环境中对同一 release/run 完成 G01—G12，返回可由目标 Provider 读取的五项 opaque receipts、active-path readback 和 target-bound attestations，实际 run 报告才允许 `product_acceptance = passed`；Module 本身仍不写 active。这个正向结论由真实 G10—G12 gate 证明，不由 verifier fake 伪造。
 - `stable_operation` 在所有组合下均只能是 `evidence-required`。一次产品验收不能宣称稳定运行。
 
 ## 必须控制的现实故障
@@ -62,11 +63,11 @@ G08 只允许预先解析的 disposable namespace；任一 current-head、旧 fe
 | 验收 | 冻结控制 |
 |---|---|
 | 119-A1 | 固定顺序；首个 failed/cannot-confirm/not-authorized 后零后继执行且全部 blocked。 |
-| 119-A2 | 每项绑定当前 release/run/gate/environment/authorization/evidence；篡改、跨 run 或旧 digest 拒绝。 |
-| 119-A3 | 稳定 execution key；既有报告重放零执行；外部 unknown 不能在同 run 重做；投递层级不折叠。 |
-| 119-A4 | G07 只 activation-ready；G12 receipts 与 active-path 证据齐全才允许 product acceptance passed。 |
+| 119-A2 | 每项绑定当前 release/run/gate/target/environment/authorization/evidence；canonical content digest、嵌套篡改、跨 run 或旧 digest 均失败关闭。 |
+| 119-A3 | 稳定 execution key；既有报告重放零执行；外部 unknown 不能在同 run 重做；形成至 unknown／纠正的 opaque stage refs 不折叠。 |
+| 119-A4 | G07 只 activation-ready；synthetic 永不验收；真实 G12 五项 receipts 与 active-path readback 齐全才允许 product acceptance passed。 |
 | 119-A5 | G08 任一代表性 no-go 使整个 gate 非 passed；禁止当前主人 namespace 和手工挑选恢复。 |
-| 119-A6 | G08/G10/G11/G12 逐 gate 授权；collector/report 严格无正文、无身份、无配置、无秘密。 |
+| 119-A6 | G08/G10/G11/G12 request 精确携带 target 与本 gate approval；target executor 验证 currentness/revocation，collector/report 严格无正文、无身份、无配置、无秘密。 |
 | 119-A7 | 技术 gate、target/deployment、product acceptance 与 stable operation 分别报告，不夸大。 |
 
 ## 复杂度上限与停止规则

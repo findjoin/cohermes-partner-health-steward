@@ -8,6 +8,8 @@ never contacts a target, network, model, channel, owner, or contact.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,8 +125,42 @@ def _g12_receipts(run_id: str) -> dict[str, str]:
         "run_receipt_ref": f"receipt:run:{suffix}",
         "owner_acceptance_receipt_ref": f"receipt:owner-acceptance:{suffix}",
         "contact_acceptance_receipt_ref": f"receipt:contact-acceptance:{suffix}",
+        "contact_correction_receipt_ref": f"receipt:contact-correction:{suffix}",
         "active_path_receipt_ref": f"receipt:active-path:{suffix}",
     }
+
+
+def _effect_stage_refs(
+    run_id: str,
+    gate_id: str,
+    *,
+    unknown_after_acceptance: bool = False,
+) -> dict[str, str | None]:
+    prefix = f"effect:{gate_id.lower()}:{run_id.replace(':', '-')}"
+    return {
+        "formed": prefix + ":formed",
+        "committed": prefix + ":committed",
+        "attempted": prefix + ":attempted",
+        "interface_accepted": prefix + ":interface-accepted",
+        "delivered": None if unknown_after_acceptance else prefix + ":delivered",
+        "read_or_action": (
+            None if unknown_after_acceptance else prefix + ":read-or-action"
+        ),
+        "correction": None,
+        "unknown": prefix + ":unknown" if unknown_after_acceptance else None,
+    }
+
+
+def _canonical_report_digest(report_wire: Mapping[str, object]) -> str:
+    identity = copy.deepcopy(dict(report_wire))
+    identity.pop("report_digest", None)
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 class _FakeGateExecutor:
@@ -135,6 +171,7 @@ class _FakeGateExecutor:
         *,
         results: Mapping[str, str] | None = None,
         mutations: Mapping[str, Mapping[str, object]] | None = None,
+        preflight_not_authorized: tuple[str, ...] = (),
         fail_on_call: bool = False,
     ) -> None:
         self.results = dict(results or {})
@@ -143,8 +180,9 @@ class _FakeGateExecutor:
             for gate, value in (mutations or {}).items()
         }
         self.fail_on_call = fail_on_call
+        self.preflight_not_authorized = frozenset(preflight_not_authorized)
         self.calls: list[dict[str, object]] = []
-        self.external_effect_keys: set[str] = set()
+        self.external_action_calls: list[str] = []
 
     def execute(self, request: Mapping[str, object]) -> dict[str, object]:
         if self.fail_on_call:
@@ -156,13 +194,21 @@ class _FakeGateExecutor:
         execution_key = call.get("execution_key")
         if type(execution_key) is not str:
             raise AssertionError("gate request lacks a stable execution key")
-        self.external_effect_keys.add(execution_key)
         gate_id = call.get("gate_id")
         if gate_id not in _GATES:
             raise AssertionError("gate request used an unknown gate")
+        if "target_ref" not in call or "approval_ref" not in call:
+            raise AssertionError("gate request omits target or approval context")
         run_id = call.get("run_id")
         if type(run_id) is not str:
             raise AssertionError("gate request lacks run identity")
+        result = (
+            "not-authorized"
+            if gate_id in self.preflight_not_authorized
+            else self.results.get(gate_id, "passed")
+        )
+        if result != "not-authorized":
+            self.external_action_calls.append(execution_key)
         observation: dict[str, object] = {
             "contract": "ticket119-gate-observation-v1",
             "release_digest": call.get("release_digest"),
@@ -174,7 +220,7 @@ class _FakeGateExecutor:
             "executor_digest": _SHA_A,
             "step_digest": _SHA_A,
             "fixture_digest": _SHA_B,
-            "result": self.results.get(gate_id, "passed"),
+            "result": result,
             "evidence_refs": [f"evidence:{gate_id.lower()}:{run_id}"],
             "blocking_evidence_refs": [],
             "rollback_ref": f"rollback:{gate_id.lower()}:{run_id}",
@@ -183,6 +229,11 @@ class _FakeGateExecutor:
             "next_step_ref": "next:ordered-gate",
             "acceptance_receipt_refs": (
                 _g12_receipts(run_id) if gate_id == "119-G12" else None
+            ),
+            "effect_stage_refs": (
+                _effect_stage_refs(run_id, gate_id)
+                if gate_id in {"119-G11", "119-G12"}
+                else None
             ),
         }
         observation.update(copy.deepcopy(self.mutations.get(gate_id, {})))
@@ -260,19 +311,27 @@ class Ticket119VerificationTests(unittest.TestCase):
         *,
         run_id: str = "acceptance-run:synthetic-001",
         approvals: tuple[str, ...] = _APPROVAL_GATES,
-        existing_report: object | None = None,
+        approval_refs: Mapping[str, str] | None = None,
+        existing_report: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
+        refs = (
+            {
+                gate: f"approval:{gate.lower()}:{run_id}"
+                for gate in approvals
+            }
+            if approval_refs is None
+            else copy.deepcopy(dict(approval_refs))
+        )
         return {
             "contract": "ticket119-run-context-v1",
             "run_id": run_id,
             "executed_at_utc": "2026-08-30T12:00:00+00:00",
             "environment_class": "verifier-synthetic-deny-network",
             "target_ref": "target:disposable-ticket119",
-            "approval_refs": {
-                gate: f"approval:{gate.lower()}:{run_id}"
-                for gate in approvals
-            },
-            "existing_report": existing_report,
+            "approval_refs": refs,
+            "existing_report": (
+                None if existing_report is None else copy.deepcopy(dict(existing_report))
+            ),
         }
 
     def _run(
@@ -330,21 +389,51 @@ class Ticket119VerificationTests(unittest.TestCase):
     def test_v119_02_observations_are_run_release_bound_and_report_is_immutable(self) -> None:
         self._require_contract(root=False)
         assert self.contract is not None
-        executor = _FakeGateExecutor(
-            mutations={"119-G02": {"release_digest": "sha256:" + "0" * 64}}
+        run_id = "acceptance-run:tamper-001"
+        report, valid_wire = self._run(_FakeGateExecutor(), self._context(run_id=run_id))
+        self.assertEqual(
+            valid_wire.get("report_digest"), _canonical_report_digest(valid_wire)
         )
-        report, wire = self._run(
-            executor, self._context(run_id="acceptance-run:tamper-001")
-        )
-        gates = _gate_map(wire)
-        self.assertEqual(gates["119-G02"]["result"], "cannot-confirm")
-        self.assertEqual([call["gate_id"] for call in executor.calls], list(_GATES[:2]))
-        self.assertRegex(str(wire.get("report_digest")), r"^sha256:[0-9a-f]{64}$")
-        wire["product_acceptance"] = "passed"
-        wire["gates"] = []
+
+        returned = _wire(report, "acceptance run report")
+        returned_gates = _gate_map(returned)
+        returned_gates["119-G01"]["evidence_refs"].append("evidence:nested-tamper")
         fresh = _wire(report, "acceptance run report")
-        self.assertNotEqual(fresh.get("product_acceptance"), "passed")
-        self.assertEqual(tuple(_gate_map(fresh)), _GATES)
+        self.assertNotIn("evidence:nested-tamper", repr(fresh))
+        self.assertEqual(fresh.get("report_digest"), _canonical_report_digest(fresh))
+
+        nested_tamper = copy.deepcopy(valid_wire)
+        _gate_map(nested_tamper)["119-G02"]["evidence_refs"].append(
+            "evidence:forged-nested-ref"
+        )
+        fake_digest = copy.deepcopy(valid_wire)
+        fake_digest["report_digest"] = "sha256:" + "0" * 64
+        cross_run = copy.deepcopy(valid_wire)
+        cross_run["run_id"] = "acceptance-run:other"
+        cross_run["report_digest"] = _canonical_report_digest(cross_run)
+        cross_release = copy.deepcopy(valid_wire)
+        cross_release["release_digest"] = "sha256:" + "f" * 64
+        cross_release["report_digest"] = _canonical_report_digest(cross_release)
+
+        contract_type = type(self.contract)
+        for name, existing in (
+            ("nested-tamper", nested_tamper),
+            ("fixed-fake-digest", fake_digest),
+            ("cross-run", cross_run),
+            ("cross-release", cross_release),
+        ):
+            with self.subTest(name=name):
+                self.contract = contract_type()
+                executor = _FakeGateExecutor(fail_on_call=True)
+                _rejected, rejected_wire = self._run(
+                    executor,
+                    self._context(run_id=run_id, existing_report=existing),
+                )
+                self.assertEqual(executor.calls, [])
+                self.assertEqual(rejected_wire.get("run_verdict"), "cannot-confirm")
+                self.assertNotEqual(
+                    rejected_wire.get("product_acceptance"), "passed"
+                )
 
     def test_v119_03_same_run_replay_never_repeats_an_external_gate(self) -> None:
         self._require_contract(root=False)
@@ -357,25 +446,61 @@ class Ticket119VerificationTests(unittest.TestCase):
         replay_executor = _FakeGateExecutor(fail_on_call=True)
         _replayed, replay_wire = self._run(
             replay_executor,
-            self._context(run_id=run_id, existing_report=first_report),
+            self._context(run_id=run_id, existing_report=first_wire),
         )
         self.assertEqual(replay_wire, first_wire)
         self.assertEqual(replay_executor.calls, [])
 
         unknown_run = "acceptance-run:unknown-001"
+        unknown_stages = _effect_stage_refs(
+            unknown_run, "119-G11", unknown_after_acceptance=True
+        )
         unknown_executor = _FakeGateExecutor(
-            results={"119-G11": "cannot-confirm"}
+            results={"119-G11": "cannot-confirm"},
+            mutations={"119-G11": {"effect_stage_refs": unknown_stages}},
         )
         _unknown, unknown_wire = self._run(
             unknown_executor, self._context(run_id=unknown_run)
         )
-        self.assertEqual(_gate_map(unknown_wire)["119-G12"]["result"], "blocked")
+        unknown_gates = _gate_map(unknown_wire)
+        self.assertEqual(unknown_gates["119-G11"]["result"], "cannot-confirm")
+        self.assertEqual(
+            unknown_gates["119-G11"]["effect_stage_refs"], unknown_stages
+        )
+        self.assertIsNotNone(unknown_stages["interface_accepted"])
+        self.assertIsNone(unknown_stages["delivered"])
+        self.assertIsNone(unknown_stages["read_or_action"])
+        self.assertIsNotNone(unknown_stages["unknown"])
+        self.assertEqual(unknown_gates["119-G12"]["result"], "blocked")
         self.assertEqual(
             [call["gate_id"] for call in unknown_executor.calls].count("119-G11"),
             1,
         )
         self.assertEqual(
-            len(unknown_executor.external_effect_keys), len(unknown_executor.calls)
+            len(set(unknown_executor.external_action_calls)),
+            len(unknown_executor.external_action_calls),
+        )
+        unknown_replay_executor = _FakeGateExecutor(fail_on_call=True)
+        _unknown_replay, unknown_replay_wire = self._run(
+            unknown_replay_executor,
+            self._context(run_id=unknown_run, existing_report=unknown_wire),
+        )
+        self.assertEqual(unknown_replay_wire, unknown_wire)
+        self.assertEqual(unknown_replay_executor.calls, [])
+
+        folded_ref = "effect:folded-interface-and-delivery"
+        folded = _effect_stage_refs("acceptance-run:folded", "119-G11")
+        folded["interface_accepted"] = folded_ref
+        folded["delivered"] = folded_ref
+        folded_executor = _FakeGateExecutor(
+            mutations={"119-G11": {"effect_stage_refs": folded}}
+        )
+        _folded, folded_wire = self._run(
+            folded_executor,
+            self._context(run_id="acceptance-run:folded"),
+        )
+        self.assertEqual(
+            _gate_map(folded_wire)["119-G11"]["result"], "cannot-confirm"
         )
 
     def test_v119_04_g07_never_activates_and_g12_needs_all_opaque_receipts(self) -> None:
@@ -391,7 +516,8 @@ class Ticket119VerificationTests(unittest.TestCase):
         )
         local_gates = _gate_map(local_wire)
         self.assertEqual(local_gates["119-G07"]["result"], "passed")
-        self.assertEqual(local_wire.get("diagnostic_scope_phase"), "activation-ready")
+        self.assertEqual(local_wire.get("evidence_scope"), "contract-fixture")
+        self.assertEqual(local_wire.get("diagnostic_scope_phase"), "staged")
         self.assertNotEqual(local_wire.get("product_acceptance"), "passed")
 
         incomplete_executor = _FakeGateExecutor(
@@ -414,12 +540,20 @@ class Ticket119VerificationTests(unittest.TestCase):
         )
         self.assertNotEqual(incomplete_wire.get("product_acceptance"), "passed")
 
+        complete_run_id = "acceptance-run:g12-complete"
         complete_executor = _FakeGateExecutor()
         _complete, complete_wire = self._run(
             complete_executor,
-            self._context(run_id="acceptance-run:g12-complete"),
+            self._context(run_id=complete_run_id),
         )
-        self.assertEqual(complete_wire.get("product_acceptance"), "passed")
+        self.assertEqual(
+            _gate_map(complete_wire)["119-G12"]["acceptance_receipt_refs"],
+            _g12_receipts(complete_run_id),
+        )
+        self.assertEqual(complete_wire.get("evidence_scope"), "contract-fixture")
+        self.assertEqual(complete_wire.get("diagnostic_scope_phase"), "staged")
+        self.assertNotEqual(complete_wire.get("product_acceptance"), "passed")
+        self.assertNotEqual(complete_wire.get("active"), "passed")
         self.assertEqual(complete_wire.get("stable_operation"), "evidence-required")
 
     def test_v119_05_g08_no_go_cannot_be_demoted_to_a_partial_pass(self) -> None:
@@ -465,19 +599,63 @@ class Ticket119VerificationTests(unittest.TestCase):
                     missing_gate, [call["gate_id"] for call in executor.calls]
                 )
 
-        leaked_identity = "owner-identity-must-not-leave-target"
-        leaking_executor = _FakeGateExecutor(
-            mutations={"119-G12": {"owner_id": leaked_identity}}
+        invalid_refs = (
+            ("cross-gate", "approval:119-g11:borrowed"),
+            ("withdrawn", "approval:119-g10:withdrawn"),
+            ("wrong-binding", "approval:119-g10:other-run-or-target"),
         )
-        _leaking, leaking_wire = self._run(
-            leaking_executor,
-            self._context(run_id="acceptance-run:g12-leak-attempt"),
-        )
-        self.assertEqual(
-            _gate_map(leaking_wire)["119-G12"]["result"], "cannot-confirm"
-        )
-        self.assertNotIn(leaked_identity, repr(leaking_wire))
-        self.assertNotIn("owner_id", repr(leaking_wire))
+        for name, invalid_ref in invalid_refs:
+            with self.subTest(preflight=name):
+                run_id = f"acceptance-run:approval-{name}"
+                refs = {
+                    gate: f"approval:{gate.lower()}:{run_id}"
+                    for gate in _APPROVAL_GATES
+                }
+                refs["119-G10"] = invalid_ref
+                executor = _FakeGateExecutor(
+                    preflight_not_authorized=("119-G10",)
+                )
+                _report, wire = self._run(
+                    executor,
+                    self._context(run_id=run_id, approval_refs=refs),
+                )
+                g10 = _gate_map(wire)["119-G10"]
+                self.assertEqual(g10["result"], "not-authorized")
+                self.assertEqual(g10["approval_ref"], invalid_ref)
+                g10_request = next(
+                    call for call in executor.calls if call["gate_id"] == "119-G10"
+                )
+                self.assertEqual(g10_request["target_ref"], "target:disposable-ticket119")
+                self.assertEqual(g10_request["approval_ref"], invalid_ref)
+                self.assertNotIn(
+                    g10_request["execution_key"], executor.external_action_calls
+                )
+
+        for name, mutation, leaked_value in (
+            (
+                "identity",
+                {"owner_id": "owner-identity-must-not-leave-target"},
+                "owner-identity-must-not-leave-target",
+            ),
+            (
+                "nested-body",
+                {"payload": {"health_body": "private-body-must-not-leave-target"}},
+                "private-body-must-not-leave-target",
+            ),
+        ):
+            with self.subTest(leak=name):
+                leaking_executor = _FakeGateExecutor(
+                    mutations={"119-G12": mutation}
+                )
+                _leaking, leaking_wire = self._run(
+                    leaking_executor,
+                    self._context(run_id=f"acceptance-run:g12-leak-{name}"),
+                )
+                self.assertEqual(
+                    _gate_map(leaking_wire)["119-G12"]["result"],
+                    "cannot-confirm",
+                )
+                self.assertNotIn(leaked_value, repr(leaking_wire))
 
     def test_v119_07_local_pass_is_not_deployment_acceptance_or_stability(self) -> None:
         self._require_contract(root=False)
@@ -492,10 +670,13 @@ class Ticket119VerificationTests(unittest.TestCase):
         )
         local_gates = _gate_map(local_wire)
         self.assertTrue(all(local_gates[gate]["result"] == "passed" for gate in _GATES[:9]))
-        self.assertEqual(local_wire.get("technical_gate_verdict"), "passed")
+        self.assertEqual(local_wire.get("evidence_scope"), "contract-fixture")
+        self.assertNotEqual(local_wire.get("technical_gate_verdict"), "passed")
         self.assertNotEqual(local_wire.get("target_binding_verdict"), "passed")
         self.assertNotEqual(local_wire.get("real_interface_verdict"), "passed")
         self.assertNotEqual(local_wire.get("product_acceptance"), "passed")
+        self.assertEqual(local_wire.get("diagnostic_scope_phase"), "staged")
+        self.assertNotEqual(local_wire.get("active"), "passed")
         self.assertEqual(local_wire.get("stable_operation"), "evidence-required")
         self.assertNotEqual(local_wire.get("deployment"), "passed")
 
@@ -504,9 +685,20 @@ class Ticket119VerificationTests(unittest.TestCase):
             full_executor,
             self._context(run_id="acceptance-run:full-twelve"),
         )
-        self.assertEqual(full_wire.get("target_binding_verdict"), "passed")
-        self.assertEqual(full_wire.get("real_interface_verdict"), "passed")
-        self.assertEqual(full_wire.get("product_acceptance"), "passed")
+        self.assertTrue(
+            all(
+                gate["result"] == "passed"
+                for gate in _gate_map(full_wire).values()
+            )
+        )
+        self.assertEqual(full_wire.get("evidence_scope"), "contract-fixture")
+        self.assertNotEqual(full_wire.get("technical_gate_verdict"), "passed")
+        self.assertNotEqual(full_wire.get("target_binding_verdict"), "passed")
+        self.assertNotEqual(full_wire.get("real_interface_verdict"), "passed")
+        self.assertNotEqual(full_wire.get("deployment"), "passed")
+        self.assertEqual(full_wire.get("diagnostic_scope_phase"), "staged")
+        self.assertNotEqual(full_wire.get("active"), "passed")
+        self.assertNotEqual(full_wire.get("product_acceptance"), "passed")
         self.assertEqual(full_wire.get("stable_operation"), "evidence-required")
 
 
