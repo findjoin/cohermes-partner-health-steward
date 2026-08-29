@@ -1,6 +1,6 @@
 # Ticket 117 冻结验证合同
 
-> 状态：frozen。当前冻结内容 checkpoint 为 `3c843ef37f3c11731af159f4c39130910bf49dab`，tree 为 `07eac3c57ffeab14758ea61fcb25549ce04f6515`；fresh-context Spec 与 Standards 有界复审均 PASS。该 checkpoint 只把实施后独立复现的三个既有 A2/A3/A6 反例补入原 V02/V03/V06；Gate 仍为 9 个，架构与 A1—A9 不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
+> 状态：frozen。当前冻结内容 checkpoint 为 `f1fb2a698fc66af3f49748673b9e85f474add0ba`，tree 为 `5c93d5f8aae9726421c6518f8d33c885d03b8ea0`；fresh-context Spec 与 Standards 有界复审均 PASS。该 checkpoint 只把实施后独立复现的既有 A2/A3/A6 反例补入原 V02/V03/V06，并在 V02 明确 lifecycle notice unknown 不形成普通 `delivery-unknown` 主人决定请求；Gate 仍为 9 个，架构与 A1—A9 不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本合同与 [`117-frozen-implementation-design.md`](117-frozen-implementation-design.md) 共同约束编码 Agent；二者任一变化都必须重新冻结和预审。
 
 ## 测试权威、公开 Seam 与依赖展开
 
@@ -57,10 +57,10 @@ pre-code checkpoint 必须运行并记录：
 
 ## 编码前预审证据
 
-- 当前冻结内容 checkpoint：`3c843ef37f3c11731af159f4c39130910bf49dab`；tree：`07eac3c57ffeab14758ea61fcb25549ce04f6515`。source、offline target、blank 与嵌套 harness 使用彼此隔离的 SQLite identity；V01/V06 先经 Ticket 116 已冻结的 synthetic Ticket 119 acceptance fixture 合法激活 scope；V02 关闭存储后不做无效 teardown；V08 从 Ticket 115 public managed view 读取真实 unknown ref 与公开发生时间。未放宽 Ticket 116 产品门禁，也未增加产品 Interface。
+- 当前冻结内容 checkpoint：`f1fb2a698fc66af3f49748673b9e85f474add0ba`；tree：`5c93d5f8aae9726421c6518f8d33c885d03b8ea0`。source、offline target、blank 与嵌套 harness 使用彼此隔离的 SQLite identity；V01/V06 先经 Ticket 116 已冻结的 synthetic Ticket 119 acceptance fixture 合法激活 scope；V02 关闭存储后不做无效 teardown；V08 从 Ticket 115 public managed view 读取真实 unknown ref 与公开发生时间。未放宽 Ticket 116 产品门禁，也未增加产品 Interface。
 - characterization 产品基线：`63a6a2333e0a7584aa51492035d3b4ca981d40c0`；旧全量测试：`720/720 PASS`。
 - 编码前冻结门：`1 failure / 8 skips / 0 errors`；唯一失败是产品尚无 `managed_lifecycle_read` / `lifecycle.execute` 公共 Seam；其余八门只因共同前置而 skip。
-- 当前实施 checkpoint `4e05fdc5db377de8b6a38b00f510e264b3528cdd` 加载本次门后：V02 因 lifecycle notice 被误送入 TaskEngine 报错，V03 因 exact lookup 已证明 terminal 后仍停在 `terminal-unknown` 失败，V06 因迁移后 writer fence 未轮换失败；其余六门 PASS。
-- Spec reviewer：PASS；三个反例分别直接追踪既有 A2/A3/A6，均使用冻结公开 Seam，未新增需求、架构或 Gate。
-- Standards reviewer：PASS；V02 明确证明原 notice 唯一落为 unknown、恢复后 transport 仍只调用一次；V03/V06 fixture 与断言有界，无剩余 P0/P1/P2。
+- 实施 checkpoint `4e05fdc5db377de8b6a38b00f510e264b3528cdd` 加载前三项门后：V02 因 lifecycle notice 被误送入 TaskEngine 报错，V03 因 exact lookup 已证明 terminal 后仍停在 `terminal-unknown` 失败，V06 因迁移后 writer fence 未轮换失败；其余六门 PASS。修复 checkpoint `f66f513513af80e64eb594c806c262928fab26fb` 加载补强后的同一 V02 后，只因另形成一条绑定原 notice 的 `delivery-unknown` 主人决定请求而 FAIL。
+- Spec reviewer：PASS；全部反例直接追踪既有 A2/A3/A6，V02 补强来自冻结设计“一次说明、不索取第二次主人确认”，未新增需求、架构或 Gate。
+- Standards reviewer：PASS；V02 只通过 public managed read 识别绑定原 notice 的第二决定请求；fixture 隔离，V03/V06 断言有界，无剩余 P0/P1/P2。
 - `compileall` 与 `git diff --check` 通过；冻结时无产品代码修改。
