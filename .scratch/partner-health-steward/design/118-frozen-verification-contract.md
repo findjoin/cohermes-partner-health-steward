@@ -46,7 +46,7 @@ V01 在临时目录建立显式 allowlist 的 synthetic release tree。它不复
 | 118-V04 | 118-A4 | runtime oracle 发出并保存同 session 的当前 core intent/grant；合法效果必须把 Adapter 返回的 status/result_ref/terminal 连同 session/lease/intent/generation/fence 精确回交并仅接受一次；无 claim、错误 grant、forged/stale 在 Adapter 前拒绝，缺 status/result_ref/terminal 调用 Adapter 后仍不被 core 接受 | Adapter 自造业务结果、错配 grant、提升 terminal 或未完整回交就被报告成功 |
 | 118-V05 | 118-A5 | worker 从 manifest 独立定位、读回并重算 native-disabled assertion path/hash，再把实际 bytes 与声明 hash 交给 host verification；预置真实 native/old candidates 后，故障前经 pinned Gateway 探测四入口，register 精确一次且仅 current 可达；core 失败并注销 current 后再次探测，四者均不可达且 old factory 始终零调用；manifest 不变但 assertion 实际文件被篡改时 discovery 前失败 | 只信 assertion 声明、空 registry 真空证明，或 Plugin 失败后 current/旧健康路径重新可达 |
 | 118-V06 | 118-A6 | install 缺 binding 或 synthetic verified 均 `cannot-confirm`；两次 `build` 的相同 manifest 是纯 offline upgrade `pass` 的独立 oracle；修改真实 schema artifact 后新 manifest 形成 drift 并 `fail`；rollback generation/fence 只有 synthetic evidence 时整体 `cannot-confirm` 且绝不恢复实例状态 | 用 `compatible/current` 字符串回显通过，或 synthetic rollback 冒充目标安全 |
-| 118-V07 | 118-A7 | manifest 四类事实互斥；全 synthetic `verified + compatible` observation 仍不能产生 Partner `pass` 或 activation；manifest/HostContractReport/ReadinessReport 三类完整 wire 递归扫描 mapping 与 list/tuple/set/frozenset，禁止开发机 root、Linux/Windows/UNC 绝对路径及注入环境秘密；artifact 注入 secret marker、健康正文或绝对路径时 build 拒绝 | 合成 fixture 冒充当前 Partner，或嵌套容器让秘密/PII/配置值进入 release/digest/report |
+| 118-V07 | 118-A7 | manifest 四类事实互斥；全 synthetic `verified + compatible` observation 仍不能产生 Partner `pass` 或 activation；manifest/HostContractReport/ReadinessReport 三类完整 wire 递归扫描所有 `Mapping`（含 dict 子类）与 list/tuple/set/frozenset，禁止开发机 root、Linux/Windows/UNC 绝对路径及注入环境秘密；artifact 注入 secret marker、健康正文或绝对路径时 build 拒绝 | 合成 fixture 冒充当前 Partner，或自定义 Mapping／嵌套容器让秘密、PII、配置值进入 release/digest/report |
 
 每门只杀死表中一个现实错误。等价输入只在同一决策点共享一个 `subTest`；不对 artifact、字段、平台、故障和阶段做笛卡尔积，也不以七个测试数量本身作为充分性证明。
 
@@ -79,4 +79,4 @@ pre-code checkpoint 必须记录：
 - `python -m compileall -q partner_health_steward tests`：通过。
 - `git diff --check`：通过，仅报告工作树既有 LF/CRLF 转换提示，无 whitespace error。
 - pinned Hermes 本地 checkout 已只读核对为 commit `3c27eb6234bf91b8ceee9e9071591b31e9b148cb`，四个 allowlisted 源文件 SHA-256 与 V02 常量一致；测试不保存该 checkout 的开发机绝对路径，执行时必须显式设置 `TICKET118_PINNED_HERMES_SOURCE`。
-- 当前 verifier-owned 测试 SHA-256：`4e0bd23067d53ae336f2723716c13dbae04aec504760f1277b365826896862c7`；冻结 checkpoint、tree 与最终 blob 由顶层冻结 Agent 提交后补入。
+- 当前 verifier-owned 测试 SHA-256：`c31095d92fcd2f4c9e159babd261a6f50f6aa87fcedd7c767e61102fbef95189`；冻结 checkpoint、tree 与最终 blob 由顶层冻结 Agent 提交后补入。

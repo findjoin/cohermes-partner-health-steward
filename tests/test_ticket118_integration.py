@@ -453,7 +453,7 @@ def _assert_public_wire_clean(
         case.assertNotIn(forbidden, encoded)
 
     def walk(value: object) -> None:
-        if type(value) is dict:
+        if isinstance(value, Mapping):
             for key, item in value.items():
                 walk(key)
                 walk(item)
@@ -1748,6 +1748,16 @@ class Ticket118VerificationTests(unittest.TestCase):
                             {"nested": container((marker,))},
                             forbidden_values=(injected_environment_secret,),
                         )
+        class MappingSubclass(dict[str, object]):
+            pass
+
+        with self.subTest(nested_wire_container="dict-subclass"):
+            with self.assertRaises(AssertionError):
+                _assert_public_wire_clean(
+                    self,
+                    {"nested": MappingSubclass(path="/home/owner/health.db")},
+                    forbidden_values=(injected_environment_secret,),
+                )
         for marker in (
             "TICKET118_SYNTHETIC_TOKEN_SHOULD_NOT_LEAK",
             "synthetic health正文 blood pressure 180/120",
