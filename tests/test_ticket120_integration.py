@@ -42,6 +42,9 @@ _DEFAULT_TARGET = {
     "hermes_home": "/root/.hermes",
     "service": "hermes-gateway.service",
 }
+_TICKET118_MARKER_EXCEPTION_PATH = (
+    "plugin/health-weixin/partner_health_steward/host_contract.py"
+)
 _REQUIRED_ARTIFACTS = (
     ("hermes-required-patch", "host/required.patch"),
     ("disabled-native-entry", "host/disabled-native-entry.assertion"),
@@ -644,6 +647,26 @@ print(json.dumps({'enabled': loaded.enabled, 'kind': loaded.manifest.kind, 'name
         finally:
             server.close()
 
+    def _assert_release_marker_policy(self, release: Path) -> None:
+        """Keep the one hash-bound policy constant distinct from fixtures."""
+
+        exception = release / Path(*_TICKET118_MARKER_EXCEPTION_PATH.split("/"))
+        source = _REPOSITORY_ROOT / "partner_health_steward" / "host_contract.py"
+        self.assertTrue(exception.is_file())
+        self.assertIn("TICKET118_", source.read_text(encoding="utf-8"))
+        self.assertEqual(self._sha256(exception), self._sha256(source))
+
+        marker_paths: set[str] = set()
+        for path in release.rglob("*"):
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("MISSING-CURRENT", text, path)
+            self.assertNotIn("REPLACED-BY-CURRENT", text, path)
+            if "TICKET118_" in text:
+                marker_paths.add(path.relative_to(release).as_posix())
+        self.assertEqual(marker_paths, {_TICKET118_MARKER_EXCEPTION_PATH})
+
     @staticmethod
     def _recv_exact(client: socket.socket, size: int) -> bytes:
         chunks: list[bytes] = []
@@ -670,11 +693,16 @@ print(json.dumps({'enabled': loaded.enabled, 'kind': loaded.manifest.kind, 'name
             body = (release / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn(skill, body)
             self.assertIn("staged", body)
-        sentinels = ("MISSING-CURRENT", "REPLACED-BY-CURRENT", "TICKET118_")
-        for path in release.rglob("*"):
-            if path.is_file():
-                text = path.read_text(encoding="utf-8")
-                self.assertFalse(any(marker in text for marker in sentinels), path)
+        self._assert_release_marker_policy(release)
+        marker_probe = self.root / "marker-policy-probe"
+        shutil.copytree(release, marker_probe)
+        extra_marker = marker_probe / "plugin" / "health-weixin" / "__init__.py"
+        extra_marker.write_text(
+            extra_marker.read_text(encoding="utf-8") + "TICKET118_\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_release_marker_policy(marker_probe)
         self._verify_isolated_plugin(release)
         self._verify_staged_runtime(release)
 

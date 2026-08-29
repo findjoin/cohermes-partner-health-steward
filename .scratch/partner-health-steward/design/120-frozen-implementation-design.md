@@ -24,6 +24,10 @@
 
 `HostReleaseContract` 继续独占 release 输入的语义闭包。120 的 distribution manifest 只是对已生成字节的内容寻址包装，不是第二 release database、批准账本或业务真相。verifier 维护独立、固定的 role/path closure；它不能从候选 manifest 自身导出预期 closure。安装前与 staging 后都必须拒绝 manifest 任何未知/缺失字段、重复 path、非 regular file、symlink、未声明 regular file、嵌入 host manifest 的任何篡改，以及任一被声明文件的 hash 不符。
 
+### V01 verifier-authority correction：唯一 hash-bound marker 常量
+
+`MISSING-CURRENT` 与 `REPLACED-BY-CURRENT` 继续对发布目录每个 regular text file 零容忍。`TICKET118_` 也继续零容忍，唯一的精确例外是 `plugin/health-weixin/partner_health_steward/host_contract.py`：verifier 必须同时证明它与仓库 `partner_health_steward/host_contract.py` SHA-256 完全一致，并收集所有含该字面量的发布相对路径，精确断言集合只等于该路径。该唯一出现是产品自身的 forbidden-marker policy 常量，不是 synthetic fixture 内容；hash-identical source copy 因而既防止例外被扩展，也防止用替换源码规避现有 policy。任何第二个 regular text file 含 `TICKET118_` 都必须使 V01 失败；不得按后缀、目录或 role 作宽泛排除。
+
 Windows 工作树不能创建 symlink 时不降低此闭包。V07 的真实 symlink/FIFO 攻击只在 `sys.platform == "linux"` 的 default target 主机、随机 `/tmp/ticket120-v07-*` isolated directory 的冻结 verifier 中运行；该程序不读取 Hermes 文件、不创建 permit、不写安装根或 service。Linux verifier 必须对同目录上传的 raw Git root tree object 重算 canonical tree hash，再与 verifier blob、run_id 和 release digest 绑定；Windows V01—V06 与 Linux V07 只有这四项及 tree 完全相同才可聚合。任一绑定不一致是 `cannot-confirm`，不是本地替代的通过。
 
 ## 唯一部署公共 Seam
