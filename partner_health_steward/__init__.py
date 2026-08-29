@@ -8,10 +8,13 @@ from .acceptance_run import AcceptanceRunContract
 from .core import HealthCore
 from .host_contract import HostReleaseContract
 from .plugin import HealthPlugin
+from .release_deployment import DefaultOnlyGateExecutor, HermesReleasePublisher
 
 __all__ = [
     "AcceptanceRunContract",
     "HealthCore",
     "HealthPlugin",
     "HostReleaseContract",
+    "HermesReleasePublisher",
+    "DefaultOnlyGateExecutor",
 ]
