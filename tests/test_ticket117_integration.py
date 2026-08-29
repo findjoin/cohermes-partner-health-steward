@@ -1059,7 +1059,14 @@ class Ticket117VerificationTests(unittest.TestCase):
             if item["intent"].get("payload_ref")
             == f"lifecycle-notice:{notice_operation}"
         ]
+        notice_decision_requests = [
+            item
+            for item in notice_unknown_view["owner_deliveries"]
+            if item["intent"].get("authorization_kind") == "delivery-unknown"
+            and item["intent"].get("source_ref") == notice_intent_id
+        ]
         self.assertEqual(len(notice_unknown_records), 1, notice_unknown_view)
+        self.assertEqual(notice_decision_requests, [], notice_unknown_view)
         self.assertEqual(
             notice_unknown_records[0]["intent"]["intent_id"],
             notice_intent_id,
