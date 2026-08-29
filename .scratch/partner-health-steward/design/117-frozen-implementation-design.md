@@ -1,6 +1,6 @@
 # Ticket 117 增量架构冻结设计
 
-> 状态：frozen。当前冻结内容 checkpoint 为 `3c843ef37f3c11731af159f4c39130910bf49dab`，tree 为 `07eac3c57ffeab14758ea61fcb25549ce04f6515`；fresh-context Spec 与 Standards 有界复审均 PASS。该 checkpoint 只把实施后独立复现的三个既有 A2/A3/A6 反例补入原 V02/V03/V06；Gate 仍为 9 个，架构内容相对首次冻结点不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本设计只冻结 Ticket 117 的难逆增量决定，适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
+> 状态：frozen。当前冻结内容 checkpoint 为 `f1fb2a698fc66af3f49748673b9e85f474add0ba`，tree 为 `5c93d5f8aae9726421c6518f8d33c885d03b8ea0`；fresh-context Spec 与 Standards 有界复审均 PASS。该 checkpoint 只把实施后独立复现的既有 A2/A3/A6 反例补入原 V02/V03/V06，并在 V02 明确“一次说明、不索取第二次主人确认”；Gate 仍为 9 个，架构内容相对首次冻结点不变。characterization 产品基线为 `63a6a2333e0a7584aa51492035d3b4ca981d40c0`，tree 为 `b90a610efa7fc4597c90dd95193ca694d0998573`。本设计只冻结 Ticket 117 的难逆增量决定，适用 [`AI 编码架构治理`](../../../docs/agents/architecture-governance.md)。
 
 ## 目标与非目标
 
