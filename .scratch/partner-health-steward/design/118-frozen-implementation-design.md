@@ -12,7 +12,7 @@
 
 - 基线全量 `729/729` 通过；Tickets 110—117 的健康命令、受控效果、bounded managed read、current-head、writer fence、删除和迁移语义全部保留，不重写业务状态机。
 - 当前 `HealthPlugin` 仍直接调用多个 `HealthCore` 方法；现有 `contract.py` 的 protocol v1、64 KiB 长度前缀 canonical JSON frame 只覆盖部分 command Interface。给每个方法机械生成 RPC 会形成庞大浅 Interface，不能作为冻结路线。
-- 当前没有 release compiler、宿主合同 Module、无凭据 preflight Module、当前 release declaration 或 Ticket 118 验证入口；历史 `ops/` 不能成为 release 输入。
+- 当前没有 release compiler、宿主合同 Module、无凭据 preflight Module、当前 release declaration 或 Ticket 118 验证入口；历史 `ops/` 不能成为 release 输入。当前 release 的 Hermes 接入必须由新建的 `partner_health_steward.hermes_host` 公共 Module 提供 `register(ctx)` 与 `health_weixin` Adapter factory；它是 Ticket 118 的当前宿主边界，不复用或复制历史 `ops/` Plugin。
 - 固定 Hermes 源码实际提供 `PluginContext.register_platform(...)`、`PluginManager.discover_and_load(...)` 与 `PlatformRegistry`。platform 注册是逐项生效且同名 last-writer-wins；Plugin 部分注册失败不会天然回滚，因此入口必须默认关闭，只有完整宿主核验后才可获得进程内 activation proof。
 - 固定源码先查 plugin platform registry、实例化失败时不会回退同名 builtin，但 builtin 与普通处理仍存在；required patch／disabled-native assertion 必须证明健康消息在原生正文去重、合批和 cursor 前进入唯一入口，并且 Plugin 缺失或失败时不会落到旧 `medical`、native health 或普通健康处理。
 
@@ -67,7 +67,7 @@ release 至少内容绑定：固定 Hermes 来源与 required patch/native-disab
 顺序固定：
 
 1. 离线验证 upstream commit、allowlisted 原始文件逐项 SHA-256、extractor 版本、required patch hash、生成物 hash 和 native-disable assertion；
-2. 将当前 release 中的真实 Plugin／host patch／Adapter artifact 接入该来源生成的 pinned artifact，运行真实 `register`、platform registry、factory、start/stop 形状；测试必须从宿主调用记录和 registry reachability 独立观察，不得以实现自报字段代替；
+2. 由真实 `PluginManager.discover_and_load(...)` 加载当前 release 的 `partner_health_steward.hermes_host`，运行真实 `register`、platform registry、factory、`connect(is_reconnect=False)`／`disconnect()`；`verify` 返回前必须完成全部 lifecycle 并关闭验证实例，测试从宿主调用记录和 registry reachability 独立观察，不得以实现自报字段、动态伪装类或历史 Plugin 代替；
 3. 证明 `health_weixin` 是唯一 pre-native 健康入口；
 4. 证明 CorePort socket peer／service identity、ACL、frame、timeout 和完整终态；
 5. 证明模型／Weixin／联系人 Adapter 只能执行 core 已授权 intent 并完整回交；
@@ -83,7 +83,7 @@ release 至少内容绑定：固定 Hermes 来源与 required patch/native-disab
 - managed read 只返回现有无正文、受限投影；不返回表、密钥、凭据或内部阶段。
 - execute effect 由 core 先形成并授权 model／delivery intent，Plugin 侧 Adapter 执行后必须回交完整 terminal。execution grant 只绑定受认证会话，不作为可持久或可由 Adapter 构造的权威值。验证必须同时证明合法 core-issued effect 的完整回交，以及 forged intent、stale fence、缺项 terminal 和外部调用后 socket 中断的失败关闭；后者必须进入既有 `unknown`，不能盲目重发。
 
-`InProcessCoreAdapter` 与 `UnixCoreAdapter` 是同一 Seam 的两个真实 Adapter。HealthPlugin 宿主可达路径必须只依赖 CorePort，不能一部分走 socket、一部分继续直接调用 concrete HealthCore。
+`InProcessCoreAdapter` 与 `UnixCoreAdapter` 是同一 Seam 的两个真实 Adapter。HealthPlugin 宿主可达路径必须只依赖 CorePort，不能一部分走 socket、一部分继续直接调用 concrete HealthCore。宿主合同验证必须让 command、managed-read、controlled-effect 三类请求都真实穿过 byte-stream framing，并由远端 runtime 的接收记录和终态接收记录作为独立 oracle；只发一个 probe command 不足以证明 Seam。
 
 socket 复用 protocol v1 的 4-byte big-endian length + canonical JSON、64 KiB 上限和 strict exact-field 语义；新增 wire 只能是三类 tagged union。错误 peer、ACL、截断、尾随、重复字段、超长、未知 kind、超时或不完整 terminal 全部失败关闭。118 在本地合成环境验证 peer／service identity 与 ACL policy 的严格 Adapter 合同及真实 AF_UNIX framing；Linux `SO_PEERCRED`、systemd UID／mode 和目标 socket 路径的现场 enforcement 证据明确留给 119，Windows 上的合成身份 Adapter 不得冒充该现场证明。
 
@@ -92,8 +92,8 @@ socket 复用 protocol v1 的 4-byte big-endian length + canonical JSON、64 KiB
 mode 只允许 `install | upgrade | rollback`。它消费已验证 release／host report 和 schema-validated 的外部 observation；不主动连接目标或修改配置。
 
 - install 检查全部 target requirement 是否已有当前证据；缺失为 `cannot-confirm`。
-- upgrade 重新核验 artifact、manifest、schema、Skill／Adapter／model／bundle hash、ACL requirement、current head 和旧入口禁用；不兼容为 `fail`，不能确认保持 offline。
-- rollback 还要求候选旧代码兼容当前 semantic manifest、generation 和 writer fence。rollback 只评价代码兼容性，绝不恢复旧数据、批准、入口、generation 或 fence。
+- upgrade 直接比较由 `build` 产生的 current/candidate release manifest 和 host report，重新核验 artifact、schema、Skill／Adapter／model／bundle hash、ACL requirement、current head 和旧入口禁用；调用者提交的 `compatible` 字符串不构成证据。不兼容为 `fail`，不能确认保持 offline。
+- rollback 直接比较候选旧 release 与当前 semantic manifest，并要求 target observation 中的 generation 和 writer fence 具有非 synthetic 的当前证据。rollback 只评价代码兼容性，绝不恢复旧数据、批准、入口、generation 或 fence；纯离线比较可以形成 `offline_compatibility=pass`，但不能把整体 target readiness 提升为 `pass`。
 
 输出是无健康正文、无秘密的逐要求报告与总体 `pass | fail | cannot-confirm`。合成 observation 永远不能升级成真实 Partner proof。
 
@@ -101,9 +101,9 @@ mode 只允许 `install | upgrade | rollback`。它消费已验证 release／hos
 
 - release 中只包含一个 health Plugin 和一个 `health_weixin` platform registration；七 Skill 是 Plugin 内资产，不是七个 Plugin。
 - platform registration 初始为 disabled。只有 manifest、pinned source、required patch、native-disable、CorePort probe 和 Adapter contracts 全部通过后才签发 activation proof 并打开入口。
-- partial registration、factory/check/config/callback/start failure、重复或覆盖注册、Plugin 缺失、core 不可达、probe 不一致均保持入口关闭；残留 registry entry 没有读正文、调用 core、模型或发送权。
+- partial registration、factory/check/config/callback/connect failure、重复或覆盖注册、Plugin 缺失、core 不可达、probe 不一致均保持入口关闭；残留 registry entry 没有读正文、调用 core、模型或发送权。
 - ordinary-forward 只能是健康入口在可信状态下对明确普通消息作出的显式结果。健康、混合、未知或宿主不可确认时不得落回普通 Agent、旧 `medical` 或 native health path。
-- stop 顺序是先撤销 activation proof 和准入，再排空已开始的 CorePort exchange，最后关闭 Adapter／socket。无法证明排空时健康保持关闭；不承诺 Hermes 没有提供的热卸载。
+- disconnect 顺序是先撤销 activation proof 和准入，再排空已开始的 CorePort exchange，最后关闭 Adapter／socket。无法证明排空时健康保持关闭；不承诺 Hermes 没有提供的热卸载。
 
 ## 依赖与 Adapter
 
