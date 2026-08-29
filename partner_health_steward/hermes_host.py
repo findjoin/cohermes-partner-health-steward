@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from partner_health_steward.host_contract import (
     _CorePortClient,
     _HostVerificationFailure,
+    _is_current_process_activation,
     _require_mapping,
 )
 
@@ -44,18 +45,55 @@ NATIVE_HEALTH_DISABLED_ASSERTION_BYTES = (
 )
 
 
+class _ActivationState:
+    """One registration's in-process activation state; never durable."""
+
+    def __init__(self) -> None:
+        self._armed = False
+        self._active = False
+        self._proof: str | None = None
+
+    def arm(self, capability: object, proof: object) -> None:
+        if not _is_current_process_activation(capability, proof):
+            raise _HostVerificationFailure("health-activation-invalid")
+        self._armed = True
+        self._active = False
+        self._proof = proof
+
+    def can_create_adapter(self) -> bool:
+        return self._armed or self._active
+
+    def activate(self, capability: object, proof: object) -> None:
+        if (
+            not self._armed
+            or self._proof != proof
+            or not _is_current_process_activation(capability, proof)
+        ):
+            raise _HostVerificationFailure("health-activation-unproven")
+        self._active = True
+
+    def revoke(self) -> None:
+        self._armed = False
+        self._active = False
+        self._proof = None
+
+
 class _HealthWeixinAdapter:
     """Minimal platform adapter used by the real pinned Gateway lifecycle."""
 
-    def __init__(self, config: object) -> None:
+    def __init__(self, config: object, activation: _ActivationState) -> None:
         extra = getattr(config, "extra", None)
         if type(extra) is not dict:
             raise _HostVerificationFailure("health-config-invalid")
         self._registry = extra.get("registry")
         self._effect_adapter = extra.get("effect_adapter")
         self._client = _CorePortClient(extra.get("core_port_endpoint"))
+        self._activation = activation
+        self._activation_capability = extra.get("activation_capability")
+        self._activation_proof = extra.get("activation_proof")
 
     def _disable_current_entry(self) -> None:
+        self._activation.revoke()
         unregister = getattr(self._registry, "unregister", None)
         if callable(unregister):
             unregister("health_weixin")
@@ -63,6 +101,9 @@ class _HealthWeixinAdapter:
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         del is_reconnect
         try:
+            self._activation.activate(
+                self._activation_capability, self._activation_proof
+            )
             self._client.request(
                 "command", {"operation": "health-runtime-probe"}
             )
@@ -151,6 +192,7 @@ class _HealthWeixinAdapter:
             raise
 
     async def disconnect(self) -> bool:
+        self._activation.revoke()
         return True
 
 
@@ -160,9 +202,23 @@ def register(ctx: object) -> None:
     register_platform = getattr(ctx, "register_platform", None)
     if not callable(register_platform):
         raise RuntimeError("Hermes PluginContext lacks platform registration")
+    activation = _ActivationState()
+
+    def adapter_factory(config: object) -> _HealthWeixinAdapter:
+        return _HealthWeixinAdapter(config, activation)
+
+    def arm(capability: object, proof: object) -> None:
+        activation.arm(capability, proof)
+
+    setattr(adapter_factory, "_ticket118_arm", arm)
+
+    def check_fn() -> bool:
+        return activation.can_create_adapter()
+
+    setattr(check_fn, "_ticket118_arm", arm)
     register_platform(
         name="health_weixin",
         label="Health Weixin",
-        adapter_factory=lambda config: _HealthWeixinAdapter(config),
-        check_fn=lambda: True,
+        adapter_factory=adapter_factory,
+        check_fn=check_fn,
     )

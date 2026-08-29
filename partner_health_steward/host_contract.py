@@ -51,6 +51,66 @@ _PINNED_FILES = {
     ),
 }
 
+_REQUIRED_RELEASE_ARTIFACTS = {
+    "hermes-required-patch": "host/required.patch",
+    "disabled-native-entry": "host/disabled-native-entry.assertion",
+    "hermes-host-health-weixin-adapter": "product/hermes_host.py",
+    "health-plugin": "product/plugin.py",
+    "health-core": "product/core.py",
+    "model-adapter-interface": "adapters/model.py",
+    "delivery-adapter-interface": "adapters/delivery.py",
+    "core-command-interface": "interfaces/core-command.json",
+    "core-managed-read-interface": "interfaces/core-managed-read.json",
+    "core-controlled-effect-interface": "interfaces/core-controlled-effect.json",
+    "health-state-schema": "schemas/health-state.json",
+    "capability-profile-schema": "model/capability-profile-schema.json",
+    "capability-profile-builder": "model/capability-profile-builder.py",
+    "capability-profile-validator": "model/capability-profile-validator.py",
+    "minimum-help-bundle": "bundles/minimum-help.json",
+    "knowledge-bundle": "bundles/knowledge.json",
+    "safety-bundle": "bundles/safety.json",
+    "diagnostic-bundle": "bundles/diagnostic.json",
+    "migration-protocol": "migration/protocol.json",
+    "migration-schema": "migration/schema.json",
+    "migration-builder": "migration/builder.py",
+    "migration-semantic-registry": "migration/semantic-registry.json",
+    "migration-synthetic-fixture": "migration/ticket117-synthetic-fixture.py",
+    "python-constraint": "environment/python.txt",
+    "dependency-constraint": "environment/dependencies.lock",
+    "service-identity-acl-requirement": "environment/service-acl.json",
+    "skill:health-init": "skills/health-init/SKILL.md",
+    "skill:health-steward": "skills/health-steward/SKILL.md",
+    "skill:health-settings": "skills/health-settings/SKILL.md",
+    "skill:health-portrait": "skills/health-portrait/SKILL.md",
+    "skill:health-evidence": "skills/health-evidence/SKILL.md",
+    "skill:health-owner-inquiry": "skills/health-owner-inquiry/SKILL.md",
+    "skill:health-literature": "skills/health-literature/SKILL.md",
+}
+_TARGET_BINDING_REQUIREMENTS = (
+    "target-hermes-artifact",
+    "target-required-patch",
+    "target-plugin-binding",
+    "target-service-identity",
+    "target-unix-acl",
+    "target-current-head",
+    "target-native-entry-disabled",
+)
+_EXTERNAL_APPROVAL_REQUIREMENTS = (
+    "model-route-owner-consent",
+    "knowledge-rights",
+    "medical-review",
+    "owner-acceptance",
+)
+_SECRET_CLASSES = (
+    "credential",
+    "token",
+    "private-key",
+    "contact-identity",
+    "health-content",
+    "partner-config-value",
+)
+_CURRENT_PROCESS_ACTIVATION_CAPABILITY = object()
+
 _ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|"
     r"/(?:home|root|Users|etc|var|tmp|opt|srv|mnt|workspace)/)"
@@ -127,6 +187,51 @@ def _scan_artifact(relative: str, content: bytes) -> None:
         raise ValueError(f"release artifact contains an absolute path: {relative}")
     if any(marker in text for marker in _FORBIDDEN_CONTENT_MARKERS):
         raise ValueError(f"release artifact contains forbidden content: {relative}")
+
+
+def _validate_release_artifact_closure(
+    entries: object,
+    *,
+    require_hashes: bool,
+) -> None:
+    if type(entries) not in (list, tuple):
+        raise ValueError("release artifact closure is unavailable")
+    declared: dict[str, str] = {}
+    for entry in entries:
+        expected_fields = {"path", "role", "sha256"} if require_hashes else {"path", "role"}
+        if type(entry) is not dict or set(entry) != expected_fields:
+            raise ValueError("release artifact closure entry is invalid")
+        relative = _relative_path(entry["path"], "artifact path")
+        role = _plain_text(entry["role"], "artifact role")
+        if role in declared:
+            raise ValueError("duplicate release artifact role")
+        if require_hashes:
+            declared_hash = _plain_text(entry["sha256"], "artifact hash")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", declared_hash):
+                raise ValueError("invalid release artifact hash")
+        declared[role] = relative
+    if declared != _REQUIRED_RELEASE_ARTIFACTS:
+        raise ValueError("release artifact closure is incomplete")
+
+
+def _activation_proof(release_digest: str) -> str:
+    return "sha256:" + _sha256_bytes(
+        _canonical_bytes(
+            {
+                "manifest": release_digest,
+                "host": "health_weixin",
+                "lifecycle": ["connect", "disconnect"],
+            }
+        )
+    )
+
+
+def _is_current_process_activation(
+    capability: object, proof: object
+) -> bool:
+    return capability is _CURRENT_PROCESS_ACTIVATION_CAPABILITY and (
+        type(proof) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", proof) is not None
+    )
 
 
 def _manifest_entry(wire: Mapping[str, object], role: str) -> dict[str, object]:
@@ -310,8 +415,10 @@ class HostReleaseContract:
         raw_artifacts = release_sources.get("artifacts")
         if type(raw_artifacts) not in (list, tuple) or not raw_artifacts:
             raise ValueError("release artifact allowlist is unavailable")
+        _validate_release_artifact_closure(raw_artifacts, require_hashes=False)
         verified: list[dict[str, str]] = []
         seen_paths: set[str] = set()
+        seen_roles: set[str] = set()
         for raw in raw_artifacts:
             if type(raw) is not dict or set(raw) != {"path", "role"}:
                 raise ValueError("invalid release artifact allowlist entry")
@@ -319,7 +426,10 @@ class HostReleaseContract:
             role = _plain_text(raw["role"], "artifact role")
             if relative in seen_paths:
                 raise ValueError("duplicate release artifact path")
+            if role in seen_roles:
+                raise ValueError("duplicate release artifact role")
             seen_paths.add(relative)
+            seen_roles.add(role)
             path = repository_root / Path(*PurePosixPath(relative).parts)
             try:
                 resolved = path.resolve(strict=True)
@@ -477,6 +587,16 @@ class HostReleaseContract:
                     "reason_code": "assessment-mode-invalid",
                 }
             )
+        if transition_assessment.get("contract") != "ticket118-transition-assessment-v1":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": mode,
+                    "verdict": "cannot-confirm",
+                    "reason_code": "assessment-contract-invalid",
+                    "activation_proof": None,
+                }
+            )
         if mode == "install":
             return self._assess_install(transition_assessment)
         if mode == "upgrade":
@@ -487,20 +607,109 @@ class HostReleaseContract:
     def _validate_manifest(
         manifest: ReleaseManifest, wire: Mapping[str, object]
     ) -> None:
-        if wire.get("contract") != "ticket118-release-manifest-v1":
-            raise _HostVerificationFailure("manifest-contract-invalid")
-        if type(wire.get("release_digest")) is not str:
-            raise _HostVerificationFailure("manifest-digest-missing")
-        identity = copy.deepcopy(dict(wire))
-        identity.pop("release_digest", None)
-        expected = "sha256:" + _sha256_bytes(_canonical_bytes(identity))
-        if wire.get("release_digest") != expected:
-            raise _HostVerificationFailure("manifest-digest-mismatch")
-        _manifest_entry(wire, "hermes-required-patch")
-        _manifest_entry(wire, "disabled-native-entry")
-        _manifest_entry(wire, "hermes-host-health-weixin-adapter")
+        try:
+            HostReleaseContract._validate_manifest_wire(wire)
+        except ValueError as exc:
+            raise _HostVerificationFailure("manifest-closure-invalid") from exc
         if manifest._repository_root.is_dir() is False:
             raise _HostVerificationFailure("manifest-source-root-missing")
+
+    @staticmethod
+    def _validate_manifest_wire(wire: Mapping[str, object]) -> None:
+        if type(wire) is not dict:
+            raise ValueError("manifest must be a plain mapping")
+        if wire.get("contract") != "ticket118-release-manifest-v1":
+            raise ValueError("manifest contract is invalid")
+        release_digest = wire.get("release_digest")
+        if type(release_digest) is not str or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", release_digest
+        ):
+            raise ValueError("manifest digest is invalid")
+        identity = copy.deepcopy(dict(wire))
+        identity.pop("release_digest", None)
+        try:
+            expected = "sha256:" + _sha256_bytes(_canonical_bytes(identity))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("manifest identity is invalid") from exc
+        if release_digest != expected:
+            raise ValueError("manifest digest does not match identity")
+        _validate_release_artifact_closure(
+            wire.get("repository_verified"), require_hashes=True
+        )
+        pinned = wire.get("pinned_hermes")
+        expected_pinned_files = [
+            {"path": path, "sha256": digest}
+            for path, digest in _PINNED_FILES.items()
+        ]
+        if (
+            type(pinned) is not dict
+            or pinned.get("commit") != _PINNED_COMMIT
+            or pinned.get("allowlisted_files") != expected_pinned_files
+            or pinned.get("extractor_version") != "ticket118-pinned-source-v1"
+        ):
+            raise ValueError("manifest pinned source is invalid")
+        environment = wire.get("environment_constraints")
+        if (
+            type(environment) is not dict
+            or set(environment) != {"python", "core_port"}
+            or type(environment.get("python")) is not str
+            or not environment["python"]
+        ):
+            raise ValueError("manifest environment is invalid")
+        core_port = environment.get("core_port")
+        if type(core_port) not in (list, tuple) or list(core_port) != [
+            "command-v1",
+            "managed-read-v1",
+            "controlled-effect-v1",
+        ]:
+            raise ValueError("manifest environment is invalid")
+        if wire.get("target_binding_required") != list(_TARGET_BINDING_REQUIREMENTS):
+            raise ValueError("manifest target binding is invalid")
+        if wire.get("external_approval_required") != list(
+            _EXTERNAL_APPROVAL_REQUIREMENTS
+        ):
+            raise ValueError("manifest external approval is invalid")
+        if wire.get("forbidden_secret_classes") != list(_SECRET_CLASSES):
+            raise ValueError("manifest secret classification is invalid")
+
+    @staticmethod
+    def _assessment_manifest(value: object) -> dict[str, object] | None:
+        if type(value) is not dict:
+            return None
+        try:
+            HostReleaseContract._validate_manifest_wire(value)
+        except ValueError:
+            return None
+        return copy.deepcopy(value)
+
+    @staticmethod
+    def _host_report_state(
+        value: object, manifest: Mapping[str, object] | None
+    ) -> str:
+        if type(value) is not dict or value.get(
+            "contract"
+        ) != "ticket118-host-contract-report-v1":
+            return "cannot-confirm"
+        verdict = value.get("verdict")
+        if verdict == "fail":
+            return "fail"
+        if verdict != "pass" or manifest is None:
+            return "cannot-confirm"
+        release_digest = manifest.get("release_digest")
+        if type(release_digest) is not str or value.get(
+            "activation_proof"
+        ) != _activation_proof(release_digest):
+            return "cannot-confirm"
+        proofs = value.get("proofs")
+        registration = proofs.get("registration") if type(proofs) is dict else None
+        if (
+            type(registration) is not dict
+            or registration.get("platform") != "health_weixin"
+            or registration.get("discovery") != "completed"
+            or registration.get("lifecycle") != ["connect", "disconnect"]
+        ):
+            return "cannot-confirm"
+        return "pass"
 
     @staticmethod
     def _validate_pinned_source(
@@ -662,6 +871,16 @@ class HostReleaseContract:
             manager = plugins.PluginManager()
             manager.discover_and_load(force=True)
             registry = registry_module.platform_registry
+            entry = registry.get("health_weixin")
+            check = getattr(entry, "check_fn", None)
+            release_digest = wire.get("release_digest")
+            if not callable(check) or type(release_digest) is not str:
+                raise _HostVerificationFailure("health-weixin-registration-missing")
+            activation = _activation_proof(release_digest)
+            activate = getattr(check, "_ticket118_arm", None)
+            if not callable(activate):
+                raise _HostVerificationFailure("health-weixin-activation-missing")
+            activate(_CURRENT_PROCESS_ACTIVATION_CAPABILITY, activation)
             runner_type = gateway_run.GatewayRunner
             runner = runner_type.__new__(runner_type)
             runner.config = type(
@@ -674,6 +893,8 @@ class HostReleaseContract:
                 "core_port_endpoint": copy.deepcopy(source["core_port_endpoint"]),
                 "effect_adapter": source["effect_adapter"],
                 "registry": registry,
+                "activation_capability": _CURRENT_PROCESS_ACTIVATION_CAPABILITY,
+                "activation_proof": activation,
             }
             names = ("health_weixin", "weixin", "medical", "ordinary")
             adapters = [
@@ -697,15 +918,6 @@ class HostReleaseContract:
 
             if registry.get("health_weixin") is None:
                 raise _HostVerificationFailure("health-weixin-registration-missing")
-            activation = "sha256:" + _sha256_bytes(
-                _canonical_bytes(
-                    {
-                        "manifest": wire["release_digest"],
-                        "host": "health_weixin",
-                        "lifecycle": ["connect", "disconnect"],
-                    }
-                )
-            )
             endpoint = source.get("core_port_endpoint")
             transport = endpoint.get("transport") if type(endpoint) is dict else None
             return {
@@ -786,12 +998,35 @@ class HostReleaseContract:
 
     @staticmethod
     def _assess_install(assessment: Mapping[str, object]) -> ReadinessReport:
-        manifest = assessment.get("release_manifest")
-        requirements = (
-            list(manifest.get("target_binding_required", []))
-            if type(manifest) is dict
-            else []
+        manifest = HostReleaseContract._assessment_manifest(
+            assessment.get("release_manifest")
         )
+        host_state = HostReleaseContract._host_report_state(
+            assessment.get("host_report"), manifest
+        )
+        if host_state == "fail":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": "install",
+                    "verdict": "fail",
+                    "reason_code": "host-report-failed",
+                    "partner_verdict": "fail",
+                    "activation_proof": None,
+                }
+            )
+        if manifest is None or host_state != "pass":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": "install",
+                    "verdict": "cannot-confirm",
+                    "reason_code": "release-or-host-evidence-invalid",
+                    "partner_verdict": "cannot-confirm",
+                    "activation_proof": None,
+                }
+            )
+        requirements = list(manifest["target_binding_required"])
         observations = assessment.get("target_observations")
         if type(observations) is not dict:
             observations = {}
@@ -801,48 +1036,73 @@ class HostReleaseContract:
             if type(observations.get(requirement)) is not dict
             or observations[requirement].get("status") != "verified"
         ]
-        if missing:
-            return ReadinessReport(
-                {
-                    "contract": "ticket118-readiness-report-v1",
-                    "mode": "install",
-                    "verdict": "cannot-confirm",
-                    "missing_requirements": missing,
-                    "partner_verdict": "cannot-confirm",
-                    "activation_proof": None,
-                }
-            )
-        if any(
-            observations[requirement].get("evidence_class") == "synthetic"
+        unconfirmed_targets = [
+            requirement
             for requirement in requirements
-        ):
-            return ReadinessReport(
-                {
-                    "contract": "ticket118-readiness-report-v1",
-                    "mode": "install",
-                    "verdict": "cannot-confirm",
-                    "missing_requirements": [],
-                    "partner_verdict": "cannot-confirm",
-                    "activation_proof": None,
-                }
-            )
+            if type(observations.get(requirement)) is not dict
+            or observations[requirement].get("evidence_class") != "target-attested"
+        ]
+        approvals = assessment.get("external_approvals")
+        if type(approvals) is not dict:
+            approvals = {}
+        required_approvals = list(manifest["external_approval_required"])
+        missing_approvals = [
+            requirement
+            for requirement in required_approvals
+            if type(approvals.get(requirement)) is not dict
+            or approvals[requirement].get("status") != "approved"
+        ]
+        unconfirmed_approvals = [
+            requirement
+            for requirement in required_approvals
+            if type(approvals.get(requirement)) is not dict
+            or approvals[requirement].get("evidence_class") != "external-attested"
+        ]
         return ReadinessReport(
             {
                 "contract": "ticket118-readiness-report-v1",
                 "mode": "install",
-                "verdict": "pass",
-                "missing_requirements": [],
-                "partner_verdict": "pass",
+                "verdict": "cannot-confirm",
+                "reason_code": "target-or-external-evidence-not-bound-in-ticket118",
+                "missing_requirements": missing,
+                "unconfirmed_target_requirements": unconfirmed_targets,
+                "missing_external_approvals": missing_approvals,
+                "unconfirmed_external_approvals": unconfirmed_approvals,
+                "partner_verdict": "cannot-confirm",
                 "activation_proof": None,
             }
         )
 
     @staticmethod
     def _assess_upgrade(assessment: Mapping[str, object]) -> ReadinessReport:
-        before = assessment.get("from_release_manifest")
-        after = assessment.get("to_release_manifest")
+        before = HostReleaseContract._assessment_manifest(
+            assessment.get("from_release_manifest")
+        )
+        after = HostReleaseContract._assessment_manifest(
+            assessment.get("to_release_manifest")
+        )
+        host_state = HostReleaseContract._host_report_state(
+            assessment.get("host_report"), before
+        )
+        if host_state == "fail":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": "upgrade",
+                    "verdict": "fail",
+                    "reason_code": "host-report-failed",
+                    "activation_proof": None,
+                }
+            )
         scope = assessment.get("assessment_scope")
-        if scope != "offline-release-compatibility" or type(before) is not dict or type(after) is not dict:
+        if (
+            scope != "offline-release-compatibility"
+            or before is None
+            or after is None
+            or host_state != "pass"
+            or assessment.get("target_binding_required") != []
+            or assessment.get("target_observations") != {}
+        ):
             return ReadinessReport(
                 {
                     "contract": "ticket118-readiness-report-v1",
@@ -866,19 +1126,43 @@ class HostReleaseContract:
 
     @staticmethod
     def _assess_rollback(assessment: Mapping[str, object]) -> ReadinessReport:
-        before = assessment.get("from_release_manifest")
-        after = assessment.get("to_release_manifest")
-        compatible = (
-            type(before) is dict
-            and type(after) is dict
-            and before.get("release_digest") == after.get("release_digest")
+        before = HostReleaseContract._assessment_manifest(
+            assessment.get("from_release_manifest")
         )
-        del compatible  # Target authority remains unproven in this ticket.
+        after = HostReleaseContract._assessment_manifest(
+            assessment.get("to_release_manifest")
+        )
+        host_state = HostReleaseContract._host_report_state(
+            assessment.get("host_report"), after
+        )
+        if host_state == "fail":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": "rollback",
+                    "verdict": "fail",
+                    "reason_code": "host-report-failed",
+                    "restore_instance_state": False,
+                    "activation_proof": None,
+                }
+            )
+        if before is None or after is None or host_state != "pass":
+            return ReadinessReport(
+                {
+                    "contract": "ticket118-readiness-report-v1",
+                    "mode": "rollback",
+                    "verdict": "cannot-confirm",
+                    "reason_code": "release-or-host-evidence-invalid",
+                    "restore_instance_state": False,
+                    "activation_proof": None,
+                }
+            )
         return ReadinessReport(
             {
                 "contract": "ticket118-readiness-report-v1",
                 "mode": "rollback",
                 "verdict": "cannot-confirm",
+                "reason_code": "target-authority-not-bound-in-ticket118",
                 "restore_instance_state": False,
                 "activation_proof": None,
             }
