@@ -1,7 +1,7 @@
 # 118 - 完成 Hermes/Weixin 宿主合同发布与回滚准备
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-establish-plugin-core-trust-boundary-and-synthetic-harness.md), [111 - 实现唯一准入与主人初始化](111-implement-unique-admission-and-owner-initialization.md), [112 - 实现七 Skill 协调与日常证据画像处理](112-implement-seven-skill-coordination-and-daily-evidence-portrait-turn.md), [113 - 实现 StrictHealthLLM 治理知识与非诊断回答](113-implement-strict-health-llm-governed-knowledge-and-nondiagnostic-answer.md), [114 - 实现主人设置数据权利与业务状态](114-implement-owner-settings-data-rights-and-business-status.md), [115 - 实现任务当地日复盘与分层主人投递](115-implement-tasks-local-day-review-and-layered-owner-delivery.md), [116 - 实现安全诊断门禁与支持联系人链](116-implement-safety-diagnostic-gates-and-support-contact-chain.md), [117 - 实现终止删除防复活与 writer-fence 迁移](117-implement-terminal-deletion-nonresurrection-and-writer-fence-migration.md)
 
@@ -98,4 +98,16 @@ Ticket 118 已完成编码前架构与验证冻结；本节不是实施证据，
 - fresh-context Spec reviewer：PASS；fresh-context Standards reviewer：PASS；最后一个 public-wire `Mapping` 假绿 mutation 已由两轴独立复核关闭，无 P0/P1/P2。
 
 编码 Agent 只能在上述 checkpoint 上实现一个深 `HostReleaseContract`、当前 `partner_health_steward.hermes_host` 宿主边界、三类 CorePort 及必要薄入口，使同一 7 门从 `1 failure / 6 skips` 变为 `7/7 PASS`。不得修改冻结设计、冻结验证合同或 verifier-owned test，不得引用历史 `ops/` 作为当前 release，不得提前获取 Ticket 119 的真实 Partner／Linux／部署证据。若冻结门错误、必须新增架构或需要真实外部决定，立即停止并返回冻结阶段。
+
+## Implementation evidence (reviewed)
+
+- 共同 `review_base`：`4f24f6d3c3addfc1c6df7976e317687c80485dca`；初始实现：`31f97c2457a8fddcd3df534279d4b53043877235`；最终受审实现 commit：`df6b9b1f2d9f5483719e6db61e24415527a1847c`，tree：`88337b7e14b1351c3c122607ea9b746a012512ad`。
+- 冻结实施设计、冻结验证合同和 verifier-owned test 相对初始实现 checkpoint 保持不变；最终 blob 分别为 `64a2b02d96729344019b36af2b04d14fd7cfc106`、`b1b370ce99674a48ec83d8c28620e20499b18f6a`、`55a2c94373548f240934d6c201a4b5a5338748ee`。
+- 审查发现并有界修复三类假绿：release artifact 闭包不完整仍可构建、readiness assessment 接受无权威或非结构化证据、宿主健康检查未绑定已验证激活状态。修复只涉及 `partner_health_steward/host_contract.py` 与 `partner_health_steward/hermes_host.py`。
+- 最终验证：Ticket 118 `7/7 PASS`；Ticket 117 `9/9 PASS`；项目全量 `736/736 PASS`；release build 入口、`compileall` 与 `git diff --check` 均通过。删除必需 release role 会失败，未验证宿主健康检查为 false，非法 assessment 失败关闭。
+- fresh-context Spec reviewer：PASS；fresh-context Standards reviewer：PASS。两轴仅复核原始 findings 的闭合，没有重开架构或新增门禁，未剩余 P0/P1/P2。
+
+## Answer
+
+Ticket 118 已在冻结的本地产品与 pinned synthetic Hermes 范围内完成：可重现 release manifest、固定 Hermes lifecycle、唯一 `health_weixin` 宿主边界、三类 CorePort、失败关闭的 install/upgrade/rollback readiness 以及回滚准备均通过冻结门和双轴复核。该结论不代表已部署，也不证明真实 Partner、Linux、Weixin、模型、联系人传输、外部批准或主人验收；这些目标继续由 Ticket 119 的 target-binding、canary 与上线证据闭合。
 
