@@ -1,6 +1,6 @@
 # Ticket 119 冻结实施设计
 
-> 状态：candidate，等待 verifier-owned 测试门与编码前 Spec／Standards 预审共同冻结。产品 characterization 基线为 commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`。本设计只增加验收编排与证据合同，不执行真实外部动作，也不改变 Tickets 110—118 的产品架构。
+> 状态：frozen。经审内容 checkpoint 为 commit `5f383842cea3cb7351663f89ebd5d1f28230b129`，tree `3238e7f9ce1d01a6637cc62ec37a1b00d581b746`；fresh-context Spec／Standards 预审均 PASS。产品 characterization 基线为 commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`。本设计只增加验收编排与证据合同，不执行真实外部动作，也不改变 Tickets 110—118 的产品架构。
 
 ## 目标、当前差额与非目标
 

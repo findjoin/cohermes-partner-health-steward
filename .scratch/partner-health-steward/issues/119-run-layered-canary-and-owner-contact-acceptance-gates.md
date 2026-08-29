@@ -109,11 +109,12 @@ Ticket 119 已完成当前产品 characterization，并形成候选冻结实施�
 
 - 产品基线：commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`；Ticket 118 `7/7 PASS`，Ticket 117 `9/9 PASS`，项目全量 `736/736 PASS`。
 - 当前可复现差额：包未公开 `AcceptanceRunContract`，不存在 Ticket 119 自动门或工具入口；`hasattr(partner_health_steward, "AcceptanceRunContract") == False`。
-- 候选冻结实施设计：`design/119-frozen-implementation-design.md`，SHA-256 `39d0fabc9bd28db4fbbdad8c9f7842dc7408e9fcb59b7607df529ddd06c0a81f`。
-- 候选冻结验证合同：`design/119-frozen-verification-contract.md`，SHA-256 `58868eb3ad70aa758814d82d7be69babf337b29869b00fd29e5cab67f619360c`。
+- 冻结实施设计：`design/119-frozen-implementation-design.md`，SHA-256 `5846c573a251cf747e7e100ef4b8b57bbed1f7f5dc40e90a78b295e7c2d28d6b`。
+- 冻结验证合同：`design/119-frozen-verification-contract.md`，SHA-256 `79ecbb7d96b642bc94ef975bf06ef39c7566b108b87993b7e24dc4b190a4ef97`。
 - verifier-owned test：`tests/test_ticket119_integration.py`，SHA-256 `978069af0dec6731111c49c9804c49982a96026e628ad60a413deb058d261642`。
 - 编码前 Gate：`1 failure / 6 skips / 0 errors`；唯一红灯是公共 Module 缺失，后六门只因同一前置缺失 skip。`compileall` 与差异检查通过。
 - 当前真实 frontier 未执行。G03 的目标 Linux peer/ACL、G07 的权利与医学审核、G08/G10—G12 的 disposable/Partner/真实接口/主人联系人动作仍需各自事实或明确批准；候选自动门不能替代这些证据。
+- 编码前双轴预审绑定 candidate commit `5f383842cea3cb7351663f89ebd5d1f28230b129`、tree `3238e7f9ce1d01a6637cc62ec37a1b00d581b746`：Spec PASS；Standards PASS。初审发现的 synthetic 假验收、A3 分层缺失、旧 report 重放与 approval/target binding 四类缺口均已在冻结阶段关闭；复核未重开风险搜索。
 
 编码 Agent 只能在预审通过的冻结 checkpoint 上实现一个深 `AcceptanceRunContract`、严格 `GateExecutor` Seam、不可变 report/value objects 和薄工具入口，使同一七门从 `1 failure / 6 skips` 变为 `7/7 PASS`。不得修改冻结三件套，不得改 HealthCore、HostReleaseContract、current-head、诊断激活或投递权威，不得执行未获批真实 gate。若冻结门错误或需要产品架构变化，立即返回冻结阶段。
 

@@ -1,6 +1,6 @@
 # Ticket 119 冻结验证合同
 
-> 状态：candidate，等待与 [`119-frozen-implementation-design.md`](119-frozen-implementation-design.md) 绑定到同一 checkpoint，并由 fresh-context Spec／Standards reviewer 完成编码前预审。characterization 产品基线为 commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`；verifier-owned 测试为 `tests/test_ticket119_integration.py`，当前 SHA-256 `978069af0dec6731111c49c9804c49982a96026e628ad60a413deb058d261642`。本合同冻结后，编码 Agent 不得修改本文件、实施设计或 verifier-owned 测试。
+> 状态：frozen。经审内容 checkpoint 为 commit `5f383842cea3cb7351663f89ebd5d1f28230b129`，tree `3238e7f9ce1d01a6637cc62ec37a1b00d581b746`；fresh-context Spec／Standards 预审均 PASS。characterization 产品基线为 commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`；verifier-owned 测试为 `tests/test_ticket119_integration.py`，当前 SHA-256 `978069af0dec6731111c49c9804c49982a96026e628ad60a413deb058d261642`。编码 Agent 不得修改本文件、实施设计或 verifier-owned 测试。
 
 ## 测试权威与唯一行为 Seam
 
