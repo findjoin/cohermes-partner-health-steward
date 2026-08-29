@@ -105,7 +105,7 @@ G01—G06、G09 的测试通过不替代 G07、G08、G10—G12。G08 永远不�
 
 ## Pre-code freeze evidence
 
-Ticket 119 已完成当前产品 characterization，并形成候选冻结实施设计和独立 verifier-owned 自动门；本节不是实施或真实 gate 证据，不构成 `resolved`，Map 未更新，也没有执行任何真实部署、模型、Weixin、联系人、删除、迁移或主人验收。
+Ticket 119 已完成当前产品 characterization，并冻结实施设计和独立 verifier-owned 自动门；本节不是实施或真实 gate 证据，不构成 `resolved`，Map 未更新，也没有执行任何真实部署、模型、Weixin、联系人、删除、迁移或主人验收。
 
 - 产品基线：commit `dc6b26b03aa076b405a7b28d440de058b783f135`，tree `d69e2b698848eae28e0245d07f28847583711877`；Ticket 118 `7/7 PASS`，Ticket 117 `9/9 PASS`，项目全量 `736/736 PASS`。
 - 当前可复现差额：包未公开 `AcceptanceRunContract`，不存在 Ticket 119 自动门或工具入口；`hasattr(partner_health_steward, "AcceptanceRunContract") == False`。
@@ -115,6 +115,7 @@ Ticket 119 已完成当前产品 characterization，并形成候选冻结实施�
 - 编码前 Gate：`1 failure / 6 skips / 0 errors`；唯一红灯是公共 Module 缺失，后六门只因同一前置缺失 skip。`compileall` 与差异检查通过。
 - 当前真实 frontier 未执行。G03 的目标 Linux peer/ACL、G07 的权利与医学审核、G08/G10—G12 的 disposable/Partner/真实接口/主人联系人动作仍需各自事实或明确批准；候选自动门不能替代这些证据。
 - 编码前双轴预审绑定 candidate commit `5f383842cea3cb7351663f89ebd5d1f28230b129`、tree `3238e7f9ce1d01a6637cc62ec37a1b00d581b746`：Spec PASS；Standards PASS。初审发现的 synthetic 假验收、A3 分层缺失、旧 report 重放与 approval/target binding 四类缺口均已在冻结阶段关闭；复核未重开风险搜索。
+- 冻结元数据提交为 `84f2976f5b72df8efb41e7127b6a8cdd7a963a0f`、tree `2b7cdaa4ebd94b944b432da2d118a99049360e2a`；实施设计 blob `fc4332aa941a168b839bd0ec1d27911a5c46049a`、验证合同 blob `86bf462a8d3563081e5652ff753a09415bb03df1`、verifier test blob `9dbf49eee033cf1804a0ef0b2bec35db5d182b68`。原 Spec／Standards reviewer 对该提交完成 metadata-only 复核并均为 PASS，确认冻结语义和测试字节级未变，且未重开风险搜索。
 
 编码 Agent 只能在预审通过的冻结 checkpoint 上实现一个深 `AcceptanceRunContract`、严格 `GateExecutor` Seam、不可变 report/value objects 和薄工具入口，使同一七门从 `1 failure / 6 skips` 变为 `7/7 PASS`。不得修改冻结三件套，不得改 HealthCore、HostReleaseContract、current-head、诊断激活或投递权威，不得执行未获批真实 gate。若冻结门错误或需要产品架构变化，立即返回冻结阶段。
 
