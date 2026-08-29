@@ -1,7 +1,7 @@
 # 117 - 实现终止删除防复活与 writer-fence 迁移
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [110 - 建立 Plugin/core 受信边界与合成验证骨架](110-establish-plugin-core-trust-boundary-and-synthetic-harness.md), [114 - 实现主人设置数据权利与业务状态](114-implement-owner-settings-data-rights-and-business-status.md), [115 - 实现任务当地日复盘与分层主人投递](115-implement-tasks-local-day-review-and-layered-owner-delivery.md), [116 - 实现安全诊断门禁与支持联系人链](116-implement-safety-diagnostic-gates-and-support-contact-chain.md)
 
@@ -103,4 +103,21 @@ Ticket 117 的实施设计和 verifier-owned 测试门已经在产品代码修�
 任何真实删除、真实密钥销毁、真实 current-head/旧 VM、真实备份或生产迁移动作都必须停止并等待单独批准；无法完整枚举受管对象、需要以后补齐部分状态或 writer-fence 路线不可实施时保持关闭并报告。冻结设计或测试门变化必须返回编码前重新冻结和预审；最终 verdict 后的生产变化必须形成新 checkpoint 并重新核验。全部冻结验收通过且没有 blocker 后应停止继续扩写审查。
 
 实施 Agent 记录 Gate 到实现位置、验证结果和 checkpoint identity；形成 `reviewed_commit` 前记录 `git status --porcelain=v1 --untracked-files=all`，不得遗留未提交或未跟踪的实现、冻结或证据文件。两轴均通过后只追加 `## Answer`、状态和 Map pointer，Answer 记录两轴可定位 verdict 及共同 base/commit/tree。确认相对 `reviewed_commit` 仅有闭票元数据后提交，并对当前分支执行普通 `git push`；推送被拒绝时停止，禁止 force push 或改写历史。
+
+## Implementation evidence (reviewed)
+
+- 最终冻结 `review_base`：`a6ed8dda02760711619c1a05fabc9c1febbb296a`；最终产品 `reviewed_commit`：`49a824ed9fa02e67749f3bc4f2a6e5bfaead7bd0`；tree：`7b6a49131820efac7389f6e08d5e4dabf46c0a3e`。
+- 冻结完整性：实施设计 blob `8e3a2b349d053aa550c7c4f155d63165b2c5926b`、验证合同 blob `0c8a005accffed69601607a1557c05be2c56fda5`、verifier-owned 测试 blob `cfc696007146962dd944d8309443ae4595ae1559`，相对最终 handoff 零修改。
+- 最终有界修复只在 `partner_health_steward/core.py` 的三条既有 unknown 结算路径排除 lifecycle notice 的普通 `delivery-unknown` 主人决定请求；保留原 unknown 事实、单次说明、无重发及删除续做语义。
+- 验证：V02 定向 `1/1 PASS`；Ticket 117 `9/9 PASS`；Tickets 113—116 `456/456 PASS`；项目全量 `729/729 PASS`；`compileall` 与 `git diff --check` 通过；工作树干净、无未跟踪文件，远端实现分支精确指向 reviewed commit。
+- 最终同树双轴审查：Spec `PASS`、Standards `PASS`，均无 P0/P1/P2；此前复现的 notice/TaskEngine、terminal exact-lookup cleanup、writer-fence rotation 与第二确认请求缺口均由同一冻结 Gate 闭合。
+
+## Answer
+
+Ticket 117 已按冻结增量设计和九个 verifier-owned Gate 完成本地合成闭合。最终审查共同基线为 `review_base=a6ed8dda02760711619c1a05fabc9c1febbb296a`，最终 `reviewed_commit=49a824ed9fa02e67749f3bc4f2a6e5bfaead7bd0`，tree `7b6a49131820efac7389f6e08d5e4dabf46c0a3e`。
+
+- Spec 轴：`PASS`，无 P0/P1/P2；A1—A9 均由冻结公开 Seam 通过，删除 unknown、终态恢复、旧快照防复活、完整 manifest、离线迁移、fence 转移和未知效果连续性符合冻结语义。
+- Standards 轴：`PASS`，无 P0/P1/P2；实现保持既有权威、事务和 Interface，最终修复未引入第二权威、测试旁路或范围扩张。
+- 验证证据：Ticket 117 `9/9`、Tickets 113—116 `456/456`、项目全量 `729/729` 全部通过；`compileall`、`git diff --check` 与冻结 blob 检查通过。
+- 本结论只覆盖本地产品代码与 synthetic Adapter。真实密钥服务、备份/副本 Provider、旧 VM、真实 current-head、生产迁移、部署和主人验收仍由后继外部门验证，不在本票中冒充完成。
 
