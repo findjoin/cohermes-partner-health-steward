@@ -12,7 +12,7 @@
 
 - 基线全量 `729/729` 通过；Tickets 110—117 的健康命令、受控效果、bounded managed read、current-head、writer fence、删除和迁移语义全部保留，不重写业务状态机。
 - 当前 `HealthPlugin` 仍直接调用多个 `HealthCore` 方法；现有 `contract.py` 的 protocol v1、64 KiB 长度前缀 canonical JSON frame 只覆盖部分 command Interface。给每个方法机械生成 RPC 会形成庞大浅 Interface，不能作为冻结路线。
-- 当前没有 release compiler、宿主合同 Module、无凭据 preflight Module、当前 release declaration 或 Ticket 118 验证入口；历史 `ops/` 不能成为 release 输入。当前 release 的 Hermes 接入必须由新建的 `partner_health_steward.hermes_host` 公共 Module 提供 `register(ctx)` 与 `health_weixin` Adapter factory；它是 Ticket 118 的当前宿主边界，不复用或复制历史 `ops/` Plugin。
+- 当前没有 release compiler、宿主合同 Module、无凭据 preflight Module、当前 release declaration 或 Ticket 118 验证入口；历史 `ops/` 不能成为 release 输入。当前 release 的 Hermes 接入必须由新建的 `partner_health_steward.hermes_host` 公共 Module 提供 `register(ctx)` 与 `health_weixin` Adapter factory，并由 release 自有的 `release_assets/hermes-v0.20.0.patch` 和 `release_assets/native-health-disabled.assertion.json` 提供相互独立、内容寻址的宿主变换与禁用声明；它们不得用同一 Python 文件复制冒充多个 artifact，也不复用历史 `ops/` Plugin。
 - 固定 Hermes 源码实际提供 `PluginContext.register_platform(...)`、`PluginManager.discover_and_load(...)` 与 `PlatformRegistry`。platform 注册是逐项生效且同名 last-writer-wins；Plugin 部分注册失败不会天然回滚，因此入口必须默认关闭，只有完整宿主核验后才可获得进程内 activation proof。
 - 固定源码先查 plugin platform registry、实例化失败时不会回退同名 builtin，但 builtin 与普通处理仍存在；required patch／disabled-native assertion 必须证明健康消息在原生正文去重、合批和 cursor 前进入唯一入口，并且 Plugin 缺失或失败时不会落到旧 `medical`、native health 或普通健康处理。
 
@@ -60,7 +60,7 @@ manifest 固定区分四种事实：
 3. `external_approval_required`：权利、医学审核、许可和主人批准，只能是未证明要求；
 4. `forbidden_secret_classes`：只声明禁止保存的秘密类别，不保存值。
 
-release 至少内容绑定：固定 Hermes 来源与 required patch/native-disable assertion；Plugin/core；七 Skill bundle；health_weixin、模型和投递 Adapter Interface；三类 CorePort Interface；schema；capability-profile schema/builder/validator；MinimumHelpBundle；知识／危险规则／诊断 bundle；Ticket 117 migration protocol/schema/builder/semantic registry 及其 synthetic fixture；Python 与依赖约束；服务身份／ACL requirement。实例 migration manifest、owner/profile/current-head 值、联系人、服务资源 ID、时间戳和开发机路径不参与 release digest。每个 `repository_verified` 项必须公开仓库相对路径、语义角色和内容 hash；验证者逐项重算，而不是相信实现自报的摘要闭包。
+release 至少内容绑定：固定 Hermes commit、逐文件来源 hash、extractor version、声明环境和三类 CorePort 版本；独立的 required patch/native-disable assertion；Plugin/core；七 Skill bundle；health_weixin、模型和投递 Adapter Interface；schema；capability-profile schema/builder/validator；MinimumHelpBundle；知识／危险规则／诊断 bundle；Ticket 117 migration protocol/schema/builder/semantic registry 及其 synthetic fixture；Python 与依赖约束；服务身份／ACL requirement。上述声明或 artifact 任一漂移都必须改变 release digest。实例 migration manifest、owner/profile/current-head 值、联系人、服务资源 ID、时间戳和开发机路径不参与 release digest。每个 `repository_verified` 项必须公开仓库相对路径、语义角色和内容 hash；验证者逐项重算，而不是相信实现自报的摘要闭包。
 
 ### `HostReleaseContract.verify`
 
@@ -95,13 +95,13 @@ mode 只允许 `install | upgrade | rollback`。它消费已验证 release／hos
 - upgrade 直接比较由 `build` 产生的 current/candidate release manifest 和 host report，重新核验 artifact、schema、Skill／Adapter／model／bundle hash、ACL requirement、current head 和旧入口禁用；调用者提交的 `compatible` 字符串不构成证据。不兼容为 `fail`，不能确认保持 offline。
 - rollback 直接比较候选旧 release 与当前 semantic manifest，并要求 target observation 中的 generation 和 writer fence 具有非 synthetic 的当前证据。rollback 只评价代码兼容性，绝不恢复旧数据、批准、入口、generation 或 fence；纯离线比较可以形成 `offline_compatibility=pass`，但不能把整体 target readiness 提升为 `pass`。
 
-输出是无健康正文、无秘密的逐要求报告与总体 `pass | fail | cannot-confirm`。合成 observation 永远不能升级成真实 Partner proof。
+输出是无健康正文、无秘密的逐要求报告与总体 `pass | fail | cannot-confirm`。合成 observation 永远不能升级成真实 Partner proof。manifest、宿主报告和 readiness 报告都不得回显仓库／pinned root、Windows 或 Linux 绝对路径、环境秘密值或目标配置值；验证子进程只继承明确列出的无秘密环境。
 
 ## Hermes 宿主与失败关闭顺序
 
 - release 中只包含一个 health Plugin 和一个 `health_weixin` platform registration；七 Skill 是 Plugin 内资产，不是七个 Plugin。
 - platform registration 初始为 disabled。只有 manifest、pinned source、required patch、native-disable、CorePort probe 和 Adapter contracts 全部通过后才签发 activation proof 并打开入口。
-- partial registration、factory/check/config/callback/connect failure、重复或覆盖注册、Plugin 缺失、core 不可达、probe 不一致均保持入口关闭；残留 registry entry 没有读正文、调用 core、模型或发送权。
+- partial registration、factory/check/config/callback/connect failure、重复或覆盖注册、Plugin 缺失、core 不可达、probe 不一致均保持入口关闭；残留 registry entry 没有读正文、调用 core、模型或发送权。失败并撤销当前 entry 后必须再次主动探测 current、native Weixin、旧 medical/split 与 ordinary fallback，仍全部不可达；只在当前 entry 存在时屏蔽旧路由不合格。
 - ordinary-forward 只能是健康入口在可信状态下对明确普通消息作出的显式结果。健康、混合、未知或宿主不可确认时不得落回普通 Agent、旧 `medical` 或 native health path。
 - disconnect 顺序是先撤销 activation proof 和准入，再排空已开始的 CorePort exchange，最后关闭 Adapter／socket。无法证明排空时健康保持关闭；不承诺 Hermes 没有提供的热卸载。
 
