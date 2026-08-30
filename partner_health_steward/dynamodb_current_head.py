@@ -444,6 +444,13 @@ class DynamoDBCurrentHead:
         if not self._proof_matches(proof, expected):
             raise HeadConflict("current writer fence capability conflict")
 
+    def _require_current_lease_authority(self, expected: AuthoritySnapshot) -> None:
+        current = self._head()
+        if current.terminal:
+            raise HeadTerminal("terminal current head")
+        if current.as_authority() != expected:
+            raise HeadConflict("execution lease authority conflict")
+
     def _head_update(self, expected: AuthoritySnapshot, applied: AuthoritySnapshot) -> dict[str, object]:
         names = _condition_names()
         values = _head_condition_values(expected)
@@ -775,6 +782,7 @@ class DynamoDBCurrentHead:
         existing = self._get(record_key)
         if existing is not None:
             first_observation = self._lease_receipt(existing, identity)
+            self._require_current_lease_authority(request.expected)
             confirmed = self._get(record_key)
             if confirmed is not None:
                 second_observation = self._lease_receipt(confirmed, identity)
@@ -836,6 +844,7 @@ class DynamoDBCurrentHead:
         except HeadConflict as conflict:
             # A durable exact receipt makes an SDK/client replay idempotent.
             try:
+                self._require_current_lease_authority(request.expected)
                 return self.lookup_execution_lease(identity)
             except ExecutionLeaseNotFound:
                 raise conflict
