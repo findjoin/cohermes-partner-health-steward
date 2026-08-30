@@ -57,23 +57,21 @@ Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-
 - 当前 verifier-owned 测试：`../../../tests/test_ticket123_production_core_service.py`；blob `7aec1af838e0cf67e23dda79bbf78da9af149214`。
 - 只补入独立双轴审查原始 finding 的 V01 current release、V03 request-side EOF/延迟 tail、V06 canonical closure/release binding 与 V06 close drain 等价类；仍为七门，不增加产品目标、架构、CorePort wire 或 Tickets 110—122 状态机。
 
-### 当前唯一 verification-authority checkpoint（`26fa1d4`）
+### 历史 verification-authority checkpoint（`26fa1d4`）
 
 - 普通 refreeze 提交：`26fa1d4` 的 `fix(ticket-123-verifier): extend V06 drain observation`。
-- 在后续 candidate 完成独立双轴预审 PASS 前，本段是唯一当前执行验收权威；不存在并列的 candidate authority。
 - 冻结实施设计 blob 保持：`f464be479f51a0d03d9cf33e964bcd2e7d190e03`（零修改）。
-- 当前冻结验证合同 blob：`49b8fba41b5a7331dcfa49b4c2aa6f364fa14a42`。
-- 当前 verifier-owned 测试 blob：`b31ffd31c56e9bc4e29e13f35e806d113f105304`。
+- 历史冻结验证合同 blob：`49b8fba41b5a7331dcfa49b4c2aa6f364fa14a42`。
+- 历史 verifier-owned 测试 blob：`b31ffd31c56e9bc4e29e13f35e806d113f105304`。
 - 唯一增量是 V06 blocked-exchange observer 的 5 秒读取窗口，明确大于产品既有 2 秒 drain timeout；不改产品 drain timeout、断言、Gate 数量或其他测试。
 
-### 提议 verification-authority refreeze candidate（非权威，待独立双轴预审）
+### 当前唯一 frozen verification authority
 
-- 普通 candidate 提交：本段、冻结验证合同与 verifier 一并提交；它只记录待审提议，在独立双轴预审 PASS 前不替代上段唯一当前 checkpoint。
+- 内容冻结提交：`9fe4bff88e07a47a9656b3b1bd556da6b103e452`；tree：`4a73a52d18daf02b31ea5355600640abfac78be8`。它冻结经独立 Spec PASS 与 Standards PASS 的 candidate `930113ddde1a8a2d95ee2e1cff857cc427a25237` 内容。
 - 冻结实施设计 blob 保持：`f464be479f51a0d03d9cf33e964bcd2e7d190e03`（零修改）。
-- candidate 冻结验证合同：`../design/123-frozen-verification-contract.md`；blob `1246c89c051ea75d1de67ebaf597c714a9e00a2b`。
-- candidate verifier-owned 测试：`../../../tests/test_ticket123_production_core_service.py`；blob `11e6da49a117338bef8a3f86acbdabe7d42ea68f`。
-- 唯一增量是 V06 的完整 runtime-closure attestation：attestation 是已验证 release `files` 中的 content-addressed artifact，不反写最终 release digest；完整 runtime 重新计算后必须与其 expected closure digest 精确相等。staged release 仍 truthful unavailable，只有带该 attestation 的 current successor 才可激活。
-- V06 新增一个等价负例：篡改未被旧四项映射覆盖的 `production_core_service.py`，并同步更新 runtime file hash、closure digest 与 binding、但保持 release-owned attestation/release 不变时，服务必须在 socket/Core/分派前拒绝；正例验证同一 attestation 对应的完整 runtime 可启动。该门只约束已验证 release 与 runtime 两个信任域的绑定，不对可改写 release root 的 root/SSH 主体作防御承诺。
-- 实施最小 seam 仅允许 Ticket 120 publisher 增加由已验证 runtime manifest 形成 current successor 的单一窄入口，或语义等价入口；禁止第二发布系统、审批账本、自动部署框架或通用 attestation registry。
+- 当前冻结验证合同：`../design/123-frozen-verification-contract.md`；blob `77962b5a14b8457097ab4fb6bd5ef996369c38fd`。
+- 当前 verifier-owned 测试：`../../../tests/test_ticket123_production_core_service.py`；blob `11e6da49a117338bef8a3f86acbdabe7d42ea68f`。
+- Linux 编码前形状为 V01–V05/V07 `6 PASS / 0 skip / 0 error`，V06 `1 expected FAIL / 0 error / 0 skip`；唯一红灯是 `HermesReleasePublisher.publish_current_successor` 尚未实现。
+- 实施只允许关闭上述 current-successor runtime-closure attestation 红门：在 Ticket 120 `HermesReleasePublisher` 增加该唯一窄公开入口，并使 Ticket 123 按冻结合同验证其 release-owned attestation；不得改写冻结设计、verifier、Gate 数量、Ticket 状态或其他业务范围。
 
 实施停止规则：冻结测试若与冻结设计自相矛盾，或实现必须改写 Tickets 110—122 的业务状态机、三类 CorePort wire、引入第二 current-head/ledger/database、访问真实 AWS/Hermes/模型/微信或执行部署，立即停止并报告一个具体阻断。正常实施完成后运行七门及受影响回归，创建普通提交并普通推送，报告 commit/tree 与逐门证据；Ticket 保持 `claimed`，等待独立完成审查。
