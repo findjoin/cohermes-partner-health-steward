@@ -1,8 +1,8 @@
 # Ticket 123 冻结验证合同
 
-> 状态：verification-authority refreeze candidate（2026-08-30，补足 runtime closure 与已验证 release 的完整内容绑定；须经新的双轴预审后才成为当前验收权威）。在 candidate PASS 前，`26fa1d4`（design `f464be…`、contract `49b8…`、verifier `b31ffd…`）继续是唯一当前验收权威。产品基线为既有产品提交 `a06988d8173bda0e7beb2ffaf147527ea0297cf2` 与此前 runner checkpoint `3e8f9ef0db1e073587a29956e2632922cfc1b3d9`；测试接缝已经由 Ticket 123 与 ADR 0022 约定：`ProductionCoreService` 的 start/endpoint/close、三类 AF_UNIX CorePort、Ticket 117 的两个 lifecycle Adapter Interface，以及为本票所限的 Ticket 120 current-successor publisher entry。测试不读取私有 helper、表结构、线程布局或摘要实现。
+> 状态：frozen/current verification authority（2026-08-30）。内容冻结来源为 refreeze candidate `930113ddde1a8a2d95ee2e1cff857cc427a25237`；独立 Spec 与 Standards 双轴预审均为 PASS。Linux 编码前形状为 V01–V05/V07 `6 PASS / 0 skip / 0 error`，V06 `1 expected FAIL / 0 error / 0 skip`，唯一红灯是 `HermesReleasePublisher.publish_current_successor` 尚未实现。产品基线为既有产品提交 `a06988d8173bda0e7beb2ffaf147527ea0297cf2` 与此前 runner checkpoint `3e8f9ef0db1e073587a29956e2632922cfc1b3d9`；测试接缝已经由 Ticket 123 与 ADR 0022 约定：`ProductionCoreService` 的 start/endpoint/close、三类 AF_UNIX CorePort、Ticket 117 的两个 lifecycle Adapter Interface，以及为本票所限的 Ticket 120 current-successor publisher entry。测试不读取私有 helper、表结构、线程布局或摘要实现。
 >
-> 本次保留 V06 的 5 秒 blocked-exchange observer，并补足其 release/runtime 内容绑定：合法 current successor 必须带 release-owned runtime-closure attestation；冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob 由本 candidate 的 Ticket authority 记录。没有改变产品 drain timeout、Gate ID、产品目标、架构或三类 CorePort wire；此前 checkpoint 保留为历史。
+> 本次保留 V06 的 5 秒 blocked-exchange observer，并补足其 release/runtime 内容绑定：合法 current successor 必须带 release-owned runtime-closure attestation；冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob `11e6da49a117338bef8a3f86acbdabe7d42ea68f`。没有改变产品 drain timeout、Gate ID、产品目标、架构或三类 CorePort wire；此前 checkpoint 保留为历史。
 
 ## Verifier ownership
 
