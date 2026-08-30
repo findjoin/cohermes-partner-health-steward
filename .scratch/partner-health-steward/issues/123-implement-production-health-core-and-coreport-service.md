@@ -1,7 +1,7 @@
 # 123 - 实现生产 health-core 与 CorePort 服务
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [121 - 实现主机私有健康密钥与能力权威](121-implement-host-private-health-authorities.md), [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md)
 Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md)
@@ -25,3 +25,12 @@ Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-
 ## Delivery discipline
 
 先冻结组合根、进程边界和故障矩阵；冻结门只测试外部行为，不绑定内部类布局。实现、双轴审查、验证通过后普通提交并推送，不部署到 default。
+
+## Pre-code freeze candidate
+
+- Characterization 基线：commit `17851080f9a5df1ad9d15187d1cc7fd93ce4f976`、tree `17bdb993958b171e64d30d5ede63769a5b011478`。
+- 当前唯一产品差额：`partner_health_steward.production_core_service` 不存在；当前发布 runtime 仍是统一拒绝的 `StagedCorePortServer`，且没有 production lifecycle 文件 Adapter 或 Python 3.11 dependency closure。
+- 冻结实施设计：`../design/123-frozen-implementation-design.md`。
+- 冻结验证合同：`../design/123-frozen-verification-contract.md`。
+- verifier-owned 门：`../../../tests/test_ticket123_production_core_service.py`。
+- 七门只覆盖组合根、AF_UNIX、三类 CorePort、重启/未知、lifecycle 文件 Adapter、systemd/runtime closure 与无副本；不执行真实 AWS、部署、Hermes 消息、模型或微信。
