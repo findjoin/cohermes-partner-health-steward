@@ -353,8 +353,11 @@ class _ScriptedDynamo:
                     )
                     guard_values = guard.get("ExpressionAttributeValues", {})
                     proves_empty = (
-                        "attribute_not_exists" in guard_condition
-                        and "active_effect_ids" in guard_condition
+                        re.search(
+                            r"\battribute_not_exists\s*\(\s*active_effect_ids\s*\)",
+                            guard_condition,
+                        )
+                        is not None
                     ) or (
                         bool(size_tokens)
                         and all(guard_values.get(token) == _ddb_n(0) for token in size_tokens)
@@ -430,7 +433,10 @@ class _ScriptedDynamo:
             if added not in (receipt["effect_id"], expected_added) and assigned_values != expected_assigned:
                 raise AssertionError("lease guard update does not bind the effect")
             if not self.active_effects:
-                if "attribute_not_exists" not in condition or "active_effect_ids" not in condition:
+                if re.search(
+                    r"\battribute_not_exists\s*\(\s*active_effect_ids\s*\)",
+                    condition,
+                ) is None:
                     raise AssertionError("lease guard does not prove the active set empty")
             else:
                 observed = pairs.get("active_effect_ids", {})
@@ -487,13 +493,16 @@ class _ScriptedDynamo:
                     if value == receipt["effect_id"]
                     or value == {"SS": [receipt["effect_id"]["S"]]}
                 ]
+                contains_tokens = re.findall(
+                    r"\bcontains\s*\(\s*active_effect_ids\s*,\s*"
+                    r"(:[A-Za-z0-9_]+)\s*\)",
+                    guard_condition,
+                )
                 guard_operations = self._update_operations(guard)
                 deleted = guard_operations["DELETE"].get("active_effect_ids")
                 if (
                     not effect_tokens
-                    or "contains" not in guard_condition
-                    or "active_effect_ids" not in guard_condition
-                    or not any(token in guard_condition for token in effect_tokens)
+                    or not any(token in effect_tokens for token in contains_tokens)
                     or deleted
                     not in (
                         receipt["effect_id"],
