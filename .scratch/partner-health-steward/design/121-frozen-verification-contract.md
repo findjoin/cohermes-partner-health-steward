@@ -23,4 +23,8 @@ V01—V05 可以在 Linux 普通 service uid 的隔离目录运行；owner/group
 
 编码前动态 import 形成唯一红灯 `1 failure / 5 skips / 0 errors`。编码后同一文件必须 `6/6 PASS`，再运行 Tickets 110/111/117 中既有的 vault unavailable、SQLite copy、old fence、terminal cleanup 与 external-call-zero 回归、全量一次、`compileall` 和 `git diff --check`。这些既有回归而非本 verifier 的新私有 harness 负责证明 `HealthCore` fail-closed。实现后必须核对本设计、本合同和 verifier Git blob 相对冻结 checkpoint 零变化。
 
+## 冻结后的机械修订
+
+首次 Linux 运行在 V04 进入产品 Adapter 前由 `subprocess.Popen` 抛出 `ValueError: embedded null byte`：verifier 的外层三引号字符串把内层 bytes literal 的 `\0` 提前解释为真实 NUL。verification authority 只把该源字符转义为 `\\0`，使生成的子进程源码仍表达相同的 NUL 分隔字节；Gate、产品输入、断言、期望结果和其余字节均未改变。修订内容点为 commit `cfe3a58a1fadb9c1a9dd0639c15d1d7c0d9369fa`、tree `919e47a19f3ebda4caf8d3aab3737070ad3721df`，修订后 verifier blob 为 `8760ee9dcd04a85fdf9cfe3a6db4e4195db32347`，取代原 verifier blob `cb8e383577b4ad62a35c05edc11e1bfd2a9faf22`。这是测试载体修复，不重开冻结架构或验收语义；实现 Agent 仍不得修改 verifier。
+
 本合同不验证 DynamoDB、CorePort server、Hermes、模型、Weixin、医学 bundle 或部署；也不承诺防护已取得 service uid/root 与 host-private facility 的恶意操作者。
