@@ -12,17 +12,21 @@ import hashlib
 import importlib
 import json
 import os
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
 
+from partner_health_steward.admission import SourceEnvelope
 from partner_health_steward.authority import AuthoritySnapshot
+from partner_health_steward.contract import CommandEnvelope, Response
 from partner_health_steward.lifecycle import LIFECYCLE_PURGE_BINDINGS
 from partner_health_steward.release_deployment import HermesReleasePublisher
 from partner_health_steward.storage import EncryptedStateStore
@@ -33,6 +37,8 @@ _SITE = "site:t123-fixture"
 _DATA_KEY = bytes(range(32))
 _WRITER_MASTER = bytes(range(32, 64))
 _EXECUTION_MASTER = bytes(range(64, 96))
+_REPLAY_CAUSAL_ID = "ticket123-managed-replay"
+_REPLAY_REASON = "ticket123-encrypted-receipt"
 
 
 def _canonical(value: object) -> bytes:
@@ -99,7 +105,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
     @staticmethod
     def _facility(module: object, root: Path):
         facility = root / "authority"
-        facility.mkdir(parents=True, mode=0o700)
+        facility.mkdir(parents=True, mode=0o700, exist_ok=True)
         for name, value in (
             ("data-key.v1", _DATA_KEY),
             ("writer-master.v1", _WRITER_MASTER),
@@ -109,7 +115,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             path.write_bytes(value)
             path.chmod(0o400)
         locks = facility / "locks"
-        locks.mkdir(mode=0o700)
+        locks.mkdir(mode=0o700, exist_ok=True)
         return module.HostPrivateFacilityPaths(
             data_key=facility / "data-key.v1",
             writer_master=facility / "writer-master.v1",
@@ -185,13 +191,26 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         )
         authority = current_head.read().head.as_authority()
         database = root / "state" / "health.sqlite"
-        database.parent.mkdir(mode=0o700)
+        database.parent.mkdir(mode=0o700, exist_ok=True)
         key_provider = host.HostPrivateKeyProvider(facility, _INSTALLATION)
         store = EncryptedStateStore(str(database), key_provider)
         store.seed_finalized_authority(authority)
+        replay_command = CommandEnvelope(
+            peer="plugin",
+            action="probe",
+            source="health_weixin",
+            causal_id=_REPLAY_CAUSAL_ID,
+            generation=1,
+            scope=("probe",),
+            payload={},
+        )
+        store.save_receipt(
+            replay_command,
+            Response("replayed", _REPLAY_CAUSAL_ID, _REPLAY_REASON),
+        )
         store.close()
         replica_root = root / "managed"
-        replica_root.mkdir(mode=0o700)
+        replica_root.mkdir(mode=0o700, exist_ok=True)
         replica_bindings: dict[str, str] = {}
         for index, binding in enumerate(LIFECYCLE_PURGE_BINDINGS):
             target = replica_root / f"object-{index:02d}.managed"
@@ -199,9 +218,9 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             target.chmod(0o600)
             replica_bindings[binding] = str(target)
         migration_root = root / "migration"
-        migration_root.mkdir(mode=0o700)
+        migration_root.mkdir(mode=0o700, exist_ok=True)
         socket_root = root / "run"
-        socket_root.mkdir(mode=0o700)
+        socket_root.mkdir(mode=0o700, exist_ok=True)
         binding = {
             "contract": "ticket123-production-core-binding-v1",
             "release_root": str(release_root),
@@ -256,6 +275,8 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         endpoint = service.start()
         if type(endpoint) is not dict:
             raise AssertionError("ProductionCoreService.start did not return an endpoint")
+        if endpoint.get("protocol") != "ticket118-core-port-v1":
+            raise AssertionError("ProductionCoreService returned an incompatible endpoint")
         return service, endpoint
 
     @staticmethod
@@ -300,7 +321,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                     "peer": "plugin",
                     "action": "probe",
                     "source": "health_weixin",
-                    "causal_id": "ticket123-probe",
+                    "causal_id": _REPLAY_CAUSAL_ID,
                     "generation": 1,
                     "scope": ["probe"],
                     "payload": {},
@@ -312,7 +333,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         self._require(red=True)
         with tempfile.TemporaryDirectory(prefix="ticket123-") as raw:
             root = Path(raw)
-            module, binding, current_head, _client = self._fixture(root)
+            module, binding, current_head, client = self._fixture(root)
             service, endpoint = self._start(module, binding, current_head)
             try:
                 response = self._request(endpoint, self._runtime_read())
@@ -326,20 +347,28 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                 self.assertFalse(projection.get("health_writes_allowed"))
                 self.assertFalse(projection.get("model_effects_allowed"))
                 self.assertFalse(projection.get("outbound_effects_allowed"))
+                self.assertTrue(projection.get("managed_lifecycle_ready"))
+                self.assertEqual(projection.get("current_head_provider"), "dynamodb")
+                self.assertTrue(any(name == "GetItem" for name, _ in client.calls))
             finally:
                 service.close()
 
-            for name, mutate in (
-                ("release-digest", lambda value: value.__setitem__("release_digest", "sha256:" + "0" * 64)),
-                ("runtime-digest", lambda value: value["runtime_manifest"].__setitem__("closure_digest", "sha256:" + "0" * 64)),
-                ("wide-socket", lambda value: value.__setitem__("socket_mode", 0o666)),
+            for name, mutate, provider in (
+                ("release-digest", lambda value: value.__setitem__("release_digest", "sha256:" + "0" * 64), current_head),
+                ("runtime-digest", lambda value: value["runtime_manifest"].__setitem__("closure_digest", "sha256:" + "0" * 64), current_head),
+                ("wide-socket", lambda value: value.__setitem__("socket_mode", 0o666), current_head),
+                ("wrong-installation", lambda value: value.__setitem__("installation_id", "installation:other"), current_head),
+                ("wrong-site", lambda value: value.__setitem__("site", "site:other"), current_head),
+                ("missing-facility", lambda value: value.__setitem__("host_private_paths", object()), current_head),
+                ("missing-lifecycle-root", lambda value: value.__setitem__("managed_replica_root", str(root / "absent-managed")), current_head),
+                ("in-memory-provider", lambda value: None, object()),
             ):
                 with self.subTest(name=name):
                     candidate = copy.deepcopy(binding)
                     candidate["socket_path"] = str(root / f"{name}.sock")
                     mutate(candidate)
                     with self.assertRaises(Exception):
-                        self._start(module, candidate, current_head)
+                        self._start(module, candidate, provider)
                     self.assertFalse(Path(candidate["socket_path"]).exists())
 
     def test_v123_02_af_unix_acl_and_peer_credentials_are_both_enforced(self) -> None:
@@ -361,7 +390,13 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                 self.assertEqual(details.st_gid, binding["socket_group_gid"])
                 self.assertIsNotNone(self._request(endpoint, self._runtime_read()))
 
-                wrong_uid = pwd.getpwnam("nobody").pw_uid
+                nobody = pwd.getpwnam("nobody")
+                wrong_uid = nobody.pw_uid
+                wrong_gid = nobody.pw_gid
+                # Permit pathname traversal and a kernel-level connect so the
+                # only remaining rejection oracle is the listener's SO_PEERCRED.
+                root.chmod(0o711)
+                socket_path.parent.chmod(0o711)
                 socket_path.chmod(0o666)  # File ACL alone must not defeat SO_PEERCRED.
                 script = """
 import json, os, socket, struct, sys
@@ -374,7 +409,7 @@ except Exception: data=b''
 raise SystemExit(0 if data==b'' else 9)
 """
                 wrong = subprocess.run(
-                    [sys.executable, "-I", "-c", script, str(wrong_uid), str(wrong_uid), str(socket_path)],
+                    [sys.executable, "-I", "-c", script, str(wrong_uid), str(wrong_gid), str(socket_path)],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -396,7 +431,13 @@ raise SystemExit(0 if data==b'' else 9)
             module, binding, current_head, _client = self._fixture(Path(raw))
             service, endpoint = self._start(module, binding, current_head)
             try:
-                command = self._request(endpoint, self._probe_command())
+                host_command_request = {
+                    "protocol_version": 1,
+                    "kind": "command",
+                    "request_id": "ticket118-command",
+                    "payload": {"operation": "health-runtime-probe"},
+                }
+                command = self._request(endpoint, host_command_request)
                 managed = self._request(endpoint, self._runtime_read())
                 controlled = self._request(
                     endpoint,
@@ -404,29 +445,60 @@ raise SystemExit(0 if data==b'' else 9)
                         "protocol_version": 1,
                         "kind": "controlled-effect",
                         "request_id": "ticket123-forged-claim",
-                        "payload": {
-                            "phase": "claim",
-                            "intent": {
-                                "effect_id": "effect:forged",
-                                "intent_digest": "sha256:forged",
-                                "effect_kind": "model-work",
-                                "authority": {
-                                    "installation_id": _INSTALLATION,
-                                    "generation": 1,
-                                    "revision_digest": "sha256:t123-empty",
-                                    "transition_id": "transition:t123-empty",
-                                    "writer_fence": "fence:forged",
-                                    "terminal": False,
-                                    "site": _SITE,
-                                },
-                            },
-                        },
+                        "payload": {"phase": "claim"},
                     },
                 )
-                self.assertEqual(command["kind"], "command")
-                self.assertEqual(managed["kind"], "managed-read")
-                self.assertEqual(controlled["kind"], "controlled-effect")
+                for request, response in (
+                    (host_command_request, command),
+                    (self._runtime_read(), managed),
+                    ({"kind": "controlled-effect", "request_id": "ticket123-forged-claim"}, controlled),
+                ):
+                    self.assertEqual(
+                        set(response),
+                        {"protocol_version", "kind", "request_id", "status", "payload"},
+                    )
+                    self.assertEqual(response["protocol_version"], 1)
+                    self.assertEqual(response["kind"], request["kind"])
+                    self.assertEqual(response["request_id"], request["request_id"])
+                    self.assertEqual(response["status"], "accepted")
                 self.assertIsNone(controlled["payload"].get("grant"))
+                self.assertIsNone(controlled["payload"].get("intent"))
+                self.assertEqual(
+                    controlled["payload"].get("current_authority", {}).get("generation"),
+                    1,
+                )
+                forged = self._request(
+                    endpoint,
+                    {
+                        "protocol_version": 1,
+                        "kind": "controlled-effect",
+                        "request_id": "ticket123-forged-intent",
+                        "payload": {"phase": "claim", "intent": {"source": "caller"}},
+                    },
+                )
+                self.assertIsNone(forged)
+                incomplete_terminal = self._request(
+                    endpoint,
+                    {
+                        "protocol_version": 1,
+                        "kind": "controlled-effect",
+                        "request_id": "ticket118-controlled-effect-terminal",
+                        "payload": {"phase": "terminal", "terminal": {}},
+                    },
+                )
+                self.assertEqual(incomplete_terminal["status"], "accepted")
+                self.assertFalse(
+                    incomplete_terminal["payload"].get("terminal_accepted")
+                )
+
+                # This exact response was encrypted before service startup.  A
+                # byte-stream shell cannot produce it without dispatching the
+                # typed CommandEnvelope through the real HealthCore/store.
+                replay = self._request(endpoint, self._probe_command())
+                self.assertEqual(
+                    replay["payload"].get("response"),
+                    Response("replayed", _REPLAY_CAUSAL_ID, _REPLAY_REASON).to_wire(),
+                )
 
                 malformed = (
                     b'{"kind":"managed-read","kind":"command","payload":{},'
@@ -435,7 +507,9 @@ raise SystemExit(0 if data==b'' else 9)
                 cases = (
                     struct.pack(">I", len(malformed)) + malformed,
                     _outer_frame({"protocol_version": 1, "kind": "unknown", "request_id": "x", "payload": {}}),
+                    _outer_frame({"protocol_version": 1, "kind": "managed-read", "request_id": "x", "payload": {}, "extra": True}),
                     struct.pack(">I", 9) + b"{}",
+                    struct.pack(">I", 0),
                     struct.pack(">I", 65537),
                 )
                 for frame in cases:
@@ -463,6 +537,10 @@ raise SystemExit(0 if data==b'' else 9)
             try:
                 replay = self._request(endpoint, self._probe_command())
                 self.assertEqual(replay, first)
+                self.assertEqual(
+                    replay["payload"].get("response"),
+                    Response("replayed", _REPLAY_CAUSAL_ID, _REPLAY_REASON).to_wire(),
+                )
                 self.assertFalse(
                     any(name == "TransactWriteItems" for name, _ in client.calls)
                 )
@@ -473,6 +551,43 @@ raise SystemExit(0 if data==b'' else 9)
                 self.assertFalse(unknown["payload"].get("outbound_effects_allowed"))
             finally:
                 service.close()
+
+            for name, mutate in (
+                (
+                    "stale-fence",
+                    lambda candidate, provider: provider.records["HEAD"].__setitem__(
+                        "writer_fence", {"S": "fence:stale-ticket123"}
+                    ),
+                ),
+                (
+                    "key-loss",
+                    lambda candidate, _provider: Path(
+                        candidate["host_private_paths"].data_key
+                    ).unlink(),
+                ),
+            ):
+                with self.subTest(name=name):
+                    fault_root = root / name
+                    _module, candidate, provider_head, provider = self._fixture(fault_root)
+                    candidate_service, candidate_endpoint = self._start(
+                        module, candidate, provider_head
+                    )
+                    try:
+                        mutate(candidate, provider)
+                        request = self._probe_command()
+                        request["request_id"] = f"ticket123-{name}"
+                        request["payload"]["command"]["causal_id"] = f"ticket123-{name}"
+                        response = self._request(candidate_endpoint, request)
+                        self.assertIsNotNone(response)
+                        self.assertIn(
+                            response["payload"].get("response", {}).get("status"),
+                            {"unavailable", "unknown", "rejected"},
+                        )
+                        self.assertFalse(
+                            any(call == "TransactWriteItems" for call, _ in provider.calls)
+                        )
+                    finally:
+                        candidate_service.close()
 
     def test_v123_05_filesystem_lifecycle_adapters_are_atomic_and_restartable(self) -> None:
         module = self._require()
@@ -495,30 +610,106 @@ raise SystemExit(0 if data==b'' else 9)
                 set(managed.enumerate(request)["configured"]),
                 set(LIFECYCLE_PURGE_BINDINGS),
             )
-            purge = managed.purge(
-                {
-                    "installation_id": _INSTALLATION,
-                    "operation_ref": "delete:t123",
-                    "purge_bindings": list(LIFECYCLE_PURGE_BINDINGS),
-                }
-            )
+            authority = AuthoritySnapshot(
+                _INSTALLATION,
+                1,
+                "sha256:t123-delete",
+                "transition:t123-delete-authority",
+                "fence:t123-delete",
+                False,
+                _SITE,
+            ).to_storage()
+            lifecycle_request = {
+                "operation_ref": "delete:t123",
+                "authority_binding": authority,
+                "transition_id": "transition:t123-delete",
+            }
+            purge = managed.purge(lifecycle_request)
             self.assertEqual(purge["status"], "confirmed")
             restarted = managed_type(managed_root, _INSTALLATION, bindings, ())
-            self.assertEqual(restarted.absence(request)["status"], "absent")
+            self.assertEqual(restarted.absence(lifecycle_request)["status"], "absent")
 
             artifact_root = root / "artifacts"
             artifact_root.mkdir(mode=0o700)
             artifacts = artifact_type(artifact_root, _INSTALLATION)
-            package = {"contract": "ticket117-migration-package-v1", "digest": "sha256:" + "a" * 64}
-            self.assertEqual(artifacts.put("package:t123", package)["status"], "confirmed")
+            binding_registry = [
+                {
+                    "family": name,
+                    "snapshot_codec": f"codec:{name}:v1",
+                    "purge_binding": purge_binding,
+                    "source_continuity": "preserve",
+                }
+                for index, purge_binding in enumerate(LIFECYCLE_PURGE_BINDINGS)
+                for name in (f"managed-family-{index}",)
+            ]
+            package = {
+                "contract": "ticket117-opaque-migration-package-v1",
+                "manifest": {
+                    "contract": "ticket117-semantic-manifest-v1",
+                    "operation_ref": "migration:t123",
+                    "source_authority": authority,
+                    "semantic_registry": binding_registry,
+                    "release": {"product_release": "sha256:" + "a" * 64},
+                    "target_site": "site:t123-target",
+                    "target_writer_fence_ref": "target-fence:t123",
+                    "artifact_sink_ref": "artifact-sink:t123",
+                    "semantic_state_digest": "sha256:" + "b" * 64,
+                },
+                "semantic_state": {"registry": binding_registry, "records": []},
+            }
+            observed: list[object] = []
+            completed = threading.Event()
+
+            def read_until_written() -> None:
+                while not completed.is_set():
+                    observed.append(artifacts.get("lifecycle-package:migration:t123"))
+
+            reader = threading.Thread(target=read_until_written)
+            reader.start()
+            try:
+                self.assertEqual(
+                    artifacts.put("lifecycle-package:migration:t123", package)["status"],
+                    "confirmed",
+                )
+            finally:
+                completed.set()
+                reader.join(timeout=2)
+            self.assertTrue(all(item is None or item == package for item in observed))
             self.assertEqual(
-                artifact_type(artifact_root, _INSTALLATION).get("package:t123"),
+                artifact_type(artifact_root, _INSTALLATION).get(
+                    "lifecycle-package:migration:t123"
+                ),
                 package,
             )
-            self.assertEqual(artifacts.remove("package:t123")["status"], "confirmed")
-            self.assertIsNone(artifacts.get("package:t123"))
+            with self.assertRaises(Exception):
+                artifacts.put(
+                    "lifecycle-package:migration:t123",
+                    {**package, "semantic_state": {"records": ["conflict"]}},
+                )
+            stored_files = [path for path in artifact_root.rglob("*") if path.is_file()]
+            self.assertTrue(stored_files)
+            hardlink = root / "artifact-hardlink"
+            os.link(stored_files[0], hardlink)
+            with self.assertRaises(Exception):
+                artifacts.get("lifecycle-package:migration:t123")
+            hardlink.unlink()
+            self.assertEqual(
+                artifacts.remove("lifecycle-package:migration:t123")["status"],
+                "confirmed",
+            )
+            self.assertIsNone(artifacts.get("lifecycle-package:migration:t123"))
             with self.assertRaises(Exception):
                 artifacts.put("../escape", package)
+
+            real_root = root / "real-artifacts"
+            real_root.mkdir(mode=0o700)
+            linked_root = root / "linked-artifacts"
+            linked_root.symlink_to(real_root, target_is_directory=True)
+            with self.assertRaises(Exception):
+                artifact_type(linked_root, _INSTALLATION)
+            real_root.chmod(0o777)
+            with self.assertRaises(Exception):
+                artifact_type(real_root, _INSTALLATION)
 
     def test_v123_06_python_closure_and_systemd_process_are_fixed(self) -> None:
         module = self._require()
@@ -567,21 +758,50 @@ raise SystemExit(0 if data==b'' else 9)
 
         if subprocess.run(["systemctl", "is-system-running"], capture_output=True).returncode not in {0, 1}:
             self.fail("V123-06 requires a systemd transient-unit environment")
-        unit_name = "ticket123-" + uuid.uuid4().hex
-        probe = subprocess.run(
-            [
-                "systemd-run", "--quiet", "--wait", "--collect", "--pipe",
-                f"--unit={unit_name}", "--property=NoNewPrivileges=yes",
-                "--property=PrivateTmp=yes", "--property=UMask=0077",
-                str(runtime_root / "bin" / "python3"), "-I", "-c",
-                "import partner_health_steward; print('TICKET123-RUNTIME-OK')",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(probe.returncode, 0, probe.stderr)
-        self.assertIn("TICKET123-RUNTIME-OK", probe.stdout)
+        def run_unit(root: Path, mode: str) -> subprocess.CompletedProcess[str]:
+            unit_name = "ticket123-" + uuid.uuid4().hex
+            return subprocess.run(
+                [
+                    "systemd-run",
+                    "--quiet",
+                    "--wait",
+                    "--collect",
+                    "--pipe",
+                    f"--unit={unit_name}",
+                    "--property=NoNewPrivileges=yes",
+                    "--property=PrivateTmp=yes",
+                    "--property=UMask=0077",
+                    str(runtime_root / "bin" / "python3"),
+                    "-I",
+                    str(Path(__file__).resolve()),
+                    "--systemd-child",
+                    str(root),
+                    mode,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="ticket123-systemd-", dir="/tmp") as raw:
+            process_root = Path(raw)
+            normal = run_unit(process_root / "normal", "normal")
+            self.assertEqual(normal.returncode, 0, normal.stderr)
+            self.assertIn("TICKET123-SERVICE-OK", normal.stdout)
+            self.assertFalse((process_root / "normal" / "run" / "health-core.sock").exists())
+
+            crash_root = process_root / "crash"
+            crashed = run_unit(crash_root, "crash")
+            self.assertNotEqual(crashed.returncode, 0)
+            stale_socket = crash_root / "run" / "health-core.sock"
+            self.assertTrue(stale_socket.exists())
+            with self.assertRaises(OSError):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.connect(str(stale_socket))
+            recovered = run_unit(crash_root, "normal")
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertIn("TICKET123-SERVICE-OK", recovered.stdout)
+            self.assertFalse(stale_socket.exists())
 
     def test_v123_07_no_plaintext_or_ordinary_state_copy_is_created(self) -> None:
         module = self._require()
@@ -591,27 +811,99 @@ raise SystemExit(0 if data==b'' else 9)
             outside = root / "ordinary-session-sentinel"
             outside.write_text("ordinary-untouched", encoding="utf-8")
             module, binding, current_head, _client = self._fixture(root)
+            host = importlib.import_module("partner_health_steward.host_authority")
+            store = EncryptedStateStore(
+                binding["database_path"],
+                host.HostPrivateKeyProvider(
+                    binding["host_private_paths"], binding["installation_id"]
+                ),
+            )
+            envelope = SourceEnvelope(
+                causal_id="source:t123-health-marker",
+                generation=1,
+                channel="weixin",
+                partner_id="partner:t123",
+                sender_id="owner:t123",
+                conversation_id="conversation:t123",
+                chat_type="private",
+                entrypoint="health_weixin",
+                requested_capability="health-init",
+                message_id="message:t123-marker",
+                protocol_timestamp="2026-08-30T08:00:00+00:00",
+                received_at="2026-08-30T08:00:01+00:00",
+                native_cursor="cursor:t123-marker",
+                body=marker,
+            )
+            store.save_source_envelope(envelope, retain_body=True)
+            store.close()
             service, endpoint = self._start(module, binding, current_head)
             try:
-                request = self._probe_command()
-                request["payload"]["unexpected_health_body"] = marker
-                self.assertIsNone(self._request(endpoint, request))
+                response = self._request(endpoint, self._runtime_read())
+                self.assertEqual(response["status"], "accepted")
             finally:
                 service.close()
+            readback = EncryptedStateStore(
+                binding["database_path"],
+                host.HostPrivateKeyProvider(
+                    binding["host_private_paths"], binding["installation_id"]
+                ),
+            )
+            try:
+                receipt = readback.source_receipt(envelope.causal_id)
+                self.assertIsNotNone(receipt)
+                self.assertEqual(receipt.envelope.body, marker)
+            finally:
+                readback.close()
             self.assertEqual(outside.read_text(encoding="utf-8"), "ordinary-untouched")
             forbidden_roots = (
                 Path(binding["release_root"]),
                 Path(binding["runtime_root"]),
                 Path(binding["migration_artifact_root"]),
+                Path(binding["managed_replica_root"]),
+                Path(binding["socket_path"]).parent,
+            )
+            forbidden_needles = (
+                marker.encode(),
+                _DATA_KEY,
+                _WRITER_MASTER,
+                _EXECUTION_MASTER,
             )
             for scan_root in forbidden_roots:
                 for path in scan_root.rglob("*"):
                     if path.is_file() and not path.is_symlink():
-                        self.assertNotIn(marker.encode(), path.read_bytes())
+                        payload = path.read_bytes()
+                        for needle in forbidden_needles:
+                            self.assertNotIn(needle, payload)
             database = Path(binding["database_path"])
             self.assertNotIn(marker.encode(), database.read_bytes())
             self.assertFalse(Path(binding["socket_path"]).exists())
 
+def _run_systemd_child(root: Path, mode: str) -> None:
+    """Start the real Ticket 123 service inside the transient unit process."""
+
+    if mode not in {"normal", "crash"}:
+        raise ValueError("invalid systemd child mode")
+    Ticket123ProductionCoreServiceTests.setUpClass()
+    case = Ticket123ProductionCoreServiceTests(
+        "test_v123_01_composition_is_release_bound_and_staged_is_truthfully_unavailable"
+    )
+    module, binding, current_head, _client = case._fixture(root)
+    service, endpoint = case._start(module, binding, current_head)
+    if mode == "crash":
+        print("TICKET123-SERVICE-CRASH-READY", flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise AssertionError("SIGKILL unexpectedly returned")
+    try:
+        response = case._request(endpoint, case._runtime_read())
+        if response is None or response.get("status") != "accepted":
+            raise AssertionError("production service did not answer inside systemd")
+    finally:
+        service.close()
+    print("TICKET123-SERVICE-OK", flush=True)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--systemd-child":
+        _run_systemd_child(Path(sys.argv[2]), sys.argv[3])
+    else:
+        unittest.main()
