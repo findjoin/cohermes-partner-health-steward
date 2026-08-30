@@ -39,6 +39,10 @@ _RELEASE_CONTRACT = "ticket120-hermes-release-v1"
 _GATE_CONTRACT = "ticket120-default-stage-install-v1"
 _PERMIT_CONTRACT = "ticket120-deployment-permit-v1"
 _GATE_ID = "119-G10"
+_TICKET123_RUNTIME_MANIFEST_CONTRACT = "ticket123-runtime-closure-v1"
+_TICKET123_RUNTIME_ATTESTATION_PATH = "runtime/ticket123-runtime-closure-attestation.json"
+_TICKET123_RUNTIME_ATTESTATION_CONTRACT = "ticket123-runtime-closure-attestation-v1"
+_TICKET123_RUNTIME_CLOSURE_ALGORITHM = "sha256(canonical-json(files))"
 _REQUIRED_ARTIFACTS = (
     ("hermes-required-patch", "host/required.patch"),
     ("disabled-native-entry", "host/disabled-native-entry.assertion"),
@@ -154,6 +158,54 @@ def _strict_json_bytes(data: bytes) -> object:
         return result
 
     return json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicates)
+
+
+def _validate_ticket123_runtime_manifest(value: object) -> dict[str, object]:
+    """Accept only the complete canonical closure input for Ticket 123."""
+
+    if type(value) is not dict or set(value) != {
+        "contract",
+        "closure_digest",
+        "files",
+    }:
+        raise ValueError("runtime closure manifest is invalid")
+    if value.get("contract") != _TICKET123_RUNTIME_MANIFEST_CONTRACT:
+        raise ValueError("runtime closure manifest is invalid")
+    files = value.get("files")
+    if type(files) is not list or not files:
+        raise ValueError("runtime closure file list is invalid")
+    declared: dict[str, str] = {}
+    previous = ""
+    for item in files:
+        if type(item) is not dict or set(item) != {"path", "sha256"}:
+            raise ValueError("runtime closure file is invalid")
+        relative = _relative_path(item.get("path"))
+        digest = item.get("sha256")
+        if (
+            relative in declared
+            or relative <= previous
+            or type(digest) is not str
+            or _DIGEST.fullmatch(digest) is None
+        ):
+            raise ValueError("runtime closure file is invalid")
+        declared[relative] = digest
+        previous = relative
+    if value.get("closure_digest") != _digest_bytes(_canonical_bytes(files)):
+        raise ValueError("runtime closure digest is invalid")
+    production_paths = [
+        path
+        for path in declared
+        if path == "partner_health_steward/production_core_service.py"
+        or path.endswith("/partner_health_steward/production_core_service.py")
+    ]
+    if (
+        "bin/python3" not in declared
+        or len(production_paths) != 1
+        or not any("/python3.11/" in path for path in declared)
+        or not any("cryptography" in path for path in declared)
+    ):
+        raise ValueError("runtime closure declaration is incomplete")
+    return copy.deepcopy(value)
 
 
 def _write_bytes(root: Path, relative: str, content: bytes) -> None:
@@ -403,6 +455,78 @@ class HermesReleasePublisher:
                 else:
                     shutil.rmtree(staging)
                     return PublishedRelease(wire)
+            os.replace(staging, destination)
+            return PublishedRelease(wire)
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+
+    def publish_current_successor(
+        self,
+        staged_release_root: Path | str,
+        verified_runtime_manifest: object,
+    ) -> PublishedRelease:
+        """Publish the one attested current successor of a verified stage.
+
+        The staged release is first verified in place and is never rewritten.
+        The runtime manifest is a strict input to this one Ticket 120 publisher
+        seam; its release-owned attestation is consequently covered by the new
+        successor's content-addressed release digest.
+        """
+
+        if not isinstance(staged_release_root, (str, os.PathLike)):
+            raise ValueError("staged release root is invalid")
+        source_root = Path(os.fspath(staged_release_root))
+        if not source_root.is_absolute():
+            raise ValueError("staged release root is invalid")
+        staged_wire = _validate_release(str(source_root))
+        source_root = source_root.resolve()
+        runtime_manifest = _validate_ticket123_runtime_manifest(
+            verified_runtime_manifest
+        )
+        output = source_root.parent
+        if not output.is_dir() or output.is_symlink():
+            raise ValueError("release output is unavailable")
+        staging = Path(tempfile.mkdtemp(prefix="ticket123-current-", dir=output))
+        try:
+            shutil.copytree(source_root, staging, dirs_exist_ok=True)
+            attestation = {
+                "contract": _TICKET123_RUNTIME_ATTESTATION_CONTRACT,
+                "closure_algorithm": _TICKET123_RUNTIME_CLOSURE_ALGORITHM,
+                "expected_closure_digest": runtime_manifest["closure_digest"],
+            }
+            _write_bytes(
+                staging,
+                _TICKET123_RUNTIME_ATTESTATION_PATH,
+                _canonical_bytes(attestation),
+            )
+            host_manifest = _strict_json_bytes(
+                (staging / "host-release-manifest.json").read_bytes()
+            )
+            if type(host_manifest) is not dict or host_manifest.get(
+                "release_digest"
+            ) != staged_wire.get("host_release_digest"):
+                raise ValueError("host release manifest is invalid")
+            files = _file_manifest(staging, exclude={"release-manifest.json"})
+            body: dict[str, object] = {
+                "contract": _RELEASE_CONTRACT,
+                "state": "current",
+                "files": files,
+                "host_release_manifest": host_manifest,
+            }
+            release_digest = _digest_bytes(_canonical_bytes(body))
+            wire = {
+                "contract": _RELEASE_CONTRACT,
+                "release_digest": release_digest,
+                "host_release_digest": host_manifest["release_digest"],
+                "state": "current",
+                "files": files,
+            }
+            _write_bytes(staging, "release-manifest.json", _canonical_bytes(wire))
+            destination = output / release_digest.removeprefix("sha256:")
+            if destination.exists():
+                raise ValueError("content-addressed current successor already exists")
             os.replace(staging, destination)
             return PublishedRelease(wire)
         except Exception:

@@ -47,9 +47,13 @@ from .probe import ProbeState
 from .release_deployment import (
     HermesReleasePublisher,
     _RELEASE_CONTRACT,
+    _TICKET123_RUNTIME_ATTESTATION_CONTRACT,
+    _TICKET123_RUNTIME_ATTESTATION_PATH,
+    _TICKET123_RUNTIME_CLOSURE_ALGORITHM,
     _digest_bytes,
     _file_manifest,
     _relative_path,
+    _validate_ticket123_runtime_manifest,
 )
 from .storage import EncryptedStateStore, KeyUnavailable, StoreUnavailable
 
@@ -81,15 +85,6 @@ _REQUEST_FIELDS = frozenset({"protocol_version", "kind", "request_id", "payload"
 _RESPONSE_FIELDS = frozenset({"protocol_version", "kind", "request_id", "status", "payload"})
 _SHA256 = "sha256:"
 _MANAGED_PURGE_RECEIPT = ".ticket123-managed-replica-purge-receipt.v1"
-_RUNTIME_RELEASE_FILE_BINDINGS = (
-    ("product/core.py", "partner_health_steward/core.py"),
-    ("product/plugin.py", "partner_health_steward/plugin.py"),
-    ("product/hermes_host.py", "partner_health_steward/hermes_host.py"),
-    (
-        "plugin/health-weixin/partner_health_steward/host_contract.py",
-        "partner_health_steward/host_contract.py",
-    ),
-)
 
 
 def _canonical(value: object) -> bytes:
@@ -266,6 +261,47 @@ def _validate_active_release(root: Path) -> dict[str, object]:
     if release_digest != _digest_bytes(_canonical(body)):
         raise ValueError("release digest is invalid")
     return copy.deepcopy(manifest)
+
+
+def _validate_current_runtime_attestation(
+    release_root: Path,
+    release: Mapping[str, object],
+    runtime_manifest: Mapping[str, object],
+) -> None:
+    """Bind a verified current release to the complete recomputed runtime."""
+
+    declared = release.get("files")
+    if type(declared) is not list:
+        raise ValueError("release file closure is invalid")
+    attestation_digest: str | None = None
+    for entry in declared:
+        if type(entry) is not dict or set(entry) != {"path", "sha256"}:
+            raise ValueError("release file closure is invalid")
+        if _relative_path(entry.get("path")) != _TICKET123_RUNTIME_ATTESTATION_PATH:
+            continue
+        if attestation_digest is not None:
+            raise ValueError("runtime closure attestation is invalid")
+        attestation_digest = _digest(entry.get("sha256"), "runtime attestation digest")
+    if attestation_digest is None:
+        raise ValueError("runtime closure attestation is unavailable")
+    path = release_root / Path(*PurePosixPath(_TICKET123_RUNTIME_ATTESTATION_PATH).parts)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("runtime closure attestation is unavailable")
+    raw = path.read_bytes()
+    if _digest_bytes(raw) != attestation_digest:
+        raise ValueError("runtime closure attestation is invalid")
+    attestation = _strict_json(raw)
+    if (
+        type(attestation) is not dict
+        or set(attestation)
+        != {"contract", "closure_algorithm", "expected_closure_digest"}
+        or attestation.get("contract") != _TICKET123_RUNTIME_ATTESTATION_CONTRACT
+        or attestation.get("closure_algorithm")
+        != _TICKET123_RUNTIME_CLOSURE_ALGORITHM
+        or attestation.get("expected_closure_digest")
+        != runtime_manifest.get("closure_digest")
+    ):
+        raise ValueError("runtime closure attestation is invalid")
 
 
 class FilesystemManagedReplicaAdapter:
@@ -669,8 +705,8 @@ class ProductionCoreService:
         root_value: object,
         manifest_value: object,
         *,
-        verified_release_digest: object,
-        verified_release_files: object,
+        verified_release_root: Path,
+        verified_release: Mapping[str, object],
     ) -> tuple[Path, dict[str, object]]:
         root = _secure_directory(root_value, "runtime closure root")
         manifest_path = root / "ticket123-runtime-manifest.json"
@@ -679,83 +715,15 @@ class ProductionCoreService:
         manifest = _strict_json(manifest_path.read_bytes())
         if type(manifest) is not dict or type(manifest_value) is not dict or manifest != manifest_value:
             raise ValueError("runtime closure manifest mismatch")
-        if set(manifest) != {"contract", "closure_digest", "files"}:
-            raise ValueError("runtime closure manifest is invalid")
-        if type(manifest["contract"]) is not str or not manifest["contract"]:
-            raise ValueError("runtime closure manifest is invalid")
-        verified_digest = _digest(verified_release_digest, "verified release digest")
-        if not verified_digest:
-            raise ValueError("runtime release binding is invalid")
+        manifest = _validate_ticket123_runtime_manifest(manifest)
         files = manifest["files"]
-        if type(files) is not list or not files:
-            raise ValueError("runtime closure file list is invalid")
+        assert type(files) is list
         declared: dict[str, str] = {}
-        previous = ""
         for item in files:
-            if type(item) is not dict or set(item) != {"path", "sha256"}:
-                raise ValueError("runtime closure file is invalid")
+            assert type(item) is dict
             relative = _relative(item["path"], "runtime file path")
             digest = _digest(item["sha256"], "runtime file digest")
-            if relative in declared or relative <= previous:
-                raise ValueError("runtime closure file is duplicated")
             declared[relative] = digest
-            previous = relative
-        if manifest["closure_digest"] != _SHA256 + hashlib.sha256(_canonical(files)).hexdigest():
-            raise ValueError("runtime closure digest mismatch")
-        if type(verified_release_files) is not list:
-            raise ValueError("verified release closure is invalid")
-        release_files: dict[str, str] = {}
-        for item in verified_release_files:
-            if type(item) is not dict or set(item) != {"path", "sha256"}:
-                raise ValueError("verified release closure is invalid")
-            release_path = _relative_path(item["path"])
-            release_digest = _digest(item["sha256"], "verified release file digest")
-            if release_path in release_files:
-                raise ValueError("verified release closure is invalid")
-            release_files[release_path] = release_digest
-        expected_commitment: list[dict[str, str]] = []
-        actual_commitment: list[dict[str, str]] = []
-        for release_path, runtime_suffix in _RUNTIME_RELEASE_FILE_BINDINGS:
-            release_digest = release_files.get(release_path)
-            matches = [
-                runtime_path
-                for runtime_path in declared
-                if runtime_path == runtime_suffix
-                or runtime_path.endswith("/" + runtime_suffix)
-            ]
-            if release_digest is None or len(matches) != 1:
-                raise ValueError("runtime release content binding is invalid")
-            runtime_path = matches[0]
-            expected_commitment.append(
-                {
-                    "release_path": release_path,
-                    "runtime_path": runtime_path,
-                    "sha256": release_digest,
-                }
-            )
-            actual_commitment.append(
-                {
-                    "release_path": release_path,
-                    "runtime_path": runtime_path,
-                    "sha256": declared[runtime_path],
-                }
-            )
-        expected_summary = _canonical(
-            {
-                "closure_digest": manifest["closure_digest"],
-                "files": expected_commitment,
-                "verified_release_digest": verified_digest,
-            }
-        )
-        actual_summary = _canonical(
-            {
-                "closure_digest": manifest["closure_digest"],
-                "files": actual_commitment,
-                "verified_release_digest": verified_digest,
-            }
-        )
-        if actual_summary != expected_summary:
-            raise ValueError("runtime release content binding is invalid")
         actual: dict[str, str] = {}
         for path in root.rglob("*"):
             if path.is_symlink():
@@ -777,6 +745,12 @@ class ProductionCoreService:
             raise ValueError("runtime interpreter is invalid")
         if not any("partner_health_steward" in path for path in declared) or not any("cryptography" in path for path in declared):
             raise ValueError("runtime dependency closure is incomplete")
+        if verified_release.get("state") == "current":
+            _validate_current_runtime_attestation(
+                verified_release_root,
+                verified_release,
+                manifest,
+            )
         return root, copy.deepcopy(manifest)
 
     def _validated_resources(self) -> dict[str, object]:
@@ -790,8 +764,8 @@ class ProductionCoreService:
         runtime_root, runtime_manifest = self._runtime(
             binding["runtime_root"],
             binding["runtime_manifest"],
-            verified_release_digest=release["release_digest"],
-            verified_release_files=release["files"],
+            verified_release_root=release_root,
+            verified_release=release,
         )
         installation_id = validate_opaque_text(binding["installation_id"], "installation_id")
         site = validate_opaque_text(binding["site"], "site")
