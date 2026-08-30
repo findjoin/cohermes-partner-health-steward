@@ -15,7 +15,7 @@ fixture 使用固定无正文 opaque 字段与 Ticket 121 的公开 fence 标准
 | 122-V01 | resource + read | constructor 只 DescribeTable 并钉死 ARN/TableId/region/schema/ACTIVE；HEAD 缺失不自动创建；所有 GetItem 显式 `ConsistentRead=True`；同名重建/错绑/未知字段失败。 |
 | 122-V02 | ordinary CAS | expected 全字段 + current fence condition，HEAD generation +1 且 site/fence 保持；HEAD 与 exact transition receipt 单事务原子形成；两并发只有一个成功。 |
 | 122-V03 | typed faults/recovery | known conflict、terminal、timeout、permission 与 ambiguous mutation 精确映射；ambiguous 零业务重试，exact strong lookup 只返回原 receipt 或 NotFound。 |
-| 122-V04 | execution lease | acquire/lookup/release exact identity 幂等；另一 holder/effect overlap 冲突；release operation ownership；release 与 LEASE-GUARD exact effect 在同一事务清除，随后新 effect 可获得 lease；terminal 与 active lease 互斥。 |
+| 122-V04 | execution lease | acquire/lookup/release exact identity 幂等；既有 bounded `_execution_overlap` permit 允许 1→2，第三个或错误 permit 冲突；release operation ownership；release 与 LEASE-GUARD exact effect 在同一事务清除，随后新 effect 可获得 lease；terminal 与 active lease 互斥。 |
 | 122-V05 | lifecycle | 无 active lease 时 terminal-delete 成功、receipt/readback/lookup 完整且后续 old snapshot/lease 为 terminal；有 active lease 时拒绝；transfer、响应丢失 lookup；transfer 精确采用 target fence/site，旧 proof 即时失效，target proof 成功，旧 lease history 保留而 live guard 清除。 |
 | 122-V06 | Interface closure | Adapter 精确暴露现有九方法，不提供 bootstrap/create-table/第二状态机入口；prepared→CAS→readback→finalize、response loss/restart、stale snapshot/fence 的 Core 语义由既有回归保持不变，真实组合属于 Ticket 123。 |
 | 122-V07 | data/IAM/closure | request actions 精确 allowlist；无 Query/Scan/auto-create；item schema/字段 allowlist；远端 request/output 无 secret/body；生成的 IAM 声明固定 table/attributes/LeadingKeys 且不宣称已在 AWS 生效。 |

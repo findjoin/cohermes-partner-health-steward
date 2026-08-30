@@ -28,6 +28,7 @@ from partner_health_steward.current_head import (
     LifecycleTransitionIdentity,
     LifecycleTransitionRequest,
     TransitionNotFound,
+    _ExecutionOverlapPermit,
 )
 
 
@@ -144,7 +145,7 @@ class _ScriptedDynamo:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.items: list[dict[str, object] | None] = []
         self.records: dict[str, dict[str, object]] = {"HEAD": _head_item()}
-        self.active_effect: str | None = None
+        self.active_effects: set[str] = set()
         self.get_error: BaseException | None = None
         self.transact_error: BaseException | None = None
         self.transact_error_after_apply: BaseException | None = None
@@ -181,8 +182,10 @@ class _ScriptedDynamo:
         return {} if item is None else {"Item": item}
 
     @staticmethod
-    def _normalized_expression(update: dict[str, object]) -> str:
-        expression = str(update.get("ConditionExpression", ""))
+    def _normalized_expression(
+        update: dict[str, object], key: str = "ConditionExpression"
+    ) -> str:
+        expression = str(update.get(key, ""))
         names = update.get("ExpressionAttributeNames", {})
         for alias in sorted(names, key=len, reverse=True):
             attribute = names[alias]
@@ -200,7 +203,58 @@ class _ScriptedDynamo:
         ):
             if token in values:
                 pairs[attribute] = values[token]
+        for token, attribute in re.findall(
+            r"\b(:[A-Za-z0-9_]+)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\b",
+            expression,
+        ):
+            if token in values:
+                pairs[attribute] = values[token]
         return pairs
+
+    @classmethod
+    def _update_operations(
+        cls, update: dict[str, object]
+    ) -> dict[str, dict[str, object]]:
+        expression = cls._normalized_expression(update, "UpdateExpression")
+        values = update.get("ExpressionAttributeValues", {})
+        result: dict[str, dict[str, object]] = {
+            "SET": {},
+            "ADD": {},
+            "DELETE": {},
+            "REMOVE": {},
+        }
+        parts = re.split(r"\b(SET|ADD|DELETE|REMOVE)\b", expression)
+        for index in range(1, len(parts), 2):
+            action = parts[index]
+            body = parts[index + 1]
+            if action == "SET":
+                matches = re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(:[A-Za-z0-9_]+)\b",
+                    body,
+                )
+                increments = re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\+\s*(:[A-Za-z0-9_]+)\b",
+                    body,
+                )
+            elif action in {"ADD", "DELETE"}:
+                matches = re.findall(
+                    r"\b([A-Za-z_][A-Za-z0-9_]*)\s+(:[A-Za-z0-9_]+)\b",
+                    body,
+                )
+            else:
+                matches = []
+            for attribute, token in matches:
+                if token in values:
+                    result[action][attribute] = values[token]
+            if action == "SET":
+                for attribute, source, token in increments:
+                    if token in values:
+                        result[action][attribute] = (
+                            "add",
+                            source,
+                            values[token],
+                        )
+        return result
 
     def transact_write_items(self, **kwargs):
         self.calls.append(("TransactWriteItems", kwargs))
@@ -229,22 +283,32 @@ class _ScriptedDynamo:
                 raise _AwsError("ConditionalCheckFailedException")
             if any(item["SK"]["S"].startswith("LIFECYCLE#") for item in puts):
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("LIFECYCLE#"))
-                if receipt["kind"]["S"] == "terminal-delete" and self.active_effect is not None:
+                if receipt["kind"]["S"] == "terminal-delete" and self.active_effects:
                     raise _AwsError("ConditionalCheckFailedException")
-                self.records["HEAD"] = _head_item(
-                    generation=int(receipt["applied_generation"]["N"]),
-                    terminal=receipt["applied_terminal"]["BOOL"],
-                    site=receipt["applied_site"]["S"],
-                    fence=receipt["applied_writer_fence"]["S"],
-                )
-                self.records[receipt["SK"]["S"]] = receipt
-                self.active_effect = None
             else:
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("TRANSITION#"))
-                self.records["HEAD"] = _head_item(
-                    generation=int(receipt["applied_generation"]["N"])
-                )
-                self.records[receipt["SK"]["S"]] = receipt
+            operations = self._update_operations(update)
+            applied = {
+                "generation": receipt["applied_generation"],
+                "revision_digest": receipt["applied_revision_digest"],
+                "transition_id": receipt["applied_transition_id"],
+                "writer_fence": receipt["applied_writer_fence"],
+                "terminal": receipt["applied_terminal"],
+                "site": receipt["applied_site"],
+            }
+            for name, value in applied.items():
+                observed = operations["SET"].get(name)
+                if type(observed) is tuple and observed[:2] == ("add", name):
+                    delta = int(observed[2]["N"])
+                    observed = _ddb_n(int(self.records["HEAD"][name]["N"]) + delta)
+                if observed != value:
+                    raise AssertionError(
+                        "HEAD update does not write the complete applied authority"
+                    )
+                self.records["HEAD"][name] = observed
+            self.records[receipt["SK"]["S"]] = receipt
+            if receipt.get("kind", {}).get("S") == "writer-transfer":
+                self.active_effects.clear()
         elif any(item["SK"]["S"].startswith("LEASE#") for item in puts):
             receipt = next(item for item in puts if item["SK"]["S"].startswith("LEASE#"))
             guard = next(update for update in updates if update["Key"]["SK"]["S"] == "LEASE-GUARD")
@@ -266,14 +330,25 @@ class _ScriptedDynamo:
                 if value == receipt["effect_id"]
                 or value == {"SS": [receipt["effect_id"]["S"]]}
             ]
-            update_expression = str(guard.get("UpdateExpression", ""))
-            if not effect_tokens or not any(token in update_expression for token in effect_tokens):
+            operations = self._update_operations(guard)
+            added = operations["ADD"].get("active_effect_ids")
+            assigned = operations["SET"].get("active_effect_ids")
+            expected_added = {"SS": [receipt["effect_id"]["S"]]}
+            expected_assigned = self.active_effects | {receipt["effect_id"]["S"]}
+            assigned_values = set(assigned.get("SS", ())) if type(assigned) is dict else set()
+            if added not in (receipt["effect_id"], expected_added) and assigned_values != expected_assigned:
                 raise AssertionError("lease guard update does not bind the effect")
-            if "attribute_not_exists" not in condition or "active_effect_ids" not in condition:
-                raise AssertionError("lease guard does not prove the active set empty")
-            if self.active_effect is not None:
+            if not self.active_effects:
+                if "attribute_not_exists" not in condition or "active_effect_ids" not in condition:
+                    raise AssertionError("lease guard does not prove the active set empty")
+            else:
+                observed = pairs.get("active_effect_ids", {})
+                observed_set = set(observed.get("SS", ())) if type(observed) is dict else set()
+                if len(self.active_effects) != 1 or observed_set != self.active_effects:
+                    raise _AwsError("ConditionalCheckFailedException")
+            if len(self.active_effects) >= 2:
                 raise _AwsError("ConditionalCheckFailedException")
-            self.active_effect = receipt["effect_id"]["S"]
+            self.active_effects.add(receipt["effect_id"]["S"])
             self.records[receipt["SK"]["S"]] = receipt
         else:
             lease_updates = [
@@ -321,24 +396,36 @@ class _ScriptedDynamo:
                     if value == receipt["effect_id"]
                     or value == {"SS": [receipt["effect_id"]["S"]]}
                 ]
+                guard_operations = self._update_operations(guard)
+                deleted = guard_operations["DELETE"].get("active_effect_ids")
                 if (
                     not effect_tokens
                     or "contains" not in guard_condition
                     or "active_effect_ids" not in guard_condition
                     or not any(token in guard_condition for token in effect_tokens)
-                    or not any(token in str(guard.get("UpdateExpression", "")) for token in effect_tokens)
+                    or deleted
+                    not in (
+                        receipt["effect_id"],
+                        {"SS": [receipt["effect_id"]["S"]]},
+                    )
                 ):
                     raise AssertionError("lease guard release condition/update is incomplete")
                 if receipt["released"]["BOOL"]:
                     raise _AwsError("ConditionalCheckFailedException")
-                receipt["released"] = {"BOOL": True}
-                receipt["released_operation_digest"] = next(
+                release_operation = next(
                     values[token]
                     for token in operation_tokens
                     if values[token].get("S") in {"sha256:release", "sha256:different-release"}
                 )
+                lease_operations = self._update_operations(lease_update)
+                if lease_operations["SET"].get("released") != {"BOOL": True}:
+                    raise AssertionError("lease release does not write released=true")
+                if lease_operations["SET"].get("released_operation_digest") != release_operation:
+                    raise AssertionError("lease release does not write operation ownership")
+                receipt["released"] = {"BOOL": True}
+                receipt["released_operation_digest"] = release_operation
                 self.records[sk] = receipt
-                self.active_effect = None
+                self.active_effects.discard(receipt["effect_id"]["S"])
         if self.transact_error_after_apply is not None:
             raise self.transact_error_after_apply
         return {}
@@ -559,7 +646,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
 
         release_client = _ScriptedDynamo()
         release_client.records["LEASE#effect:t122"] = _lease_item()
-        release_client.active_effect = "effect:t122"
+        release_client.active_effects = {"effect:t122"}
         release_port = self._port(release_client)
         released = release_port.release_execution_lease(
             ExecutionLeaseRelease(
@@ -600,9 +687,22 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
             writer_fence=_FENCE,
             holder_id="holder:other",
             writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+            _execution_overlap=_ExecutionOverlapPermit("effect:t122"),
+        )
+        self.assertEqual(
+            port.acquire_execution_lease(overlap_request).request,
+            overlap_request.identity(),
+        )
+        third_request = ExecutionLeaseRequest(
+            expected=self._authority(),
+            effect_id="effect:third",
+            intent_digest="sha256:third-intent",
+            writer_fence=_FENCE,
+            holder_id="holder:third",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
         )
         with self.assertRaises(HeadConflict):
-            port.acquire_execution_lease(overlap_request)
+            port.acquire_execution_lease(third_request)
 
         missing = _ScriptedDynamo()
         missing.items = [None]
@@ -637,7 +737,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
             f"{hashlib.sha256(target_capability.encode()).hexdigest()}"
         )
         client.records["LEASE#effect:t122"] = _lease_item()
-        client.active_effect = "effect:t122"
+        client.active_effects = {"effect:t122"}
         port = self._port(client)
         request = LifecycleTransitionRequest(
             kind="writer-transfer",
@@ -660,7 +760,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertIn("LEASE-GUARD", wire)
         self.assertNotIn(target_capability, wire)
         self.assertIn("LEASE#effect:t122", client.records)
-        self.assertIsNone(client.active_effect)
+        self.assertEqual(client.active_effects, set())
         self.assertFalse(port.validate_writer_fence(WriterFenceProof(self._authority(), _CAPABILITY)))
 
         target_client = _ScriptedDynamo()
@@ -699,7 +799,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
 
         terminal_client = _ScriptedDynamo()
         terminal_client.records["LEASE#effect:t122"] = _lease_item()
-        terminal_client.active_effect = "effect:t122"
+        terminal_client.active_effects = {"effect:t122"}
         terminal_request = LifecycleTransitionRequest(
             kind="terminal-delete",
             expected=self._authority(),
