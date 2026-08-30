@@ -240,7 +240,7 @@ root, fence = Path(sys.argv[1]), sys.argv[2]
 paths = HostPrivateFacilityPaths(root/'data-key.v1', root/'writer-master.v1', root/'execution-master.v1', root/'locks')
 authority = AuthoritySnapshot('installation:t121-fixture',4,'sha256:t121-revision','transition:t121-current',fence,False,'site:t121-fixture')
 nonce = fence.split(':')[2]
-body = b'partner-health-steward/writer-capability/v1\0' + json.dumps(['installation:t121-fixture','site:t121-fixture',nonce],ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()
+body = b'partner-health-steward/writer-capability/v1\\0' + json.dumps(['installation:t121-fixture','site:t121-fixture',nonce],ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()
 capability = hmac.new((root/'writer-master.v1').read_bytes(), body, hashlib.sha256).hexdigest()
 session = HostPrivateExecutionCapabilityVault(paths).acquire_or_resume_session(authority, WriterFenceProof(authority, capability))
 print('READY' if session is not None else 'FAILED', flush=True)
