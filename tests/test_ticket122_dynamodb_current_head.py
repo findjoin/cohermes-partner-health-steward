@@ -930,6 +930,16 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertIn("LEASE#effect:t122", client.records)
         self.assertEqual(client.active_effects, set())
         self.assertFalse(port.validate_writer_fence(WriterFenceProof(self._authority(), _CAPABILITY)))
+        old_lease_request = ExecutionLeaseRequest(
+            expected=self._authority(),
+            effect_id="effect:t122",
+            intent_digest="sha256:intent",
+            writer_fence=_FENCE,
+            holder_id="holder:t122",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+        )
+        with self.assertRaises(HeadConflict):
+            port.acquire_execution_lease(old_lease_request)
 
         target_client = _ScriptedDynamo()
         target_client.items = [_head_item(generation=2, site="site:b", fence=target_fence)]
@@ -984,6 +994,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
             )
 
         terminal_success = _ScriptedDynamo()
+        terminal_success.records["LEASE#effect:t122"] = _lease_item(released=True)
         terminal_port = self._port(terminal_success)
         terminal_head = terminal_port.conditional_lifecycle_transition(
             terminal_request
@@ -1007,6 +1018,8 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
                     writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
                 )
             )
+        with self.assertRaises(HeadTerminal):
+            terminal_port.acquire_execution_lease(old_lease_request)
 
     def test_v122_06_exposes_exact_existing_port_only(self) -> None:
         self._require()
