@@ -12,7 +12,9 @@ import hmac
 import importlib
 import json
 import os
+import base64
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,7 +30,6 @@ from partner_health_steward.authority import (
 
 _INSTALLATION = "installation:t121-fixture"
 _SITE = "site:t121-fixture"
-_NONCE = "ABEiM0RVZneImaq7zN3u_w"
 _DATA_KEY = bytes(range(32))
 _WRITER_MASTER = bytes(range(32, 64))
 _EXECUTION_MASTER = bytes(range(64, 96))
@@ -43,15 +44,23 @@ def _canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _nonce() -> str:
+    body = b"partner-health-steward/writer-nonce/v1\0" + _canonical(
+        [_INSTALLATION, _SITE]
+    )
+    raw = hmac.new(_WRITER_MASTER, body, hashlib.sha256).digest()[:16]
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 def _writer_capability() -> str:
     body = b"partner-health-steward/writer-capability/v1\0" + _canonical(
-        [_INSTALLATION, _SITE, _NONCE]
+        [_INSTALLATION, _SITE, _nonce()]
     )
     return hmac.new(_WRITER_MASTER, body, hashlib.sha256).hexdigest()
 
 
 def _fence_ref() -> str:
-    return f"fence:v1:{_NONCE}:{hashlib.sha256(_writer_capability().encode()).hexdigest()}"
+    return f"fence:v1:{_nonce()}:{hashlib.sha256(_writer_capability().encode()).hexdigest()}"
 
 
 def _authority(*, terminal: bool = False, fence: str | None = None) -> AuthoritySnapshot:
@@ -87,7 +96,9 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             self.skipTest("Ticket 121 formal gates require an isolated Linux host")
         return self.module
 
-    def _facility(self, root: Path) -> Path:
+    def _facility(self, root: Path):
+        module = self.module
+        root.mkdir(parents=True, exist_ok=True)
         facility = root / "authority"
         facility.mkdir(mode=0o700)
         for name, value in (
@@ -98,13 +109,21 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             path = facility / name
             path.write_bytes(value)
             path.chmod(0o400)
-        return facility
+        locks = facility / "locks"
+        locks.mkdir(mode=0o700)
+        return module.HostPrivateFacilityPaths(
+            data_key=facility / "data-key.v1",
+            writer_master=facility / "writer-master.v1",
+            execution_master=facility / "execution-master.v1",
+            lock_directory=locks,
+            destruction_receipt=facility / "destroyed-data-key.receipt",
+        )
 
     def test_v121_01_key_provider_rejects_unsafe_files(self) -> None:
         module = self._require(red=True)
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
-            facility = self._facility(Path(raw))
-            provider = module.HostPrivateKeyProvider(facility, _INSTALLATION)
+            paths = self._facility(Path(raw))
+            provider = module.HostPrivateKeyProvider(paths, _INSTALLATION)
             self.assertEqual(
                 provider.key_id,
                 "key:v1:" + hashlib.sha256(_DATA_KEY).hexdigest(),
@@ -112,8 +131,8 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             self.assertEqual(provider.get_key(), _DATA_KEY)
             self.assertNotIn(_DATA_KEY.hex(), repr(provider))
 
-            key_path = facility / "data-key.v1"
-            replacement = facility / "replacement"
+            key_path = Path(paths.data_key)
+            replacement = key_path.parent / "replacement"
             replacement.write_bytes(_DATA_KEY)
             replacement.chmod(0o400)
             os.replace(replacement, key_path)
@@ -124,49 +143,56 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
                 ("wrong-size", lambda p: p.write_bytes(b"short")),
                 ("wide-mode", lambda p: (p.write_bytes(_DATA_KEY), p.chmod(0o640))),
             ):
-                case = Path(raw) / name
-                case.mkdir(mode=0o700)
-                for filename, value in (
-                    ("data-key.v1", _DATA_KEY),
-                    ("writer-master.v1", _WRITER_MASTER),
-                    ("execution-master.v1", _EXECUTION_MASTER),
-                ):
-                    target = case / filename
-                    target.write_bytes(value)
-                    target.chmod(0o400)
-                setup(case / "data-key.v1")
+                case_paths = self._facility(Path(raw) / name)
+                setup(Path(case_paths.data_key))
                 with self.assertRaises(Exception):
-                    module.HostPrivateKeyProvider(case, _INSTALLATION)
+                    module.HostPrivateKeyProvider(case_paths, _INSTALLATION)
 
     def test_v121_02_writer_holder_is_exclusive_and_crash_recoverable(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
-            facility = self._facility(Path(raw))
-            first = module.HostPrivateWriterFenceVault(facility)
-            second = module.HostPrivateWriterFenceVault(facility)
-            session = first.acquire_or_resume(
-                _INSTALLATION, _SITE, WriterHolderClaim("holder:first")
+            paths = self._facility(Path(raw))
+            first = module.HostPrivateWriterFenceVault(paths)
+            self.assertEqual(first.public_fence_ref(_INSTALLATION, _SITE), _fence_ref())
+            script = """
+import sys, time, hashlib, hmac, json
+from pathlib import Path
+from partner_health_steward.authority import WriterHolderClaim
+from partner_health_steward.host_authority import HostPrivateFacilityPaths, HostPrivateWriterFenceVault
+root = Path(sys.argv[1])
+paths = HostPrivateFacilityPaths(root/'data-key.v1', root/'writer-master.v1', root/'execution-master.v1', root/'locks', root/'destroyed-data-key.receipt')
+session = HostPrivateWriterFenceVault(paths).acquire_or_resume('installation:t121-fixture','site:t121-fixture',WriterHolderClaim('holder:child'))
+print('READY' if session is not None else 'FAILED', flush=True)
+time.sleep(60)
+"""
+            child = subprocess.Popen(
+                [sys.executable, "-c", script, str(Path(paths.data_key).parent)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            self.assertIsNotNone(session)
-            self.assertIsNone(
-                second.acquire_or_resume(
-                    _INSTALLATION, _SITE, WriterHolderClaim("holder:second")
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "READY")
+                self.assertIsNone(
+                    first.acquire_or_resume(
+                        _INSTALLATION, _SITE, WriterHolderClaim("holder:parent")
+                    )
                 )
-            )
-            proof = session.proof_for(_authority())
-            self.assertEqual(proof.capability, _writer_capability())
-            session.release()
-            recovered = second.acquire_or_resume(
+            finally:
+                child.kill()
+                child.wait(timeout=10)
+            recovered = first.acquire_or_resume(
                 _INSTALLATION, _SITE, WriterHolderClaim("holder:second")
             )
             self.assertIsNotNone(recovered)
+            self.assertEqual(recovered.proof_for(_authority()).capability, _writer_capability())
             recovered.release()
 
     def test_v121_03_writer_proof_is_exact_and_secret_free(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
-            facility = self._facility(Path(raw))
-            vault = module.HostPrivateWriterFenceVault(facility)
+            paths = self._facility(Path(raw))
+            vault = module.HostPrivateWriterFenceVault(paths)
             session = vault.acquire_or_resume(
                 _INSTALLATION, _SITE, WriterHolderClaim("holder:exact")
             )
@@ -178,19 +204,43 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             self.assertIsNone(session.proof_for(_authority(fence="fence:v1:bad:bad")))
             self.assertIsNone(session.proof_for(_authority(terminal=True)))
             self.assertNotIn(proof.capability, repr(vault))
-            (facility / "writer-master.v1").unlink()
+            Path(paths.writer_master).unlink()
             self.assertIsNone(session.proof_for(_authority()))
 
     def test_v121_04_execution_capability_has_exact_binding(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
-            facility = self._facility(Path(raw))
-            writer = module.HostPrivateWriterFenceVault(facility)
-            holder = writer.acquire_or_resume(
-                _INSTALLATION, _SITE, WriterHolderClaim("holder:execution")
+            paths = self._facility(Path(raw))
+            from partner_health_steward.authority import WriterFenceProof
+            proof = WriterFenceProof(_authority(), _writer_capability())
+            script = """
+import sys, time
+from pathlib import Path
+from partner_health_steward.authority import AuthoritySnapshot, WriterFenceProof
+from partner_health_steward.host_authority import HostPrivateFacilityPaths, HostPrivateExecutionCapabilityVault
+root, fence = Path(sys.argv[1]), sys.argv[2]
+paths = HostPrivateFacilityPaths(root/'data-key.v1', root/'writer-master.v1', root/'execution-master.v1', root/'locks', root/'destroyed-data-key.receipt')
+authority = AuthoritySnapshot('installation:t121-fixture',4,'sha256:t121-revision','transition:t121-current',fence,False,'site:t121-fixture')
+nonce = fence.split(':')[2]
+body = b'partner-health-steward/writer-capability/v1\0' + json.dumps(['installation:t121-fixture','site:t121-fixture',nonce],ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()
+capability = hmac.new((root/'writer-master.v1').read_bytes(), body, hashlib.sha256).hexdigest()
+session = HostPrivateExecutionCapabilityVault(paths).acquire_or_resume_session(authority, WriterFenceProof(authority, capability))
+print('READY' if session is not None else 'FAILED', flush=True)
+time.sleep(60)
+"""
+            child = subprocess.Popen(
+                [sys.executable, "-c", script, str(Path(paths.data_key).parent), _fence_ref()],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            proof = holder.proof_for(_authority())
-            vault = module.HostPrivateExecutionCapabilityVault(facility)
+            vault = module.HostPrivateExecutionCapabilityVault(paths)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "READY")
+                self.assertIsNone(vault.acquire_or_resume_session(_authority(), proof))
+            finally:
+                child.kill()
+                child.wait(timeout=10)
             session = vault.acquire_or_resume_session(_authority(), proof)
             binding = ExecutionCapabilityBinding(
                 authority=_authority(),
@@ -200,21 +250,18 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             )
             capability = session.mint(binding)
             self.assertEqual(session.mint(binding), capability)
-            self.assertIsNone(
-                session.recover(
-                    ExecutionCapabilityBinding(
-                        authority=_authority(),
-                        effect_id="effect:other",
-                        intent_digest=binding.intent_digest,
-                        vault_claim_ref=binding.vault_claim_ref,
-                    ),
-                    capability,
-                )
+            self.assertIsNone(module.HostPrivateExecutionCapabilityVault(paths).acquire_or_resume_session(_authority(), proof))
+            mutations = (
+                ExecutionCapabilityBinding(_authority(), "effect:other", binding.intent_digest, binding.vault_claim_ref),
+                ExecutionCapabilityBinding(_authority(), binding.effect_id, "sha256:other", binding.vault_claim_ref),
+                ExecutionCapabilityBinding(_authority(), binding.effect_id, binding.intent_digest, "claim:other"),
+                ExecutionCapabilityBinding(_authority(fence="fence:v1:bad:bad"), binding.effect_id, binding.intent_digest, binding.vault_claim_ref),
             )
+            for changed in mutations:
+                self.assertIsNone(session.recover(changed, holder_id_for(capability)))
+            self.assertIsNone(session.recover(binding, "holder:wrong"))
             session.release()
-            resumed = module.HostPrivateExecutionCapabilityVault(
-                facility
-            ).acquire_or_resume_session(_authority(), proof)
+            resumed = module.HostPrivateExecutionCapabilityVault(paths).acquire_or_resume_session(_authority(), proof)
             self.assertEqual(
                 resumed.recover(binding, holder_id_for(capability)), capability
             )
@@ -222,8 +269,8 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
     def test_v121_05_terminal_key_destruction_is_bounded(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
-            facility = self._facility(Path(raw))
-            provider = module.HostPrivateKeyProvider(facility, _INSTALLATION)
+            paths = self._facility(Path(raw))
+            provider = module.HostPrivateKeyProvider(paths, _INSTALLATION)
             nonterminal = {
                 "operation_ref": "delete:t121",
                 "authority_binding": _authority().to_storage(),
@@ -235,24 +282,53 @@ class Ticket121HostAuthorityTests(unittest.TestCase):
             terminal["authority_binding"] = _authority(terminal=True).to_storage()
             self.assertEqual(provider.destroy(terminal), {"status": "confirmed"})
             self.assertEqual(provider.absence(terminal), {"status": "absent"})
-            self.assertEqual(provider.destroy(terminal), {"status": "confirmed"})
-            self.assertTrue((facility / "writer-master.v1").is_file())
-            self.assertTrue((facility / "execution-master.v1").is_file())
+            receipt_bytes = Path(paths.destruction_receipt).read_bytes()
+            for secret in (_DATA_KEY, _WRITER_MASTER, _EXECUTION_MASTER):
+                self.assertNotIn(secret, receipt_bytes)
+            restarted = module.HostPrivateKeyProvider(paths, _INSTALLATION)
+            self.assertEqual(restarted.destroy(terminal), {"status": "confirmed"})
+            changed = dict(terminal)
+            changed["operation_ref"] = "delete:other"
+            with self.assertRaises(Exception):
+                restarted.destroy(changed)
+            self.assertTrue(Path(paths.writer_master).is_file())
+            self.assertTrue(Path(paths.execution_master).is_file())
 
     def test_v121_06_linux_file_type_and_output_closure(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket121-") as raw:
             root = Path(raw)
-            facility = self._facility(root)
-            original = facility / "data-key.v1"
+            paths = self._facility(root)
+            original = Path(paths.data_key)
             original.unlink()
-            os.symlink(facility / "writer-master.v1", original)
+            os.symlink(Path(paths.writer_master), original)
             self.assertTrue(stat.S_ISLNK(os.lstat(original).st_mode))
             with self.assertRaises(Exception) as caught:
-                module.HostPrivateKeyProvider(facility, _INSTALLATION)
+                module.HostPrivateKeyProvider(paths, _INSTALLATION)
             public = repr(caught.exception)
             for secret in (_DATA_KEY.hex(), _WRITER_MASTER.hex(), _EXECUTION_MASTER.hex(), raw):
                 self.assertNotIn(secret, public)
+
+            fifo_root = root / "fifo-case"
+            fifo_paths = self._facility(fifo_root)
+            Path(fifo_paths.data_key).unlink()
+            os.mkfifo(fifo_paths.data_key, mode=0o400)
+            with self.assertRaises(Exception):
+                module.HostPrivateKeyProvider(fifo_paths, _INSTALLATION)
+
+            hard_root = root / "hardlink-case"
+            hard_paths = self._facility(hard_root)
+            os.link(hard_paths.data_key, hard_root / "second-link")
+            with self.assertRaises(Exception):
+                module.HostPrivateKeyProvider(hard_paths, _INSTALLATION)
+
+            if os.geteuid() != 0:
+                self.fail("V121-06 requires root to prove wrong uid/gid rejection")
+            owner_root = root / "owner-case"
+            owner_paths = self._facility(owner_root)
+            os.chown(owner_paths.data_key, 65534, 65534)
+            with self.assertRaises(Exception):
+                module.HostPrivateKeyProvider(owner_paths, _INSTALLATION)
 
 
 if __name__ == "__main__":

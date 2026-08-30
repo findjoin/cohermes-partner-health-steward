@@ -1,6 +1,6 @@
 # Ticket 122 冻结验证合同
 
-> 状态：frozen。与 `122-frozen-implementation-design.md` 同属 commit `52d569dc487b3bbc8023a797bd67b70a30cab0cb`、tree `5cfe065de74f6a86696a7a7fc79923d1f28ab8b1` 的编码前 characterization。verifier-owned 文件固定为 `tests/test_ticket122_dynamodb_current_head.py`；实现 Agent 不得修改三件套。
+> 状态：freeze-candidate。characterization 产品基线为 commit `52d569dc487b3bbc8023a797bd67b70a30cab0cb`、tree `5cfe065de74f6a86696a7a7fc79923d1f28ab8b1`；最终 frozen checkpoint 和 reviewer identity 只在复审通过后写入。verifier-owned 文件固定为 `tests/test_ticket122_dynamodb_current_head.py`；实现 Agent 不得修改三件套。
 
 ## 测试边界
 

@@ -1,6 +1,6 @@
 # Ticket 122 冻结实施设计
 
-> 状态：frozen。候选基线为 commit `52d569dc487b3bbc8023a797bd67b70a30cab0cb`、tree `5cfe065de74f6a86696a7a7fc79923d1f28ab8b1`。本票只实现现有九方法 `CurrentHeadPort` 的 DynamoDB Adapter，不改变 Interface、`HealthCore`、`InMemoryCurrentHead` 或 ADR 0022。
+> 状态：freeze-candidate。characterization 产品基线为 commit `52d569dc487b3bbc8023a797bd67b70a30cab0cb`、tree `5cfe065de74f6a86696a7a7fc79923d1f28ab8b1`。最终 frozen checkpoint 和 reviewer identity 只在本轮复审通过后写入。本票只实现现有九方法 `CurrentHeadPort` 的 DynamoDB Adapter，不改变 Interface、`HealthCore`、`InMemoryCurrentHead` 或 ADR 0022。
 
 ## 唯一产品增量
 
@@ -21,6 +21,8 @@
 - `LEASE-GUARD`：当前活 effect id 集合及 generation/fence guard。
 
 不得存 raw writer capability、completion capability、主人/联系人身份、健康正文、prompt、模型输出、医学值、凭据或任意 diagnostic text。decoder 对未知字段、类型、版本或不透明值失败关闭。
+
+远端字段集也冻结，避免 verifier 与实现各自解释：所有 item 只有 `PK/SK/schema_version` 加下列字段。HEAD 为 `generation,revision_digest,transition_id,writer_fence,terminal,site`；TRANSITION 为 `kind`、完整 expected 六字段、request 的 transition/revision/operation 三字段、完整 applied 六字段；LIFECYCLE 在同样 expected/applied 六字段外加 `kind,operation_ref,operation_digest,transition_id,revision_digest` 及 transfer 时的 `target_site,target_writer_fence_ref`；LEASE 为完整 expected 六字段、`effect_id,intent_digest,holder_id,lease_id,released` 及 released 时的 `released_operation_digest`；LEASE-GUARD 只含 `generation,writer_fence,active_effect_ids`。`installation_id` 只出现为 PK，不再复制身份字段。具体 Dynamo expression 名称和内部 helper 不冻结。
 
 每个 advance/lifecycle/lease acquire/release 使用一个 `TransactWriteItems`：条件必须合并在同一 HEAD 或 LEASE-GUARD 的 Put/Update `ConditionExpression` 中；DynamoDB 禁止在同一事务对同 item 再放独立 ConditionCheck。状态更新与 exact receipt 原子形成。成功返回前强读 HEAD/receipt；响应丢失或结果未知时不重做新 identity，只由 `HealthCore` 调用 exact lookup。
 
