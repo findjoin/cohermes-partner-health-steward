@@ -328,7 +328,6 @@ class DynamoDBCurrentHead:
             raise TypeError("invalid DynamoDB current-head binding")
         self._client = client
         self._binding = binding
-        self._known_leases: dict[ExecutionLeaseIdentity, ExecutionLeaseReceipt] = {}
         try:
             response = client.describe_table(TableName=binding.table_name)  # type: ignore[attr-defined]
         except BaseException as exc:
@@ -536,9 +535,22 @@ class DynamoDBCurrentHead:
             "operation_digest": _s(identity.operation_digest),
             **_applied_values(applied),
         }
+        guard = {
+            "TableName": self._binding.table_name,
+            "Key": self._key("LEASE-GUARD"),
+            "ConditionExpression": "generation = :eg AND writer_fence = :ew",
+            "UpdateExpression": "SET generation = :ng, writer_fence = :nw",
+            "ExpressionAttributeValues": {
+                ":eg": _n(identity.expected.generation),
+                ":ew": _s(identity.expected.writer_fence),
+                ":ng": _n(applied.generation),
+                ":nw": _s(applied.writer_fence),
+            },
+        }
         self._transact(
             [
                 {"Update": self._head_update(request.expected, applied)},
+                {"Update": guard},
                 {
                     "Put": {
                         "TableName": self._binding.table_name,
@@ -633,18 +645,17 @@ class DynamoDBCurrentHead:
         guard_values: dict[str, object] = {
             ":eg": _n(identity.expected.generation),
             ":ew": _s(identity.expected.writer_fence),
+            ":ng": _n(applied.generation),
+            ":nw": _s(applied.writer_fence),
         }
         if identity.kind == "terminal-delete":
             guard_condition = (
                 "generation = :eg AND writer_fence = :ew AND "
                 "attribute_not_exists(active_effect_ids)"
             )
-            guard_update = "SET generation = :eg, writer_fence = :ew"
+            guard_update = "SET generation = :ng, writer_fence = :nw"
         else:
             guard_condition = "generation = :eg AND writer_fence = :ew"
-            guard_values.update(
-                {":ng": _n(applied.generation), ":nw": _s(applied.writer_fence)}
-            )
             guard_update = "SET generation = :ng, writer_fence = :nw REMOVE active_effect_ids"
         guard = {
             "TableName": self._binding.table_name,
@@ -760,9 +771,16 @@ class DynamoDBCurrentHead:
             raise AuthorityValidationError("invalid execution lease request")
         self._verify_request_proof(request.writer_proof, request.expected)
         identity = request.identity()
-        known = self._known_leases.get(identity)
-        if known is not None:
-            return known
+        record_key = self._lease_key(identity.effect_id)
+        existing = self._get(record_key)
+        if existing is not None:
+            first_observation = self._lease_receipt(existing, identity)
+            confirmed = self._get(record_key)
+            if confirmed is not None:
+                second_observation = self._lease_receipt(confirmed, identity)
+                if second_observation != first_observation:
+                    raise CurrentHeadError("DynamoDB lease replay readback changed")
+                return second_observation
         lease_id = "lease:" + (
             request.effect_id.split(":", 1)[1]
             if ":" in request.effect_id
@@ -821,11 +839,10 @@ class DynamoDBCurrentHead:
                 return self.lookup_execution_lease(identity)
             except ExecutionLeaseNotFound:
                 raise conflict
-        item = self._get(self._lease_key(identity.effect_id))
+        item = self._get(record_key)
         if item is None:
             raise CurrentHeadError("DynamoDB lease readback is absent")
         receipt = self._lease_receipt(item, identity)
-        self._known_leases[identity] = receipt
         return receipt
 
     def lookup_execution_lease(
@@ -836,9 +853,7 @@ class DynamoDBCurrentHead:
         item = self._get(self._lease_key(identity.effect_id))
         if item is None:
             raise ExecutionLeaseNotFound("execution lease not found")
-        receipt = self._lease_receipt(item, identity)
-        self._known_leases[identity] = receipt
-        return receipt
+        return self._lease_receipt(item, identity)
 
     def release_execution_lease(
         self, release: ExecutionLeaseRelease
@@ -853,12 +868,10 @@ class DynamoDBCurrentHead:
             writer_fence=release.lease.authority.writer_fence,
             holder_id=release.lease.holder_id,
         )
-        known = self._known_leases.get(identity)
-        if known is None:
-            known = self.lookup_execution_lease(identity)
-        if known is not None and known.lease != release.lease:
+        known = self.lookup_execution_lease(identity)
+        if known.lease != release.lease:
             raise HeadConflict("execution lease release conflict")
-        if known is not None and known.released:
+        if known.released:
             if known.released_operation_digest != release.operation_digest:
                 raise HeadConflict("execution lease release ownership conflict")
             return known
@@ -904,7 +917,6 @@ class DynamoDBCurrentHead:
         receipt = self._lease_receipt(item, identity)
         if not receipt.released or receipt.released_operation_digest != release.operation_digest:
             raise CurrentHeadError("DynamoDB lease release readback mismatch")
-        self._known_leases[identity] = receipt
         return receipt
 
 
