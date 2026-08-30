@@ -146,6 +146,8 @@ class _ScriptedDynamo:
         self.items: list[dict[str, object] | None] = []
         self.records: dict[str, dict[str, object]] = {"HEAD": _head_item()}
         self.active_effects: set[str] = set()
+        self.guard_generation = _ddb_n(1)
+        self.guard_fence = _ddb_s(_FENCE)
         self.get_error: BaseException | None = None
         self.transact_error: BaseException | None = None
         self.transact_error_after_apply: BaseException | None = None
@@ -295,6 +297,23 @@ class _ScriptedDynamo:
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("LIFECYCLE#"))
             else:
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("TRANSITION#"))
+            guard_updates = [
+                candidate
+                for candidate in updates
+                if candidate["Key"]["SK"]["S"] == "LEASE-GUARD"
+            ]
+            if len(guard_updates) != 1:
+                raise AssertionError(
+                    "HEAD transition did not update LEASE-GUARD atomically"
+                )
+            guard = guard_updates[0]
+            guard_condition = self._normalized_expression(guard)
+            guard_pairs = self._equality_pairs(guard)
+            if (
+                guard_pairs.get("generation") != self.guard_generation
+                or guard_pairs.get("writer_fence") != self.guard_fence
+            ):
+                raise _AwsError("ConditionalCheckFailedException")
             operations = self._update_operations(update)
             applied = {
                 "generation": receipt["applied_generation"],
@@ -324,28 +343,36 @@ class _ScriptedDynamo:
                     )
                 self.records["HEAD"][name] = observed
             self.records[receipt["SK"]["S"]] = receipt
+            guard_operations = self._update_operations(guard)
+            guard_generation = guard_operations["SET"].get("generation")
+            guard_increment = guard_operations["ADD"].get("generation")
+            if guard_increment is not None:
+                guard_generation = _ddb_n(
+                    int(self.guard_generation["N"])
+                    + int(guard_increment["N"])
+                )
+            elif (
+                type(guard_generation) is tuple
+                and guard_generation[:2] == ("add", "generation")
+            ):
+                guard_generation = _ddb_n(
+                    int(self.guard_generation["N"])
+                    + int(guard_generation[2]["N"])
+                )
+            if (
+                guard_generation != receipt["applied_generation"]
+                or guard_operations["SET"].get("writer_fence")
+                != receipt["applied_writer_fence"]
+            ):
+                raise AssertionError(
+                    "HEAD transition does not advance the lease guard authority"
+                )
+            self.guard_generation = guard_generation
+            self.guard_fence = receipt["applied_writer_fence"]
             if receipt.get("kind", {}).get("S") in {
                 "writer-transfer",
                 "terminal-delete",
             }:
-                guard_updates = [
-                    candidate
-                    for candidate in updates
-                    if candidate["Key"]["SK"]["S"] == "LEASE-GUARD"
-                ]
-                if len(guard_updates) != 1:
-                    raise AssertionError(
-                        "lifecycle transition did not update LEASE-GUARD atomically"
-                    )
-                guard = guard_updates[0]
-                guard_condition = self._normalized_expression(guard)
-                guard_pairs = self._equality_pairs(guard)
-                for attribute in ("generation", "writer_fence"):
-                    if guard_pairs.get(attribute) != required[attribute]:
-                        raise AssertionError(
-                            "lifecycle guard does not bind current generation/fence"
-                        )
-                guard_operations = self._update_operations(guard)
                 if receipt["kind"]["S"] == "terminal-delete":
                     size_tokens = re.findall(
                         r"size\s*\(\s*active_effect_ids\s*\)\s*=\s*(:[A-Za-z0-9_]+)",
@@ -369,29 +396,6 @@ class _ScriptedDynamo:
                     if self.active_effects:
                         raise _AwsError("ConditionalCheckFailedException")
                 else:
-                    guard_generation = guard_operations["SET"].get("generation")
-                    guard_increment = guard_operations["ADD"].get("generation")
-                    if guard_increment is not None:
-                        guard_generation = _ddb_n(
-                            int(required["generation"]["N"])
-                            + int(guard_increment["N"])
-                        )
-                    elif (
-                        type(guard_generation) is tuple
-                        and guard_generation[:2] == ("add", "generation")
-                    ):
-                        guard_generation = _ddb_n(
-                            int(required["generation"]["N"])
-                            + int(guard_generation[2]["N"])
-                        )
-                    if (
-                        guard_generation != receipt["applied_generation"]
-                        or guard_operations["SET"].get("writer_fence")
-                        != receipt["applied_writer_fence"]
-                    ):
-                        raise AssertionError(
-                            "writer transfer does not advance the lease guard authority"
-                        )
                     removed = guard_operations["REMOVE"].get("active_effect_ids")
                     deleted = guard_operations["DELETE"].get("active_effect_ids")
                     exact_deleted = (
@@ -414,9 +418,12 @@ class _ScriptedDynamo:
             if "writer_fence" not in pairs:
                 raise AssertionError("lease guard fence condition is incomplete")
             if (
-                pairs["generation"] != self.records["HEAD"]["generation"]
-                or pairs["writer_fence"] != self.records["HEAD"]["writer_fence"]
+                pairs["generation"] != self.guard_generation
+                or pairs["writer_fence"] != self.guard_fence
             ):
+                raise _AwsError("ConditionalCheckFailedException")
+            lease_key = receipt["SK"]["S"]
+            if lease_key in self.records:
                 raise _AwsError("ConditionalCheckFailedException")
             effect_tokens = [
                 token
@@ -633,7 +640,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         transactions = [value for name, value in client.calls if name == "TransactWriteItems"]
         self.assertEqual(len(transactions), 1)
         actions = transactions[0]["TransactItems"]
-        self.assertEqual(len(actions), 2)
+        self.assertEqual(len(actions), 3)
         self.assertTrue(all("ConditionCheck" not in action for action in actions))
         self.assertTrue(any("Update" in action and "ConditionExpression" in action["Update"] for action in actions))
         rendered = repr(actions)
@@ -651,11 +658,28 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         receipt_puts = [action["Put"]["Item"] for action in actions if "Put" in action]
         self.assertEqual(receipt_puts, [_transition_item(self._advance())])
 
+        current = applied.as_authority()
+        next_lease = ExecutionLeaseRequest(
+            expected=current,
+            effect_id="effect:after-advance",
+            intent_digest="sha256:after-advance",
+            writer_fence=current.writer_fence,
+            holder_id="holder:after-advance",
+            writer_proof=WriterFenceProof(current, _CAPABILITY),
+        )
+        self.assertEqual(
+            port.acquire_execution_lease(next_lease).request,
+            next_lease.identity(),
+        )
+
+        before_conflict = sum(
+            name == "TransactWriteItems" for name, _ in client.calls
+        )
         with self.assertRaises(HeadConflict):
             port.conditional_advance(self._advance())
         self.assertIn(
             sum(name == "TransactWriteItems" for name, _ in client.calls),
-            {1, 2},
+            {before_conflict, before_conflict + 1},
         )
         self.assertEqual(client.records["HEAD"]["generation"], _ddb_n(2))
         self.assertEqual(
@@ -734,15 +758,42 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         )
         self.assertEqual(lease_put, _lease_item())
         before_repeat = sum(name == "TransactWriteItems" for name, _ in client.calls)
+        before_repeat_reads = sum(name == "GetItem" for name, _ in client.calls)
         self.assertEqual(port.acquire_execution_lease(request), receipt)
         self.assertEqual(
             sum(name == "TransactWriteItems" for name, _ in client.calls),
             before_repeat,
         )
+        self.assertGreater(
+            sum(name == "GetItem" for name, _ in client.calls),
+            before_repeat_reads,
+        )
 
         lookup = _ScriptedDynamo()
         lookup.items = [_lease_item()]
         self.assertEqual(self._port(lookup).lookup_execution_lease(request.identity()).request, request.identity())
+
+        cross_instance = _ScriptedDynamo()
+        cross_instance.items = [_lease_item()]
+        original_port = self._port(cross_instance)
+        original_receipt = original_port.acquire_execution_lease(request)
+        releasing_port = self._port(cross_instance)
+        releasing_port.release_execution_lease(
+            ExecutionLeaseRelease(
+                lease=original_receipt.lease,
+                writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+                operation_digest="sha256:release",
+            )
+        )
+        before_replay_reads = sum(
+            name == "GetItem" for name, _ in cross_instance.calls
+        )
+        replayed = original_port.acquire_execution_lease(request)
+        self.assertTrue(replayed.released)
+        self.assertGreater(
+            sum(name == "GetItem" for name, _ in cross_instance.calls),
+            before_replay_reads,
+        )
 
         release_client = _ScriptedDynamo()
         release_client.records["LEASE#effect:t122"] = _lease_item()
