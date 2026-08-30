@@ -1,0 +1,29 @@
+# 122 - 实现 DynamoDB current-head 生产 Provider
+
+Type: task
+Status: ready-for-agent
+Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
+Builds on: Ticket 120 staged release evidence at `777cc585bbda3e13385b73b9146c0d8f948838d1`
+Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-production-health-core-and-coreport-service.md)
+
+**What to build:** 严格实现现有 `CurrentHeadPort` 的单区域 DynamoDB Adapter，并以 disposable installation/table namespace 完成 Ticket 119 G08 所需的 current-head、lease、terminal、旧 fence 和迁移 canary。远端 item 不得包含健康正文、主人／联系人身份、凭据或医学值。
+
+## Bounded acceptance
+
+- 强一致 `read`、条件 `advance`、transition readback、lifecycle transition、execution lease acquire/lookup/release 与 writer-fence validation 一一实现现有 Interface。
+- 超时、条件冲突、响应未知、重复 transition、旧 generation、旧 writer fence、terminal 和 lease overlap 保持既有 typed 结果；未知只按原 transition/execution identity 回查，不换 key 重做。
+- DynamoDB item 字段和 IAM action 使用固定 allowlist；未知字段、区域／表／installation 错绑或一致性不可证明时在业务读写前失败关闭。
+- disposable canary 覆盖 CAS/readback、terminal delete、旧 snapshot、writer-fence transfer/unknown 与回滚；销毁仅限预先解析并获批的 disposable namespace。
+- Adapter contract 测试可用 local fake；G08 正向结论必须来自获准的真实单区域 disposable resource，fake 不得冒充通过。
+
+## External prerequisite
+
+完成真实 G08 需要主人提供或批准一个专用 AWS account/region/table、最小 IAM 身份、费用／配额边界和针对 disposable namespace 的破坏性动作批准。Agent 不得读取或保存凭据值；缺少这些事实时可以完成代码但必须把 gate 保持 `not-authorized` 或 `cannot-confirm`。
+
+## Not in this ticket
+
+不实现本机密钥/vault、CorePort、Hermes、模型、Weixin、医学审核或真实主人迁移；不创建第二 current-head 或可配置多云抽象。
+
+## Delivery discipline
+
+编码前冻结一份 Provider 设计与 verifier-owned 测试门。只复用现有 `CurrentHeadPort`，不得为了通过测试改写状态机。通过后普通提交并推送当前任务分支。

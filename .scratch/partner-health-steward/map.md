@@ -113,7 +113,19 @@ Type: wayfinder:map
 
 - [【HOW】选择健康管家的统一技术路线、权威职责与分层验证架构](issues/98-choose-unified-health-steward-technical-route-and-authority-architecture.md) — 2026-08-20 旧合同下曾选择 Partner Health Plugin、`health_weixin`、`health-core`、SQLite、DynamoDB current head 与 `StrictHealthLLM` 等候选组合；在最新 TO 和本轮能力链重建后已失效为当前选定路线，只保留历史候选、设计理由和验证清单。
 
-## Not yet specified
+## 从 staged 到主人可用的有限实施链
+
+- [有限缺口清单](design/staged-to-usable-gap-register.md)固定当前八项差额、唯一 Ticket 归属、可并行点和统一停止规则；它只承接现有 Spec、ADR 0022 与 Ticket 119，不建立第二路线。
+- [Ticket 121：实现主机私有健康密钥与能力权威](issues/121-implement-host-private-health-authorities.md) — 补齐生产 `KeyProvider`、writer-fence vault 和 execution-capability vault；不接触 DynamoDB、Hermes 或外部效果。
+- [Ticket 122：实现 DynamoDB current-head 生产 Provider](issues/122-implement-dynamodb-current-head-provider.md) — 补齐现有 `CurrentHeadPort` 的单区域强读／CAS／readback／lease／terminal 实现和 disposable G08 canary。
+- [Ticket 123：实现生产 health-core 与 CorePort 服务](issues/123-implement-production-health-core-and-coreport-service.md) — 组合 121/122 与现有 HealthCore，通过受限 AF_UNIX socket 和低权限 systemd 服务闭合 G03/G04。
+- [Ticket 124：接通 pinned Hermes 的真实健康入口](issues/124-connect-pinned-hermes-live-health-entry.md) — 实现逐条消息、回复、cursor、七 Skill 调度和 Cron 唤醒，闭合唯一入口与无旁路的 G05/G09。
+- [Ticket 125：实现 Partner 首跳模型与治理知识 Adapter](issues/125-implement-partner-model-and-governed-knowledge-adapter.md) — 绑定真实 capability profile、严格终态和不可变知识发布；不激活医学范围。
+- [Ticket 126：实现真实 Weixin 与支持联系人投递 Adapter](issues/126-implement-live-weixin-and-support-contact-delivery-adapter.md) — 闭合分层投递、幂等、unknown 冻结和最小联系人 payload。
+- [Ticket 127：取得医学内容权利与专业审核](issues/127-obtain-medical-content-rights-and-review.md) — 人类权威票；把精确 bundle 推进到 activation-ready，Agent 不得伪造许可或审核。
+- [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 完成 G10—G12、真实 `health-init` 和主人验收，明确不触碰 partner Hermes。
+
+### 已完成的 staged 基线
 
 - [Ticket 118：完成 Hermes/Weixin 宿主合同发布与回滚准备](issues/118-complete-hermes-weixin-host-contract-release-and-rollback-preparation.md)已完成可重现 release manifest、固定 Hermes lifecycle、唯一 `health_weixin` 宿主边界、三类 CorePort 及失败关闭的 install/upgrade/rollback readiness 本地合成合同；真实 Partner/Linux/Weixin/model、外部批准、生产迁移与主人验收继续由 Ticket 119 闭合。
 
