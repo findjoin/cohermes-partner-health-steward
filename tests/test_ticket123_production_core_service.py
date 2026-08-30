@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -57,6 +59,12 @@ def _canonical(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _runtime_closure_digest(files: object) -> str:
+    if type(files) is not list:
+        raise AssertionError("runtime closure file table is invalid")
+    return "sha256:" + hashlib.sha256(_canonical(files)).hexdigest()
 
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes | None:
@@ -183,6 +191,36 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         return root / "releases" / digest.removeprefix("sha256:"), wire
 
     @staticmethod
+    def _as_current_release(binding: dict[str, object]) -> None:
+        """Promote one verified fixture release without changing its assets."""
+
+        release_root = Path(binding["release_root"])
+        manifest_path = release_root / "release-manifest.json"
+        host_path = release_root / "host-release-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        host = json.loads(host_path.read_text(encoding="utf-8"))
+        manifest["state"] = "current"
+        body = {
+            "contract": manifest["contract"],
+            "state": manifest["state"],
+            "files": manifest["files"],
+            "host_release_manifest": host,
+        }
+        digest = "sha256:" + hashlib.sha256(_canonical(body)).hexdigest()
+        manifest["release_digest"] = digest
+        destination = release_root.parent / digest.removeprefix("sha256:")
+        if destination.exists():
+            raise AssertionError("current release fixture already exists")
+        manifest_path.write_bytes(_canonical(manifest))
+        release_root.rename(destination)
+        binding["release_root"] = str(destination)
+        binding["release_digest"] = digest
+        lifecycle_release = binding["lifecycle_release"]
+        if type(lifecycle_release) is not dict:
+            raise AssertionError("fixture lifecycle release is invalid")
+        lifecycle_release["product_release"] = digest
+
+    @staticmethod
     def _recovery_command() -> CommandEnvelope:
         return CommandEnvelope(
             peer="plugin",
@@ -205,6 +243,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         *,
         seed_effect: bool = False,
         seed_recovery: bool = False,
+        client_factory: object | None = None,
     ):
         module = self._require()
         host = importlib.import_module("partner_health_steward.host_authority")
@@ -217,7 +256,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         fence = writer.prepare_fence_ref(
             _INSTALLATION, _SITE, "writer-epoch:t123-initial"
         )
-        client = t122._ScriptedDynamo()
+        client = t122._ScriptedDynamo() if client_factory is None else client_factory()
         client.records["HEAD"] = {
             "PK": {"S": _INSTALLATION},
             "SK": {"S": "HEAD"},
@@ -400,6 +439,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             connection.settimeout(2)
             connection.connect(endpoint["path"])
             connection.sendall(_outer_frame(value))
+            connection.shutdown(socket.SHUT_WR)
             header = _recv_exact(connection, 4)
             if header is None:
                 return None
@@ -483,6 +523,22 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             )
             self.assertIsNotNone(released_holder)
             released_holder.release()
+
+            current_binding = copy.deepcopy(binding)
+            self._as_current_release(current_binding)
+            current_service, current_endpoint = self._start(
+                module, current_binding, current_head
+            )
+            try:
+                current_projection = self._request(
+                    current_endpoint, self._runtime_read()
+                )["payload"]
+                self.assertEqual(current_projection.get("state"), "healthy")
+                self.assertTrue(current_projection.get("health_writes_allowed"))
+                self.assertTrue(current_projection.get("model_effects_allowed"))
+                self.assertTrue(current_projection.get("outbound_effects_allowed"))
+            finally:
+                current_service.close()
 
             for name, mutate, provider in (
                 ("release-digest", lambda value: value.__setitem__("release_digest", "sha256:" + "0" * 64), current_head),
@@ -624,7 +680,7 @@ raise SystemExit(0 if data==b'' else 9)
     def test_v123_03_all_three_coreport_kinds_use_one_strict_byte_stream(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket123-") as raw:
-            module, binding, current_head, _client = self._fixture(Path(raw))
+            module, binding, current_head, client = self._fixture(Path(raw))
             service, endpoint = self._start(module, binding, current_head)
             try:
                 host_command_request = {
@@ -695,6 +751,42 @@ raise SystemExit(0 if data==b'' else 9)
                     replay["payload"].get("response"),
                     Response("replayed", _REPLAY_CAUSAL_ID, _REPLAY_REASON).to_wire(),
                 )
+
+                # A complete request is delimited by the client half-close,
+                # not by a speculative server-side timing window.  The
+                # request is otherwise legal; a later tail must still stop it
+                # before the managed-read can dereference current-head.
+                calls_before_tail = len(client.calls)
+                delayed_tail = _outer_frame(self._runtime_read())
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(2)
+                    connection.connect(endpoint["path"])
+                    connection.sendall(delayed_tail)
+                    time.sleep(0.08)
+                    try:
+                        connection.sendall(b"tail")
+                        connection.shutdown(socket.SHUT_WR)
+                    except BrokenPipeError:
+                        # The legacy 30ms window may already have dispatched
+                        # and closed.  Its response remains the evidence that
+                        # the later tail was not checked before dispatch.
+                        pass
+                    try:
+                        observed = connection.recv(1)
+                    except (ConnectionResetError, socket.timeout):
+                        observed = b""
+                self.assertEqual(observed, b"")
+                self.assertEqual(len(client.calls), calls_before_tail)
+
+                # A sender that never half-closes has not delimited its one
+                # request.  The server must time out without dispatching it.
+                calls_before_open_request = len(client.calls)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(2)
+                    connection.connect(endpoint["path"])
+                    connection.sendall(_outer_frame(self._runtime_read()))
+                    self.assertEqual(connection.recv(1), b"")
+                self.assertEqual(len(client.calls), calls_before_open_request)
 
                 malformed = (
                     b'{"kind":"managed-read","kind":"command","payload":{},'
@@ -986,6 +1078,7 @@ raise SystemExit(0 if data==b'' else 9)
         self.assertEqual(sys.version_info[:2], (3, 11))
         files = manifest.get("files")
         self.assertIsInstance(files, list)
+        self.assertEqual(manifest.get("closure_digest"), _runtime_closure_digest(files))
         declared = {
             item["path"]: item["sha256"]
             for item in files
@@ -1058,6 +1151,86 @@ raise SystemExit(0 if data==b'' else 9)
                 self.assertFalse(Path(binding["socket_path"]).exists())
         finally:
             undeclared.unlink()
+
+        t122 = importlib.import_module("tests.test_ticket122_dynamodb_current_head")
+
+        class BlockingDynamo(t122._ScriptedDynamo):
+            def __init__(self) -> None:
+                super().__init__()
+                self.block_reads = threading.Event()
+                self.read_entered = threading.Event()
+                self.release_reads = threading.Event()
+
+            def get_item(self, **kwargs):
+                if self.block_reads.is_set():
+                    self.read_entered.set()
+                    if not self.release_reads.wait(timeout=5):
+                        raise RuntimeError("blocked current-head probe timed out")
+                return super().get_item(**kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="ticket123-close-drain-") as raw:
+            root = Path(raw)
+            module, binding, current_head, client = self._fixture(
+                root, client_factory=BlockingDynamo
+            )
+            service, endpoint = self._start(module, binding, current_head)
+            socket_path = Path(endpoint["path"])
+            exchange_errors: list[BaseException] = []
+
+            def exchange() -> None:
+                try:
+                    self._request(endpoint, self._runtime_read())
+                except BaseException as exc:
+                    exchange_errors.append(exc)
+
+            client.block_reads.set()
+            worker = threading.Thread(target=exchange, name="ticket123-blocked-exchange")
+            worker.start()
+            self.assertTrue(client.read_entered.wait(timeout=2))
+            try:
+                with self.assertRaises(RuntimeError):
+                    service.close()
+                self.assertTrue(socket_path.exists())
+                with self.assertRaises(RuntimeError):
+                    service.start()
+            finally:
+                client.release_reads.set()
+                worker.join(timeout=3)
+                service.close()
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(exchange_errors)
+            self.assertFalse(socket_path.exists())
+
+        # The runtime closure manifest and the start binding must not be able
+        # to agree on a reordered, self-rehashed table.  Run the probe with a
+        # copied closure so the persistent verifier runtime stays untouched.
+        with tempfile.TemporaryDirectory(prefix="ticket123-runtime-tamper-") as raw:
+            tamper_root = Path(raw)
+            cloned_runtime = tamper_root / "runtime"
+            shutil.copytree(runtime_root, cloned_runtime)
+            environment = dict(os.environ)
+            environment["TICKET123_RUNTIME_ROOT"] = str(cloned_runtime)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            tampered = subprocess.run(
+                [
+                    str(cloned_runtime / "bin" / "python3"),
+                    "-I",
+                    "-B",
+                    str(Path(__file__).resolve()),
+                    "--runtime-tamper",
+                    str(tamper_root / "process"),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=30,
+            )
+            self.assertNotEqual(
+                tampered.returncode,
+                0,
+                tampered.stdout + tampered.stderr,
+            )
 
         if subprocess.run(["systemctl", "is-system-running"], capture_output=True).returncode not in {0, 1}:
             self.fail("V123-06 requires a systemd transient-unit environment")
@@ -1207,6 +1380,30 @@ raise SystemExit(0 if data==b'' else 9)
             self.assertNotIn(marker.encode(), database.read_bytes())
             self.assertFalse(Path(binding["socket_path"]).exists())
 
+
+def _run_runtime_tamper(root: Path) -> None:
+    """Prove a self-rehashed runtime table cannot authorize service start."""
+
+    Ticket123ProductionCoreServiceTests.setUpClass()
+    case = Ticket123ProductionCoreServiceTests(
+        "test_v123_06_python_closure_and_systemd_process_are_fixed"
+    )
+    module, binding, current_head, _client = case._fixture(root)
+    runtime_root = Path(binding["runtime_root"])
+    manifest_path = runtime_root / "ticket123-runtime-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = manifest["files"]
+    if type(files) is not list:
+        raise AssertionError("runtime closure fixture is invalid")
+    manifest["files"] = list(reversed(files))
+    manifest["closure_digest"] = _runtime_closure_digest(manifest["files"])
+    manifest_path.write_bytes(_canonical(manifest))
+    binding["runtime_manifest"] = copy.deepcopy(manifest)
+    service, _endpoint = case._start(module, binding, current_head)
+    service.close()
+    print("TICKET123-RUNTIME-TAMPER-ACCEPTED", flush=True)
+
+
 def _run_systemd_child(root: Path, mode: str) -> None:
     """Start the real Ticket 123 service inside the transient unit process."""
 
@@ -1232,7 +1429,9 @@ def _run_systemd_child(root: Path, mode: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--systemd-child":
+    if len(sys.argv) == 3 and sys.argv[1] == "--runtime-tamper":
+        _run_runtime_tamper(Path(sys.argv[2]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "--systemd-child":
         _run_systemd_child(Path(sys.argv[2]), sys.argv[3])
     else:
         unittest.main()
