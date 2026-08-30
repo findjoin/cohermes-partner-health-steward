@@ -378,6 +378,12 @@ time.sleep(60)
             with self.assertRaises(Exception):
                 module.HostPrivateExecutionCapabilityVault(execution_paths)
 
+            directory_root = root / "directory-mode-case"
+            directory_paths = self._facility(directory_root)
+            Path(directory_paths.lock_directory).chmod(0o750)
+            with self.assertRaises(Exception):
+                module.HostPrivateWriterFenceVault(directory_paths)
+
             if os.geteuid() != 0:
                 self.fail("V121-06 requires root to prove wrong uid/gid rejection")
             owner_root = root / "owner-case"
