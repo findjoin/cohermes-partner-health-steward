@@ -16,8 +16,12 @@ def _build(args: argparse.Namespace) -> int:
 
 
 def _execute(args: argparse.Namespace) -> int:
-    request = json.loads(Path(args.request).read_text(encoding="utf-8"))
-    observation = DefaultOnlyGateExecutor().execute(request)
+    try:
+        request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        observation = DefaultOnlyGateExecutor().execute({})
+    else:
+        observation = DefaultOnlyGateExecutor().execute(request)
     print(json.dumps(observation.to_wire(), ensure_ascii=False, separators=(",", ":"), sort_keys=True))
     return 0 if observation.to_wire()["verdict"] == "staged" else 1
 

@@ -547,6 +547,8 @@ class _DefaultTargetOperations:
         if path is None:
             return "not-authorized"
         try:
+            if not self._target_root_is_safe() or not self._private_directory(self._permits):
+                return "not-authorized"
             details = path.lstat()
             if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode) or details.st_uid != 0 or (details.st_mode & 0o777) != 0o600:
                 return "not-authorized"
@@ -571,14 +573,83 @@ class _DefaultTargetOperations:
             return False
         consumed = self.root / ".ticket120-consumed-permits" / approval_ref.removeprefix("sha256:") / f"{execution_key}.json"
         try:
-            consumed.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(path, consumed)
+            if (
+                not self._target_root_is_safe()
+                or not self._private_directory(self._permits)
+                or not self._create_private_directory(self.root / ".ticket120-consumed-permits")
+                or not self._create_private_directory(consumed.parent)
+            ):
+                return False
+            details = path.lstat()
+            if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode) or details.st_uid != 0 or (details.st_mode & 0o777) != 0o600:
+                return False
+            body = self._permit_body(_strict_json_bytes(path.read_bytes()))
+            if body is None or _digest_bytes(_canonical_bytes(body)) != approval_ref:
+                return False
+            # O_EXCL creates only the minimal consumption fact.  It never
+            # retains the permit's expiry/target body as a second authority.
+            descriptor = os.open(
+                consumed,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(
+                    _canonical_bytes(
+                        {
+                            "execution_key": execution_key,
+                            "permit_digest": approval_ref,
+                            "release_digest": body["release_digest"],
+                        }
+                    )
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.unlink(path)
             return True
-        except OSError:
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             # A consumed permit may only prove the already-completed staged
             # state through ``is_staged`` above.  It never authorizes a
             # second attempt after a partial or uncertain execution.
             return False
+
+    def _target_root_is_safe(self) -> bool:
+        try:
+            details = self.root.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(details.st_mode)
+            and not stat.S_ISLNK(details.st_mode)
+            and details.st_uid == 0
+        )
+
+    @staticmethod
+    def _private_directory(path: Path) -> bool:
+        try:
+            details = path.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(details.st_mode)
+            and not stat.S_ISLNK(details.st_mode)
+            and details.st_uid == 0
+            and (details.st_mode & 0o077) == 0
+        )
+
+    def _create_private_directory(self, path: Path) -> bool:
+        if not self._target_root_is_safe() or path.is_symlink():
+            return False
+        parent = path.parent
+        if parent != self.root and not self._private_directory(parent):
+            return False
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            return False
+        return self._private_directory(path)
 
     def backup(self) -> str:
         reference = "backup:" + uuid.uuid4().hex
@@ -634,8 +705,18 @@ class _DefaultTargetOperations:
         plugin = self.root / "plugins" / "health-weixin" / "plugin.yaml"
         record = self.root / "ticket120-release-metadata" / "health-weixin.json"
         try:
+            staged = self.staged_release_directory(release_digest)
+            _validate_release(str(staged))
+            expected_plugin = _file_manifest(
+                staged / "plugin" / "health-weixin",
+                exclude=set(),
+            )
+            installed_plugin = _file_manifest(
+                self.root / "plugins" / "health-weixin",
+                exclude=set(),
+            )
             return (
-                self.staged_release_directory(release_digest).is_dir()
+                expected_plugin == installed_plugin
                 and plugin.is_file()
                 and _strict_json_bytes(record.read_bytes()) == {"release_digest": release_digest, "execution_key": execution_key}
             )
