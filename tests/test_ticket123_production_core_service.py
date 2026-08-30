@@ -1088,18 +1088,36 @@ raise SystemExit(0 if data==b'' else 9)
                 text=True,
             )
 
-        process_parent = Path(__file__).resolve().parents[1] / "process-root"
+        verification_root = Path(__file__).resolve().parents[1]
+        root_name = verification_root.name
+        self.assertEqual(verification_root.parent, Path("/opt"))
+        self.assertTrue(
+            root_name.startswith("t123v-")
+            and len(root_name) == len("t123v-") + 8
+            and all(character in "0123456789abcdef" for character in root_name[6:])
+        )
+        process_parent = verification_root / "p"
         process_parent.mkdir(mode=0o700)
         process_parent.chmod(0o700)
         try:
-            with tempfile.TemporaryDirectory(prefix="ticket123-systemd-", dir=process_parent) as raw:
+            with tempfile.TemporaryDirectory(prefix="r-", dir=process_parent) as raw:
                 process_root = Path(raw)
-                normal = run_unit(process_root / "normal", "normal")
+                normal_root = process_root / "n"
+                crash_root = process_root / "c"
+                for socket_path in (
+                    normal_root / "run" / "health-core.sock",
+                    crash_root / "run" / "health-core.sock",
+                ):
+                    self.assertLessEqual(
+                        len(os.fsencode(socket_path)),
+                        90,
+                        f"V123-06 AF_UNIX path is too long: {socket_path}",
+                    )
+                normal = run_unit(normal_root, "normal")
                 self.assertEqual(normal.returncode, 0, normal.stderr)
                 self.assertIn("TICKET123-SERVICE-OK", normal.stdout)
-                self.assertFalse((process_root / "normal" / "run" / "health-core.sock").exists())
+                self.assertFalse((normal_root / "run" / "health-core.sock").exists())
 
-                crash_root = process_root / "crash"
                 crashed = run_unit(crash_root, "crash")
                 self.assertNotEqual(crashed.returncode, 0)
                 stale_socket = crash_root / "run" / "health-core.sock"
