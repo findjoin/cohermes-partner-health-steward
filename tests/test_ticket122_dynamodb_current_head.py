@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import re
 import unittest
 
 from partner_health_steward.authority import AuthoritySnapshot, WriterFenceProof
@@ -179,6 +180,28 @@ class _ScriptedDynamo:
             item = self.records.get(key["SK"]["S"])
         return {} if item is None else {"Item": item}
 
+    @staticmethod
+    def _normalized_expression(update: dict[str, object]) -> str:
+        expression = str(update.get("ConditionExpression", ""))
+        names = update.get("ExpressionAttributeNames", {})
+        for alias in sorted(names, key=len, reverse=True):
+            attribute = names[alias]
+            expression = expression.replace(alias, attribute)
+        return " ".join(expression.replace("(", " ( ").replace(")", " ) ").split())
+
+    @classmethod
+    def _equality_pairs(cls, update: dict[str, object]) -> dict[str, object]:
+        expression = cls._normalized_expression(update)
+        values = update.get("ExpressionAttributeValues", {})
+        pairs: dict[str, object] = {}
+        for attribute, token in re.findall(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(:[A-Za-z0-9_]+)\b",
+            expression,
+        ):
+            if token in values:
+                pairs[attribute] = values[token]
+        return pairs
+
     def transact_write_items(self, **kwargs):
         self.calls.append(("TransactWriteItems", kwargs))
         if self.transact_error is not None:
@@ -191,19 +214,18 @@ class _ScriptedDynamo:
         ]
         if head_updates:
             update = head_updates[0]
-            values = update.get("ExpressionAttributeValues", {})
-            condition = update.get("ConditionExpression", "")
+            pairs = self._equality_pairs(update)
             required = {
-                ":expected_generation": self.records["HEAD"]["generation"],
-                ":expected_revision_digest": self.records["HEAD"]["revision_digest"],
-                ":expected_transition_id": self.records["HEAD"]["transition_id"],
-                ":expected_writer_fence": self.records["HEAD"]["writer_fence"],
-                ":expected_terminal": self.records["HEAD"]["terminal"],
-                ":expected_site": self.records["HEAD"]["site"],
+                "generation": self.records["HEAD"]["generation"],
+                "revision_digest": self.records["HEAD"]["revision_digest"],
+                "transition_id": self.records["HEAD"]["transition_id"],
+                "writer_fence": self.records["HEAD"]["writer_fence"],
+                "terminal": self.records["HEAD"]["terminal"],
+                "site": self.records["HEAD"]["site"],
             }
-            if any(name not in condition or name not in values for name in required):
+            if any(name not in pairs for name in required):
                 raise AssertionError("HEAD condition does not bind the complete expected authority")
-            if any(values[name] != value for name, value in required.items()):
+            if any(pairs[name] != value for name, value in required.items()):
                 raise _AwsError("ConditionalCheckFailedException")
             if any(item["SK"]["S"].startswith("LIFECYCLE#") for item in puts):
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("LIFECYCLE#"))
@@ -226,15 +248,29 @@ class _ScriptedDynamo:
         elif any(item["SK"]["S"].startswith("LEASE#") for item in puts):
             receipt = next(item for item in puts if item["SK"]["S"].startswith("LEASE#"))
             guard = next(update for update in updates if update["Key"]["SK"]["S"] == "LEASE-GUARD")
-            condition = guard.get("ConditionExpression", "")
+            condition = self._normalized_expression(guard)
             values = guard.get("ExpressionAttributeValues", {})
-            for name, value in (
-                (":expected_generation", self.records["HEAD"]["generation"]),
-                (":expected_writer_fence", self.records["HEAD"]["writer_fence"]),
-                (":effect_id", receipt["effect_id"]),
+            pairs = self._equality_pairs(guard)
+            if "generation" not in pairs:
+                raise AssertionError("lease guard generation condition is incomplete")
+            if "writer_fence" not in pairs:
+                raise AssertionError("lease guard fence condition is incomplete")
+            if (
+                pairs["generation"] != self.records["HEAD"]["generation"]
+                or pairs["writer_fence"] != self.records["HEAD"]["writer_fence"]
             ):
-                if values.get(name) != value or name not in condition:
-                    raise AssertionError("lease guard condition is incomplete")
+                raise _AwsError("ConditionalCheckFailedException")
+            effect_tokens = [
+                token
+                for token, value in values.items()
+                if value == receipt["effect_id"]
+                or value == {"SS": [receipt["effect_id"]["S"]]}
+            ]
+            update_expression = str(guard.get("UpdateExpression", ""))
+            if not effect_tokens or not any(token in update_expression for token in effect_tokens):
+                raise AssertionError("lease guard update does not bind the effect")
+            if "attribute_not_exists" not in condition or "active_effect_ids" not in condition:
+                raise AssertionError("lease guard does not prove the active set empty")
             if self.active_effect is not None:
                 raise _AwsError("ConditionalCheckFailedException")
             self.active_effect = receipt["effect_id"]["S"]
@@ -247,17 +283,60 @@ class _ScriptedDynamo:
             ]
             if lease_updates:
                 lease_update = lease_updates[0]
-                condition = lease_update.get("ConditionExpression", "")
+                condition = self._normalized_expression(lease_update)
                 values = lease_update.get("ExpressionAttributeValues", {})
-                for name in (":lease_id", ":holder_id", ":released_false", ":release_operation_digest"):
-                    if name not in values or name not in condition:
-                        raise AssertionError("lease release condition is incomplete")
                 sk = lease_update["Key"]["SK"]["S"]
                 receipt = dict(self.records[sk])
+                pairs = self._equality_pairs(lease_update)
+                if pairs.get("lease_id") != receipt["lease_id"]:
+                    raise AssertionError("lease release does not bind lease_id")
+                if pairs.get("holder_id") != receipt["holder_id"]:
+                    raise AssertionError("lease release does not bind holder_id")
+                if pairs.get("released") != {"BOOL": False}:
+                    raise AssertionError("lease release does not bind unreleased state")
+                operation_tokens = [
+                    token
+                    for token, value in values.items()
+                    if value.get("S", "").startswith("sha256:")
+                    and value != receipt["intent_digest"]
+                    and value != receipt["expected_revision_digest"]
+                ]
+                if not operation_tokens or not any(
+                    token in condition for token in operation_tokens
+                ):
+                    raise AssertionError("lease release does not bind operation ownership")
+                guard_updates = [
+                    update
+                    for update in updates
+                    if update["Key"]["SK"]["S"] == "LEASE-GUARD"
+                ]
+                if len(guard_updates) != 1:
+                    raise AssertionError("lease release did not update LEASE-GUARD atomically")
+                guard = guard_updates[0]
+                guard_condition = self._normalized_expression(guard)
+                guard_values = guard.get("ExpressionAttributeValues", {})
+                effect_tokens = [
+                    token
+                    for token, value in guard_values.items()
+                    if value == receipt["effect_id"]
+                    or value == {"SS": [receipt["effect_id"]["S"]]}
+                ]
+                if (
+                    not effect_tokens
+                    or "contains" not in guard_condition
+                    or "active_effect_ids" not in guard_condition
+                    or not any(token in guard_condition for token in effect_tokens)
+                    or not any(token in str(guard.get("UpdateExpression", "")) for token in effect_tokens)
+                ):
+                    raise AssertionError("lease guard release condition/update is incomplete")
                 if receipt["released"]["BOOL"]:
                     raise _AwsError("ConditionalCheckFailedException")
                 receipt["released"] = {"BOOL": True}
-                receipt["released_operation_digest"] = values[":release_operation_digest"]
+                receipt["released_operation_digest"] = next(
+                    values[token]
+                    for token in operation_tokens
+                    if values[token].get("S") in {"sha256:release", "sha256:different-release"}
+                )
                 self.records[sk] = receipt
                 self.active_effect = None
         if self.transact_error_after_apply is not None:
@@ -501,6 +580,19 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
                 )
             )
 
+        next_request = ExecutionLeaseRequest(
+            expected=self._authority(),
+            effect_id="effect:after-release",
+            intent_digest="sha256:after-release",
+            writer_fence=_FENCE,
+            holder_id="holder:after-release",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+        )
+        self.assertEqual(
+            release_port.acquire_execution_lease(next_request).request,
+            next_request.identity(),
+        )
+
         overlap_request = ExecutionLeaseRequest(
             expected=self._authority(),
             effect_id="effect:other",
@@ -621,6 +713,31 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         with self.assertRaises(HeadConflict):
             self._port(terminal_client).conditional_lifecycle_transition(
                 terminal_request
+            )
+
+        terminal_success = _ScriptedDynamo()
+        terminal_port = self._port(terminal_success)
+        terminal_head = terminal_port.conditional_lifecycle_transition(
+            terminal_request
+        )
+        self.assertTrue(terminal_head.terminal)
+        terminal_receipt = terminal_port.lookup_lifecycle_transition(
+            terminal_request.identity()
+        )
+        self.assertEqual(terminal_receipt.request, terminal_request.identity())
+        self.assertTrue(terminal_receipt.applied.terminal)
+        with self.assertRaises(HeadTerminal):
+            terminal_port.conditional_advance(self._advance())
+        with self.assertRaises(HeadTerminal):
+            terminal_port.acquire_execution_lease(
+                ExecutionLeaseRequest(
+                    expected=self._authority(),
+                    effect_id="effect:after-terminal",
+                    intent_digest="sha256:after-terminal",
+                    writer_fence=_FENCE,
+                    holder_id="holder:after-terminal",
+                    writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+                )
             )
 
     def test_v122_06_exposes_exact_existing_port_only(self) -> None:

@@ -312,17 +312,6 @@ time.sleep(60)
                 provider.destroy(nonterminal)
             terminal = dict(nonterminal)
             terminal["authority_binding"] = _authority(terminal=True).to_storage()
-            original_replace = module.os.replace
-            module.os.replace = lambda *args, **kwargs: (_ for _ in ()).throw(
-                OSError("synthetic pre-replace crash")
-            )
-            try:
-                with self.assertRaises(Exception):
-                    provider.destroy(terminal)
-            finally:
-                module.os.replace = original_replace
-            provider = module.HostPrivateKeyProvider(paths, _INSTALLATION)
-            self.assertEqual(provider.get_key(), _DATA_KEY)
             self.assertEqual(provider.destroy(terminal), {"status": "confirmed"})
             self.assertEqual(provider.absence(terminal), {"status": "absent"})
             receipt_bytes = Path(paths.data_key).read_bytes()
@@ -336,6 +325,43 @@ time.sleep(60)
                 restarted.destroy(changed)
             self.assertTrue(Path(paths.writer_master).is_file())
             self.assertTrue(Path(paths.execution_master).is_file())
+
+            crash_script = """
+import sys
+from pathlib import Path
+from partner_health_steward.authority import AuthoritySnapshot
+from partner_health_steward.host_authority import HostPrivateFacilityPaths, HostPrivateKeyProvider
+root = Path(sys.argv[1])
+paths = HostPrivateFacilityPaths(root/'data-key.v1', root/'writer-master.v1', root/'execution-master.v1', root/'locks')
+authority = AuthoritySnapshot('installation:t121-fixture',4,'sha256:t121-revision','transition:t121-current',sys.argv[2],True,'site:t121-fixture')
+request = {'operation_ref':'delete:t121','authority_binding':authority.to_storage(),'transition_id':'transition:t121-current'}
+HostPrivateKeyProvider(paths, 'installation:t121-fixture').destroy(request)
+"""
+            for index, delay in enumerate((0.0, 0.001, 0.003, 0.01, 0.03, 0.1)):
+                crash_paths = self._facility(Path(raw) / f"crash-{index}")
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        crash_script,
+                        str(Path(crash_paths.data_key).parent),
+                        _fence_ref(),
+                    ]
+                )
+                import time
+                time.sleep(delay)
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=10)
+                recovered = module.HostPrivateKeyProvider(
+                    crash_paths, _INSTALLATION
+                )
+                self.assertEqual(
+                    recovered.destroy(terminal), {"status": "confirmed"}
+                )
+                self.assertEqual(
+                    recovered.absence(terminal), {"status": "absent"}
+                )
 
     def test_v121_06_linux_file_type_and_output_closure(self) -> None:
         module = self._require()
