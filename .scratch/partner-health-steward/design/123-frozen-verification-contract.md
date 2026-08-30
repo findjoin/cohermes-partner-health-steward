@@ -1,8 +1,8 @@
 # Ticket 123 冻结验证合同
 
-> 状态：verification-authority final refreeze checkpoint（2026-08-30，V06 timeout-boundary 机械更正后，独立双轴审查原始 finding 的唯一当前权威）。产品基线为既有产品提交 `a06988d8173bda0e7beb2ffaf147527ea0297cf2` 与此前 runner checkpoint `3e8f9ef0db1e073587a29956e2632922cfc1b3d9`；测试接缝已经由 Ticket 123 与 ADR 0022 约定：`ProductionCoreService` 的 start/endpoint/close、三类 AF_UNIX CorePort、以及 Ticket 117 的两个 lifecycle Adapter Interface。测试不读取私有 helper、表结构、线程布局或摘要实现。
+> 状态：verification-authority refreeze candidate（2026-08-30，补足 runtime closure 与已验证 release 的完整内容绑定；须经新的双轴预审后才成为当前验收权威）。产品基线为既有产品提交 `a06988d8173bda0e7beb2ffaf147527ea0297cf2` 与此前 runner checkpoint `3e8f9ef0db1e073587a29956e2632922cfc1b3d9`；测试接缝已经由 Ticket 123 与 ADR 0022 约定：`ProductionCoreService` 的 start/endpoint/close、三类 AF_UNIX CorePort、Ticket 117 的两个 lifecycle Adapter Interface，以及为本票所限的 Ticket 120 current-successor publisher entry。测试不读取私有 helper、表结构、线程布局或摘要实现。
 >
-> 本次只更正 V06 blocked-exchange observer：其客户端读取 timeout 固定为 5 秒，严格大于既有 2 秒产品 drain timeout，以先观察 fail-closed，再解除阻塞并观察同一 exchange 排空及 retry close。没有改变产品 drain timeout、断言、Gate ID、产品目标、架构或 CorePort wire。此前 `b41b678` checkpoint 保留为历史。冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob `b31ffd31c56e9bc4e29e13f35e806d113f105304`。
+> 本次保留 V06 的 5 秒 blocked-exchange observer，并补足其 release/runtime 内容绑定：合法 current successor 必须带 release-owned runtime-closure attestation；冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob 由本 candidate 的 Ticket authority 记录。没有改变产品 drain timeout、Gate ID、产品目标、架构或三类 CorePort wire；此前 checkpoint 保留为历史。
 
 ## Verifier ownership
 
@@ -15,6 +15,8 @@
 
 `partner_health_steward` 只新增导出 `ProductionCoreService`。Interface 为一个严格 start binding、只读 endpoint 和 `close()`；endpoint 精确为既有 `ticket118-core-port-v1` 的 AF_UNIX wire。`health-runtime` 投影只增加无正文的 `current_head_provider=dynamodb` 与 `managed_lifecycle_ready` 组合证据；不导出 release validator、Provider registry、数据库或通用 method dispatcher。
 
+为形成唯一可激活的 current successor，Ticket 123 只允许 Ticket 120 `HermesReleasePublisher` 增加一个从**已验证 runtime manifest**生成 content-addressed current successor release 的窄入口，或语义等价的单一入口。它只产生包含本节 attestation 的 release，不建立第二发布系统、审批账本、自动部署框架或通用 attestation registry。
+
 生产 module 内的 filesystem Adapter 按 Ticket 117 既有 Interface 接受验证：
 
 - `enumerate(request) / purge(request) / absence(request)`；
@@ -26,12 +28,12 @@
 
 | ID | 可观察断言 | 受影响回归 |
 |---|---|---|
-| 123-V01 | 构造使用 product `DynamoDBCurrentHead`、Ticket 121 host-private paths 与两个生产 lifecycle Adapter；投影观察 Dynamo 强读/lifecycle ready，服务期第二 writer holder 失败而 close 后成功，预置 effect 的正向 grant 与 execution-master 删除后的拒绝证明 execution vault；同一完整发布闭包的 staged 资产只给无正文 unavailable，合法 current release 才可使资产 current；digest、closure、path、provider、设施、lifecycle root 或 installation/site 错误时 socket/DB 零创建 | 121、122、120 release |
+| 123-V01 | 构造使用 product `DynamoDBCurrentHead`、Ticket 121 host-private paths 与两个生产 lifecycle Adapter；投影观察 Dynamo 强读/lifecycle ready，服务期第二 writer holder 失败而 close 后成功，预置 effect 的正向 grant 与 execution-master 删除后的拒绝证明 execution vault；同一完整发布闭包的 staged 资产只给无正文 unavailable，只有 V06 定义的合法 attested current successor 才可使资产 current；digest、closure、path、provider、设施、lifecycle root 或 installation/site 错误时 socket/DB 零创建 | 121、122、120 release |
 | 123-V02 | 真实 AF_UNIX + `SO_PEERCRED`；为错误 UID 开放 pathname traverse/socket connect 后只接受 listener EOF/reset，timeout 明确失败；正确 UID可读，symlink 与活动旧 listener 不被替换，当前进程 TCP listener inode 集合不增加 | 118 CorePort/host |
 | 123-V03 | 逐字兼容现有 Hermes `health-runtime-probe`、`health-runtime` read、effect claim/terminal wire；每个合法 request 由客户端 `shutdown(SHUT_WR)` 的 request-side EOF 定界，服务只在 `recv(1)` 返回 EOF 后分派；未 half-close 至 socket timeout、任何 trailing byte（包括超过旧 30ms 窗口后到达）均在业务分派前关闭；加密预置 Core receipt 经 typed CommandEnvelope 精确重放；重复 key、noncanonical、未知 field/kind、截断、尾随、空/超长 frame 无业务响应，caller intent/incomplete terminal 不成功 | 110、115、118 |
 | 123-V04 | 同一 DB/head 重启精确返回同一 receipt；prepared record + remote-attempted journal + 已推进 product current-head 的重启 tracer 只 finalize 并精确 replay，恢复期间 Dynamo transaction 为零；head timeout/unknown、key loss、stale fence typed fail-closed，external model/delivery 为零；进程 SIGKILL 由 V06 负责 | 110、115、117、122 |
 | 123-V05 | 使用 `lifecycle.py` 真实传入的 exact `operation_ref/authority_binding/transition_id` 和完整 opaque migration package；首次 immutable put 的并发 reader 必须实际观察 absence 与完整对象，线程异常回传；重启读回，遍历、symlink、hardlink、错 owner/mode/installation、内容冲突拒绝，purge/remove 后读回 absence | 117 |
-| 123-V06 | runtime manifest 的 `files` 必须按 POSIX relative path 严格升序，`closure_digest` 精确为 `sha256(canonical-json(files))`；`canonical-json` 为 UTF-8、`ensure_ascii=false`、`sort_keys=true`、逗号和冒号无空白。服务逐项重算实际 closure，并在同一严格 start binding 中重新验证同一 release root/digest；重排 files、同步自重算 manifest/binding 仍拒绝。实际 `sys.executable` 和未声明文件负测证明封闭 3.11 closure；renderer 精确输出 closure Python、`-I -m`、生产 module、binding path，CLI 在同一解释器只解析参数。transient unit 以 verifier-owned product `DynamoDBCurrentHead` 注入实际运行同一服务；停止 accept 后等待已进入 exchange，超时必须报错并保留 Core/store/current socket、禁止第二次 start，排空后重试 close 才清理。blocked-exchange observer 以 5 秒读取窗口观察该 2 秒 fail-closed 路径，随后才解除阻塞；正常 stop 清理，SIGKILL 后 socket 不可连接且同根重启取得 holder并清旧 socket | 120 release、121 holder |
+| 123-V06 | runtime manifest 的 `files` 必须按 POSIX relative path 严格升序，`closure_digest` 精确为 `sha256(canonical-json(files))`；`canonical-json` 为 UTF-8、`ensure_ascii=false`、`sort_keys=true`、逗号和冒号无空白。完整 files 必须覆盖实际解释器、stdlib、依赖（含 `cryptography`）和真实 `production_core_service.py`，服务逐项独立重算实际 closure。已验证 release 的 `runtime/ticket123-runtime-closure-attestation.json` 必须严格为 `contract`、`closure_algorithm`、`expected_closure_digest` 三字段：contract 为 `ticket123-runtime-closure-attestation-v1`、algorithm 为 `sha256(canonical-json(files))`，expected digest 精确等于完整 runtime closure；attestation 自身进入 release `files` 并因此受新 release digest 承诺，禁止反写最终 release digest。runtime manifest/binding 只作输入，不是信任锚。staged release 继续 truthful unavailable；只有带同一 attestation 的 content-addressed current successor 可激活。重排 files、同步自重算 manifest/binding，或修改未被旧四项映射覆盖的 `production_core_service.py` 后同步更新其 runtime hash、closure digest 与 binding、但不改 release-owned attestation/release，均须在 socket/Core/业务分派前拒绝；同一 attestation 对应的未篡改完整 runtime 正例可启动。实际 `sys.executable` 和未声明文件负测证明封闭 3.11 closure；renderer 精确输出 closure Python、`-I -m`、生产 module、binding path，CLI 在同一解释器只解析参数。transient unit 以 verifier-owned product `DynamoDBCurrentHead` 注入实际运行同一服务；停止 accept 后等待已进入 exchange，超时必须报错并保留 Core/store/current socket、禁止第二次 start，排空后重试 close 才清理。blocked-exchange observer 以 5 秒读取窗口观察该 2 秒 fail-closed 路径，随后才解除阻塞；正常 stop 清理，SIGKILL 后 socket 不可连接且同根重启取得 holder并清旧 socket | 120 release、121 holder |
 | 123-V07 | 通过公开 store seam 持久化且读回合法 synthetic `SourceEnvelope.body`；数据库原始字节及 release/runtime/socket/lifecycle/ordinary roots 无 marker/key/credential，close 不改非目标 sentinel | 110 storage、117 lifecycle、120 secret scan |
 
 ## 防假绿
@@ -41,6 +43,7 @@
 - V02/V06 的正式 PASS 只能来自 Linux 内核与 systemd；Windows skip 不能用于闭票。
 - staged release 的 truthful unavailable 是正向结果之一，不能替代同一完整 closure 的合法 current activation；也不能代替 V03 的 typed Core receipt 重放、V04 的实际重启/authority 故障或 V06 的真实进程崩溃恢复。
 - V03 的 EOF 仅是既有单连接单 request CorePort 客户端的发送半关闭，不改变 response wire；V06 的 digest oracle 由 verifier 从文件表与实际 closure 独立重算，不能相信 binding 自报摘要。
+- V06 只验证已验证 release 与可变 runtime 两个信任域的内容绑定；不要求抵御能够改写已验证 release root 的 root/SSH 恶意者，也不将该威胁模型扩入本票。
 - V06 不接触真实 AWS：正式 launcher 的 exact `ExecStart` 与 CLI parser、以及同一 `ProductionCoreService` 的 systemd 生命周期分别验证。真实 launcher + AWS binding 只在后继获准部署票验收。
 - 测试不得 monkeypatch产品私有 helper、读取 SQLite 表断言业务成功、从 source 文本寻找关键词，或建立 test-only bypass。
 

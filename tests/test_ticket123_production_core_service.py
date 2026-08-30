@@ -50,6 +50,14 @@ _EXECUTION_MASTER = hashlib.sha256(
 ).digest()
 _REPLAY_CAUSAL_ID = "ticket123-managed-replay"
 _REPLAY_REASON = "ticket123-encrypted-receipt"
+_RUNTIME_ATTESTATION_PATH = "runtime/ticket123-runtime-closure-attestation.json"
+_RUNTIME_ATTESTATION_CONTRACT = "ticket123-runtime-closure-attestation-v1"
+_RUNTIME_CLOSURE_ALGORITHM = "sha256(canonical-json(files))"
+_ISOLATED_VERIFIER_BOOTSTRAP = (
+    "import runpy,sys;root,script,*args=sys.argv[1:];"
+    "sys.path.insert(0,root);sys.argv=[script,*args];"
+    "runpy.run_path(script,run_name='__main__')"
+)
 
 
 def _canonical(value: object) -> bytes:
@@ -65,6 +73,29 @@ def _runtime_closure_digest(files: object) -> str:
     if type(files) is not list:
         raise AssertionError("runtime closure file table is invalid")
     return "sha256:" + hashlib.sha256(_canonical(files)).hexdigest()
+
+
+def _release_file_manifest(root: Path) -> list[dict[str, str]]:
+    """Independently enumerate the immutable release closure for V06."""
+
+    entries: list[dict[str, str]] = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise AssertionError("release fixture contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise AssertionError("release fixture contains a non-regular file")
+        relative = path.relative_to(root).as_posix()
+        if relative != "release-manifest.json":
+            entries.append(
+                {
+                    "path": relative,
+                    "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            )
+    entries.sort(key=lambda item: item["path"])
+    return entries
 
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes | None:
@@ -191,15 +222,40 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         return root / "releases" / digest.removeprefix("sha256:"), wire
 
     @staticmethod
-    def _as_current_release(binding: dict[str, object]) -> None:
-        """Promote one verified fixture release without changing its assets."""
+    def _as_current_release(
+        binding: dict[str, object], *, expected_closure_digest: str | None = None
+    ) -> dict[str, object]:
+        """Build a verifier-owned, attested current successor release."""
 
         release_root = Path(binding["release_root"])
         manifest_path = release_root / "release-manifest.json"
         host_path = release_root / "host-release-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         host = json.loads(host_path.read_text(encoding="utf-8"))
+        runtime_manifest = binding.get("runtime_manifest")
+        if type(runtime_manifest) is not dict:
+            raise AssertionError("runtime closure fixture is invalid")
+        files = runtime_manifest.get("files")
+        observed_closure_digest = _runtime_closure_digest(files)
+        if runtime_manifest.get("closure_digest") != observed_closure_digest:
+            raise AssertionError("runtime closure fixture digest is invalid")
+        expected = (
+            observed_closure_digest
+            if expected_closure_digest is None
+            else expected_closure_digest
+        )
+        if type(expected) is not str or not expected.startswith("sha256:"):
+            raise AssertionError("runtime closure attestation digest is invalid")
+        attestation = {
+            "contract": _RUNTIME_ATTESTATION_CONTRACT,
+            "closure_algorithm": _RUNTIME_CLOSURE_ALGORITHM,
+            "expected_closure_digest": expected,
+        }
+        attestation_path = release_root / _RUNTIME_ATTESTATION_PATH
+        attestation_path.parent.mkdir(mode=0o700, exist_ok=True)
+        attestation_path.write_bytes(_canonical(attestation))
         manifest["state"] = "current"
+        manifest["files"] = _release_file_manifest(release_root)
         body = {
             "contract": manifest["contract"],
             "state": manifest["state"],
@@ -219,6 +275,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         if type(lifecycle_release) is not dict:
             raise AssertionError("fixture lifecycle release is invalid")
         lifecycle_release["product_release"] = digest
+        return attestation
 
     @staticmethod
     def _recovery_command() -> CommandEnvelope:
@@ -1091,8 +1148,73 @@ raise SystemExit(0 if data==b'' else 9)
             path = runtime_root / relative
             self.assertTrue(path.is_file() and not path.is_symlink())
             self.assertEqual("sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+        self.assertIn("bin/python3", declared)
+        self.assertEqual(
+            1,
+            sum(
+                relative == "partner_health_steward/production_core_service.py"
+                or relative.endswith("/partner_health_steward/production_core_service.py")
+                for relative in declared
+            ),
+        )
+        self.assertTrue(any("/python3.11/" in path for path in declared))
         self.assertTrue(any("partner_health_steward" in path for path in declared))
         self.assertTrue(any("cryptography" in path for path in declared))
+
+        # A current successor is not a state-bit rewrite: the attestation is
+        # a release file, so its bytes enter the content-addressed release.
+        with tempfile.TemporaryDirectory(prefix="ticket123-attested-current-") as raw:
+            root = Path(raw)
+            module, current_binding, current_head, _client = self._fixture(root)
+            attestation = self._as_current_release(current_binding)
+            release_root = Path(current_binding["release_root"])
+            release_manifest = json.loads(
+                (release_root / "release-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                attestation,
+                json.loads(
+                    (release_root / _RUNTIME_ATTESTATION_PATH).read_text(
+                        encoding="utf-8"
+                    )
+                ),
+            )
+            self.assertEqual(
+                set(attestation),
+                {"contract", "closure_algorithm", "expected_closure_digest"},
+            )
+            self.assertEqual(attestation["contract"], _RUNTIME_ATTESTATION_CONTRACT)
+            self.assertEqual(
+                attestation["closure_algorithm"], _RUNTIME_CLOSURE_ALGORITHM
+            )
+            self.assertEqual(
+                attestation["expected_closure_digest"], manifest["closure_digest"]
+            )
+            self.assertNotIn("release_digest", attestation)
+            release_entries = {
+                entry["path"]: entry["sha256"]
+                for entry in release_manifest["files"]
+                if type(entry) is dict and set(entry) == {"path", "sha256"}
+            }
+            self.assertEqual(
+                release_entries.get(_RUNTIME_ATTESTATION_PATH),
+                "sha256:"
+                + hashlib.sha256(
+                    (release_root / _RUNTIME_ATTESTATION_PATH).read_bytes()
+                ).hexdigest(),
+            )
+            current_service, current_endpoint = self._start(
+                module, current_binding, current_head
+            )
+            try:
+                current_projection = self._request(
+                    current_endpoint, self._runtime_read()
+                )
+                self.assertIsNotNone(current_projection)
+                self.assertEqual(current_projection["status"], "accepted")
+                self.assertEqual(current_projection["payload"].get("state"), "healthy")
+            finally:
+                current_service.close()
 
         render = getattr(module, "render_health_core_systemd_unit", None)
         self.assertTrue(callable(render))
@@ -1218,6 +1340,9 @@ raise SystemExit(0 if data==b'' else 9)
                     str(cloned_runtime / "bin" / "python3"),
                     "-I",
                     "-B",
+                    "-c",
+                    _ISOLATED_VERIFIER_BOOTSTRAP,
+                    str(Path(__file__).resolve().parents[1]),
                     str(Path(__file__).resolve()),
                     "--runtime-tamper",
                     str(tamper_root / "process"),
@@ -1232,6 +1357,73 @@ raise SystemExit(0 if data==b'' else 9)
                 tampered.returncode,
                 0,
                 tampered.stdout + tampered.stderr,
+            )
+
+        # The original release attestation commits the good full closure.  A
+        # mutable runtime manifest and binding therefore cannot legitimize a
+        # synchronized mutation of production_core_service.py.
+        with tempfile.TemporaryDirectory(prefix="ticket123-attestation-tamper-") as raw:
+            tamper_root = Path(raw)
+            cloned_runtime = tamper_root / "runtime"
+            shutil.copytree(runtime_root, cloned_runtime)
+            manifest_path = cloned_runtime / "ticket123-runtime-manifest.json"
+            tampered_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tampered_files = tampered_manifest.get("files")
+            if type(tampered_files) is not list:
+                self.fail("runtime closure fixture is invalid")
+            matching_entries = [
+                entry
+                for entry in tampered_files
+                if type(entry) is dict
+                and type(entry.get("path")) is str
+                and (
+                    entry["path"]
+                    == "partner_health_steward/production_core_service.py"
+                    or entry["path"].endswith(
+                        "/partner_health_steward/production_core_service.py"
+                    )
+                )
+            ]
+            self.assertEqual(len(matching_entries), 1)
+            production_entry = matching_entries[0]
+            production_path = cloned_runtime / production_entry["path"]
+            payload = production_path.read_bytes() + b"\n# ticket123-attestation-tamper\n"
+            production_path.write_bytes(payload)
+            production_entry["sha256"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+            tampered_manifest["closure_digest"] = _runtime_closure_digest(
+                tampered_files
+            )
+            manifest_path.write_bytes(_canonical(tampered_manifest))
+            environment = dict(os.environ)
+            environment["TICKET123_RUNTIME_ROOT"] = str(cloned_runtime)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            tampered = subprocess.run(
+                [
+                    str(cloned_runtime / "bin" / "python3"),
+                    "-I",
+                    "-B",
+                    "-c",
+                    _ISOLATED_VERIFIER_BOOTSTRAP,
+                    str(Path(__file__).resolve().parents[1]),
+                    str(Path(__file__).resolve()),
+                    "--runtime-attestation-tamper",
+                    str(tamper_root / "process"),
+                    manifest["closure_digest"],
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=30,
+            )
+            self.assertEqual(
+                tampered.returncode,
+                0,
+                tampered.stdout + tampered.stderr,
+            )
+            self.assertIn(
+                "TICKET123-RUNTIME-ATTESTATION-TAMPER-REJECTED-BEFORE-START",
+                tampered.stdout,
             )
 
         if subprocess.run(["systemctl", "is-system-running"], capture_output=True).returncode not in {0, 1}:
@@ -1253,6 +1445,9 @@ raise SystemExit(0 if data==b'' else 9)
                     str(runtime_root / "bin" / "python3"),
                     "-I",
                     "-B",
+                    "-c",
+                    _ISOLATED_VERIFIER_BOOTSTRAP,
+                    str(Path(__file__).resolve().parents[1]),
                     str(Path(__file__).resolve()),
                     "--systemd-child",
                     str(root),
@@ -1406,6 +1601,34 @@ def _run_runtime_tamper(root: Path) -> None:
     print("TICKET123-RUNTIME-TAMPER-ACCEPTED", flush=True)
 
 
+def _run_runtime_attestation_tamper(
+    root: Path, expected_closure_digest: str
+) -> None:
+    """Prove release-owned closure evidence rejects a synchronized runtime edit."""
+
+    Ticket123ProductionCoreServiceTests.setUpClass()
+    case = Ticket123ProductionCoreServiceTests(
+        "test_v123_06_python_closure_and_systemd_process_are_fixed"
+    )
+    module, binding, current_head, _client = case._fixture(root)
+    case._as_current_release(
+        binding, expected_closure_digest=expected_closure_digest
+    )
+    try:
+        service, _endpoint = case._start(module, binding, current_head)
+    except Exception:
+        if Path(binding["socket_path"]).exists():
+            raise AssertionError("tampered runtime left a socket")
+        print(
+            "TICKET123-RUNTIME-ATTESTATION-TAMPER-REJECTED-BEFORE-START",
+            flush=True,
+        )
+        return
+    service.close()
+    print("TICKET123-RUNTIME-ATTESTATION-TAMPER-ACCEPTED", flush=True)
+    raise AssertionError("release-unbound runtime reached ProductionCoreService.start")
+
+
 def _run_systemd_child(root: Path, mode: str) -> None:
     """Start the real Ticket 123 service inside the transient unit process."""
 
@@ -1433,6 +1656,8 @@ def _run_systemd_child(root: Path, mode: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--runtime-tamper":
         _run_runtime_tamper(Path(sys.argv[2]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "--runtime-attestation-tamper":
+        _run_runtime_attestation_tamper(Path(sys.argv[2]), sys.argv[3])
     elif len(sys.argv) == 4 and sys.argv[1] == "--systemd-child":
         _run_systemd_child(Path(sys.argv[2]), sys.argv[3])
     else:
