@@ -81,6 +81,15 @@ _REQUEST_FIELDS = frozenset({"protocol_version", "kind", "request_id", "payload"
 _RESPONSE_FIELDS = frozenset({"protocol_version", "kind", "request_id", "status", "payload"})
 _SHA256 = "sha256:"
 _MANAGED_PURGE_RECEIPT = ".ticket123-managed-replica-purge-receipt.v1"
+_RUNTIME_RELEASE_FILE_BINDINGS = (
+    ("product/core.py", "partner_health_steward/core.py"),
+    ("product/plugin.py", "partner_health_steward/plugin.py"),
+    ("product/hermes_host.py", "partner_health_steward/hermes_host.py"),
+    (
+        "plugin/health-weixin/partner_health_steward/host_contract.py",
+        "partner_health_steward/host_contract.py",
+    ),
+)
 
 
 def _canonical(value: object) -> bytes:
@@ -661,6 +670,7 @@ class ProductionCoreService:
         manifest_value: object,
         *,
         verified_release_digest: object,
+        verified_release_files: object,
     ) -> tuple[Path, dict[str, object]]:
         root = _secure_directory(root_value, "runtime closure root")
         manifest_path = root / "ticket123-runtime-manifest.json"
@@ -692,6 +702,60 @@ class ProductionCoreService:
             previous = relative
         if manifest["closure_digest"] != _SHA256 + hashlib.sha256(_canonical(files)).hexdigest():
             raise ValueError("runtime closure digest mismatch")
+        if type(verified_release_files) is not list:
+            raise ValueError("verified release closure is invalid")
+        release_files: dict[str, str] = {}
+        for item in verified_release_files:
+            if type(item) is not dict or set(item) != {"path", "sha256"}:
+                raise ValueError("verified release closure is invalid")
+            release_path = _relative_path(item["path"])
+            release_digest = _digest(item["sha256"], "verified release file digest")
+            if release_path in release_files:
+                raise ValueError("verified release closure is invalid")
+            release_files[release_path] = release_digest
+        expected_commitment: list[dict[str, str]] = []
+        actual_commitment: list[dict[str, str]] = []
+        for release_path, runtime_suffix in _RUNTIME_RELEASE_FILE_BINDINGS:
+            release_digest = release_files.get(release_path)
+            matches = [
+                runtime_path
+                for runtime_path in declared
+                if runtime_path == runtime_suffix
+                or runtime_path.endswith("/" + runtime_suffix)
+            ]
+            if release_digest is None or len(matches) != 1:
+                raise ValueError("runtime release content binding is invalid")
+            runtime_path = matches[0]
+            expected_commitment.append(
+                {
+                    "release_path": release_path,
+                    "runtime_path": runtime_path,
+                    "sha256": release_digest,
+                }
+            )
+            actual_commitment.append(
+                {
+                    "release_path": release_path,
+                    "runtime_path": runtime_path,
+                    "sha256": declared[runtime_path],
+                }
+            )
+        expected_summary = _canonical(
+            {
+                "closure_digest": manifest["closure_digest"],
+                "files": expected_commitment,
+                "verified_release_digest": verified_digest,
+            }
+        )
+        actual_summary = _canonical(
+            {
+                "closure_digest": manifest["closure_digest"],
+                "files": actual_commitment,
+                "verified_release_digest": verified_digest,
+            }
+        )
+        if actual_summary != expected_summary:
+            raise ValueError("runtime release content binding is invalid")
         actual: dict[str, str] = {}
         for path in root.rglob("*"):
             if path.is_symlink():
@@ -727,6 +791,7 @@ class ProductionCoreService:
             binding["runtime_root"],
             binding["runtime_manifest"],
             verified_release_digest=release["release_digest"],
+            verified_release_files=release["files"],
         )
         installation_id = validate_opaque_text(binding["installation_id"], "installation_id")
         site = validate_opaque_text(binding["site"], "site")
