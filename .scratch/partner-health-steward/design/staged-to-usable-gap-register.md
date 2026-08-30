@@ -23,9 +23,9 @@
 
 | 缺口 | 当前证据 | 唯一闭合 Ticket | 完成后能证明什么 |
 | --- | --- | --- | --- |
-| 本机密钥、writer holder 与 effect completion capability 只有静态／内存实现 | `storage.StaticKeyProvider`；`core.InMemoryWriterFenceVault`；`core.InMemoryExecutionCapabilityVault` | 121 | 复制 SQLite 或重启进程不能复制写入／完成权限；密钥缺失时健康路径关闭 |
+| 本机数据密钥／删除、writer holder 与 effect completion capability 只有静态／内存实现 | `storage.StaticKeyProvider`；`core.InMemoryWriterFenceVault`；`core.InMemoryExecutionCapabilityVault`；Ticket 117 `destroyable_key_adapter` 只有 synthetic 实现 | 121 | 复制 SQLite 或重启进程不能复制写入／完成权限；密钥缺失时健康路径关闭；terminal 删除可真实销毁 exact 数据密钥 |
 | `CurrentHeadPort` 只有 `InMemoryCurrentHead` | `current_head.py` | 122 | disposable 单区域 DynamoDB 上的强读、CAS、未知回查、lease、terminal 与旧 fence 行为成立 |
-| 发布物只有拒绝请求的 staged server，没有生产 `HealthCore` 组合根和 AF_UNIX 服务 | `release_deployment.StagedCorePortServer` | 123 | 本机真实 socket、peer/ACL、加密 SQLite、重启恢复和三类 CorePort 可运行 |
+| 发布物只有拒绝请求的 staged server，没有生产 `HealthCore` 组合根、AF_UNIX 服务、受管 replica/migration-artifact Adapter 和 Python 3.11 dependency-closed runtime | `release_deployment.StagedCorePortServer`；Ticket 117 lifecycle 配置仍是 synthetic adapters；目标机当前只有 Python 3.10.12 且无 pip | 123 | 本机真实 socket、peer/ACL、加密 SQLite、受管删除/迁移恢复、固定运行时依赖和三类 CorePort 可运行 |
 | Hermes Plugin 只有注册和 lifecycle 探针，没有把真实逐条微信消息、回复和 Cron 唤醒接入 `HealthPlugin` | `hermes_host.py` | 124 | pinned default Hermes 的唯一健康入口、七 Skill 调度、cursor 和无旁路合同真实成立 |
 | `StrictModelAdapter` 只有 Interface，没有绑定当前 Partner 首跳的生产 Adapter | `model_contract.py` | 125 | 当前 capability profile 下真实模型请求、严格终态、actual-model 与无 fallback 可证明 |
 | 主人／联系人投递只有 wire Interface，没有真实 Weixin Transport Adapter | `delivery.py` | 126 | 形成、尝试、接口接受、送达／已读／unknown 分层，且 unknown 不盲重发 |

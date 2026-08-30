@@ -15,6 +15,8 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 - DynamoDB item 字段和 IAM action 使用固定 allowlist；未知字段、区域／表／installation 错绑或一致性不可证明时在业务读写前失败关闭。
 - disposable canary 覆盖 CAS/readback、terminal delete、旧 snapshot、writer-fence transfer/unknown 与回滚；销毁仅限预先解析并获批的 disposable namespace。
 - Adapter contract 测试可用 local fake；G08 正向结论必须来自获准的真实单区域 disposable resource，fake 不得冒充通过。
+- public writer-fence ref 严格使用 Ticket 121/122 共享 v1 格式；writer-transfer 必须采用 request 的 target ref，不得在 Provider 内另生成 fence。
+- `GetItem` 全部强一致；状态与 exact receipt 由同一 `TransactWriteItems` 原子形成。SDK 的短时幂等 token 不能代替持久 receipt。
 
 ## External prerequisite
 
@@ -27,3 +29,11 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 ## Delivery discipline
 
 编码前冻结一份 Provider 设计与 verifier-owned 测试门。只复用现有 `CurrentHeadPort`，不得为了通过测试改写状态机。通过后普通提交并推送当前任务分支。
+
+## Frozen pre-code artifacts
+
+- 实施设计：`../design/122-frozen-implementation-design.md`
+- 独立验证合同：`../design/122-frozen-verification-contract.md`
+- verifier-owned 门：`../../../tests/test_ticket122_dynamodb_current_head.py`
+- 编码前机械结果：`1 failure / 6 skips / 0 errors`；唯一红灯为 `partner_health_steward.dynamodb_current_head` 尚不存在。
+- 实现 Agent 不得修改上述三件套或既有 `CurrentHeadPort/HealthCore`；真实 G08 未获批准时只完成代码 checkpoint，不伪造 gate 通过。
