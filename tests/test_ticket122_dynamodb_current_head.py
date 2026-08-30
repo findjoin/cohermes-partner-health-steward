@@ -241,10 +241,20 @@ class _ScriptedDynamo:
                     r"\b([A-Za-z_][A-Za-z0-9_]*)\s+(:[A-Za-z0-9_]+)\b",
                     body,
                 )
+            elif action == "REMOVE":
+                matches = [
+                    (attribute, None)
+                    for attribute in re.findall(
+                        r"\b([A-Za-z_][A-Za-z0-9_]*)\b",
+                        body,
+                    )
+                ]
             else:
                 matches = []
             for attribute, token in matches:
-                if token in values:
+                if action == "REMOVE":
+                    result[action][attribute] = True
+                elif token in values:
                     result[action][attribute] = values[token]
             if action == "SET":
                 for attribute, source, token in increments:
@@ -283,8 +293,6 @@ class _ScriptedDynamo:
                 raise _AwsError("ConditionalCheckFailedException")
             if any(item["SK"]["S"].startswith("LIFECYCLE#") for item in puts):
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("LIFECYCLE#"))
-                if receipt["kind"]["S"] == "terminal-delete" and self.active_effects:
-                    raise _AwsError("ConditionalCheckFailedException")
             else:
                 receipt = next(item for item in puts if item["SK"]["S"].startswith("TRANSITION#"))
             operations = self._update_operations(update)
@@ -298,17 +306,100 @@ class _ScriptedDynamo:
             }
             for name, value in applied.items():
                 observed = operations["SET"].get(name)
-                if type(observed) is tuple and observed[:2] == ("add", name):
-                    delta = int(observed[2]["N"])
-                    observed = _ddb_n(int(self.records["HEAD"][name]["N"]) + delta)
+                if name == "generation":
+                    increment = operations["ADD"].get(name)
+                    if increment is not None:
+                        observed = _ddb_n(
+                            int(self.records["HEAD"][name]["N"])
+                            + int(increment["N"])
+                        )
+                    elif type(observed) is tuple and observed[:2] == ("add", name):
+                        delta = int(observed[2]["N"])
+                        observed = _ddb_n(
+                            int(self.records["HEAD"][name]["N"]) + delta
+                        )
                 if observed != value:
                     raise AssertionError(
                         "HEAD update does not write the complete applied authority"
                     )
                 self.records["HEAD"][name] = observed
             self.records[receipt["SK"]["S"]] = receipt
-            if receipt.get("kind", {}).get("S") == "writer-transfer":
-                self.active_effects.clear()
+            if receipt.get("kind", {}).get("S") in {
+                "writer-transfer",
+                "terminal-delete",
+            }:
+                guard_updates = [
+                    candidate
+                    for candidate in updates
+                    if candidate["Key"]["SK"]["S"] == "LEASE-GUARD"
+                ]
+                if len(guard_updates) != 1:
+                    raise AssertionError(
+                        "lifecycle transition did not update LEASE-GUARD atomically"
+                    )
+                guard = guard_updates[0]
+                guard_condition = self._normalized_expression(guard)
+                guard_pairs = self._equality_pairs(guard)
+                for attribute in ("generation", "writer_fence"):
+                    if guard_pairs.get(attribute) != required[attribute]:
+                        raise AssertionError(
+                            "lifecycle guard does not bind current generation/fence"
+                        )
+                guard_operations = self._update_operations(guard)
+                if receipt["kind"]["S"] == "terminal-delete":
+                    size_tokens = re.findall(
+                        r"size\s*\(\s*active_effect_ids\s*\)\s*=\s*(:[A-Za-z0-9_]+)",
+                        guard_condition,
+                    )
+                    guard_values = guard.get("ExpressionAttributeValues", {})
+                    proves_empty = (
+                        "attribute_not_exists" in guard_condition
+                        and "active_effect_ids" in guard_condition
+                    ) or (
+                        bool(size_tokens)
+                        and all(guard_values.get(token) == _ddb_n(0) for token in size_tokens)
+                    )
+                    if not proves_empty:
+                        raise AssertionError(
+                            "terminal lifecycle guard does not prove the active set empty"
+                        )
+                    if self.active_effects:
+                        raise _AwsError("ConditionalCheckFailedException")
+                else:
+                    guard_generation = guard_operations["SET"].get("generation")
+                    guard_increment = guard_operations["ADD"].get("generation")
+                    if guard_increment is not None:
+                        guard_generation = _ddb_n(
+                            int(required["generation"]["N"])
+                            + int(guard_increment["N"])
+                        )
+                    elif (
+                        type(guard_generation) is tuple
+                        and guard_generation[:2] == ("add", "generation")
+                    ):
+                        guard_generation = _ddb_n(
+                            int(required["generation"]["N"])
+                            + int(guard_generation[2]["N"])
+                        )
+                    if (
+                        guard_generation != receipt["applied_generation"]
+                        or guard_operations["SET"].get("writer_fence")
+                        != receipt["applied_writer_fence"]
+                    ):
+                        raise AssertionError(
+                            "writer transfer does not advance the lease guard authority"
+                        )
+                    removed = guard_operations["REMOVE"].get("active_effect_ids")
+                    deleted = guard_operations["DELETE"].get("active_effect_ids")
+                    exact_deleted = (
+                        type(deleted) is dict
+                        and set(deleted.get("SS", ())) == self.active_effects
+                    )
+                    if removed is not True and not exact_deleted:
+                        raise AssertionError(
+                            "writer transfer does not clear the live guard"
+                        )
+                    self.active_effects.clear()
         elif any(item["SK"]["S"].startswith("LEASE#") for item in puts):
             receipt = next(item for item in puts if item["SK"]["S"].startswith("LEASE#"))
             guard = next(update for update in updates if update["Key"]["SK"]["S"] == "LEASE-GUARD")
@@ -703,6 +794,23 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         )
         with self.assertRaises(HeadConflict):
             port.acquire_execution_lease(third_request)
+
+        wrong_overlap = _ScriptedDynamo()
+        wrong_overlap.records["LEASE#effect:t122"] = _lease_item()
+        wrong_overlap.active_effects = {"effect:t122"}
+        wrong_overlap_request = ExecutionLeaseRequest(
+            expected=self._authority(),
+            effect_id="effect:wrong-overlap",
+            intent_digest="sha256:wrong-overlap",
+            writer_fence=_FENCE,
+            holder_id="holder:wrong-overlap",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+            _execution_overlap=_ExecutionOverlapPermit("effect:not-active"),
+        )
+        with self.assertRaises(HeadConflict):
+            self._port(wrong_overlap).acquire_execution_lease(
+                wrong_overlap_request
+            )
 
         missing = _ScriptedDynamo()
         missing.items = [None]
