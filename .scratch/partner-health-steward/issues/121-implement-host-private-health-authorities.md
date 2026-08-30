@@ -29,8 +29,11 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 
 ## Frozen pre-code artifacts
 
+- 冻结 checkpoint：commit `8de120d447c53848af2afbc9fce71a2afa71a642`、tree `0007c31f95a6712e2fefca1ff16790b53bee2da8`。
+- 双轴共同审查内容点：commit `60121ea635b8cedc09556163bc9a6a6cb7294078`、tree `bcc4566d517155b720b28b5a8eb929bd8b6ddb3b`；Spec reviewer `PASS`，Standards reviewer `PASS`。
 - 实施设计：`../design/121-frozen-implementation-design.md`
 - 独立验证合同：`../design/121-frozen-verification-contract.md`
 - verifier-owned 门：`../../../tests/test_ticket121_host_authority.py`
+- 冻结 blob：design `e6b1a132d99c38748cd91b897e75286f5fe951f1`；contract `5e535a35a8e867f8056a469a7f94ae79f77b2f8e`；verifier `cb8e383577b4ad62a35c05edc11e1bfd2a9faf22`。
 - 编码前机械结果：`1 failure / 5 skips / 0 errors`；唯一红灯为 `partner_health_steward.host_authority` 尚不存在。
 - 实现 Agent 不得修改上述三件套；若需改变既有 Interface、共享 fence 合同或增加 capability ledger，按停止规则返回，不自行扩票。

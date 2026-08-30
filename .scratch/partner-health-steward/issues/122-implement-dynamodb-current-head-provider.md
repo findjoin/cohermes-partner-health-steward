@@ -32,8 +32,11 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 
 ## Frozen pre-code artifacts
 
+- 冻结 checkpoint：commit `8de120d447c53848af2afbc9fce71a2afa71a642`、tree `0007c31f95a6712e2fefca1ff16790b53bee2da8`。
+- 双轴共同审查内容点：commit `60121ea635b8cedc09556163bc9a6a6cb7294078`、tree `bcc4566d517155b720b28b5a8eb929bd8b6ddb3b`；Spec reviewer `PASS`，Standards reviewer `PASS`。
 - 实施设计：`../design/122-frozen-implementation-design.md`
 - 独立验证合同：`../design/122-frozen-verification-contract.md`
 - verifier-owned 门：`../../../tests/test_ticket122_dynamodb_current_head.py`
+- 冻结 blob：design `23791cb5609d8f2b70e839d595cfe37192db875a`；contract `9814d413890891e40dc88fb556a9cec0245c59e3`；verifier `3d67ff08ba79fe1a30fe0b58f676fb2d255f557a`。
 - 编码前机械结果：`1 failure / 6 skips / 0 errors`；唯一红灯为 `partner_health_steward.dynamodb_current_head` 尚不存在。
 - 实现 Agent 不得修改上述三件套或既有 `CurrentHeadPort/HealthCore`；真实 G08 未获批准时只完成代码 checkpoint，不伪造 gate 通过。
