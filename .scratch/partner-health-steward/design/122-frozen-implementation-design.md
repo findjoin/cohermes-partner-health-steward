@@ -26,6 +26,8 @@
 
 每个 advance/lifecycle/lease acquire/release 使用一个 `TransactWriteItems`：条件必须合并在同一 HEAD 或 LEASE-GUARD 的 Put/Update `ConditionExpression` 中；DynamoDB 禁止在同一事务对同 item 再放独立 ConditionCheck。状态更新与 exact receipt 原子形成。成功返回前强读 HEAD/receipt；响应丢失或结果未知时不重做新 identity，只由 `HealthCore` 调用 exact lookup。
 
+为让 verifier 机械执行并发条件，HEAD condition 的 value token 固定为 `:expected_generation/:expected_revision_digest/:expected_transition_id/:expected_writer_fence/:expected_terminal/:expected_site`；lease guard 至少复用 `:expected_generation/:expected_writer_fence` 并使用 `:effect_id`；release condition 固定带 `:lease_id/:holder_id/:released_false/:release_operation_digest`。这些 token 必须真实出现在对应 ConditionExpression，不能只放在 receipt。其余 expression aliases/helper 保持可逆。
+
 可使用稳定且不超过 36 字符的 `ClientRequestToken` 降低 SDK 的短时重送风险，但其 10 分钟窗口不是持久恢复证据；永久恢复只能依赖事务内 receipt 的强读。
 
 ## Writer fence 与 lifecycle

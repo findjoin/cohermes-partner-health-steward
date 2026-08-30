@@ -15,8 +15,8 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 - execution completion capability 绑定当前 authority、writer proof 与 exact effect；重启可恢复原能力，复制数据库、旧 fence 或另一个进程不能恢复。
 - 密钥、vault、权限或当前性不可确认时，Core 只能报告 unavailable/cannot-confirm，健康写入、模型和外发调用均为零。
 - 使用临时 Linux 用户／目录和合成无正文数据验证重启、并发、权限、symlink、copy、revocation 与 crash recovery；不得触碰 default/partner 的真实健康目录。
-- public writer-fence ref 严格使用冻结设计的 v1 nonce + capability digest 格式，与 Ticket 122 交叉验证；迁移目标 ref 必须可由目标主机设施产生。
-- terminal 删除只销毁 exact installation 的数据密钥，`destroy/absence` 可恢复且不顺带删除 writer/execution master；非 terminal 或错 binding 请求拒绝。
+- public writer-fence ref 严格使用冻结设计的 v1 epoch + nonce + capability digest 规则，与 Ticket 122 交叉验证；每次 bootstrap/transfer 的唯一 operation ref 通过目标设施 `prepare_fence_ref` 预生成目标 ref，回迁不得复活旧 fence。
+- terminal 删除只把 exact installation 的数据密钥原子替换为非秘密 tombstone，`destroy/absence` 跨崩溃可恢复且不顺带删除 writer/execution master；非 terminal 或错 binding 请求拒绝。
 
 ## Not in this ticket
 

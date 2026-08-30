@@ -18,6 +18,7 @@ from partner_health_steward.current_head import (
     ExecutionLeaseRequest,
     ExecutionLeaseRelease,
     ExecutionLeaseNotFound,
+    CurrentHeadError,
     HeadConflict,
     HeadRead,
     HeadTerminal,
@@ -140,14 +141,17 @@ class _AwsError(RuntimeError):
 class _ScriptedDynamo:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
-        self.items: list[dict[str, object] | None] = [_head_item()]
+        self.items: list[dict[str, object] | None] = []
+        self.records: dict[str, dict[str, object]] = {"HEAD": _head_item()}
+        self.active_effect: str | None = None
         self.get_error: BaseException | None = None
         self.transact_error: BaseException | None = None
+        self.transact_error_after_apply: BaseException | None = None
+        self.table_overrides: dict[str, object] = {}
 
     def describe_table(self, **kwargs):
         self.calls.append(("DescribeTable", kwargs))
-        return {
-            "Table": {
+        table = {
                 "TableName": "t122-fixture",
                 "TableArn": _TABLE_ARN,
                 "TableId": "11111111-2222-3333-4444-555555555555",
@@ -161,19 +165,103 @@ class _ScriptedDynamo:
                     {"AttributeName": "SK", "AttributeType": "S"},
                 ],
             }
-        }
+        table.update(self.table_overrides)
+        return {"Table": table}
 
     def get_item(self, **kwargs):
         self.calls.append(("GetItem", kwargs))
         if self.get_error is not None:
             raise self.get_error
-        item = self.items.pop(0) if self.items else None
+        if self.items:
+            item = self.items.pop(0)
+        else:
+            key = kwargs["Key"]
+            item = self.records.get(key["SK"]["S"])
         return {} if item is None else {"Item": item}
 
     def transact_write_items(self, **kwargs):
         self.calls.append(("TransactWriteItems", kwargs))
         if self.transact_error is not None:
             raise self.transact_error
+        actions = kwargs["TransactItems"]
+        puts = [action["Put"]["Item"] for action in actions if "Put" in action]
+        updates = [action["Update"] for action in actions if "Update" in action]
+        head_updates = [
+            update for update in updates if update["Key"]["SK"]["S"] == "HEAD"
+        ]
+        if head_updates:
+            update = head_updates[0]
+            values = update.get("ExpressionAttributeValues", {})
+            condition = update.get("ConditionExpression", "")
+            required = {
+                ":expected_generation": self.records["HEAD"]["generation"],
+                ":expected_revision_digest": self.records["HEAD"]["revision_digest"],
+                ":expected_transition_id": self.records["HEAD"]["transition_id"],
+                ":expected_writer_fence": self.records["HEAD"]["writer_fence"],
+                ":expected_terminal": self.records["HEAD"]["terminal"],
+                ":expected_site": self.records["HEAD"]["site"],
+            }
+            if any(name not in condition or name not in values for name in required):
+                raise AssertionError("HEAD condition does not bind the complete expected authority")
+            if any(values[name] != value for name, value in required.items()):
+                raise _AwsError("ConditionalCheckFailedException")
+            if any(item["SK"]["S"].startswith("LIFECYCLE#") for item in puts):
+                receipt = next(item for item in puts if item["SK"]["S"].startswith("LIFECYCLE#"))
+                if receipt["kind"]["S"] == "terminal-delete" and self.active_effect is not None:
+                    raise _AwsError("ConditionalCheckFailedException")
+                self.records["HEAD"] = _head_item(
+                    generation=int(receipt["applied_generation"]["N"]),
+                    terminal=receipt["applied_terminal"]["BOOL"],
+                    site=receipt["applied_site"]["S"],
+                    fence=receipt["applied_writer_fence"]["S"],
+                )
+                self.records[receipt["SK"]["S"]] = receipt
+                self.active_effect = None
+            else:
+                receipt = next(item for item in puts if item["SK"]["S"].startswith("TRANSITION#"))
+                self.records["HEAD"] = _head_item(
+                    generation=int(receipt["applied_generation"]["N"])
+                )
+                self.records[receipt["SK"]["S"]] = receipt
+        elif any(item["SK"]["S"].startswith("LEASE#") for item in puts):
+            receipt = next(item for item in puts if item["SK"]["S"].startswith("LEASE#"))
+            guard = next(update for update in updates if update["Key"]["SK"]["S"] == "LEASE-GUARD")
+            condition = guard.get("ConditionExpression", "")
+            values = guard.get("ExpressionAttributeValues", {})
+            for name, value in (
+                (":expected_generation", self.records["HEAD"]["generation"]),
+                (":expected_writer_fence", self.records["HEAD"]["writer_fence"]),
+                (":effect_id", receipt["effect_id"]),
+            ):
+                if values.get(name) != value or name not in condition:
+                    raise AssertionError("lease guard condition is incomplete")
+            if self.active_effect is not None:
+                raise _AwsError("ConditionalCheckFailedException")
+            self.active_effect = receipt["effect_id"]["S"]
+            self.records[receipt["SK"]["S"]] = receipt
+        else:
+            lease_updates = [
+                update
+                for update in updates
+                if update["Key"]["SK"]["S"].startswith("LEASE#")
+            ]
+            if lease_updates:
+                lease_update = lease_updates[0]
+                condition = lease_update.get("ConditionExpression", "")
+                values = lease_update.get("ExpressionAttributeValues", {})
+                for name in (":lease_id", ":holder_id", ":released_false", ":release_operation_digest"):
+                    if name not in values or name not in condition:
+                        raise AssertionError("lease release condition is incomplete")
+                sk = lease_update["Key"]["SK"]["S"]
+                receipt = dict(self.records[sk])
+                if receipt["released"]["BOOL"]:
+                    raise _AwsError("ConditionalCheckFailedException")
+                receipt["released"] = {"BOOL": True}
+                receipt["released_operation_digest"] = values[":release_operation_digest"]
+                self.records[sk] = receipt
+                self.active_effect = None
+        if self.transact_error_after_apply is not None:
+            raise self.transact_error_after_apply
         return {}
 
 
@@ -246,10 +334,33 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertIs(get.get("ConsistentRead"), True)
         self.assertEqual(get.get("TableName"), "t122-fixture")
 
+        missing = _ScriptedDynamo()
+        missing.records.pop("HEAD")
+        with self.assertRaises(CurrentHeadError):
+            self._port(missing).read()
+        self.assertFalse(
+            any(name == "TransactWriteItems" for name, _ in missing.calls)
+        )
+
+        for override in (
+            {"TableArn": _TABLE_ARN + "-recreated"},
+            {"TableId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+            {"TableStatus": "CREATING"},
+            {"KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}]},
+        ):
+            bad = _ScriptedDynamo()
+            bad.table_overrides = override
+            with self.assertRaises(CurrentHeadError):
+                self._port(bad)
+
+        unknown = _ScriptedDynamo()
+        unknown.records["HEAD"] = dict(_head_item(), unexpected=_ddb_s("no"))
+        with self.assertRaises(CurrentHeadError):
+            self._port(unknown).read()
+
     def test_v122_02_cas_and_receipt_are_one_transaction(self) -> None:
         self._require()
         client = _ScriptedDynamo()
-        client.items = [_head_item(generation=2)]
         port = self._port(client)
         applied = port.conditional_advance(self._advance())
         self.assertEqual(applied.generation, 2)
@@ -274,10 +385,17 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         receipt_puts = [action["Put"]["Item"] for action in actions if "Put" in action]
         self.assertEqual(receipt_puts, [_transition_item(self._advance())])
 
-        concurrent = _ScriptedDynamo()
-        concurrent.transact_error = _AwsError("ConditionalCheckFailedException")
         with self.assertRaises(HeadConflict):
-            self._port(concurrent).conditional_advance(self._advance())
+            port.conditional_advance(self._advance())
+        self.assertIn(
+            sum(name == "TransactWriteItems" for name, _ in client.calls),
+            {1, 2},
+        )
+        self.assertEqual(client.records["HEAD"]["generation"], _ddb_n(2))
+        self.assertEqual(
+            len([key for key in client.records if key.startswith("TRANSITION#")]),
+            1,
+        )
 
     def test_v122_03_maps_ambiguous_mutation_without_retry(self) -> None:
         self._require()
@@ -290,6 +408,15 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
             sum(name == "TransactWriteItems" for name, _ in client.calls),
             1,
         )
+
+        lost = _ScriptedDynamo()
+        lost.transact_error_after_apply = _AwsError("RequestTimeout")
+        lost_port = self._port(lost)
+        with self.assertRaises(HeadUnknown):
+            lost_port.conditional_advance(self._advance())
+        lost.transact_error_after_apply = None
+        recovered = lost_port.lookup_transition(self._advance().identity())
+        self.assertEqual(recovered.request, self._advance().identity())
 
         conflict = _ScriptedDynamo()
         conflict.transact_error = _AwsError("ConditionalCheckFailedException")
@@ -334,13 +461,26 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertEqual(len(transaction["TransactItems"]), 2)
         self.assertIn("LEASE-GUARD", repr(transaction))
         self.assertIn("effect:t122", repr(transaction))
+        lease_put = next(
+            action["Put"]["Item"]
+            for action in transaction["TransactItems"]
+            if "Put" in action
+        )
+        self.assertEqual(lease_put, _lease_item())
+        before_repeat = sum(name == "TransactWriteItems" for name, _ in client.calls)
+        self.assertEqual(port.acquire_execution_lease(request), receipt)
+        self.assertEqual(
+            sum(name == "TransactWriteItems" for name, _ in client.calls),
+            before_repeat,
+        )
 
         lookup = _ScriptedDynamo()
         lookup.items = [_lease_item()]
         self.assertEqual(self._port(lookup).lookup_execution_lease(request.identity()).request, request.identity())
 
         release_client = _ScriptedDynamo()
-        release_client.items = [_lease_item(released=True)]
+        release_client.records["LEASE#effect:t122"] = _lease_item()
+        release_client.active_effect = "effect:t122"
         release_port = self._port(release_client)
         released = release_port.release_execution_lease(
             ExecutionLeaseRelease(
@@ -352,10 +492,25 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertTrue(released.released)
         self.assertEqual(released.released_operation_digest, "sha256:release")
 
-        overlap = _ScriptedDynamo()
-        overlap.transact_error = _AwsError("ConditionalCheckFailedException")
         with self.assertRaises(HeadConflict):
-            self._port(overlap).acquire_execution_lease(request)
+            release_port.release_execution_lease(
+                ExecutionLeaseRelease(
+                    lease=receipt.lease,
+                    writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+                    operation_digest="sha256:different-release",
+                )
+            )
+
+        overlap_request = ExecutionLeaseRequest(
+            expected=self._authority(),
+            effect_id="effect:other",
+            intent_digest="sha256:other-intent",
+            writer_fence=_FENCE,
+            holder_id="holder:other",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+        )
+        with self.assertRaises(HeadConflict):
+            port.acquire_execution_lease(overlap_request)
 
         missing = _ScriptedDynamo()
         missing.items = [None]
@@ -389,10 +544,8 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
             f"fence:v1:{target_nonce}:"
             f"{hashlib.sha256(target_capability.encode()).hexdigest()}"
         )
-        client.items = [
-            _head_item(generation=2, site="site:b", fence=target_fence),
-            _head_item(generation=2, site="site:b", fence=target_fence),
-        ]
+        client.records["LEASE#effect:t122"] = _lease_item()
+        client.active_effect = "effect:t122"
         port = self._port(client)
         request = LifecycleTransitionRequest(
             kind="writer-transfer",
@@ -414,6 +567,8 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         self.assertIn("site:b", wire)
         self.assertIn("LEASE-GUARD", wire)
         self.assertNotIn(target_capability, wire)
+        self.assertIn("LEASE#effect:t122", client.records)
+        self.assertIsNone(client.active_effect)
         self.assertFalse(port.validate_writer_fence(WriterFenceProof(self._authority(), _CAPABILITY)))
 
         target_client = _ScriptedDynamo()
@@ -438,6 +593,35 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
         result = self._port(lookup).lookup_lifecycle_transition(request.identity())
         self.assertEqual(result.request, request.identity())
         self.assertEqual(result.applied.writer_fence, target_fence)
+
+        lost = _ScriptedDynamo()
+        lost.transact_error_after_apply = _AwsError("RequestTimeout")
+        lost_port = self._port(lost)
+        with self.assertRaises(HeadUnknown):
+            lost_port.conditional_lifecycle_transition(request)
+        lost.transact_error_after_apply = None
+        self.assertEqual(
+            lost_port.lookup_lifecycle_transition(request.identity()).request,
+            request.identity(),
+        )
+
+        terminal_client = _ScriptedDynamo()
+        terminal_client.records["LEASE#effect:t122"] = _lease_item()
+        terminal_client.active_effect = "effect:t122"
+        terminal_request = LifecycleTransitionRequest(
+            kind="terminal-delete",
+            expected=self._authority(),
+            operation_ref="delete:t122",
+            transition_id="transition:next",
+            revision_digest="sha256:next",
+            writer_fence=_FENCE,
+            operation_digest="sha256:delete",
+            writer_proof=WriterFenceProof(self._authority(), _CAPABILITY),
+        )
+        with self.assertRaises(HeadConflict):
+            self._port(terminal_client).conditional_lifecycle_transition(
+                terminal_request
+            )
 
     def test_v122_06_exposes_exact_existing_port_only(self) -> None:
         self._require()
