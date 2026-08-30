@@ -74,6 +74,6 @@ git diff --check
 
 实施后先跑执行门，再由两个只读 reviewer 只核对冻结落地。只有可复现 P0—P2 且直接破坏 123-V01—V07 或既有回归才阻塞；理论风险、替代架构、未来 Hermes/model/Weixin/AWS 要求不扩入本票。
 
-## Proposed mechanical refreeze candidate (non-authoritative)
+## Frozen/current mechanical refreeze
 
-V06 的 `--runtime-attestation-tamper` launcher 将第三个 argv 路径显式转换为 `Path` 后再传入 `_run_runtime_attestation_tamper`。这是与该函数既有 `Path.read_text()` 使用相符的一行类型修正；不改变 Gate、断言、fixture、current-successor 红灯、runtime attestation 算法或任何产品语义。在独立双轴预审通过前，本段不替代当前 frozen/current authority。
+内容冻结来源为 mechanical candidate `fcb1d42d547c86f7257f1195f2b4cd98c8e35016`，已获独立 Spec PASS 与 Standards PASS。V06 的 `--runtime-attestation-tamper` launcher 将第三个 argv 路径显式转换为 `Path` 后再传入 `_run_runtime_attestation_tamper`；这是与该函数既有 `Path.read_text()` 使用相符的一行类型修正，不改变 Gate、断言、fixture、current-successor 红灯、runtime attestation 算法或任何产品语义。Linux 编码前形状保持 V01–V05/V07 `6 PASS / 0 skip / 0 error`，V06 `1 expected FAIL / 0 error / 0 skip`，唯一红灯仍为 `HermesReleasePublisher.publish_current_successor` 尚未实现。
