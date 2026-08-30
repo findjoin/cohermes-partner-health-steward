@@ -13,7 +13,6 @@ import copy
 import hashlib
 import json
 import os
-import select
 import socket
 import stat
 import struct
@@ -41,10 +40,17 @@ from .host_authority import (
     HostPrivateKeyProvider,
     HostPrivateWriterFenceVault,
 )
+from .host_contract import HostReleaseContract
 from .lifecycle import LIFECYCLE_PURGE_BINDINGS, LIFECYCLE_REGISTRY_FAMILIES
 from .plugin import HealthPlugin
 from .probe import ProbeState
-from .release_deployment import _validate_release
+from .release_deployment import (
+    HermesReleasePublisher,
+    _RELEASE_CONTRACT,
+    _digest_bytes,
+    _file_manifest,
+    _relative_path,
+)
 from .storage import EncryptedStateStore, KeyUnavailable, StoreUnavailable
 
 
@@ -186,6 +192,71 @@ def _current_lstat(path: Path, expected: os.stat_result) -> None:
     current = path.lstat()
     if not _same_identity(current, expected):
         raise ValueError("path identity changed")
+
+
+def _validate_active_release(root: Path) -> dict[str, object]:
+    """Validate the Ticket 120 release closure for staged or current use."""
+
+    manifest_path = root / "release-manifest.json"
+    host_path = root / "host-release-manifest.json"
+    if (
+        not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or not host_path.is_file()
+        or host_path.is_symlink()
+    ):
+        raise ValueError("release manifest is unavailable")
+    manifest = _strict_json(manifest_path.read_bytes())
+    host = _strict_json(host_path.read_bytes())
+    if type(manifest) is not dict or set(manifest) != {
+        "contract",
+        "release_digest",
+        "host_release_digest",
+        "state",
+        "files",
+    }:
+        raise ValueError("release manifest is invalid")
+    if manifest.get("contract") != _RELEASE_CONTRACT or manifest.get("state") not in {
+        "staged",
+        "current",
+    }:
+        raise ValueError("release manifest is invalid")
+    release_digest = _digest(manifest.get("release_digest"), "release digest")
+    if type(host) is not dict or manifest.get("host_release_digest") != host.get("release_digest"):
+        raise ValueError("host release manifest is invalid")
+    expected_host = HostReleaseContract().build(
+        HermesReleasePublisher._release_sources(root)
+    ).to_wire()
+    if host != expected_host:
+        raise ValueError("host release manifest is invalid")
+    declared = manifest.get("files")
+    if type(declared) is not list:
+        raise ValueError("release file closure is invalid")
+    declared_files: dict[str, str] = {}
+    for entry in declared:
+        if type(entry) is not dict or set(entry) != {"path", "sha256"}:
+            raise ValueError("release file closure is invalid")
+        relative = _relative_path(entry.get("path"))
+        digest = entry.get("sha256")
+        if relative in declared_files or type(digest) is not str or not digest.startswith(_SHA256):
+            raise ValueError("release file closure is invalid")
+        _digest(digest, "release file digest")
+        declared_files[relative] = digest
+    actual = {
+        entry["path"]: entry["sha256"]
+        for entry in _file_manifest(root, exclude={"release-manifest.json"})
+    }
+    if declared_files != actual:
+        raise ValueError("release file closure is invalid")
+    body = {
+        "contract": manifest["contract"],
+        "state": manifest["state"],
+        "files": declared,
+        "host_release_manifest": host,
+    }
+    if release_digest != _digest_bytes(_canonical(body)):
+        raise ValueError("release digest is invalid")
+    return copy.deepcopy(manifest)
 
 
 class FilesystemManagedReplicaAdapter:
@@ -556,6 +627,7 @@ class ProductionCoreService:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._closing = False
         self._core: HealthCore | None = None
         self._plugin: HealthPlugin | None = None
         self._store: EncryptedStateStore | None = None
@@ -584,7 +656,12 @@ class ProductionCoreService:
         )
 
     @staticmethod
-    def _runtime(root_value: object, manifest_value: object) -> tuple[Path, dict[str, object]]:
+    def _runtime(
+        root_value: object,
+        manifest_value: object,
+        *,
+        verified_release_digest: object,
+    ) -> tuple[Path, dict[str, object]]:
         root = _secure_directory(root_value, "runtime closure root")
         manifest_path = root / "ticket123-runtime-manifest.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
@@ -592,23 +669,29 @@ class ProductionCoreService:
         manifest = _strict_json(manifest_path.read_bytes())
         if type(manifest) is not dict or type(manifest_value) is not dict or manifest != manifest_value:
             raise ValueError("runtime closure manifest mismatch")
-        if not {"contract", "closure_digest", "files"}.issubset(manifest):
+        if set(manifest) != {"contract", "closure_digest", "files"}:
             raise ValueError("runtime closure manifest is invalid")
         if type(manifest["contract"]) is not str or not manifest["contract"]:
             raise ValueError("runtime closure manifest is invalid")
-        _digest(manifest["closure_digest"], "runtime closure digest")
+        verified_digest = _digest(verified_release_digest, "verified release digest")
+        if not verified_digest:
+            raise ValueError("runtime release binding is invalid")
         files = manifest["files"]
         if type(files) is not list or not files:
             raise ValueError("runtime closure file list is invalid")
         declared: dict[str, str] = {}
+        previous = ""
         for item in files:
             if type(item) is not dict or set(item) != {"path", "sha256"}:
                 raise ValueError("runtime closure file is invalid")
             relative = _relative(item["path"], "runtime file path")
             digest = _digest(item["sha256"], "runtime file digest")
-            if relative in declared:
+            if relative in declared or relative <= previous:
                 raise ValueError("runtime closure file is duplicated")
             declared[relative] = digest
+            previous = relative
+        if manifest["closure_digest"] != _SHA256 + hashlib.sha256(_canonical(files)).hexdigest():
+            raise ValueError("runtime closure digest mismatch")
         actual: dict[str, str] = {}
         for path in root.rglob("*"):
             if path.is_symlink():
@@ -637,10 +720,14 @@ class ProductionCoreService:
         if set(binding) != _BINDING_FIELDS or binding.get("contract") != "ticket123-production-core-binding-v1":
             raise ValueError("invalid production core binding")
         release_root = _secure_directory(binding["release_root"], "release root")
-        release = _validate_release(str(release_root))
+        release = _validate_active_release(release_root)
         if binding["release_digest"] != release.get("release_digest") or release_root.name != str(release["release_digest"]).removeprefix(_SHA256):
             raise ValueError("release binding mismatch")
-        runtime_root, runtime_manifest = self._runtime(binding["runtime_root"], binding["runtime_manifest"])
+        runtime_root, runtime_manifest = self._runtime(
+            binding["runtime_root"],
+            binding["runtime_manifest"],
+            verified_release_digest=release["release_digest"],
+        )
         installation_id = validate_opaque_text(binding["installation_id"], "installation_id")
         site = validate_opaque_text(binding["site"], "site")
         head = self._current_head.read().head.as_authority()
@@ -751,7 +838,7 @@ class ProductionCoreService:
 
     def start(self) -> dict[str, object]:
         with self._lock:
-            if self._listener is not None:
+            if self._listener is not None or self._closing:
                 raise RuntimeError("production core service is already started")
             resources = self._validated_resources()
             store: EncryptedStateStore | None = None
@@ -798,16 +885,26 @@ class ProductionCoreService:
 
     def close(self) -> None:
         with self._lock:
+            if (
+                self._listener is None
+                and self._thread is None
+                and self._core is None
+                and self._store is None
+            ):
+                return
             listener, thread = self._listener, self._thread
-            self._listener = None
-            self._thread = None
+            self._closing = True
             self._stop.set()
             if listener is not None:
                 listener.close()
         if thread is not None:
             thread.join(timeout=2)
+            if thread.is_alive():
+                raise RuntimeError("production core service drain timed out")
         with self._lock:
             core, store = self._core, self._store
+            self._listener = None
+            self._thread = None
             self._core = None
             self._plugin = None
             self._store = None
@@ -827,6 +924,7 @@ class ProductionCoreService:
                         _fsync_directory(path.parent)
                 except OSError:
                     pass
+            self._closing = False
 
     def _serve(self) -> None:
         while not self._stop.is_set():
@@ -870,8 +968,11 @@ class ProductionCoreService:
         body = self._receive(connection, size)
         if body is None:
             return
-        readable, _writeable, _errors = select.select([connection], [], [], 0.03)
-        if readable and connection.recv(1):
+        try:
+            trailing = connection.recv(1)
+        except socket.timeout:
+            return
+        if trailing != b"":
             return
         request = _strict_json(body)
         if _canonical(request) != body:
