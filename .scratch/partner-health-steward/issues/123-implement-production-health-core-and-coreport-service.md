@@ -1,7 +1,7 @@
 # 123 - 实现生产 health-core 与 CorePort 服务
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [121 - 实现主机私有健康密钥与能力权威](121-implement-host-private-health-authorities.md), [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md)
 Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md)
@@ -88,4 +88,14 @@ Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-
 - Linux 编码前形状为 V01–V05/V07 `6 PASS / 0 skip / 0 error`，V06 `1 expected FAIL / 0 error / 0 skip`；唯一红灯仍是 `HermesReleasePublisher.publish_current_successor` 尚未实现。
 - 实施只允许关闭 current-successor runtime-closure attestation 红门：在 Ticket 120 `HermesReleasePublisher` 增加该唯一窄公开入口，并使 Ticket 123 按冻结合同验证其 release-owned attestation；不得改写冻结设计、verifier、Gate 数量、Ticket 状态或其他业务范围。
 
-实施停止规则：冻结测试若与冻结设计自相矛盾，或实现必须改写 Tickets 110—122 的业务状态机、三类 CorePort wire、引入第二 current-head/ledger/database、访问真实 AWS/Hermes/模型/微信或执行部署，立即停止并报告一个具体阻断。正常实施完成后运行七门及受影响回归，创建普通提交并普通推送，报告 commit/tree 与逐门证据；Ticket 保持 `claimed`，等待独立完成审查。
+实施停止规则：冻结测试若与冻结设计自相矛盾，或实现必须改写 Tickets 110—122 的业务状态机、三类 CorePort wire、引入第二 current-head/ledger/database、访问真实 AWS/Hermes/模型/微信或执行部署，立即停止并报告一个具体阻断。正常实施完成后运行七门及受影响回归，创建普通提交并普通推送，报告 commit/tree 与逐门证据；在独立完成审查前，Ticket 保持 `claimed`。
+
+## Answer
+
+Ticket 123 已完成并经最终定向 Spec/Standards 双轴审查 PASS（0 个阻塞项）。本票仅交付生产 `HealthCore` 组合根、受限 AF_UNIX `CorePort` 与 lifecycle 接缝、固定 Python 3.11 runtime 闭包，以及 release-owned runtime-closure attestation；不代表 Hermes 消息接通、真实模型或 Weixin Adapter、部署或主人验收已完成。
+
+- 最终产品提交：`76bb054f8281e2edd5e75d51767e192d20fecd28`；tree：`83b1d401ff2287fe05c9ab1933140f4fb56a1f91`。
+- 最终冻结权威：metadata `431ffe68775403ced3cde6e986e77d1b1e4106af`，内容冻结 `22c6a1194c8ca68bad04c22f21f99331ba8ae53a`；design `f464be479f51a0d03d9cf33e964bcd2e7d190e03`、contract `274bd672a7996cfa18c507d8e904f5a727a63aaf`、verifier `ccb534abe36d3b5eab11a585b753bb3cfacdf1b3` 均保持冻结内容。
+- 验证：普通回归 `1 PASS`；default Linux V123 `7/7 PASS`；Ticket 121/122 `7 PASS + 6 platform skip`；Ticket 117/118/120 `22 PASS + 1 Linux-only skip`；项目全量 `757 PASS + 14 platform skip`，均为 `0 failure/error`；`compileall` 与 `git diff --check` 均 PASS。
+- 运行边界：临时验证根与 transient units 均已清理；default/partner 服务前后均为 `inactive`；系统 Python 保持 `3.10.12`，专用 Python `3.11.16` runtime 保留且未改动。
+- Ticket 124 与 Ticket 125 现在可将本票的生产组合根视为已满足的前置依赖；其各自入口、Adapter、部署和验收范围仍未解决。

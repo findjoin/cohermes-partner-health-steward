@@ -118,7 +118,7 @@ Type: wayfinder:map
 - [有限缺口清单](design/staged-to-usable-gap-register.md)固定当前八项差额、唯一 Ticket 归属、可并行点和统一停止规则；它只承接现有 Spec、ADR 0022 与 Ticket 119，不建立第二路线。
 - [Ticket 121：实现主机私有健康密钥与能力权威](issues/121-implement-host-private-health-authorities.md) — 已实现三个 Linux 主机私有权威 Adapter，并通过 `6/6` 正式 Linux 门及双轴终审；未触碰真实健康目录或服务。
 - [Ticket 122：实现 DynamoDB current-head 生产 Provider](issues/122-implement-dynamodb-current-head-provider.md) — Provider 代码已通过 `7/7` 冻结门、全量回归与双轴终审；真实 AWS disposable G08 尚未授权，保持 `not-authorized/cannot-confirm`。
-- [Ticket 123：实现生产 health-core 与 CorePort 服务](issues/123-implement-production-health-core-and-coreport-service.md) — 组合 121/122 与现有 HealthCore，通过受限 AF_UNIX socket 和低权限 systemd 服务闭合 G03/G04。
+- [Ticket 123：实现生产 health-core 与 CorePort 服务](issues/123-implement-production-health-core-and-coreport-service.md#answer) — 已解决：生产 HealthCore 组合根、受限 AF_UNIX CorePort/lifecycle、固定 Python 3.11 runtime closure 与 release-owned attestation；Ticket 124/125 的本票前置依赖已可用，未接通 Hermes/模型/Weixin、未部署或完成主人验收。
 - [Ticket 124：接通 pinned Hermes 的真实健康入口](issues/124-connect-pinned-hermes-live-health-entry.md) — 实现逐条消息、回复、cursor、七 Skill 调度和 Cron 唤醒，闭合唯一入口与无旁路的 G05/G09。
 - [Ticket 125：实现 Partner 首跳模型与治理知识 Adapter](issues/125-implement-partner-model-and-governed-knowledge-adapter.md) — 绑定真实 capability profile、严格终态和不可变知识发布；不激活医学范围。
 - [Ticket 126：实现真实 Weixin 与支持联系人投递 Adapter](issues/126-implement-live-weixin-and-support-contact-delivery-adapter.md) — 闭合分层投递、幂等、unknown 冻结和最小联系人 payload。
