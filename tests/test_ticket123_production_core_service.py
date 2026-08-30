@@ -54,8 +54,9 @@ _RUNTIME_ATTESTATION_PATH = "runtime/ticket123-runtime-closure-attestation.json"
 _RUNTIME_ATTESTATION_CONTRACT = "ticket123-runtime-closure-attestation-v1"
 _RUNTIME_CLOSURE_ALGORITHM = "sha256(canonical-json(files))"
 _ISOLATED_VERIFIER_BOOTSTRAP = (
-    "import runpy,sys;root,script,*args=sys.argv[1:];"
-    "sys.path.insert(0,root);sys.argv=[script,*args];"
+    "import runpy,sys,types;root,script,*args=sys.argv[1:];"
+    "tests=types.ModuleType('tests');tests.__path__=[root+'/tests'];"
+    "tests.__package__='tests';sys.modules['tests']=tests;sys.argv=[script,*args];"
     "runpy.run_path(script,run_name='__main__')"
 )
 
@@ -96,6 +97,33 @@ def _release_file_manifest(root: Path) -> list[dict[str, str]]:
             )
     entries.sort(key=lambda item: item["path"])
     return entries
+
+
+def _assert_production_module_is_runtime_site_package() -> None:
+    """Child processes may import test modules only from the verifier root."""
+
+    raw_runtime_root = os.environ.get("TICKET123_RUNTIME_ROOT")
+    if not raw_runtime_root:
+        raise AssertionError("TICKET123_RUNTIME_ROOT is unavailable to verifier child")
+    runtime_root = Path(raw_runtime_root).resolve()
+    module = importlib.import_module("partner_health_steward.production_core_service")
+    raw_module_path = getattr(module, "__file__", None)
+    if not isinstance(raw_module_path, str):
+        raise AssertionError("production_core_service has no import path")
+    module_path = Path(raw_module_path).resolve()
+    try:
+        relative = module_path.relative_to(runtime_root)
+    except ValueError as exc:
+        raise AssertionError(
+            "production_core_service did not load from TICKET123_RUNTIME_ROOT"
+        ) from exc
+    if "site-packages" not in relative.parts or relative.parts[-2:] != (
+        "partner_health_steward",
+        "production_core_service.py",
+    ):
+        raise AssertionError(
+            "production_core_service did not load from runtime site-packages"
+        )
 
 
 def _recv_exact(connection: socket.socket, size: int) -> bytes | None:
@@ -220,62 +248,6 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         digest = wire["release_digest"]
         assert type(digest) is str
         return root / "releases" / digest.removeprefix("sha256:"), wire
-
-    @staticmethod
-    def _as_current_release(
-        binding: dict[str, object], *, expected_closure_digest: str | None = None
-    ) -> dict[str, object]:
-        """Build a verifier-owned, attested current successor release."""
-
-        release_root = Path(binding["release_root"])
-        manifest_path = release_root / "release-manifest.json"
-        host_path = release_root / "host-release-manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        host = json.loads(host_path.read_text(encoding="utf-8"))
-        runtime_manifest = binding.get("runtime_manifest")
-        if type(runtime_manifest) is not dict:
-            raise AssertionError("runtime closure fixture is invalid")
-        files = runtime_manifest.get("files")
-        observed_closure_digest = _runtime_closure_digest(files)
-        if runtime_manifest.get("closure_digest") != observed_closure_digest:
-            raise AssertionError("runtime closure fixture digest is invalid")
-        expected = (
-            observed_closure_digest
-            if expected_closure_digest is None
-            else expected_closure_digest
-        )
-        if type(expected) is not str or not expected.startswith("sha256:"):
-            raise AssertionError("runtime closure attestation digest is invalid")
-        attestation = {
-            "contract": _RUNTIME_ATTESTATION_CONTRACT,
-            "closure_algorithm": _RUNTIME_CLOSURE_ALGORITHM,
-            "expected_closure_digest": expected,
-        }
-        attestation_path = release_root / _RUNTIME_ATTESTATION_PATH
-        attestation_path.parent.mkdir(mode=0o700, exist_ok=True)
-        attestation_path.write_bytes(_canonical(attestation))
-        manifest["state"] = "current"
-        manifest["files"] = _release_file_manifest(release_root)
-        body = {
-            "contract": manifest["contract"],
-            "state": manifest["state"],
-            "files": manifest["files"],
-            "host_release_manifest": host,
-        }
-        digest = "sha256:" + hashlib.sha256(_canonical(body)).hexdigest()
-        manifest["release_digest"] = digest
-        destination = release_root.parent / digest.removeprefix("sha256:")
-        if destination.exists():
-            raise AssertionError("current release fixture already exists")
-        manifest_path.write_bytes(_canonical(manifest))
-        release_root.rename(destination)
-        binding["release_root"] = str(destination)
-        binding["release_digest"] = digest
-        lifecycle_release = binding["lifecycle_release"]
-        if type(lifecycle_release) is not dict:
-            raise AssertionError("fixture lifecycle release is invalid")
-        lifecycle_release["product_release"] = digest
-        return attestation
 
     @staticmethod
     def _recovery_command() -> CommandEnvelope:
@@ -582,22 +554,6 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             )
             self.assertIsNotNone(released_holder)
             released_holder.release()
-
-            current_binding = copy.deepcopy(binding)
-            self._as_current_release(current_binding)
-            current_service, current_endpoint = self._start(
-                module, current_binding, current_head
-            )
-            try:
-                current_projection = self._request(
-                    current_endpoint, self._runtime_read()
-                )["payload"]
-                self.assertEqual(current_projection.get("state"), "healthy")
-                self.assertTrue(current_projection.get("health_writes_allowed"))
-                self.assertTrue(current_projection.get("model_effects_allowed"))
-                self.assertTrue(current_projection.get("outbound_effects_allowed"))
-            finally:
-                current_service.close()
 
             for name, mutate, provider in (
                 ("release-digest", lambda value: value.__setitem__("release_digest", "sha256:" + "0" * 64), current_head),
@@ -1161,23 +1117,101 @@ raise SystemExit(0 if data==b'' else 9)
         self.assertTrue(any("partner_health_steward" in path for path in declared))
         self.assertTrue(any("cryptography" in path for path in declared))
 
-        # A current successor is not a state-bit rewrite: the attestation is
-        # a release file, so its bytes enter the content-addressed release.
+        # A current successor is not a state-bit rewrite.  Ticket 120 owns the
+        # sole publication seam; V123 only independently audits its result.
         with tempfile.TemporaryDirectory(prefix="ticket123-attested-current-") as raw:
             root = Path(raw)
             module, current_binding, current_head, _client = self._fixture(root)
-            attestation = self._as_current_release(current_binding)
-            release_root = Path(current_binding["release_root"])
-            release_manifest = json.loads(
-                (release_root / "release-manifest.json").read_text(encoding="utf-8")
+            staged_root = Path(current_binding["release_root"])
+            staged_digest = current_binding["release_digest"]
+            self.assertIsInstance(staged_digest, str)
+            staged_bytes = {
+                path.relative_to(staged_root).as_posix(): path.read_bytes()
+                for path in staged_root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            publisher = HermesReleasePublisher(Path(__file__).resolve().parents[1])
+            publish_current_successor = getattr(
+                publisher, "publish_current_successor", None
+            )
+            self.assertTrue(
+                callable(publish_current_successor),
+                "V123-06 prerequisite: "
+                "HermesReleasePublisher.publish_current_successor is unavailable",
+            )
+            published = publish_current_successor(
+                staged_root, copy.deepcopy(manifest)
+            )
+            to_wire = getattr(published, "to_wire", None)
+            self.assertTrue(callable(to_wire))
+            release_manifest = to_wire()
+            self.assertIsInstance(release_manifest, dict)
+            assert isinstance(release_manifest, dict)
+            self.assertEqual(
+                set(release_manifest),
+                {
+                    "contract",
+                    "release_digest",
+                    "host_release_digest",
+                    "state",
+                    "files",
+                },
+            )
+            self.assertEqual(release_manifest["state"], "current")
+            successor_digest = release_manifest["release_digest"]
+            self.assertIsInstance(successor_digest, str)
+            assert isinstance(successor_digest, str)
+            self.assertNotEqual(successor_digest, staged_digest)
+            successor_root = staged_root.parent / successor_digest.removeprefix("sha256:")
+            self.assertNotEqual(successor_root, staged_root)
+            self.assertTrue(successor_root.is_dir() and not successor_root.is_symlink())
+            self.assertEqual(Path(current_binding["release_root"]), staged_root)
+            self.assertEqual(current_binding["release_digest"], staged_digest)
+            self.assertEqual(
+                staged_bytes,
+                {
+                    path.relative_to(staged_root).as_posix(): path.read_bytes()
+                    for path in staged_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                },
             )
             self.assertEqual(
-                attestation,
                 json.loads(
-                    (release_root / _RUNTIME_ATTESTATION_PATH).read_text(
+                    (successor_root / "release-manifest.json").read_text(
                         encoding="utf-8"
                     )
                 ),
+                release_manifest,
+            )
+            self.assertEqual(
+                _release_file_manifest(successor_root),
+                release_manifest["files"],
+            )
+            host_manifest = json.loads(
+                (successor_root / "host-release-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                successor_digest,
+                "sha256:"
+                + hashlib.sha256(
+                    _canonical(
+                        {
+                            "contract": release_manifest["contract"],
+                            "state": release_manifest["state"],
+                            "files": release_manifest["files"],
+                            "host_release_manifest": host_manifest,
+                        }
+                    )
+                ).hexdigest(),
+            )
+            release_root = successor_root
+            attestation = json.loads(
+                (release_root / _RUNTIME_ATTESTATION_PATH).read_text(encoding="utf-8")
+            )
+            release_manifest = json.loads(
+                (release_root / "release-manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
                 set(attestation),
@@ -1203,6 +1237,12 @@ raise SystemExit(0 if data==b'' else 9)
                     (release_root / _RUNTIME_ATTESTATION_PATH).read_bytes()
                 ).hexdigest(),
             )
+            current_binding["release_root"] = str(successor_root)
+            current_binding["release_digest"] = successor_digest
+            lifecycle_release = current_binding["lifecycle_release"]
+            self.assertIsInstance(lifecycle_release, dict)
+            assert isinstance(lifecycle_release, dict)
+            lifecycle_release["product_release"] = successor_digest
             current_service, current_endpoint = self._start(
                 module, current_binding, current_head
             )
@@ -1364,6 +1404,8 @@ raise SystemExit(0 if data==b'' else 9)
         # synchronized mutation of production_core_service.py.
         with tempfile.TemporaryDirectory(prefix="ticket123-attestation-tamper-") as raw:
             tamper_root = Path(raw)
+            verified_manifest_path = tamper_root / "verified-runtime-manifest.json"
+            verified_manifest_path.write_bytes(_canonical(manifest))
             cloned_runtime = tamper_root / "runtime"
             shutil.copytree(runtime_root, cloned_runtime)
             manifest_path = cloned_runtime / "ticket123-runtime-manifest.json"
@@ -1408,7 +1450,7 @@ raise SystemExit(0 if data==b'' else 9)
                     str(Path(__file__).resolve()),
                     "--runtime-attestation-tamper",
                     str(tamper_root / "process"),
-                    manifest["closure_digest"],
+                    str(verified_manifest_path),
                 ],
                 check=False,
                 capture_output=True,
@@ -1581,6 +1623,7 @@ raise SystemExit(0 if data==b'' else 9)
 def _run_runtime_tamper(root: Path) -> None:
     """Prove a self-rehashed runtime table cannot authorize service start."""
 
+    _assert_production_module_is_runtime_site_package()
     Ticket123ProductionCoreServiceTests.setUpClass()
     case = Ticket123ProductionCoreServiceTests(
         "test_v123_06_python_closure_and_systemd_process_are_fixed"
@@ -1602,18 +1645,55 @@ def _run_runtime_tamper(root: Path) -> None:
 
 
 def _run_runtime_attestation_tamper(
-    root: Path, expected_closure_digest: str
+    root: Path, verified_manifest_path: Path
 ) -> None:
     """Prove release-owned closure evidence rejects a synchronized runtime edit."""
 
+    _assert_production_module_is_runtime_site_package()
+    verified_manifest = json.loads(verified_manifest_path.read_text(encoding="utf-8"))
+    if type(verified_manifest) is not dict:
+        raise AssertionError("verified runtime manifest is invalid")
+    verified_files = verified_manifest.get("files")
+    if (
+        type(verified_files) is not list
+        or verified_manifest.get("closure_digest")
+        != _runtime_closure_digest(verified_files)
+    ):
+        raise AssertionError("verified runtime manifest is invalid")
     Ticket123ProductionCoreServiceTests.setUpClass()
     case = Ticket123ProductionCoreServiceTests(
         "test_v123_06_python_closure_and_systemd_process_are_fixed"
     )
     module, binding, current_head, _client = case._fixture(root)
-    case._as_current_release(
-        binding, expected_closure_digest=expected_closure_digest
+    publisher = HermesReleasePublisher(Path(__file__).resolve().parents[1])
+    publish_current_successor = getattr(
+        publisher, "publish_current_successor", None
     )
+    if not callable(publish_current_successor):
+        raise AssertionError(
+            "HermesReleasePublisher.publish_current_successor is unavailable"
+        )
+    published = publish_current_successor(
+        Path(binding["release_root"]), copy.deepcopy(verified_manifest)
+    )
+    to_wire = getattr(published, "to_wire", None)
+    if not callable(to_wire):
+        raise AssertionError("current successor lacks a public release wire")
+    successor = to_wire()
+    if type(successor) is not dict or successor.get("state") != "current":
+        raise AssertionError("current successor release is invalid")
+    successor_digest = successor.get("release_digest")
+    if type(successor_digest) is not str:
+        raise AssertionError("current successor digest is invalid")
+    successor_root = Path(binding["release_root"]).parent / successor_digest.removeprefix(
+        "sha256:"
+    )
+    binding["release_root"] = str(successor_root)
+    binding["release_digest"] = successor_digest
+    lifecycle_release = binding.get("lifecycle_release")
+    if type(lifecycle_release) is not dict:
+        raise AssertionError("fixture lifecycle release is invalid")
+    lifecycle_release["product_release"] = successor_digest
     try:
         service, _endpoint = case._start(module, binding, current_head)
     except Exception:
@@ -1634,6 +1714,7 @@ def _run_systemd_child(root: Path, mode: str) -> None:
 
     if mode not in {"normal", "crash"}:
         raise ValueError("invalid systemd child mode")
+    _assert_production_module_is_runtime_site_package()
     Ticket123ProductionCoreServiceTests.setUpClass()
     case = Ticket123ProductionCoreServiceTests(
         "test_v123_01_composition_is_release_bound_and_staged_is_truthfully_unavailable"
