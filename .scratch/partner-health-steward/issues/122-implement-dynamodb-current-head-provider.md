@@ -34,9 +34,10 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 
 - 冻结 checkpoint：commit `8de120d447c53848af2afbc9fce71a2afa71a642`、tree `0007c31f95a6712e2fefca1ff16790b53bee2da8`。
 - 双轴共同审查内容点：commit `60121ea635b8cedc09556163bc9a6a6cb7294078`、tree `bcc4566d517155b720b28b5a8eb929bd8b6ddb3b`；Spec reviewer `PASS`，Standards reviewer `PASS`。
+- 首次实施双轴审查发现 ordinary/terminal 推进未同步 LEASE-GUARD，且进程 lease cache 可遮蔽跨 Adapter release。verification authority 仅把既有 V02/V04 的 guard 同步与强读持久 receipt 要求机械化，没有增加产品能力或替代架构。修订 checkpoint：commit `1f6f55fe9930cbcfb3b59f9cc5def2cd09d089cc`、tree `d0b81b5208c15889558b08407d25bed095207d16`。
 - 实施设计：`../design/122-frozen-implementation-design.md`
 - 独立验证合同：`../design/122-frozen-verification-contract.md`
 - verifier-owned 门：`../../../tests/test_ticket122_dynamodb_current_head.py`
-- 冻结 blob：design `23791cb5609d8f2b70e839d595cfe37192db875a`；contract `9814d413890891e40dc88fb556a9cec0245c59e3`；verifier `3d67ff08ba79fe1a30fe0b58f676fb2d255f557a`。
+- 当前冻结 blob：design `eec6f5a258030cea23e7f8e1d9bae0a116f0381c`；contract `a1a2424e8c03dab6d33c3ef0c4f070441193efed`；verifier `a932683c319761c76417bc0012731463778de5f7`。原三 blob 已由上述既有语义机械化修订取代。
 - 编码前机械结果：`1 failure / 6 skips / 0 errors`；唯一红灯为 `partner_health_steward.dynamodb_current_head` 尚不存在。
 - 实现 Agent 不得修改上述三件套或既有 `CurrentHeadPort/HealthCore`；真实 G08 未获批准时只完成代码 checkpoint，不伪造 gate 通过。
