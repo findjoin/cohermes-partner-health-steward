@@ -1,7 +1,7 @@
 # 121 - 实现主机私有健康密钥与能力权威
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Builds on: Ticket 120 staged release evidence at `777cc585bbda3e13385b73b9146c0d8f948838d1`
 Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-production-health-core-and-coreport-service.md)
@@ -38,3 +38,12 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 - 当前冻结 blob：design `e6b1a132d99c38748cd91b897e75286f5fe951f1`；contract `1f969ce5fca374a0e9c3eceacb1f9c6ccb696ddf`；verifier `8760ee9dcd04a85fdf9cfe3a6db4e4195db32347`。原 verifier blob `cb8e383577b4ad62a35c05edc11e1bfd2a9faf22` 已被机械修订取代。
 - 编码前机械结果：`1 failure / 5 skips / 0 errors`；唯一红灯为 `partner_health_steward.host_authority` 尚不存在。
 - 实现 Agent 不得修改上述三件套；若需改变既有 Interface、共享 fence 合同或增加 capability ledger，按停止规则返回，不自行扩票。
+
+## Answer
+
+Ticket 121 已按冻结设计实现并通过独立双轴审查，可供 Ticket 123 组合使用。
+
+- 产品实现：`partner_health_steward/host_authority.py`，实施提交 `edd8eea2183cc255bc489411df4540f01daf7a88`。
+- Linux 正式冻结门：使用仅位于 `/tmp/ticket121-*` 的临时 CPython 3.11.16，在 default Hermes 主机完成 `6/6 PASS`；临时目录随后精确删除，default/partner 服务前后均保持 `active/enabled`，未修改服务或真实健康目录。
+- 回归与审查：相关回归 `190/190 PASS`；最终 Spec 与 Standards 有界复核均为 `PASS`，没有阻塞 finding。
+- 本票只证明主机私有权威 Adapter；CorePort、Hermes 接线与真实外部效果仍由后继 Tickets 验收。
