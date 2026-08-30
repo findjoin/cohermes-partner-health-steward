@@ -24,7 +24,14 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .authority import AuthoritySnapshot, EffectExecutionGrant, EffectIntent, validate_opaque_text
+from .authority import (
+    AuthoritySnapshot,
+    CommittedTransition,
+    EffectExecutionGrant,
+    EffectIntent,
+    PreparedTransition,
+    validate_opaque_text,
+)
 from .contract import CommandEnvelope, EffectResultPayload, ProtocolViolation, Response, StateCommitPayload
 from .core import HealthCore
 from .dynamodb_current_head import DynamoDBCurrentHead
@@ -67,6 +74,7 @@ _BINDING_FIELDS = frozenset(
 _REQUEST_FIELDS = frozenset({"protocol_version", "kind", "request_id", "payload"})
 _RESPONSE_FIELDS = frozenset({"protocol_version", "kind", "request_id", "status", "payload"})
 _SHA256 = "sha256:"
+_MANAGED_PURGE_RECEIPT = ".ticket123-managed-replica-purge-receipt.v1"
 
 
 def _canonical(value: object) -> bytes:
@@ -197,7 +205,6 @@ class FilesystemManagedReplicaAdapter:
         normalized: dict[str, Path] = {}
         for binding in LIFECYCLE_PURGE_BINDINGS:
             path = _absolute(bindings[binding], "managed replica path")
-            _secure_regular(path, root=self._root, mode=0o600, name="managed replica")
             normalized[binding] = path
         if type(remains_unproven) not in (tuple, list) or not all(type(item) is str and item for item in remains_unproven):
             raise ValueError("invalid unproven replica providers")
@@ -205,9 +212,127 @@ class FilesystemManagedReplicaAdapter:
             raise ValueError("duplicate unproven replica providers")
         self._bindings = normalized
         self._remains_unproven = tuple(remains_unproven)
+        self._purge_receipt = self._root / _MANAGED_PURGE_RECEIPT
         self._lock = threading.RLock()
+        present = self._replica_presence()
+        if all(present):
+            if self._purge_receipt_exists():
+                raise ValueError("managed replica purge receipt conflicts with live replicas")
+        elif any(present):
+            raise ValueError("managed replica is unavailable")
+        else:
+            self._read_purge_receipt()
 
-    def _request(self, request: object) -> None:
+    def _replica_presence(self) -> tuple[bool, ...]:
+        present: list[bool] = []
+        for path in self._bindings.values():
+            try:
+                path.relative_to(self._root)
+                path.lstat()
+            except FileNotFoundError:
+                present.append(False)
+                continue
+            except (OSError, ValueError) as exc:
+                raise ValueError("managed replica is unavailable") from exc
+            _secure_regular(path, root=self._root, mode=0o600, name="managed replica")
+            present.append(True)
+        return tuple(present)
+
+    def _purge_receipt_exists(self) -> bool:
+        try:
+            self._purge_receipt.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ValueError("managed replica purge receipt is unavailable") from exc
+        return True
+
+    def _read_purge_receipt(self) -> tuple[str, AuthoritySnapshot, str]:
+        _secure_regular(
+            self._purge_receipt,
+            root=self._root,
+            mode=0o600,
+            name="managed replica purge receipt",
+        )
+        try:
+            raw = self._purge_receipt.read_bytes()
+            value = _strict_json(raw)
+            if _canonical(value) != raw or type(value) is not dict or set(value) != {
+                "contract",
+                "operation_ref",
+                "authority_binding",
+                "transition_id",
+            }:
+                raise ValueError("invalid managed replica purge receipt")
+            if value["contract"] != "ticket123-managed-replica-purge-v1":
+                raise ValueError("invalid managed replica purge receipt")
+            operation_ref = validate_opaque_text(value["operation_ref"], "operation_ref")
+            transition_id = validate_opaque_text(value["transition_id"], "transition_id")
+            authority = AuthoritySnapshot.from_storage(value["authority_binding"])
+        except (OSError, ProtocolViolation, ValueError) as exc:
+            raise ValueError("invalid managed replica purge receipt") from exc
+        if authority.transition_id != transition_id:
+            raise ValueError("managed replica purge receipt authority mismatch")
+        return operation_ref, authority, transition_id
+
+    def _write_purge_receipt(
+        self,
+        operation_ref: str,
+        authority: AuthoritySnapshot,
+        transition_id: str,
+    ) -> None:
+        if self._purge_receipt_exists():
+            raise ValueError("managed replica purge receipt already exists")
+        wire = _canonical(
+            {
+                "contract": "ticket123-managed-replica-purge-v1",
+                "operation_ref": operation_ref,
+                "authority_binding": authority.to_storage(),
+                "transition_id": transition_id,
+            }
+        )
+        temporary = self._root / (_MANAGED_PURGE_RECEIPT + "." + uuid.uuid4().hex)
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            remaining = memoryview(wire)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("managed replica purge receipt write failed")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            _secure_regular(
+                temporary,
+                root=self._root,
+                mode=0o600,
+                name="managed replica purge receipt",
+            )
+            os.link(temporary, self._purge_receipt, follow_symlinks=False)
+            temporary.unlink()
+            _fsync_directory(self._root)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        observed_operation, observed_authority, observed_transition = self._read_purge_receipt()
+        if (
+            observed_operation != operation_ref
+            or observed_authority != authority
+            or observed_transition != transition_id
+        ):
+            raise ValueError("managed replica purge receipt mismatch")
+
+    def _request(self, request: object) -> tuple[str, AuthoritySnapshot, str]:
         if type(request) is not dict or set(request) != {
             "operation_ref",
             "authority_binding",
@@ -219,6 +344,7 @@ class FilesystemManagedReplicaAdapter:
         authority = AuthoritySnapshot.from_storage(request["authority_binding"])
         if not operation_ref or authority.installation_id != self._installation_id or authority.transition_id != transition_id:
             raise ValueError("managed replica authority mismatch")
+        return operation_ref, authority, transition_id
 
     def enumerate(self, request: object) -> dict[str, object]:
         if type(request) is not dict or set(request) != {"installation_id"}:
@@ -227,17 +353,19 @@ class FilesystemManagedReplicaAdapter:
             raise ValueError("managed replica installation mismatch")
         with self._lock:
             _secure_directory(self._root, "managed replica root")
-            for path in self._bindings.values():
-                _secure_regular(path, root=self._root, mode=0o600, name="managed replica")
+            if not all(self._replica_presence()) or self._purge_receipt_exists():
+                raise ValueError("managed replica is unavailable")
             return {
                 "configured": list(LIFECYCLE_PURGE_BINDINGS),
                 "remains_unproven": list(self._remains_unproven),
             }
 
     def purge(self, request: object) -> dict[str, object]:
-        self._request(request)
+        operation_ref, authority, transition_id = self._request(request)
         with self._lock:
             _secure_directory(self._root, "managed replica root")
+            if self._purge_receipt_exists() or not all(self._replica_presence()):
+                raise ValueError("managed replica is unavailable")
             checked: list[tuple[Path, os.stat_result]] = []
             for path in self._bindings.values():
                 checked.append((path, _secure_regular(path, root=self._root, mode=0o600, name="managed replica")))
@@ -245,18 +373,29 @@ class FilesystemManagedReplicaAdapter:
                 _current_lstat(path, details)
                 path.unlink()
             _fsync_directory(self._root)
-            if any(path.exists() or path.is_symlink() for path in self._bindings.values()):
+            if any(self._replica_presence()):
                 raise ValueError("managed replica absence is unconfirmed")
+            self._write_purge_receipt(operation_ref, authority, transition_id)
             return {"status": "confirmed"}
 
     def absence(self, request: object) -> dict[str, object]:
-        self._request(request)
+        operation_ref, authority, transition_id = self._request(request)
         with self._lock:
             _secure_directory(self._root, "managed replica root")
-            for path in self._bindings.values():
-                if path.exists() or path.is_symlink():
-                    _secure_regular(path, root=self._root, mode=0o600, name="managed replica")
-                    return {"status": "present", "remains_unproven": list(self._remains_unproven)}
+            present = self._replica_presence()
+            if all(present):
+                if self._purge_receipt_exists():
+                    raise ValueError("managed replica purge receipt conflicts with live replicas")
+                return {"status": "present", "remains_unproven": list(self._remains_unproven)}
+            if any(present):
+                raise ValueError("managed replica is unavailable")
+            observed_operation, observed_authority, observed_transition = self._read_purge_receipt()
+            if (
+                observed_operation != operation_ref
+                or observed_authority != authority
+                or observed_transition != transition_id
+            ):
+                raise ValueError("managed replica authority mismatch")
             return {"status": "absent", "remains_unproven": list(self._remains_unproven)}
 
 
@@ -753,6 +892,101 @@ class ProductionCoreService:
             return None
         return value
 
+    def _recovery_finalize_candidate(
+        self,
+        command: CommandEnvelope,
+        store: EncryptedStateStore,
+    ) -> PreparedTransition | None:
+        """Recognize only a journal whose original CAS is already proven."""
+
+        payload = command.payload
+        if command.action != "state.commit" or not isinstance(payload, StateCommitPayload):
+            return None
+        pending = store.pending_for_record(payload.record_id)
+        stored = store.record(payload.record_id)
+        if (
+            pending is None
+            or not pending.remote_attempted
+            or pending.command.to_wire() != command.to_wire()
+            or stored is None
+            or stored.state not in {"prepared", "unknown"}
+            or not isinstance(stored.payload, PreparedTransition)
+        ):
+            return None
+        prepared = stored.payload
+        if (
+            command.generation != prepared.base.generation
+            or payload.writer_fence != prepared.base.writer_fence
+            or not prepared.target.matches_commit(
+                record_id=payload.record_id,
+                revision_digest=payload.revision_digest,
+                transition_id=payload.transition_id,
+            )
+        ):
+            return None
+        try:
+            head = self._current_head.read().head.as_authority()
+        except Exception:
+            return None
+        if (
+            head.terminal
+            or head.installation_id != prepared.base.installation_id
+            or head.site != prepared.base.site
+            or head.generation != prepared.base.generation + 1
+            or head.revision_digest != prepared.target.revision_digest
+            or head.transition_id != prepared.target.transition_id
+            or head.writer_fence != prepared.base.writer_fence
+        ):
+            return None
+        return prepared
+
+    @staticmethod
+    def _recovery_finalize_command(
+        command: CommandEnvelope,
+        committed: CommittedTransition,
+    ) -> CommandEnvelope:
+        target = committed.prepared.target
+        return CommandEnvelope(
+            peer="plugin",
+            action="state.finalize",
+            source=command.source,
+            causal_id="ticket123-recovery-finalize:"
+            + hashlib.sha256(_canonical(command.to_wire())).hexdigest(),
+            generation=committed.committed.generation,
+            scope=("state:finalize",),
+            payload=StateCommitPayload(
+                record_id=target.record_id,
+                revision_digest=target.revision_digest,
+                transition_id=target.transition_id,
+                writer_fence=committed.committed.writer_fence,
+            ),
+        )
+
+    def _finalize_recovered_commit(
+        self,
+        command: CommandEnvelope,
+        prepared: PreparedTransition,
+        store: EncryptedStateStore,
+        plugin: HealthPlugin,
+    ) -> None:
+        """Use the existing finalize protocol after lookup-only recovery."""
+
+        stored = store.record(prepared.target.record_id)
+        if stored is None or stored.state == "final":
+            return
+        if (
+            stored.state != "committed"
+            or not isinstance(stored.payload, CommittedTransition)
+            or stored.payload.prepared != prepared
+        ):
+            raise StoreUnavailable("recovered state commit is not locally committed")
+        finalized = plugin.invoke(
+            self._recovery_finalize_command(command, stored.payload),
+            peer_id="plugin",
+        )
+        if finalized.status not in {"accepted", "replayed"}:
+            raise StoreUnavailable("recovered state commit finalization is unavailable")
+
     def _dispatch(self, raw: object) -> dict[str, object] | None:
         request = self._request(raw)
         if request is None:
@@ -797,7 +1031,11 @@ class ProductionCoreService:
             pending = store.pending_for_record(command.payload.record_id)
             if pending is None or pending.command.to_wire() != command.to_wire():
                 return {"response": Response("unavailable", command.causal_id, "health-assets-staged").to_wire()}
-        return {"response": plugin.invoke(command, peer_id="plugin").to_wire()}
+        recovery = self._recovery_finalize_candidate(command, store)
+        response = plugin.invoke(command, peer_id="plugin")
+        if recovery is not None and response.status == "accepted":
+            self._finalize_recovered_commit(command, recovery, store, plugin)
+        return {"response": response.to_wire()}
 
     def _runtime_projection(self) -> dict[str, object]:
         core = self._core
