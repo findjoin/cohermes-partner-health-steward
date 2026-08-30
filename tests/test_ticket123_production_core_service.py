@@ -405,7 +405,8 @@ request={'protocol_version':1,'kind':'managed-read','request_id':'wrong-peer','p
 body=json.dumps(request,separators=(',',':'),sort_keys=True).encode()
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(1); s.connect(sys.argv[3]); s.sendall(struct.pack('>I',len(body))+body)
 try: data=s.recv(1)
-except Exception: data=b''
+except ConnectionResetError: data=b''
+except socket.timeout: raise SystemExit(8)
 raise SystemExit(0 if data==b'' else 9)
 """
                 wrong = subprocess.run(
@@ -658,22 +659,40 @@ raise SystemExit(0 if data==b'' else 9)
                 "semantic_state": {"registry": binding_registry, "records": []},
             }
             observed: list[object] = []
+            reader_errors: list[BaseException] = []
+            reader_ready = threading.Event()
+            observed_complete = threading.Event()
             completed = threading.Event()
 
             def read_until_written() -> None:
-                while not completed.is_set():
-                    observed.append(artifacts.get("lifecycle-package:migration:t123"))
+                try:
+                    while not completed.is_set():
+                        value = artifacts.get("lifecycle-package:migration:t123")
+                        observed.append(value)
+                        reader_ready.set()
+                        if value == package:
+                            observed_complete.set()
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                    completed.set()
 
             reader = threading.Thread(target=read_until_written)
             reader.start()
             try:
+                self.assertTrue(reader_ready.wait(timeout=2))
                 self.assertEqual(
                     artifacts.put("lifecycle-package:migration:t123", package)["status"],
                     "confirmed",
                 )
+                self.assertTrue(observed_complete.wait(timeout=2))
             finally:
                 completed.set()
                 reader.join(timeout=2)
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(reader_errors)
+            self.assertTrue(observed)
+            self.assertIn(None, observed)
+            self.assertIn(package, observed)
             self.assertTrue(all(item is None or item == package for item in observed))
             self.assertEqual(
                 artifact_type(artifact_root, _INSTALLATION).get(

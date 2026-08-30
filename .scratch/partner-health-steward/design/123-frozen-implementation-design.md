@@ -87,7 +87,7 @@ systemd / fixed Python closure
 | 123-V02 | Linux AF_UNIX owner/group/0660 与 `SO_PEERCRED` 同时执行；错误 UID、宽权限、symlink、旧 socket 均不能到达 Core；无 TCP | 只靠文件权限、自报 peer 或 loopback TCP 冒充本机权限边界 |
 | 123-V03 | 既有 Hermes 握手 wire 与三类 request 真实穿过 canonical byte stream；预置的加密 Core receipt 经 typed CommandEnvelope 精确重放；严格错误在分派前关闭，forged effect 无 grant，不完整 terminal 不成功 | 只做回显外壳、任意方法 RPC、宽松 JSON 或 socket 旁直调 Core |
 | 123-V04 | 同一 DB/head 重启精确重放同一 receipt 且无第二次 current-head transaction；head unknown、key loss、stale fence 失败关闭，模型/外发为零；进程 SIGKILL 由 V06 证明 holder/socket 恢复 | 重启生成第二结果、旧 fence 继续写、未知时盲目重做 |
-| 123-V05 | 两个生产 filesystem Adapter 使用 Ticket 117 的 exact request/package 形状完成原子 put/read/remove、enumerate/purge/absence 与重启读回；并发只观察完整旧/新值，遍历、symlink、hardlink、错 mode/installation 和内容冲突失败关闭 | 继续注入 Ticket 117 fake、自创 wire、部分写、路径遍历/链接删除或清理未读回就宣称完成 |
+| 123-V05 | 两个生产 filesystem Adapter 使用 Ticket 117 的 exact request/package 形状完成原子 put/read/remove、enumerate/purge/absence 与重启读回；首次 immutable put 的并发 reader 只观察 absence 或完整对象且异常必须传回，遍历、symlink、hardlink、错 mode/installation 和内容冲突失败关闭 | 继续注入 Ticket 117 fake、自创 wire、部分写、路径遍历/链接删除或清理未读回就宣称完成 |
 | 123-V06 | 内容寻址 Python 3.11 闭包内由 hardened systemd transient 实际启动同一 `ProductionCoreService`；正常 stop 清 socket/holder，SIGKILL 后旧 socket 不可连接且同一根可重启取得 holder；系统 Python/在线 pip/未声明包不可达 | 只在 systemd 中 import 包、依赖目标 Python 3.10/用户 site，或崩溃后服务不能恢复 |
 | 123-V07 | 用公开 `EncryptedStateStore.save_source_envelope` 写入可读回的合法 synthetic health body；SQLite 原始字节、release/runtime/socket/lifecycle/ordinary roots 无明文或密钥，关闭只移除本服务对象 | 先拒绝 marker 再宣称加密、明文副本、秘密日志或普通 Hermes 状态成为第二健康库 |
 

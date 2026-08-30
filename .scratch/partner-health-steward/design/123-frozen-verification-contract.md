@@ -28,7 +28,7 @@
 | 123-V02 | 真实 AF_UNIX + `SO_PEERCRED`；为错误 UID 只开放 pathname traverse/socket connect 后仍由 listener 拒绝，证明不是父目录 ACL 假绿；正确 UID 可取得 unavailable runtime projection，symlink／旧 socket 拒绝且无 TCP listener | 118 CorePort/host |
 | 123-V03 | 逐字兼容现有 Hermes `health-runtime-probe`、`health-runtime` read、effect claim/terminal wire；加密预置 Core receipt 经 typed CommandEnvelope 精确重放；重复 key、noncanonical、未知 field/kind、截断、尾随、空/超长 frame 无业务响应，caller intent/incomplete terminal 不成功 | 110、115、118 |
 | 123-V04 | 同一 DB/head 重启精确返回同一 receipt 且 Dynamo transaction 为零；head timeout/unknown、key loss、stale fence 沿用 typed fail-closed，观测期 external model/delivery 调用为零；进程 SIGKILL 证据由 V06 负责 | 110、115、117、122 |
-| 123-V05 | 使用 `lifecycle.py` 真实传入的 exact `operation_ref/authority_binding/transition_id` 和完整 opaque migration package；并发观察只见 absence 或完整对象，重启读回，遍历、symlink、hardlink、错 owner/mode/installation、内容冲突拒绝，purge/remove 后读回 absence | 117 |
+| 123-V05 | 使用 `lifecycle.py` 真实传入的 exact `operation_ref/authority_binding/transition_id` 和完整 opaque migration package；首次 immutable put 的并发 reader 必须实际观察 absence 与完整对象，线程异常回传；重启读回，遍历、symlink、hardlink、错 owner/mode/installation、内容冲突拒绝，purge/remove 后读回 absence | 117 |
 | 123-V06 | runtime manifest 逐项 hash 与实际 `sys.executable` 证明 3.11 closure；unit 的用户/组、UMask、NoNewPrivileges、PrivateTmp、读写路径与 ExecStart 精确；transient unit 实际运行同一生产服务，正常 stop 清理，SIGKILL 后 socket 不可连接且同根重启取得 holder并清旧 socket | 120 release、121 holder |
 | 123-V07 | 通过公开 store seam 持久化且读回合法 synthetic `SourceEnvelope.body`；数据库原始字节及 release/runtime/socket/lifecycle/ordinary roots 无 marker/key/credential，close 不改非目标 sentinel | 110 storage、117 lifecycle、120 secret scan |
 
