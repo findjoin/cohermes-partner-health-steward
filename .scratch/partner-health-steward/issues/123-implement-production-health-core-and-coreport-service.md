@@ -74,4 +74,10 @@ Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-
 - Linux 编码前形状为 V01–V05/V07 `6 PASS / 0 skip / 0 error`，V06 `1 expected FAIL / 0 error / 0 skip`；唯一红灯是 `HermesReleasePublisher.publish_current_successor` 尚未实现。
 - 实施只允许关闭上述 current-successor runtime-closure attestation 红门：在 Ticket 120 `HermesReleasePublisher` 增加该唯一窄公开入口，并使 Ticket 123 按冻结合同验证其 release-owned attestation；不得改写冻结设计、verifier、Gate 数量、Ticket 状态或其他业务范围。
 
+### Proposed mechanical refreeze candidate（非当前权威）
+
+- 当前唯一权威仍为上段的 authority handoff `aceb6fdee9116edb4cd38663ffdbfd7db06900ba` 与内容冻结 `9fe4bff88e07a47a9656b3b1bd556da6b103e452`；本候选不改变其状态、design blob 或实施范围。
+- 候选仅修正 V06 `--runtime-attestation-tamper` launcher 的第三个 argv 从 `str` 到 `Path` 的类型转换，使既有 `_run_runtime_attestation_tamper(..., Path)` 读取路径可执行；不改变 Gate、断言、fixture 或产品语义。
+- proposed contract blob：`0393b6cc21221cacf942a49b7a85fea92d81b573`；proposed verifier blob：`ccb534abe36d3b5eab11a585b753bb3cfacdf1b3`；冻结设计仍为 `f464be479f51a0d03d9cf33e964bcd2e7d190e03`。候选在独立双轴预审 PASS 前不得作为实施或验收 authority。
+
 实施停止规则：冻结测试若与冻结设计自相矛盾，或实现必须改写 Tickets 110—122 的业务状态机、三类 CorePort wire、引入第二 current-head/ledger/database、访问真实 AWS/Hermes/模型/微信或执行部署，立即停止并报告一个具体阻断。正常实施完成后运行七门及受影响回归，创建普通提交并普通推送，报告 commit/tree 与逐门证据；Ticket 保持 `claimed`，等待独立完成审查。

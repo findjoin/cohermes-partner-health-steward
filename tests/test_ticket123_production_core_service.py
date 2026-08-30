@@ -1738,7 +1738,7 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--runtime-tamper":
         _run_runtime_tamper(Path(sys.argv[2]))
     elif len(sys.argv) == 4 and sys.argv[1] == "--runtime-attestation-tamper":
-        _run_runtime_attestation_tamper(Path(sys.argv[2]), sys.argv[3])
+        _run_runtime_attestation_tamper(Path(sys.argv[2]), Path(sys.argv[3]))
     elif len(sys.argv) == 4 and sys.argv[1] == "--systemd-child":
         _run_systemd_child(Path(sys.argv[2]), sys.argv[3])
     else:
