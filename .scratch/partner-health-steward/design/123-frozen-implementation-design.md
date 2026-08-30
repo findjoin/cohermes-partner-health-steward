@@ -83,12 +83,12 @@ systemd / fixed Python closure
 
 | Gate | 现实结果 | 必须杀死的错误 |
 |---|---|---|
-| 123-V01 | 同一 release/runtime/binding 构造真实 121/122 + SQLite + HealthCore + 两个生产 lifecycle Adapter；投影观察 Dynamo 强读和 lifecycle ready，staged 资产只报告 unavailable；错 digest、installation/site、系统 Python、InMemory Provider、缺设施/根在监听前失败 | 用 staged server／内存 Adapter 冒充生产，忽略 121/122/lifecycle 注入，或先建 socket 后发现配置错误 |
-| 123-V02 | Linux AF_UNIX owner/group/0660 与 `SO_PEERCRED` 同时执行；错误 UID、宽权限、symlink、旧 socket 均不能到达 Core；无 TCP | 只靠文件权限、自报 peer 或 loopback TCP 冒充本机权限边界 |
+| 123-V01 | 同一 release/runtime/binding 构造真实 121/122 + SQLite + HealthCore + 两个生产 lifecycle Adapter；投影观察 Dynamo 强读/lifecycle ready，第二 writer holder 在服务期失败、close 后成功；预置 effect 只有执行密钥在位才取得 host grant；staged 资产只报告 unavailable；错 digest、installation/site、InMemory Provider、缺设施/根在监听前失败 | 用 staged server／内存 vault/Adapter 冒充生产，忽略 121/122/lifecycle 注入，或先建 socket 后发现配置错误 |
+| 123-V02 | Linux AF_UNIX owner/group/0660 与 `SO_PEERCRED` 同时执行；错误 UID 已有 pathname/connect 权限仍由 listener EOF/reset 拒绝且 timeout 算失败；symlink 与活动旧 listener 不被替换，进程 TCP listener 集合不增加 | 只靠父目录权限、自报 peer、悬挂连接或 loopback TCP 冒充本机权限边界 |
 | 123-V03 | 既有 Hermes 握手 wire 与三类 request 真实穿过 canonical byte stream；预置的加密 Core receipt 经 typed CommandEnvelope 精确重放；严格错误在分派前关闭，forged effect 无 grant，不完整 terminal 不成功 | 只做回显外壳、任意方法 RPC、宽松 JSON 或 socket 旁直调 Core |
-| 123-V04 | 同一 DB/head 重启精确重放同一 receipt 且无第二次 current-head transaction；head unknown、key loss、stale fence 失败关闭，模型/外发为零；进程 SIGKILL 由 V06 证明 holder/socket 恢复 | 重启生成第二结果、旧 fence 继续写、未知时盲目重做 |
+| 123-V04 | 同一 DB/head 重启精确重放同一 receipt；另以 prepared + remote-attempted journal + 已推进 current-head 构造重启恢复，只 finalize 既有决定且无第二次 transaction；head unknown、key loss、stale fence 失败关闭，模型/外发为零；进程 SIGKILL 由 V06 证明 holder/socket 恢复 | 重启生成第二结果、把已发生 CAS 重做、旧 fence 继续写或未知时盲目重做 |
 | 123-V05 | 两个生产 filesystem Adapter 使用 Ticket 117 的 exact request/package 形状完成原子 put/read/remove、enumerate/purge/absence 与重启读回；首次 immutable put 的并发 reader 只观察 absence 或完整对象且异常必须传回，遍历、symlink、hardlink、错 mode/installation 和内容冲突失败关闭 | 继续注入 Ticket 117 fake、自创 wire、部分写、路径遍历/链接删除或清理未读回就宣称完成 |
-| 123-V06 | 内容寻址 Python 3.11 闭包内由 hardened systemd transient 实际启动同一 `ProductionCoreService`；正常 stop 清 socket/holder，SIGKILL 后旧 socket 不可连接且同一根可重启取得 holder；系统 Python/在线 pip/未声明包不可达 | 只在 systemd 中 import 包、依赖目标 Python 3.10/用户 site，或崩溃后服务不能恢复 |
+| 123-V06 | 内容寻址 Python 3.11 闭包逐项 hash 且拒绝未声明文件；正式 renderer 精确固定 closure Python + `-I -m partner_health_steward.production_core_service --binding ...`，同一解释器验证 CLI 参数；hardened systemd transient 通过 verifier-owned 已绑定 122 Adapter 实际启动同一 `ProductionCoreService`，正常 stop 清 socket/holder，SIGKILL 后旧 socket 不可连接且同一根可重启取得 holder | 只在 systemd 中 import 包、renderer 不可执行、依赖目标 Python 3.10/用户 site/额外包，或崩溃后服务不能恢复 |
 | 123-V07 | 用公开 `EncryptedStateStore.save_source_envelope` 写入可读回的合法 synthetic health body；SQLite 原始字节、release/runtime/socket/lifecycle/ordinary roots 无明文或密钥，关闭只移除本服务对象 | 先拒绝 marker 再宣称加密、明文副本、秘密日志或普通 Hermes 状态成为第二健康库 |
 
 每门只使用一个正向 tracer 和能杀死该现实错误的等价类，不按字段、崩溃点或请求种类做笛卡尔积。实现 Agent 按 V01→V07 纵向 red→green；每个 checkpoint 只重跑当前门及已绿门。
@@ -98,5 +98,7 @@ systemd / fixed Python closure
 允许：一个深 `ProductionCoreService`、两个既有 lifecycle Seam 的本机 Adapter、一个严格 CorePort server、一个固定 launcher/unit、一个 runtime-closure builder/validator。内部可按 locality 分文件，但不增加新的业务 Interface。
 
 禁止：第二 current-head、第二数据库或 activation ledger、Provider framework、通用 RPC、TCP、后台自动 retry、在线依赖安装、自动 AWS 建表、真实部署、Hermes 消息、模型、微信、医学激活、读取真实健康资料或 partner profile。
+
+V06 只证明正式 launcher 形状/参数解析和由同一 `ProductionCoreService` 承担的真实 systemd 生命周期；隔离门中的 current-head 仍由 verifier 注入已绑定的 product `DynamoDBCurrentHead`。真实 launcher + AWS 身份/资源接线属于获准部署票，不得由本票报告为已通过。
 
 冻结后 finding 只按 `architecture-governance.md` 处置。若 121/122 或现有 CorePort Interface 无法承载本设计，以可复现证据停止；不得在 123 更换 ADR 0022。七门、受影响回归、全量测试与双轴实施审查通过后立即停止，不因另一种实现偏好扩大本票。

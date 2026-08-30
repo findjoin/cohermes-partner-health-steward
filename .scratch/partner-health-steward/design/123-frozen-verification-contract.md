@@ -24,12 +24,12 @@
 
 | ID | 可观察断言 | 受影响回归 |
 |---|---|---|
-| 123-V01 | 构造使用 product `DynamoDBCurrentHead`、Ticket 121 host-private paths 与两个生产 lifecycle Adapter；投影观察 Dynamo 强读/lifecycle ready，当前 staged release 只给无正文 unavailable；digest、closure、path、provider、设施、lifecycle root 或 installation/site 错误时 socket/DB 零创建 | 121、122、120 release |
-| 123-V02 | 真实 AF_UNIX + `SO_PEERCRED`；为错误 UID 只开放 pathname traverse/socket connect 后仍由 listener 拒绝，证明不是父目录 ACL 假绿；正确 UID 可取得 unavailable runtime projection，symlink／旧 socket 拒绝且无 TCP listener | 118 CorePort/host |
+| 123-V01 | 构造使用 product `DynamoDBCurrentHead`、Ticket 121 host-private paths 与两个生产 lifecycle Adapter；投影观察 Dynamo 强读/lifecycle ready，服务期第二 writer holder 失败而 close 后成功，预置 effect 的正向 grant 与 execution-master 删除后的拒绝证明 execution vault；当前 staged release 只给无正文 unavailable；digest、closure、path、provider、设施、lifecycle root 或 installation/site 错误时 socket/DB 零创建 | 121、122、120 release |
+| 123-V02 | 真实 AF_UNIX + `SO_PEERCRED`；为错误 UID 开放 pathname traverse/socket connect 后只接受 listener EOF/reset，timeout 明确失败；正确 UID可读，symlink 与活动旧 listener 不被替换，当前进程 TCP listener inode 集合不增加 | 118 CorePort/host |
 | 123-V03 | 逐字兼容现有 Hermes `health-runtime-probe`、`health-runtime` read、effect claim/terminal wire；加密预置 Core receipt 经 typed CommandEnvelope 精确重放；重复 key、noncanonical、未知 field/kind、截断、尾随、空/超长 frame 无业务响应，caller intent/incomplete terminal 不成功 | 110、115、118 |
-| 123-V04 | 同一 DB/head 重启精确返回同一 receipt 且 Dynamo transaction 为零；head timeout/unknown、key loss、stale fence 沿用 typed fail-closed，观测期 external model/delivery 调用为零；进程 SIGKILL 证据由 V06 负责 | 110、115、117、122 |
+| 123-V04 | 同一 DB/head 重启精确返回同一 receipt；prepared record + remote-attempted journal + 已推进 product current-head 的重启 tracer 只 finalize 并精确 replay，恢复期间 Dynamo transaction 为零；head timeout/unknown、key loss、stale fence typed fail-closed，external model/delivery 为零；进程 SIGKILL 由 V06 负责 | 110、115、117、122 |
 | 123-V05 | 使用 `lifecycle.py` 真实传入的 exact `operation_ref/authority_binding/transition_id` 和完整 opaque migration package；首次 immutable put 的并发 reader 必须实际观察 absence 与完整对象，线程异常回传；重启读回，遍历、symlink、hardlink、错 owner/mode/installation、内容冲突拒绝，purge/remove 后读回 absence | 117 |
-| 123-V06 | runtime manifest 逐项 hash 与实际 `sys.executable` 证明 3.11 closure；unit 的用户/组、UMask、NoNewPrivileges、PrivateTmp、读写路径与 ExecStart 精确；transient unit 实际运行同一生产服务，正常 stop 清理，SIGKILL 后 socket 不可连接且同根重启取得 holder并清旧 socket | 120 release、121 holder |
+| 123-V06 | runtime manifest 逐项 hash、实际 `sys.executable` 和未声明文件负测证明封闭 3.11 closure；renderer 精确输出 closure Python、`-I -m`、生产 module、binding path，CLI 在同一解释器只解析参数；transient unit 以 verifier-owned product `DynamoDBCurrentHead` 注入实际运行同一服务，正常 stop 清理，SIGKILL 后 socket 不可连接且同根重启取得 holder并清旧 socket | 120 release、121 holder |
 | 123-V07 | 通过公开 store seam 持久化且读回合法 synthetic `SourceEnvelope.body`；数据库原始字节及 release/runtime/socket/lifecycle/ordinary roots 无 marker/key/credential，close 不改非目标 sentinel | 110 storage、117 lifecycle、120 secret scan |
 
 ## 防假绿
@@ -38,6 +38,7 @@
 - 正向 current-head 对象必须是 `DynamoDBCurrentHead`；其 SDK 边界可使用 verifier-owned deny-network Dynamo client，但不得改用 `InMemoryCurrentHead`。真实 AWS G08 保持 `not-authorized/cannot-confirm`。
 - V02/V06 的正式 PASS 只能来自 Linux 内核与 systemd；Windows skip 不能用于闭票。
 - staged release 的 truthful unavailable 是正向结果之一，但不能代替 V03 的 typed Core receipt 重放、V04 的实际重启/authority 故障或 V06 的真实进程崩溃恢复。
+- V06 不接触真实 AWS：正式 launcher 的 exact `ExecStart` 与 CLI parser、以及同一 `ProductionCoreService` 的 systemd 生命周期分别验证。真实 launcher + AWS binding 只在后继获准部署票验收。
 - 测试不得 monkeypatch产品私有 helper、读取 SQLite 表断言业务成功、从 source 文本寻找关键词，或建立 test-only bypass。
 
 ## 验证命令

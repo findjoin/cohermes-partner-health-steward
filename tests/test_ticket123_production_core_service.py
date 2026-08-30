@@ -25,11 +25,18 @@ import uuid
 from pathlib import Path
 
 from partner_health_steward.admission import SourceEnvelope
-from partner_health_steward.authority import AuthoritySnapshot
+from partner_health_steward.authority import (
+    AuthoritySnapshot,
+    EffectIntent,
+    PreparedTransition,
+    RevisionTarget,
+    WriterHolderClaim,
+)
 from partner_health_steward.contract import CommandEnvelope, Response
+from partner_health_steward.current_head import AdvanceRequest
 from partner_health_steward.lifecycle import LIFECYCLE_PURGE_BINDINGS
 from partner_health_steward.release_deployment import HermesReleasePublisher
-from partner_health_steward.storage import EncryptedStateStore
+from partner_health_steward.storage import CurrentHeadRecoveryBinding, EncryptedStateStore
 
 
 _INSTALLATION = "installation:t123-fixture"
@@ -75,6 +82,28 @@ def _decode_outer(frame: bytes) -> dict[str, object]:
     if type(value) is not dict:
         raise AssertionError("response is not a mapping")
     return value
+
+
+def _process_tcp_listener_inodes() -> set[str]:
+    listening: set[str] = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        if not table.is_file():
+            continue
+        for line in table.read_text(encoding="ascii").splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 9 and fields[3] == "0A":
+                listening.add(fields[9])
+    owned: set[str] = set()
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            inode = target[8:-1]
+            if inode in listening:
+                owned.add(inode)
+    return owned
 
 
 class Ticket123ProductionCoreServiceTests(unittest.TestCase):
@@ -151,7 +180,30 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         assert type(digest) is str
         return root / "releases" / digest.removeprefix("sha256:"), wire
 
-    def _fixture(self, root: Path):
+    @staticmethod
+    def _recovery_command() -> CommandEnvelope:
+        return CommandEnvelope(
+            peer="plugin",
+            action="state.commit",
+            source="health_weixin",
+            causal_id="ticket123-recover-commit",
+            generation=1,
+            scope=("state:commit",),
+            payload={
+                "record_id": "record:t123-recovery",
+                "revision_digest": "sha256:t123-recovered",
+                "transition_id": "transition:t123-recovered",
+                "writer_fence": "placeholder-replaced-by-fixture",
+            },
+        )
+
+    def _fixture(
+        self,
+        root: Path,
+        *,
+        seed_effect: bool = False,
+        seed_recovery: bool = False,
+    ):
         module = self._require()
         host = importlib.import_module("partner_health_steward.host_authority")
         ddb = importlib.import_module("partner_health_steward.dynamodb_current_head")
@@ -208,6 +260,65 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             replay_command,
             Response("replayed", _REPLAY_CAUSAL_ID, _REPLAY_REASON),
         )
+        if seed_effect:
+            store.write_effect(
+                "effect:t123-host-vault",
+                "intent",
+                EffectIntent(
+                    effect_id="effect:t123-host-vault",
+                    effect_kind="model-work",
+                    intent_digest="sha256:t123-host-vault-intent",
+                    authority=authority,
+                ),
+            )
+        if seed_recovery:
+            target = RevisionTarget(
+                "record:t123-recovery",
+                "sha256:t123-recovered",
+                "transition:t123-recovered",
+                "sha256:t123-recovery-payload",
+            )
+            prepared = PreparedTransition(target, authority)
+            recovery = self._recovery_command().to_wire()
+            recovery["payload"]["writer_fence"] = authority.writer_fence
+            recovery_command = CommandEnvelope.from_wire(recovery)
+            store.write_record(
+                target.record_id,
+                "prepared",
+                target.revision_digest,
+                target.transition_id,
+                prepared,
+            )
+            store.write_pending_command(
+                recovery_command,
+                target.record_id,
+                remote_attempted=True,
+            )
+            holder = writer.acquire_or_resume(
+                _INSTALLATION,
+                _SITE,
+                WriterHolderClaim("holder:t123-recovery-setup"),
+            )
+            if holder is None:
+                raise AssertionError("cannot create Ticket 123 recovery fixture")
+            try:
+                proof = holder.proof_for(authority)
+                if proof is None:
+                    raise AssertionError("cannot prove Ticket 123 recovery fixture")
+                current_head.conditional_advance(
+                    AdvanceRequest(
+                        expected=authority,
+                        transition_id=target.transition_id,
+                        revision_digest=target.revision_digest,
+                        writer_fence=authority.writer_fence,
+                        operation_digest=CurrentHeadRecoveryBinding.from_command(
+                            recovery_command
+                        ).command_digest,
+                        writer_proof=proof,
+                    )
+                )
+            finally:
+                holder.release()
         store.close()
         replica_root = root / "managed"
         replica_root.mkdir(mode=0o700, exist_ok=True)
@@ -335,6 +446,10 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
             root = Path(raw)
             module, binding, current_head, client = self._fixture(root)
             service, endpoint = self._start(module, binding, current_head)
+            host = importlib.import_module("partner_health_steward.host_authority")
+            competing_writer = host.HostPrivateWriterFenceVault(
+                binding["host_private_paths"]
+            )
             try:
                 response = self._request(endpoint, self._runtime_read())
                 self.assertIsNotNone(response)
@@ -350,8 +465,22 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                 self.assertTrue(projection.get("managed_lifecycle_ready"))
                 self.assertEqual(projection.get("current_head_provider"), "dynamodb")
                 self.assertTrue(any(name == "GetItem" for name, _ in client.calls))
+                self.assertIsNone(
+                    competing_writer.acquire_or_resume(
+                        _INSTALLATION,
+                        _SITE,
+                        WriterHolderClaim("holder:t123-competing-service"),
+                    )
+                )
             finally:
                 service.close()
+            released_holder = competing_writer.acquire_or_resume(
+                _INSTALLATION,
+                _SITE,
+                WriterHolderClaim("holder:t123-after-close"),
+            )
+            self.assertIsNotNone(released_holder)
+            released_holder.release()
 
             for name, mutate, provider in (
                 ("release-digest", lambda value: value.__setitem__("release_digest", "sha256:" + "0" * 64), current_head),
@@ -371,6 +500,51 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                         self._start(module, candidate, provider)
                     self.assertFalse(Path(candidate["socket_path"]).exists())
 
+            effect_root = root / "execution-vault"
+            _module, effect_binding, effect_head, _effect_client = self._fixture(
+                effect_root, seed_effect=True
+            )
+            effect_service, effect_endpoint = self._start(
+                module, effect_binding, effect_head
+            )
+            try:
+                claim = self._request(
+                    effect_endpoint,
+                    {
+                        "protocol_version": 1,
+                        "kind": "controlled-effect",
+                        "request_id": "ticket123-host-execution-claim",
+                        "payload": {"phase": "claim"},
+                    },
+                )
+                self.assertEqual(
+                    claim["payload"].get("intent", {}).get("effect_id"),
+                    "effect:t123-host-vault",
+                )
+                self.assertIsInstance(claim["payload"].get("grant"), dict)
+            finally:
+                effect_service.close()
+
+            lost_root = root / "execution-key-loss"
+            _module, lost_binding, lost_head, _lost_client = self._fixture(
+                lost_root, seed_effect=True
+            )
+            lost_service, lost_endpoint = self._start(module, lost_binding, lost_head)
+            try:
+                Path(lost_binding["host_private_paths"].execution_master).unlink()
+                denied = self._request(
+                    lost_endpoint,
+                    {
+                        "protocol_version": 1,
+                        "kind": "controlled-effect",
+                        "request_id": "ticket123-lost-execution-key",
+                        "payload": {"phase": "claim"},
+                    },
+                )
+                self.assertIsNone(denied["payload"].get("grant"))
+            finally:
+                lost_service.close()
+
     def test_v123_02_af_unix_acl_and_peer_credentials_are_both_enforced(self) -> None:
         module = self._require()
         if os.geteuid() != 0:
@@ -379,6 +553,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="ticket123-") as raw:
             root = Path(raw)
+            tcp_before = _process_tcp_listener_inodes()
             module, binding, current_head, _client = self._fixture(root)
             service, endpoint = self._start(module, binding, current_head)
             socket_path = Path(endpoint["path"])
@@ -389,6 +564,7 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
                 self.assertEqual(details.st_uid, binding["socket_owner_uid"])
                 self.assertEqual(details.st_gid, binding["socket_group_gid"])
                 self.assertIsNotNone(self._request(endpoint, self._runtime_read()))
+                self.assertEqual(_process_tcp_listener_inodes(), tcp_before)
 
                 nobody = pwd.getpwnam("nobody")
                 wrong_uid = nobody.pw_uid
@@ -425,6 +601,20 @@ raise SystemExit(0 if data==b'' else 9)
             Path(symlink_binding["socket_path"]).symlink_to(root / "target.sock")
             with self.assertRaises(Exception):
                 self._start(module, symlink_binding, current_head)
+
+            active_path = root / "active-old.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as old_listener:
+                old_listener.bind(str(active_path))
+                old_listener.listen()
+                old_inode = active_path.lstat().st_ino
+                active_binding = copy.deepcopy(binding)
+                active_binding["socket_path"] = str(active_path)
+                with self.assertRaises(Exception):
+                    self._start(module, active_binding, current_head)
+                self.assertEqual(active_path.lstat().st_ino, old_inode)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(active_path))
+            active_path.unlink()
 
     def test_v123_03_all_three_coreport_kinds_use_one_strict_byte_stream(self) -> None:
         module = self._require()
@@ -589,6 +779,60 @@ raise SystemExit(0 if data==b'' else 9)
                         )
                     finally:
                         candidate_service.close()
+
+            recovery_root = root / "prepared-finalize-recovery"
+            _module, recovery_binding, recovery_head, recovery_client = self._fixture(
+                recovery_root, seed_recovery=True
+            )
+            recovery_wire = self._recovery_command().to_wire()
+            recovery_wire["payload"]["writer_fence"] = recovery_head.read().head.writer_fence
+            core_request = {
+                "protocol_version": 1,
+                "kind": "command",
+                "request_id": "ticket123-prepared-finalize",
+                "payload": {"interface": "command-v1", "command": recovery_wire},
+            }
+            recovery_service, recovery_endpoint = self._start(
+                module, recovery_binding, recovery_head
+            )
+            recovery_client.calls.clear()
+            try:
+                finalized = self._request(recovery_endpoint, core_request)
+                self.assertIn(
+                    finalized["payload"].get("response", {}).get("status"),
+                    {"accepted", "replayed"},
+                )
+                self.assertFalse(
+                    any(name == "TransactWriteItems" for name, _ in recovery_client.calls)
+                )
+            finally:
+                recovery_service.close()
+            recovery_service, recovery_endpoint = self._start(
+                module, recovery_binding, recovery_head
+            )
+            try:
+                exact_replay = self._request(recovery_endpoint, core_request)
+                self.assertEqual(exact_replay, finalized)
+            finally:
+                recovery_service.close()
+            recovery_store = EncryptedStateStore(
+                recovery_binding["database_path"],
+                importlib.import_module(
+                    "partner_health_steward.host_authority"
+                ).HostPrivateKeyProvider(
+                    recovery_binding["host_private_paths"],
+                    recovery_binding["installation_id"],
+                ),
+            )
+            try:
+                self.assertEqual(
+                    recovery_store.record_state("record:t123-recovery"), "final"
+                )
+                self.assertIsNotNone(
+                    recovery_store.receipt(CommandEnvelope.from_wire(recovery_wire))
+                )
+            finally:
+                recovery_store.close()
 
     def test_v123_05_filesystem_lifecycle_adapters_are_atomic_and_restartable(self) -> None:
         module = self._require()
@@ -772,8 +1016,41 @@ raise SystemExit(0 if data==b'' else 9)
             str(runtime_root / "bin" / "python3"),
         ):
             self.assertIn(required, unit)
+        expected_exec = (
+            "ExecStart="
+            + str(runtime_root / "bin" / "python3")
+            + " -I -m partner_health_steward.production_core_service"
+            + " --binding /etc/partner-health-steward/health-core.json"
+        )
+        self.assertIn(expected_exec, unit)
         self.assertNotIn("pip install", unit)
         self.assertNotIn("Environment=PYTHONPATH", unit)
+
+        cli = subprocess.run(
+            [
+                str(runtime_root / "bin" / "python3"),
+                "-I",
+                "-m",
+                "partner_health_steward.production_core_service",
+                "--help",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        self.assertIn("--binding", cli.stdout)
+
+        undeclared = runtime_root / ("ticket123-undeclared-" + uuid.uuid4().hex)
+        undeclared.write_text("must invalidate the closure", encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory(prefix="ticket123-extra-file-") as raw:
+                module, binding, current_head, _client = self._fixture(Path(raw))
+                with self.assertRaises(Exception):
+                    self._start(module, binding, current_head)
+                self.assertFalse(Path(binding["socket_path"]).exists())
+        finally:
+            undeclared.unlink()
 
         if subprocess.run(["systemctl", "is-system-running"], capture_output=True).returncode not in {0, 1}:
             self.fail("V123-06 requires a systemd transient-unit environment")
