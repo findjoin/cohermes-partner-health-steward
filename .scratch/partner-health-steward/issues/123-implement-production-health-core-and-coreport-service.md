@@ -49,12 +49,20 @@ Unblocks: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-
 - 受影响既有回归：Ticket 122 与 Ticket 120 共 `14/14 OK`（另有一个按既有环境条件跳过）；`compileall` 与 `git diff --check` 通过。
 - 新鲜 Spec 预审：PASS；新鲜 Standards 预审：PASS。两轴审查均针对上述同一 commit/tree，且未修改文件。
 
-### 当前 verification-authority refreeze（唯一当前验收权威）
+### 历史 verification-authority refreeze（`b41b678`，不是当前验收权威）
 
 - 普通 refreeze 提交：本段与其 verifier/合同一并提交的 `fix(ticket-123-verifier): refreeze review findings`；提交 SHA 以该提交本身为准。
 - 冻结实施设计 blob 保持：`f464be479f51a0d03d9cf33e964bcd2e7d190e03`（零修改）。
-- 当前冻结验证合同：`../design/123-frozen-verification-contract.md`；blob `5dfa7c8fa32d81c79507a85433c98dd7d25cc01f`。
+- 冻结验证合同 blob：`5dfa7c8fa32d81c79507a85433c98dd7d25cc01f`。
 - 当前 verifier-owned 测试：`../../../tests/test_ticket123_production_core_service.py`；blob `7aec1af838e0cf67e23dda79bbf78da9af149214`。
 - 只补入独立双轴审查原始 finding 的 V01 current release、V03 request-side EOF/延迟 tail、V06 canonical closure/release binding 与 V06 close drain 等价类；仍为七门，不增加产品目标、架构、CorePort wire 或 Tickets 110—122 状态机。
+
+### 当前 verification-authority refreeze（唯一当前验收权威）
+
+- 普通 refreeze 提交：本段与其 verifier/合同一并提交的 `fix(ticket-123-verifier): extend V06 drain observation`；提交 SHA 以该提交本身为准。
+- 冻结实施设计 blob 保持：`f464be479f51a0d03d9cf33e964bcd2e7d190e03`（零修改）。
+- 当前冻结验证合同：`../design/123-frozen-verification-contract.md`；blob `49b8fba41b5a7331dcfa49b4c2aa6f364fa14a42`。
+- 当前 verifier-owned 测试：`../../../tests/test_ticket123_production_core_service.py`；blob `b31ffd31c56e9bc4e29e13f35e806d113f105304`。
+- 唯一增量是 V06 blocked-exchange observer 的 5 秒读取窗口，明确大于产品既有 2 秒 drain timeout；不改产品 drain timeout、断言、Gate 数量或其他测试。
 
 实施停止规则：冻结测试若与冻结设计自相矛盾，或实现必须改写 Tickets 110—122 的业务状态机、三类 CorePort wire、引入第二 current-head/ledger/database、访问真实 AWS/Hermes/模型/微信或执行部署，立即停止并报告一个具体阻断。正常实施完成后运行七门及受影响回归，创建普通提交并普通推送，报告 commit/tree 与逐门证据；Ticket 保持 `claimed`，等待独立完成审查。

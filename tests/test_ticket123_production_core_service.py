@@ -432,11 +432,13 @@ class Ticket123ProductionCoreServiceTests(unittest.TestCase):
         return service, endpoint
 
     @staticmethod
-    def _request(endpoint: dict[str, object], value: dict[str, object]) -> dict[str, object] | None:
+    def _request(
+        endpoint: dict[str, object], value: dict[str, object], *, timeout: float = 2
+    ) -> dict[str, object] | None:
         if endpoint.get("transport") != "af-unix" or type(endpoint.get("path")) is not str:
             raise AssertionError("production endpoint is not AF_UNIX")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(2)
+            connection.settimeout(timeout)
             connection.connect(endpoint["path"])
             connection.sendall(_outer_frame(value))
             connection.shutdown(socket.SHUT_WR)
@@ -1179,7 +1181,7 @@ raise SystemExit(0 if data==b'' else 9)
 
             def exchange() -> None:
                 try:
-                    self._request(endpoint, self._runtime_read())
+                    self._request(endpoint, self._runtime_read(), timeout=5)
                 except BaseException as exc:
                     exchange_errors.append(exc)
 
