@@ -31,9 +31,10 @@ Unblocks: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-pro
 
 - 冻结 checkpoint：commit `8de120d447c53848af2afbc9fce71a2afa71a642`、tree `0007c31f95a6712e2fefca1ff16790b53bee2da8`。
 - 双轴共同审查内容点：commit `60121ea635b8cedc09556163bc9a6a6cb7294078`、tree `bcc4566d517155b720b28b5a8eb929bd8b6ddb3b`；Spec reviewer `PASS`，Standards reviewer `PASS`。
+- Linux 首跑发现 verifier 外层字符串提前生成 NUL；verification authority 只修复源字符转义，未改变 Gate、产品输入或断言。修订内容点：commit `cfe3a58a1fadb9c1a9dd0639c15d1d7c0d9369fa`、tree `919e47a19f3ebda4caf8d3aab3737070ad3721df`；修订记录 checkpoint：commit `2878406f8f1e5178e10dbaf529c12870347d3f84`、tree `53d804735caa05e8369b38f951539970b0d93c76`。
 - 实施设计：`../design/121-frozen-implementation-design.md`
 - 独立验证合同：`../design/121-frozen-verification-contract.md`
 - verifier-owned 门：`../../../tests/test_ticket121_host_authority.py`
-- 冻结 blob：design `e6b1a132d99c38748cd91b897e75286f5fe951f1`；contract `5e535a35a8e867f8056a469a7f94ae79f77b2f8e`；verifier `cb8e383577b4ad62a35c05edc11e1bfd2a9faf22`。
+- 当前冻结 blob：design `e6b1a132d99c38748cd91b897e75286f5fe951f1`；contract `1f969ce5fca374a0e9c3eceacb1f9c6ccb696ddf`；verifier `8760ee9dcd04a85fdf9cfe3a6db4e4195db32347`。原 verifier blob `cb8e383577b4ad62a35c05edc11e1bfd2a9faf22` 已被机械修订取代。
 - 编码前机械结果：`1 failure / 5 skips / 0 errors`；唯一红灯为 `partner_health_steward.host_authority` 尚不存在。
 - 实现 Agent 不得修改上述三件套；若需改变既有 Interface、共享 fence 合同或增加 capability ledger，按停止规则返回，不自行扩票。
