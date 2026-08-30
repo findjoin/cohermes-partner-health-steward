@@ -591,7 +591,7 @@ except socket.timeout: raise SystemExit(8)
 raise SystemExit(0 if data==b'' else 9)
 """
                 wrong = subprocess.run(
-                    [sys.executable, "-I", "-c", script, str(wrong_uid), str(wrong_gid), str(socket_path)],
+                    [sys.executable, "-I", "-B", "-c", script, str(wrong_uid), str(wrong_gid), str(socket_path)],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -1036,6 +1036,7 @@ raise SystemExit(0 if data==b'' else 9)
             [
                 str(runtime_root / "bin" / "python3"),
                 "-I",
+                "-B",
                 "-m",
                 "partner_health_steward.production_core_service",
                 "--help",
@@ -1073,8 +1074,10 @@ raise SystemExit(0 if data==b'' else 9)
                     "--property=NoNewPrivileges=yes",
                     "--property=PrivateTmp=yes",
                     "--property=UMask=0077",
+                    f"--setenv=TICKET123_RUNTIME_ROOT={runtime_root}",
                     str(runtime_root / "bin" / "python3"),
                     "-I",
+                    "-B",
                     str(Path(__file__).resolve()),
                     "--systemd-child",
                     str(root),
@@ -1085,25 +1088,31 @@ raise SystemExit(0 if data==b'' else 9)
                 text=True,
             )
 
-        with tempfile.TemporaryDirectory(prefix="ticket123-systemd-", dir="/tmp") as raw:
-            process_root = Path(raw)
-            normal = run_unit(process_root / "normal", "normal")
-            self.assertEqual(normal.returncode, 0, normal.stderr)
-            self.assertIn("TICKET123-SERVICE-OK", normal.stdout)
-            self.assertFalse((process_root / "normal" / "run" / "health-core.sock").exists())
+        process_parent = Path(__file__).resolve().parents[1] / "process-root"
+        process_parent.mkdir(mode=0o700)
+        process_parent.chmod(0o700)
+        try:
+            with tempfile.TemporaryDirectory(prefix="ticket123-systemd-", dir=process_parent) as raw:
+                process_root = Path(raw)
+                normal = run_unit(process_root / "normal", "normal")
+                self.assertEqual(normal.returncode, 0, normal.stderr)
+                self.assertIn("TICKET123-SERVICE-OK", normal.stdout)
+                self.assertFalse((process_root / "normal" / "run" / "health-core.sock").exists())
 
-            crash_root = process_root / "crash"
-            crashed = run_unit(crash_root, "crash")
-            self.assertNotEqual(crashed.returncode, 0)
-            stale_socket = crash_root / "run" / "health-core.sock"
-            self.assertTrue(stale_socket.exists())
-            with self.assertRaises(OSError):
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                    connection.connect(str(stale_socket))
-            recovered = run_unit(crash_root, "normal")
-            self.assertEqual(recovered.returncode, 0, recovered.stderr)
-            self.assertIn("TICKET123-SERVICE-OK", recovered.stdout)
-            self.assertFalse(stale_socket.exists())
+                crash_root = process_root / "crash"
+                crashed = run_unit(crash_root, "crash")
+                self.assertNotEqual(crashed.returncode, 0)
+                stale_socket = crash_root / "run" / "health-core.sock"
+                self.assertTrue(stale_socket.exists())
+                with self.assertRaises(OSError):
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                        connection.connect(str(stale_socket))
+                recovered = run_unit(crash_root, "normal")
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertIn("TICKET123-SERVICE-OK", recovered.stdout)
+                self.assertFalse(stale_socket.exists())
+        finally:
+            process_parent.rmdir()
 
     def test_v123_07_no_plaintext_or_ordinary_state_copy_is_created(self) -> None:
         module = self._require()

@@ -2,14 +2,14 @@
 
 > 状态：verification-authority refreeze checkpoint（2026-08-30）。产品基线为 `d29041bc5b52db2228acc6c08ac2e1aaaf2fd3e5`；测试接缝已经由 Ticket 123 与 ADR 0022 约定：`ProductionCoreService` 的 start/endpoint/close、三类 AF_UNIX CorePort、以及 Ticket 117 的两个 lifecycle Adapter Interface。测试不读取私有 helper、表结构、线程布局或摘要实现。
 >
-> 本次重冻权威：仅按已复现的 Linux 机械缺陷修复 V02 的错误 peer 拒绝生命周期、V04 的 temporary-directory 变量绑定、V05 的 fixture authority transition 接线，以及 V07 三个 fixture key 的 runtime collision；不改变产品目标、架构、门数量或断言语义。冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob `17d1d4d9caf08f2c49e549792ae25ab3f376bee0`。
+> 本次重冻权威：仅按已复现的 Linux 机械缺陷修复 V02 的错误 peer 拒绝生命周期、V04 的 temporary-directory 变量绑定、V05 的 fixture authority transition 接线、V06 的 transient child runtime/process-root 接线，以及 V07 fixture/runtime 的 bytecode 漂移；不改变产品目标、架构、门数量或断言语义。冻结 verifier：`tests/test_ticket123_production_core_service.py`，blob `e677632ee73aeb09c41299d030987de7611e0c31`。
 
 ## Verifier ownership
 
 - verifier-owned 文件：`tests/test_ticket123_production_core_service.py`。
 - 实现 Agent 不得修改本合同、冻结设计或 verifier-owned test；若门错误，停止并交回 verification authority。
 - Windows 编码前唯一接受形状：`1 failure / 6 skips / 0 errors`，唯一根失败为 `partner_health_steward.production_core_service` 尚不存在。
-- Linux 完成形状：`7/7 PASS / 0 skip / 0 error`。正式环境必须显式提供 `TICKET123_RUNTIME_ROOT`，测试进程本身由该闭包内 Python 3.11 启动；V06 还要求可用的 systemd transient-unit 环境。缺失不得写成 PASS。
+- Linux 完成形状：`7/7 PASS / 0 skip / 0 error`。正式环境必须显式提供 `TICKET123_RUNTIME_ROOT`，测试进程本身由该闭包内 Python 3.11 启动；所有 verifier 及其 child Python 调用必须禁用 bytecode 写入；V06 还要求可用的 systemd transient-unit 环境。缺失不得写成 PASS。
 
 ## 公开 Interface
 
@@ -62,7 +62,7 @@ python -m compileall -q partner_health_steward tests
 git diff --check
 ```
 
-正式 Linux V06 的合成 fixture/process root 只可使用随机 `/tmp/ticket123-*`，并使用随机 transient unit 名和合成无正文 fixture；为使 verifier 的 `PrivateTmp=yes` child 可见，verifier 与最小测试闭包必须临时置于唯一 `/opt/cohermes/ticket123-verify-<verifier-blob>`。开始/结束记录 default/partner service 状态但不重启、不配置、不写入它们。测试完成必须精确清理临时 unit、`/tmp` 目录、`/opt` verifier 闭包和进程。
+正式 Linux V06 的一般合成 fixture 只可使用随机 `/tmp/ticket123-*`，并使用随机 transient unit 名和合成无正文 fixture；为使 `PrivateTmp=yes` child 可见，verifier 与最小测试闭包必须临时置于唯一 `/opt/cohermes/ticket123-verify-<verifier-blob>`，其 process root/socket 只可在该目录下新建的唯一 `0700` `process-root` 中。V06 child 必须显式继承当前 `TICKET123_RUNTIME_ROOT`；所有 verifier/child Python 调用必须禁止 bytecode 写入，V07 不得通过重生成 manifest 或缩小扫描范围掩盖漂移。开始/结束记录 default/partner service 状态但不重启、不配置、不写入它们。测试完成必须精确清理临时 unit、`/tmp` 目录、`/opt` verifier 闭包和进程。
 
 ## 审查与停止
 
