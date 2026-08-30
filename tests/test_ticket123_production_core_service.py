@@ -41,9 +41,11 @@ from partner_health_steward.storage import CurrentHeadRecoveryBinding, Encrypted
 
 _INSTALLATION = "installation:t123-fixture"
 _SITE = "site:t123-fixture"
-_DATA_KEY = bytes(range(32))
-_WRITER_MASTER = bytes(range(32, 64))
-_EXECUTION_MASTER = bytes(range(64, 96))
+_DATA_KEY = hashlib.sha256(b"ticket123-verifier-data-key-v1").digest()
+_WRITER_MASTER = hashlib.sha256(b"ticket123-verifier-writer-master-v1").digest()
+_EXECUTION_MASTER = hashlib.sha256(
+    b"ticket123-verifier-execution-master-v1"
+).digest()
 _REPLAY_CAUSAL_ID = "ticket123-managed-replay"
 _REPLAY_REASON = "ticket123-encrypted-receipt"
 
@@ -579,9 +581,12 @@ import json, os, socket, struct, sys
 os.setgid(int(sys.argv[2])); os.setuid(int(sys.argv[1]))
 request={'protocol_version':1,'kind':'managed-read','request_id':'wrong-peer','payload':{'projection':'health-runtime'}}
 body=json.dumps(request,separators=(',',':'),sort_keys=True).encode()
-s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(1); s.connect(sys.argv[3]); s.sendall(struct.pack('>I',len(body))+body)
-try: data=s.recv(1)
-except ConnectionResetError: data=b''
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(1); s.connect(sys.argv[3])
+try:
+    s.sendall(struct.pack('>I',len(body))+body)
+    try: data=s.recv(1)
+    except ConnectionResetError: data=b''
+except (BrokenPipeError, ConnectionResetError): data=b''
 except socket.timeout: raise SystemExit(8)
 raise SystemExit(0 if data==b'' else 9)
 """
@@ -720,7 +725,8 @@ raise SystemExit(0 if data==b'' else 9)
     def test_v123_04_restart_and_authority_faults_do_not_create_a_second_result(self) -> None:
         module = self._require()
         with tempfile.TemporaryDirectory(prefix="ticket123-") as raw:
-            module, binding, current_head, client = self._fixture(Path(raw))
+            root = Path(raw)
+            module, binding, current_head, client = self._fixture(root)
             service, endpoint = self._start(module, binding, current_head)
             first = self._request(endpoint, self._probe_command())
             service.close()
@@ -867,7 +873,7 @@ raise SystemExit(0 if data==b'' else 9)
             lifecycle_request = {
                 "operation_ref": "delete:t123",
                 "authority_binding": authority,
-                "transition_id": "transition:t123-delete",
+                "transition_id": authority["transition_id"],
             }
             purge = managed.purge(lifecycle_request)
             self.assertEqual(purge["status"], "confirmed")
