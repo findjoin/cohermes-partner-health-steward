@@ -891,7 +891,7 @@ class Ticket122DynamoDBCurrentHeadTests(unittest.TestCase):
 
         terminal = _ScriptedDynamo()
         terminal.transact_error = _AwsError("ConditionalCheckFailedException")
-        terminal.items = [_head_item(terminal=True)]
+        terminal.records["HEAD"] = _head_item(terminal=True)
         with self.assertRaises(HeadTerminal):
             self._port(terminal).acquire_execution_lease(request)
 
