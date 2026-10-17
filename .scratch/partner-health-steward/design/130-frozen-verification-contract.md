@@ -1,0 +1,45 @@
+# Ticket130 独立验证合同候选
+
+状态：pre-code candidate，尚未冻结。独立verification authority：implementation_audit；唯一设计作者deployment_audit。设计以本checkpoint的`130-governed-live-nondiagnostic-runtime-design.md`为准（含6dab079的真实300秒短内存事实修正及650e8c5的主人独立delete确认语法澄清）。本合同不授予模型、网络、诊断、发布或主人canary权限；不新增业务ledger、第四种CorePort或长期恢复正文。
+
+## 已知差额与验证边界
+
+现有124真实发布包/registry/AF_UNIX、125单次Responses adapter、131显式非诊断预算及原七Skill、typed日报、owner settings/tasks/rights、126受控投递是继承边界。当前产品没有130纯typed运行时或Plugin模型Bridge，既有同步Core executor不能冒充跨进程生产NL。旧125/131/113/116三件套及其他已冻结文件不修改。126当前最终审查另有独立历史source与794门记录；新增130预期红灯不属于该794结果，也不能把126尚未闭合的差额写成已完成。
+
+新增verifier仅为`tests/test_ticket130_governed_runtime.py`。主要正向tracer从实际Publisher生成的Plugin包经pinned registry真实activation创建Live Adapter，再经实际ProductionCoreService同一AF_UNIX三kind执行。父Core产品必须来自声明的隔离runtime；子进程产品路径逐个核对真实发布目录，tests仅为资料fixture，不能由repo产品掩盖发布缺包。模型只在httpx HTTPTransport边界离线替换，真实BoundResponsesTransport、ProductionModelAdapter、原131测量及完整terminal转换执行；微信只替aiohttp HTTP边界，真实pinned低层和126 Bridge执行。fake无权给出grant、approval、Core report、业务提交或handoff。
+
+## 七个有限mutation门
+
+| 门 | 最高公开接口与必要结果 | 可杀死的现实错误等价类 |
+|---|---|---|
+|130-V01|同一真实发布/registry/socket完成首次披露、独立confirm、Core绑定成功说明及131限制；record一模型、mixed/question至多两固定stage，原evidence→portrait→answer→唯一daily提交→126受控发送及ACK。原生重投不增加模型、业务record或发送。|factory未接通、初始化只读enabled就自造成功、同步executor/普通Session旁路、将question记成主人事实、第三次模型或第二次提交、隐藏限制。|
+|130-V02|真实Core准入的原body经125完整terminal进入intake；完整否定/原文/范围、真实45topic及时间边界；question疾病原文不能变成fact；answer不能在同源intake/证据前取得grant。正常owner statement可用未知时间，不逼模型猜日期。|截断否定、改写quote、诊断问句逐字子串升级、越界时间、错stage/重复效果；只靠非法topic等无关原因形成假负例。|
+|130-V03|合法request/result均可大于64KiB而每一实际RPC frame仍≤65536；按bytes跨UTF-8边界分片、全canonical摘要重验；同source/stage/grant顺序及receipt/currentness严格绑定；HTTP期间第二条真正Core probe返回合法envelope。|扩大旧帧、单片UTF-8解析、只传摘要/Plugin report、跨源/阶段/错序拼接、错receipt仍start、prepare后head失效仍尝试、Core锁或串行dispatcher等待模型网络。|
+|130-V04|真实known incomplete/failed保完整terminal并产生可见限制；started timeout、完整terminal回交已落但reply丢失、completed候选失用、实际peer退出/重建的有限恢复；已观察report/result保持同digest/actual/usage绑定。unknown或丢候选不调第二次、不补事实、不ACK原未决NL。|把已完成误写unknown/not-started、信Plugin缓存或digest恢复正文、丢reply再调模型、自动重试、把限制通知的handoff当原NL业务成功。|
+|130-V05|实际主人可见status、暂停/恢复、停止/恢复记录、明确单次提醒/取消；源头原settings/approval/task读回真实状态；当前due wake实际task推进/solve及localday review，重复wake零新增发送/完成key。|仅RPC状态而无受控显示、NL自动批准任务、假提醒文本无原任务、错主人/错误次数、取消仍发、重启/当前wake补跑或重复。|
+|130-V06|实际admitted主人view/correct复用真实受管对象和原纠正原子链；停止记录时原文只为当前阶段短内存，持久receipt不含body、受管事实和本fixture文件无sentinel；真实显示的delete确认命令由独立晚于说明的原生来源确认。|普通问答写纠正、另一个store替代事实、停止记录仍落正文/WAL/临时文件、模型批准删除、首个/重投删除请求直接purge。|
+|130-V07|明确主人导出经同原outbox/effect授权、Core真实主人记录形成大于64KiB的受管canonical ManagedExport按序分片、发送前第二授权、真实pinned AES/CDN/fileitem；解密捕获的CDN bytes逐字等于Core导出，metadata/文件名/SHA/size一致；accepted/rejected/最终响应丢失/不准上传URL/读后对象已纠正有限类。|opaque引用冒充文件、模型或caller拼JSON、旧对象/route授权继续发、换origin/带token到CDN、caption或隐藏重试、CDN成功冒充已发/已下载、宣称删除能撤回平台副本。|
+
+这些是有限现实mutation家族，不按字段或网络故障做笛卡尔积，不冻结私有SQL、新索引、buffer helper名称、executor内部拆分或可逆布局。现有Service对象引用只作为fixture连接同一真实Core的已有公开读方法，不能替代最高公开链或授权；实现者不能靠修改测试获得绿灯。
+
+## 关键fixture一致性与恢复事实
+
+- 两阶段使用同一concrete131预算、route/owner decision/期限，intake和answer各有真实schema/authority；无stage的旧answer wire/digest保持。Core自己的完整结果resolve/report仍是权威。report原有结构不凭空扩展usage字段；usage/response/model完整typed结果由result_digest绑定并读回核对。
+- 全部输入、身份、账户token、模型credential、asset及approved atoms/template均为离线合成。预算明确覆盖Core业务clock和Plugin真实UTC；从不把配置240000、sample usage或65536 bytes说成共同上下文保证。模型说明来自实际Core budget/report，必须实际显示“不提供共同上下文保证”。
+- 主人业务clock受控用于due/wake；该家族仅以真实126 Bridge的已声明clock注入与真实pinned sender保持同一时间，既不伪造业务结果也不等待真实分钟流逝。完整初始化/模型/附件tracer仍测试生产autowire。NL相对时间依据原protocol timestamp与主人时区，而非接收时刻或模型日期。
+- 实际native重投保留同一原message ID及protocol time；独立确认是另一真实synthetic来源且晚于披露。ACK观察等待实际Core-approved cursor/后继poll的因果回交，不以transport先append就宣布committed。
+- Session清理是130明确的≤300秒短内存上限及真实peer生命周期约束；原ExecutionLease没有TTL字段，不用owner delivery/task的300常量伪装模型lease到期。门通过真实peer结束/重建及原attempt恢复观察，不要求给旧typed grant添加时间字段或建立持久transfer ledger。
+- export fake只返回HTTP证据；原受管字节来自Core，第二authorize前由另一个真实admitted纠正来源改变选中对象，不能由fake宣布currentness失败。平台接受仅为accepted，最终发送未知冻结且无第二attempt；固定外部副本限制实际可见。生命周期能确认本产品受管副本清理，不能制造Weixin/CDN删除证据。
+
+## 执行、诚实边界及冻结要求
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_ticket130_governed_runtime -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_ticket125_partner_model tests.test_ticket131_nondiagnostic_budget tests.test_ticket113_strict_port tests.test_ticket116_integration -v
+```
+
+正式门继承123/124/126真实Linux/Python3.11 sealed runtime、pinned Git及Publisher包。缺环境不能skip成完成；本地缺130模块应为清楚的prerequisite failure，而不是ImportError/环境error。当前七门是预期红，内部130路径尚未运行，不声称新增完整链绿色。独立当前继承回归125/131/113/116为52/52 PASS，44.196秒、0skip，日志`/tmp/ticket130-inherited-green.log`；新门为7个明确缺130 Module的prerequisite failure、0error/skip，日志`/tmp/ticket130-precode-red.log`。候选源码compile通过；正式完整测试计数只对真实隔离source/runtime陈述。
+
+当前产品上的独立纯内存characterization已执行：合法131 ND预算/StrictModelRequest，经真实125 ProductionModelAdapter得到completed ModelTransportResult，最终HTTP wire1548 bytes、request canonical wire69483 bytes、result canonical wire66662 bytes；没有扩HTTP预算或raw响应上限，也没有网络，日志`/tmp/ticket130-wide-codec-characterization.log`。新intake schema尚未实现，因此这只是原codec与分片必要性的事实，不冒充130执行通过。
+
+编码前同一Git commit/tree绑定唯一design/本合同/verifier三件套，fresh Spec与Standards双PASS后才冻结和产品编码。具体可复现矛盾只由本独立verification authority有界修订并新checkpoint，不修改旧冻结票，不允许产品作者静默改门。实际资源、主人canary、诊断许可与target部署仍归其原票和精确批准，不由本离线门证明。
