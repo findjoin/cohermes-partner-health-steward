@@ -117,9 +117,10 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             if set(probe) == {"projection"} and type(probe["projection"]) is dict:
                 probe = probe["projection"]
             runtime = await self._rpc("managed-read", {"projection": "health-runtime"})
-            if (probe.get("state") != "healthy" or runtime.get("state") != "healthy"
-                    or probe.get("health_writes_allowed") is not True
-                    or runtime.get("health_writes_allowed") is not True):
+            # A healthy, uninitialized Core must receive the explicit init
+            # request. Per-message preflight and Core consent still govern all
+            # business writes, model work and controlled delivery.
+            if probe.get("state") != "healthy" or runtime.get("state") != "healthy":
                 raise _EntryUnavailable("health-entry-core-unavailable")
             retained = await self._read("health-entry-native-cursor")
             if set(retained) != {"native_cursor"}:
