@@ -3,7 +3,7 @@
 Type: task
 Status: ready-for-agent
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
-Blocked by: [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md), [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md)
+Blocked by: [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md), [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 
 **What to do:** 对一个新内容寻址 release 在用户的 default Hermes 上分两阶段完成真实部署与验收。阶段 A 在诊断范围保持 staged 时完成 target binding、最小 canary、主人初始化和非诊断能力验收，使主人可以先使用健康记录、画像、非诊断问答、提醒、任务、安全提示、控制和数据权利；阶段 B 仅在 Ticket 127 闭合后完成 BMI 诊断激活、完整 G12 和完整首发验收。明确禁止访问或部署女友的 partner Hermes。
 
@@ -51,3 +51,4 @@ Blocked by: [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-d
 
 - 用户已明确选择仅DMIT并接受整机旧快照恢复限制；129实现该Provider，部署不再以AWS账号为前提，不伪造历史DynamoDB证据。真实初始化披露必须说明当前受管删除与整机旧快照限制，并显示诊断未启用；可用既有HealthInitRuntime executor形成该已批准内容，不改写旧frozen111披露历史。
 - Ticket130记录真实生产typed executor/受控自然语言候选阶段缺口，是本票非诊断产品可用性的前置实现，不将fixture或124装配单独宣称为完整产品。
+- 主人已选择继续 JOJO 并接受非诊断操作预算／不提供共同上下文保证，见 ADR 0024 与 Ticket131。阶段 A 需经该票验证并如实披露；该决定不是 G10/G11 passed，full／诊断继续需要严格 profile／容量证明及原医学门槛。

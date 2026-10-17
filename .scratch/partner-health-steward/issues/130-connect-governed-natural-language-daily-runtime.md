@@ -3,7 +3,7 @@
 Type: task
 Status: ready-for-agent
 Parent: [健康管家有限实施链](../map.md)
-Blocked by: [124 - 真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 生产模型Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md)
+Blocked by: [124 - 真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 生产模型Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
 
 ## Characterization input
@@ -17,6 +17,8 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 承接同一Core的controlled-effect、当前owner/route/profile同意、源绑定、typed候选与唯一提交。若模型做证据前抽取，先冻结最小候选阶段及其purpose、exact effect identity、重放/unknown/失败与后续问答的关系；不得直接在executor HTTP绕过Core授权，不新增第二业务状态/批准ledger。模型无数据库写权；既有七Skill runtime实际use proof与Core验证继续成立。任何未获批准的模型/owner资料路径保持关闭。
 
 本票当前只记录已复现的实现差额，是128非诊断产品可用性的前置输入；不提前冻结详细设计/测试，待124/125当前接口闭合后独立验证与双轴预审。医学许可及诊断激活仍归127，不被此票替代。
+
+主人已选择当前 JOJO 的非诊断操作预算与公开上下文限制，见 [ADR 0024](../../../docs/adr/0024-allow-owner-selected-nondiagnostic-model-operational-budget.md) 与 Ticket 131；本票须待该模式经验证后承接，不自行把配置窗口、风险接受或生产 executor 当作共同容量证明，亦不借此放开诊断。
 
 ## Cross-process characterization input
 

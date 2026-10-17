@@ -127,6 +127,7 @@ Type: wayfinder:map
 - [Ticket 129：实现 DMIT 宿主 SQLite current-head Provider](issues/129-implement-host-sqlite-current-head-provider.md) — 主人于 2026-10-18 明确选择仅 DMIT 并接受整机旧快照恢复限制；在现有九方法 Port 内实现真实受限宿主 head，保留正常删除、CAS、lease、fencing 与 unknown；候选尚待独立冻结/实现/验收，旧 DynamoDB 代码与外部证据不冒充本模式证明。
 
 - [Ticket 130：接通受控自然语言日常 Runtime](issues/130-connect-governed-natural-language-daily-runtime.md) — 2026-10-18实查未有生产typed executor，且证据前抽取与现有模型授权阶段存在明确差额；在同一受控效果与唯一提交链中补齐，不以测试executor或有限parser冒充完整自然语言能力。
+- [Ticket 131：支持明确标识的非诊断模型操作预算](issues/131-support-explicit-nondiagnostic-model-operational-budget.md) — 主人于 2026-10-18 选择继续 JOJO，并接受仅非诊断、最终请求长度固定、禁自动切换／重试、不完整停止及不提供共同上下文保证；[ADR 0024](../../docs/adr/0024-allow-owner-selected-nondiagnostic-model-operational-budget.md)记录该决定。125 闭票后才冻结详细设计；本票先于 130／128，保留 full／诊断严格 profile 与证明模式，不把配置窗口或风险接受冒充容量依据。
 
 ### 已完成的 staged 基线
 
