@@ -28,3 +28,12 @@ Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-imple
 ## 2026-10-18 pre-code checkpoint candidate
 
 唯一设计 `../design/124-live-entry-design.md`；独立验证合同 `../design/124-frozen-verification-contract.md` 与 verifier-owned `../../../tests/test_ticket124_live_entry.py`。基线19417da保留111/112已验证业务与123生产装配；124公开Module缺失使新门4个预期failure、0error/skip。正式运行要求可核验pinned Git来源、root和Python3.11 runtime，尚未以本机替代环境冒充通过。产品实现等待同一commit/tree新鲜双轴预审；真实模型、微信、部署另按既有后继门执行。
+
+## Frozen implementation authority (2026-10-18)
+
+- reviewed pre-code commit: `fe9c058fcf634ebe624f98c1c72adde90a86032a`; tree: `858f0cd397853138c226f35a968d1deef014dd28`.
+- Fresh-context Spec: PASS；Fresh-context Standards: PASS；证据 `../evidence/40-ticket124-129-precode-review-20261018.md`。
+- `.scratch/partner-health-steward/design/124-live-entry-design.md` blob: `ed27c319dbb57e974ca7df193c74df708689e399`.
+- `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob: `dfa4d0a283f4703ff5ee47262c345febe8f5e36d`.
+- `tests/test_ticket124_live_entry.py` blob: `34ea7c8d8797e8b77df9a9ab5109a6ba309c0a7f`.
+- 允许严格按上述冻结设计实施；产品实施者不得修改冻结三件套或自行闭票。真实部署/外部效果仍按后继既有门，未被本次预审冒充通过。

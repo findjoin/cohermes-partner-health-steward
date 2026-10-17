@@ -48,3 +48,12 @@ Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owne
 ## 2026-10-18 pre-code checkpoint candidate
 
 独立 verification authority 为 implementation_audit；候选合同 `../design/129-frozen-verification-contract.md`，verifier-owned `../../../tests/test_ticket129_host_current_head.py`。6个有限门当前是缺公开Module的6个明确failure、0error/skip；并发、真实HostPrivateVault、SIGKILL/readback、typed overlap、terminal/transfer和生产身份均使用离线合成安装，不接触真实健康数据。产品实现仍待同一commit/tree新鲜双轴预审。
+
+## Frozen implementation authority (2026-10-18)
+
+- reviewed pre-code commit: `fe9c058fcf634ebe624f98c1c72adde90a86032a`; tree: `858f0cd397853138c226f35a968d1deef014dd28`.
+- Fresh-context Spec: PASS；Fresh-context Standards: PASS；证据 `../evidence/40-ticket124-129-precode-review-20261018.md`。
+- `.scratch/partner-health-steward/design/129-host-current-head-design.md` blob: `ce191ff936b75ab7171a3a7aab792c2732b835b2`.
+- `.scratch/partner-health-steward/design/129-frozen-verification-contract.md` blob: `c8f30f68c6fb520a5dc43b0a01b09176a4dadec6`.
+- `tests/test_ticket129_host_current_head.py` blob: `40ee8f1fae15beaefaae63e803ad9f07fed0ad76`.
+- 允许严格按上述冻结设计实施；产品实施者不得修改冻结三件套或自行闭票。真实部署/外部效果仍按后继既有门，未被本次预审冒充通过。
