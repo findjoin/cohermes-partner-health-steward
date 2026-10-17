@@ -1,7 +1,7 @@
 # 130 - 接通受控自然语言日常 Runtime
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家有限实施链](../map.md)
 Blocked by: [124 - 真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 生产模型Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -29,3 +29,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Live owner-operation characterization input
 
 当前 `HealthPlugin.health_operation`（plugin.py约939–977）虽可构造TrustedHealthCommand，真实 `receive_weixin` 在初始化后只进入safety/coarse/daily路径；`LiveHealthCoreOperations`与`LiveHealthWeixinAdapter`未映射主人任务、控制及数据权利操作。因此仅提供NL证据executor仍不能完成128阶段A所列的提醒/任务/暂停/停止记录/权利的真实入口。后继只在同一Module/同三类kind内承接受真实admitted owner source绑定的有限显式命令或typed候选；现有Core命令权威、批准和回执不变，不能把模型抽取的文本当成主人已批准的不可逆动作，也不能从普通handler直接调用健康写入。这里仅记录现行公开链的实现差额，不提前冻结详细命令API或测试。
+
+## 唯一增量设计候选
+
+2026-10-18由deployment_audit承接只读characterization与[受控NL唯一设计候选](../design/130-governed-live-nondiagnostic-runtime-design.md)。候选明确同源intake/answer、同budget/stage关系、短Core调用与Plugin125网络、真实主人有限入口；独立verification authority为implementation_audit。当前尚未冻结、未实现，候选接口与最小权利等价类需同一checkpoint预审后固定；不改变131或126冻结权威。
