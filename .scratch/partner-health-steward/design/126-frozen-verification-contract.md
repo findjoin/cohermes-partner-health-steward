@@ -69,3 +69,7 @@ R4正式冻结后的精确`6752fad`新sealed runtime执行126五门为5run、1fa
 本R5候选仅在两个故意非法输入的调用周围捕获具体`_HostVerificationFailure`，并断言唯一允许的固定EOF原因及异常不包含caller正文／非owner输入；正常连接、披露、后续查询、重放与独立确认路径不捕获异常。原无handoff拒绝断言保留，显式accepted业务结果仍拒绝；每个负例后证明无新send、真实查询仍可读且初始化仍uninitialized。设计、产品、R3 unknown ACK及其余验收不变，旧122／123冻结文件不改。
 
 R5尚未冻结。允许对精确6752产品字节加候选verifier的全新隔离快照做provisional最高V02／必要五门characterization，须单独标明候选Git身份及未冻结边界；该证据不替代fresh有界双轴审查后的正式五门／full794。此时不启动full794，也不声称R5正式门已绿。
+
+首个未冻结候选`cde88eb`的provisional五门为5run、1fail、0error/skip、38.360秒：EOF修正已通过，init-form的两个非法binding均正确拒绝，正常查询仍uninitialized且无第二发送；其余四门绿。后继init-confirm因合成时间矛盾未启用：共享native时间`1787520000000`实际为2026-08-23T21:20:00Z，原confirm仅加1秒，仍早于fixture真实披露时刻2026-08-24T00:00:00Z。Core严格要求披露早于protocol_timestamp及received_at，没有产品缺陷。证据`/tmp/dmit-connection-audit/formal-126-r5-provisional-cde88eb-{components-only,postfailure-guard}.log`；未执行full794，源87／候选身份15／运行环境7464文件均未变化。
+
+R5第二个样例修正仅把V02 init-confirm的合成protocol timestamp明确设为2026-08-24T00:00:01Z，不改共享native fixture／生产顺序检查／其他四门。局部真实Core／Plugin公开流程已验证旧protocol时间在received_at也晚于披露时仍被`health-init-disclosure-order-invalid`拒绝；protocol=00:00:01Z且received_at=00:00:02Z时可依原prepare／commit／finalize启用，日志`/tmp/ticket126-r5-confirmation-order.log`。最高入口中received_at仍由真实Adapter取当前接收时间并由未放宽的Core同一严格顺序门检查，不能用修改生产检查或自动同意换绿。此样例修正仍须新干净候选provisional五门观察及R5有界双轴审查后正式冻结。

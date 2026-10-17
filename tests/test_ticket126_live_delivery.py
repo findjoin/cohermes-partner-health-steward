@@ -994,7 +994,9 @@ async def _registered_gate(config):
                 else:
                     assert router.sends == [], "retained first event must not send another disclosure"
                     confirm = _native_message("ticket126-independent-confirm", config["data"]["command"], config["policy"])
-                    confirm["create_time_ms"] += 1000
+                    # The fixture's actual disclosure is issued at 00:00Z;
+                    # this independent owner confirmation must follow it.
+                    confirm["create_time_ms"] = int(datetime(2026, 8, 24, 0, 0, 1, tzinfo=timezone.utc).timestamp() * 1000)
                     router.enqueue("cursor-confirm", confirm)
                     await _wait_until(lambda: projection("health-entry-initialization")["initialization"]["phase"] == "enabled")
                     result = {"new_disclosure_sends": len(router.sends)}
