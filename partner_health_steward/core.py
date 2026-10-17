@@ -3099,6 +3099,7 @@ class HealthCore:
             command.action not in _PROBE_BYPASS_ACTIONS
             and not mandatory_owner_decision
             and not self._live_exact_owner_request(command, head)
+            and not self._live_terminal_cursor_request(command)
             and not lifecycle_notice
             and not ticket116_safety_admission
             and not ticket116_contact_authority_change
@@ -12082,7 +12083,9 @@ class HealthCore:
         with self._lifecycle_lock:
             if self._closed or not self.admission_policy_matches(policy):
                 return None
-            if self._probe_open().state is not ProbeState.HEALTHY:
+            report = self._probe_open()
+            if (report.state is not ProbeState.HEALTHY
+                    and not (report.state is ProbeState.UNKNOWN and report.reason_code == "effect-result-unknown")):
                 return None
             with self._store.serialized():
                 receipts = self._store.native_cursor_receipts()
@@ -12141,7 +12144,7 @@ class HealthCore:
         """Release one exact native cursor only after its business transition finalizes."""
 
         with self._lifecycle_lock:
-            if self._closed or (not self.health_writes_allowed() and not self._live_preconsent_source(causal_id)):
+            if self._closed or (not self.health_writes_allowed() and not self._live_terminal_handoff_source(causal_id)):
                 return None
             try:
                 receipt = self._store.source_receipt(causal_id)
@@ -12252,6 +12255,42 @@ class HealthCore:
                     and self._live_challenge_for_intent(intent) is not None)
         except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable):
             return False
+
+    def _live_terminal_handoff_source(self, causal_id):
+        """A terminal handoff permits only its cursor, never another effect."""
+        report = self.probe()
+        if (report.state is not ProbeState.HEALTHY
+                and not (report.state is ProbeState.UNKNOWN and report.reason_code == "effect-result-unknown")):
+            return False
+        policy = self._admission_policy
+        head = self._store.finalized_authority()
+        receipt = self._store.source_receipt(causal_id)
+        if (type(policy) is not AdmissionPolicy or head is None or receipt is None
+                or receipt.managed_cursor_state != "committed"
+                or not policy.accepts(receipt.envelope, allowed_capabilities=("health-init", *DAILY_HEALTH_SKILL_NAMES))):
+            return False
+        initialization = self._store.initialization()
+        if initialization is not None and (initialization.phase != "enabled"
+                or not self._initialization_configuration_matches(initialization.draft)):
+            return False
+        outbox = self._store.delivery_outbox_state(policy.owner_sender_id, head.installation_id)
+        source_id = receipt.business_causal_id
+        records = [r for r in outbox.records if r.intent.source_ref == source_id
+                   and (self._live_owner_intent(r.intent) or r.intent.authorization_kind == "ticket116-contact")]
+        if not records or not any(self._live_owner_intent(r.intent) for r in records):
+            return False
+        if initialization is None and any(self._live_challenge_for_intent(r.intent) is None for r in records):
+            return False
+        return all(self._live_projection(r)["handoff_complete"] for r in records)
+
+    def _live_terminal_cursor_request(self, command):
+        payload = command.payload
+        if command.action != "cursor.result" or not isinstance(payload, NativeCursorResultPayload):
+            return False
+        receipt = self._store.source_receipt(payload.source_causal_id)
+        return (receipt is not None and receipt.envelope.native_cursor == payload.native_cursor
+                and receipt.native_cursor_state == "executing"
+                and self._live_terminal_handoff_source(payload.source_causal_id))
 
     def _live_preconsent_source(self, causal_id):
         try:
