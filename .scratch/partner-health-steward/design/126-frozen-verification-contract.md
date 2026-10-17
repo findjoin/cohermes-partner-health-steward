@@ -83,3 +83,12 @@ R5第二个样例修正仅把V02 init-confirm的合成protocol timestamp明确�
 
 
 同一R6门补一个独立负向等价类：owner unknown之后，用原116公开safety.evaluate形成另一来源、当前同联系人且批准有效的contact，真实bind/prepare仍有intent，但claim必须拒绝、零contact网络。该负例杀死直接删除non-contact过滤或放行任意unknown的修复，不要求字段笛卡尔积。root已局部表征该来源可在owner unknown后由真实公开安全路径形成（`/tmp/ticket126-owner-unknown-contact-after-isolation.log`）；正式修订门仍未执行。只有同一committed safety fact/source的原主人提示未知终态可以形成极窄例外，原一般UNKNOWN/模型/不同来源阻断不变。
+
+
+### R6.1局部样例修正：不扩大owner unknown的普通控制权限
+
+R6产品作者在原接缝写入未提交53行极窄helper后，实际公开smoke证明同来源owner unknown→contact accepted已通过；新第三类继承旧pause步骤却被原Core正常拒绝，精确owner.prepare为unavailable/effect-result-unknown，日志`/tmp/ticket126-r6-pause-diagnostic.log`。旧仅contact unknown可暂停的窄规则不能泛化为owner unknown也允许普通settings写入；为了测试去放宽该权限违反R6“保留一般UNKNOWN”边界。
+
+仅将原V05 pause限定在原有两类（owner accepted）执行，保留它们原样paused correction；新owner unknown类不强求pause，但仍执行既有safety.correct及当前contact-correction单次授权/完成、owner unknown保留与禁止重发。不同来源负例不变。没有删除纠正/原暂停验收或改生产普通UNKNOWN门，不新增门或状态。产品作者未改verifier；root自行修正该局部假红并重新双轴checkpoint，未据局部绿灯闭票。
+
+作者与root各自实际运行`/tmp/ticket126-r6-independent-public-smoke.py`，root日志`/tmp/ticket126-r6-root-independent-public-smoke.log`：同来源contact及原纠正链accepted once，owner unknown保留且无重发，不同来源当前contact prepare有intent/claim拒绝，health_writes_allowed和model_effects_allowed均False。该证据来自当前53行未提交产品候选的真实公开方法，只是局部char，未执行新最高V05/794；编码前checkpoint仍排除该未提交Core字节，其他四门、设计、旧冻结文件全部不变。新fresh有界双轴/root冻结后才提交产品并跑全门。

@@ -841,7 +841,8 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
                     self.assertIsNone(replay["effect_intent"])
                     self.assertIsNone(replay["send_intent"])
                     self.assertEqual(len(calls), before)
-                    fixture._apply_contact_control("pause")
+                    if not owner_unknown:
+                        fixture._apply_contact_control("pause")
                     corrected = fixture._health("safety.correct", {
                         "source_alert_intent_id": meta["contact_alert"]["intent_id"],
                         "basis_change_ref": "owner-correction:ticket126",
