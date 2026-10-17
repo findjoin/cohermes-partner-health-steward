@@ -405,6 +405,12 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                     return result
         return SendResult(success=False, error="health-controlled-delivery-required", retryable=False)
 
+    async def get_chat_info(self, chat_id):
+        """Describe the supplied route without fetching account or chat data."""
+        chat_id = _text(chat_id)
+        return {"name": chat_id, "type": "group" if chat_id.endswith("@chatroom") else "dm",
+                "chat_id": chat_id}
+
     async def wake_current(self):
         if not self._running:
             return False
