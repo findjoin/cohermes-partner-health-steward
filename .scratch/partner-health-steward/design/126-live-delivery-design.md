@@ -53,11 +53,13 @@ send是同步接口。Bridge通过`asyncio.to_thread`调用；send在自己`asyn
 |---|---|---|
 |`committed-turn`|`source_causal_id, record_id, transition_id`|当前source receipt及其同一已finalized DailyTurnResult唯一回复；native重投alias须由Core证明|
 |`initialization-disclosure`|`source_causal_id, workflow_id, disclosure_id, headers`|当前未同意challenge、真实第一事件的准入headers及明确init workflow绑定|
-|`committed-safety`|`source_causal_id`|当前Core已提交116 safety result的原source/managed-command receipt，包含必要owner最低提示及已有contact intent引用；不编造现有Response没有的result_ref|
+|`committed-safety`|`source_causal_id, result_ref`|result_ref精确等于现有HealthCommandReceipt.causal_id；Core以此取原已提交116 safety result，并核验原source及已有contact intent引用，不创建另一份result账本|
 |`owner-outbox`|`intent_id`|现有复盘/task/lifecycle/owner-decision outbox，不是caller自造payload|
 |`contact-alert`|`intent_id`|现有116已签发的唯一联系人alert/correction，不是owner发送|
 
 无body/text/destination字段。`headers`沿124的11个公开header字段；Core重新做唯一owner/private/account/entrypoint准入，不能仅信workflow字符串。返回固定`{deliveries: [projection, ...], source_causal_id: str|null, handoff_complete: bool}`。
+
+`committed-safety.result_ref`是原managed-command receipt的现有主键；不是transport观察result_ref，也不是新增安全结果ID。Plugin实际两处`ticket116-safety-result`返回在meta中补`result_ref`，值为已提交`safety.evaluate`原context.causal_id（当前入站路径为`ticket116-inbound-safety:`加source causal ID）；Adapter只转交该引用。Core exact lookup原HealthCommandReceipt，验证`_ticket116_action=safety.evaluate`、`_source_causal_id`及当前source配对后，从原`owner_result.template_ref`解析当前approved assets的固定模板正文。引用错配、模板不存在/版本过期或正文已不可合法取得均失败关闭；不信caller的owner_result或模板文字。真实116 fixture可保留它自己提交时的context.causal_id走同一路径，不要求该fixture伪造入站命名前缀。
 
 delivery projection固定无正文：`{intent_id, recipient_role, source_causal_id, current_layer, unknown_frozen, handoff_complete}`。recipient_role只可为`owner/support-contact`，current_layer沿既有outbox事实，非新的状态机。contact的intent_id沿116已公开alert/correction effect ID，Core仅在内部映射原outbox ID；不能把caller传入的ID直接当另一个outbox。整条source的handoff_complete只在所有必需的独立delivery均已Core持久确认时为true。
 
@@ -105,7 +107,7 @@ LiveAdapter不能吞掉Bridge的not-authorized/unavailable、异常或畸形返�
 
 ## 最小联系人与安全主人提示
 
-只承接Core现有提交的116 safety/alert/correction。source meta.branch为safety时不能因为没有meta.turn_result就丢掉owner_result；Bridge交Core查同一committed safety result，绑定owner最低提示和已存在的contact意图。owner提示和contact终态各自独立，任一路失败不抑制另一路。
+只承接Core现有提交的116 safety/alert/correction。source meta.branch为safety时不能因为没有meta.turn_result就丢掉owner_result；Bridge交Core以source_causal_id和原receipt causal ID查同一committed safety result，绑定由当前approved模板解析的owner最低提示和已存在的contact意图。owner提示和contact终态各自独立，任一路失败不抑制另一路。
 
 支持联系人只接受现有明确`method_kind=weixin_user`，method_value为非空Weixin ID；电话或其他方法不强转to。当前唯一contact/version/批准/route必须在authorize前仍有效。payload仅`owner_recognizable_name/event_time/fixed_urgent_help_request`，或既有最小纠正语义；不含症状、诊断、位置、原消息、证据或画像。固定render不是自由文本拼接入口。unknown及纠正次数沿116，不创造备用联系人或自动重试。
 
