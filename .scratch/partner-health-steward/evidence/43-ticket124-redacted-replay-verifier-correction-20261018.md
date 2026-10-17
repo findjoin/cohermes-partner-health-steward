@@ -14,7 +14,7 @@ PASS — spec reviewer。限定于本次 V04 验证预期修正，未发现剩�
 
 仅做只读审查，未重跑门禁或重开既往结论。
 
-Commit: `78bfe92b3be3286f338969315ef8e44def54daf6`  
+Commit: `78bfe92b3be3286f338969315ef8e44def54daf6`
 Tree: `9af993bef6defdb9493c5ac8991b7f7dc0eea733`
 
 ## Standards review
