@@ -39,3 +39,7 @@ Pinned低层_get_updates/_send_message各一次调用_api_post，可用于生产
 当前直接链还证明：`live_weixin`只处理`meta.turn_result`，漏掉现有116 safety branch的主人最低提示/联系人接续；第一init分支返回`(None,False)`，需要原challenge/source receipt的可推进终态；daily advanced后会按旧112释放正文，实际授权交接必须先成立，不能在重投时重建。候选统一覆盖这些既有主人/联系人投递缺口，不另建发送账本。
 
 准备验证通过最高生产socket/真实pinned低层网络替身和真实115/116业务fixture，明确accepted/unknown而不伪造delivered/read。本阶段不读取真实账户秘密、不实际发微信、不改产品或冻结旧测试；同一checkpoint新鲜Spec/Standards及精确三件套冻结后才实施。
+
+## Independent verification candidate (2026-10-18)
+
+root独立持有`../design/126-frozen-verification-contract.md`与`../../../tests/test_ticket126_live_delivery.py`五个有限门，唯一设计为`../design/126-live-delivery-design.md`。真pinned低层/HTTP-only替身、同socket与Publisher registry、preconsent stable native事件、Core exact daily/safety回复、unknown回交丢失重启及唯一contact批准/纠正均在公开生产接口验证；当前产品缺失为5明确prerequisite failure、0error/skip，新内链尚未执行。compile/diffcheck通过，继承785/14及独立contact旧链char见合同。等待同一checkpoint fresh Spec/Standards；不授权产品编码，不接真实渠道，不改旧冻结门。
