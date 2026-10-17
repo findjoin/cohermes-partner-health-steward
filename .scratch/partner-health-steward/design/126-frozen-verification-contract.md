@@ -73,3 +73,10 @@ R5尚未冻结。允许对精确6752产品字节加候选verifier的全新隔离
 首个未冻结候选`cde88eb`的provisional五门为5run、1fail、0error/skip、38.360秒：EOF修正已通过，init-form的两个非法binding均正确拒绝，正常查询仍uninitialized且无第二发送；其余四门绿。后继init-confirm因合成时间矛盾未启用：共享native时间`1787520000000`实际为2026-08-23T21:20:00Z，原confirm仅加1秒，仍早于fixture真实披露时刻2026-08-24T00:00:00Z。Core严格要求披露早于protocol_timestamp及received_at，没有产品缺陷。证据`/tmp/dmit-connection-audit/formal-126-r5-provisional-cde88eb-{components-only,postfailure-guard}.log`；未执行full794，源87／候选身份15／运行环境7464文件均未变化。
 
 R5第二个样例修正仅把V02 init-confirm的合成protocol timestamp明确设为2026-08-24T00:00:01Z，不改共享native fixture／生产顺序检查／其他四门。局部真实Core／Plugin公开流程已验证旧protocol时间在received_at也晚于披露时仍被`health-init-disclosure-order-invalid`拒绝；protocol=00:00:01Z且received_at=00:00:02Z时可依原prepare／commit／finalize启用，日志`/tmp/ticket126-r5-confirmation-order.log`。最高入口中received_at仍由真实Adapter取当前接收时间并由未放宽的Core同一严格顺序门检查，不能用修改生产检查或自动同意换绿。此样例修正仍须新干净候选provisional五门观察及R5有界双轴审查后正式冻结。
+
+
+## R6：独立安全投递的owner unknown故障补齐
+
+精确837按R5冻结后的正式126五门/131四门/124四门、full794及root23全部绿色，source87/冻结15/runtime7464/编译闭包均通过，实施后Spec PASS。然而Standards源追踪发现设计第112行“任一路失败不抑制另一路”的现实边界未被V05覆盖：旧V05始终先把owner提示完成为accepted，只对contact模拟unknown。报告未执行重现；root随后在真实837 Core/Plugin/116当前已批准contact fixture独立执行公开bind→prepare→claim→authorize→complete，owner结果为unknown且该delivery持久handoff=true；接续同来源contact prepare仍有真实intent，claim却为None。证据 `/tmp/ticket126-owner-unknown-contact-repro.py` 与同名.log；实际bound列表虽contact在先，原公开合法owner-first路径和两路独立义务不能用排序约定替代。整体handoff=false此时是正确的，因为contact尚未完成，不将它误判为owner终态丢失。
+
+本有界补门只在原V05等价类加入owner-response-lost=true/contact-known，沿同原execute/真实Core/当前批准路径证明owner unknown不抑制contact单次发送及原当前纠正；并再次读回原owner unknown_frozen且prepare不产生新send。旧accepted-owner/accepted-contact与accepted-owner/unknown-contact两类及其他四门保持，唯一设计/旧116/122/123冻结文件不变；不新增门ID、批准ledger、联系人、网络重试或一般UNKNOWN写入权限。纯局部公开repro已真实执行，修订完整V05及新产品修复尚未执行，不借旧794宣称本次已通过。产品作者不得改本测试/合同；须同一新干净checkpoint fresh有界Spec/Standards通过后才允许仅修同已committed safety source的独立投递重叠。之后仍重跑原五门/794/23/编译/完整性及仅原finding的实施后双轴复核。

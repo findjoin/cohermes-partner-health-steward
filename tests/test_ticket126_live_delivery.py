@@ -757,8 +757,8 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
         self._run_child("safety-routing")
         from partner_health_steward.delivery import OwnerDeliveryTransportResult
         from tests import test_ticket116_integration as contact_fixture
-        for unknown in (False, True):
-            with self.subTest(response_lost=unknown):
+        for unknown, owner_unknown in ((False, False), (True, False), (False, True)):
+            with self.subTest(response_lost=unknown, owner_response_lost=owner_unknown):
                 fixture = contact_fixture.Ticket116VerificationTests()
                 fixture.setUp()
                 try:
@@ -795,7 +795,7 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
                         self.assertTrue(result["delivery"]["handoff_complete"])
                         return authorization, result
                     owner = next(p for p in bound["deliveries"] if p["recipient_role"] == "owner")
-                    owner_authorized, _ = execute(owner["intent_id"])
+                    owner_authorized, _ = execute(owner["intent_id"], lost=owner_unknown)
                     self.assertEqual(owner_authorized["payload"], {
                         "text": assets["minimum_help_bundle"]["templates"]["danger_owner"]["text"]})
                     contact = next(p for p in bound["deliveries"] if p["recipient_role"] == "support-contact")
@@ -807,6 +807,17 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
                     self.assertEqual(authorization["send_intent"]["destination"]["method_kind"], "weixin_user")
                     self.assertEqual(result["delivery"]["current_layer"], "unknown" if unknown else "accepted")
                     self.assertEqual(result["delivery"]["unknown_frozen"], unknown)
+                    if owner_unknown:
+                        # Independently current contact work must survive the
+                        # owner's uncertain send, without retrying that send.
+                        owner_replay = core.prepare_live_delivery(owner["intent_id"],
+                            attempted_at_utc="2026-08-24T03:50:02+00:00")
+                        self.assertIsNone(owner_replay["effect_intent"])
+                        self.assertIsNone(owner_replay["send_intent"])
+                        owner_retained = core.live_delivery_status(owner["intent_id"])
+                        self.assertEqual(owner_retained["current_layer"], "unknown")
+                        self.assertTrue(owner_retained["unknown_frozen"])
+                        self.assertEqual(len(calls), 2)
                     before = len(calls)
                     replay = core.prepare_live_delivery(contact["intent_id"], attempted_at_utc="2026-08-24T03:51:00+00:00")
                     self.assertIsNone(replay["effect_intent"])
