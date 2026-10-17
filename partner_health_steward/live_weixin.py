@@ -64,6 +64,32 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             raise _EntryUnavailable("health-entry-core-required")
         self._ingress = ingress_transport if ingress_transport is not None else extra.get("ingress_transport")
         self._delivery = delivery_transport if delivery_transport is not None else extra.get("delivery_transport")
+        self._context_tokens = None
+        if "weixin_transport_binding" in extra and (self._ingress is None or self._delivery is None):
+            from .weixin_transport import (
+                WeixinTransportBinding, PinnedWeixinIngressTransport, PinnedWeixinOwnerDeliveryAdapter,
+            )
+            from .live_delivery import LiveWeixinDeliveryBridge
+            from gateway.platforms.weixin import ContextTokenStore, get_hermes_home
+            wire_binding = extra["weixin_transport_binding"]
+            if type(wire_binding) is not dict or set(wire_binding) != {"account_id", "base_url"}:
+                raise _EntryUnavailable("health-entry-transport-binding-required")
+            binding = WeixinTransportBinding(**wire_binding)
+            if binding.account_id != self._policy.partner_id:
+                raise _EntryUnavailable("health-entry-transport-account-mismatch")
+            token = _text(getattr(config, "token", None))
+            tokens = ContextTokenStore(str(get_hermes_home()))
+            tokens.restore(binding.account_id)
+            self._context_tokens = (binding.account_id, tokens)
+            if self._ingress is None:
+                self._ingress = PinnedWeixinIngressTransport(binding, token=token)
+            if self._delivery is None:
+                def factory(authorization):
+                    return PinnedWeixinOwnerDeliveryAdapter(
+                        binding, authorization, token=token,
+                        context_token_provider=lambda recipient: tokens.get(binding.account_id, recipient))
+                self._delivery = LiveWeixinDeliveryBridge(
+                    self._core_port, factory, clock=lambda: datetime.now(timezone.utc))
         self._template = None
         if "initialization_template" in extra:
             self._template = OwnerInitialization.from_storage(extra["initialization_template"])
@@ -183,7 +209,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             if (type(batch) is not dict or batch.get("ret") != 0
                     or batch.get("errcode", 0) != 0 or type(batch.get("msgs")) is not list):
                 raise _EntryUnavailable("health-entry-poll-unconfirmed")
-            cursor = _text(batch.get("get_updates_buf"))
+            cursor = batch.get("get_updates_buf")
+            if type(cursor) is not str or len(cursor.encode("utf-8")) > 16384:
+                raise _EntryUnavailable("health-entry-invalid-native-cursor")
             sources = []
             can_ack = True
             for index, native in enumerate(batch["msgs"]):
@@ -227,7 +255,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         partner = _text(native.get("to_user_id"))
         message_id = _text(native.get("message_id"), optional=True)
         conversation = native.get("conversation_id", sender)
-        grouped = any(native.get(key) for key in ("group_id", "group_chat_id", "chatroom_id"))
+        grouped = any(native.get(key) for key in ("group_id", "group_chat_id", "chatroom_id", "room_id", "chat_room_id"))
         native_chat_type = native.get("chat_type", "private")
         if native_chat_type not in {"private", "dm"}:
             grouped = True
@@ -275,10 +303,20 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
 
     async def _bridge(self, value):
         send = getattr(self._delivery, "send_committed", None)
-        if callable(send):
-            # The bridge owns intent/grant acquisition, idempotency and unknown.
-            # Its response is deliberately not interpreted as delivered/read.
-            await send(copy.deepcopy(value))
+        if not callable(send):
+            return False
+        result = await send(copy.deepcopy(value))
+        from .live_delivery import LiveWeixinDeliveryBridge
+        if isinstance(self._delivery, LiveWeixinDeliveryBridge):
+            # Production progress is a Core-persisted handoff, not a network
+            # accepted/unknown result or an injected fixture's dictionary.
+            return (type(result) is dict and set(result) == {
+                "status", "source_causal_id", "handoff_complete", "deliveries"}
+                and result["status"] in {"accepted", "rejected", "unknown"}
+                and result["handoff_complete"] is True)
+        # Preserve 124's explicitly injected whole-bridge seam. It proves no
+        # production handoff; the production bridge above cannot use it.
+        return type(result) is dict and result.get("status") in {"accepted", "unknown"}
 
     async def _process(self, native, cursor, index):
         try:
@@ -297,12 +335,20 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             body = self._body(native)
         except (ValueError, TypeError):
             return None, False
+        if self._context_tokens is not None:
+            account, tokens = self._context_tokens
+            context = native.get("context_token")
+            if type(context) is str and context:
+                tokens.set(account, headers["sender_id"], context)
         words = body.strip().split()
         if words == ["/health-init"]:
             if self._template is None or preflight["initialization_phase"] == "enabled":
                 return None, False
-            workflow = "health-init-workflow:" + headers["causal_id"].split(":", 1)[1]
-            callback = "health-init-consent:" + stable_digest({"workflow": workflow}).removeprefix("sha256:")
+            from .admission import live_native_event_identity
+            identity = live_native_event_identity(headers)
+            workflow = "live-init:" + identity
+            callback = "live-init-confirm:" + identity
+            headers["causal_id"] = "live-init-source:" + identity
             initialization = replace(self._template, workflow_id=workflow, admission_causal_id=callback)
             disclosure = await self._command("initialization-disclosure", {"initialization": initialization.to_storage()})
             if set(disclosure) != {"disclosure"}:
@@ -310,9 +356,13 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             actual = InitializationDisclosure.from_storage(disclosure["disclosure"])
             if actual.skill_proof.workflow_id != workflow or actual.skill_proof.admission_causal_id != callback:
                 return None, False
-            await self._bridge({"kind": "initialization-disclosure", "workflow_id": workflow,
-                                "disclosure": actual.to_storage()})
-            return None, False
+            presentation = {"kind": "initialization-disclosure", "workflow_id": workflow,
+                            "disclosure": actual.to_storage()}
+            from .live_delivery import LiveWeixinDeliveryBridge
+            if isinstance(self._delivery, LiveWeixinDeliveryBridge):
+                presentation.update(source_causal_id=headers["causal_id"], headers=headers)
+            handed_off = await self._bridge(presentation)
+            return (headers["causal_id"], True) if handed_off else (None, False)
         initialization = None
         capability = "health-steward"
         if words and words[0] == "/health-init-confirm":
@@ -371,6 +421,13 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             return None, True
         else:
             meta = response.get("meta")
+            if response.get("reason_code") == "ticket116-safety-result":
+                if type(meta) is not dict:
+                    return None, False
+                result_ref = _text(meta.get("result_ref"))
+                handed_off = await self._bridge({"kind": "committed-safety",
+                    "source_causal_id": headers["causal_id"], "result_ref": result_ref})
+                return (headers["causal_id"], True) if handed_off else (None, False)
             turn = meta.get("turn_result") if type(meta) is dict else None
             if type(turn) is not dict:
                 return None, False
@@ -379,8 +436,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             # its original source. 126 resolves that relation before sending.
             for name in ("source_causal_id", "record_id", "transition_id"):
                 _text(turn.get(name))
-            await self._bridge({"kind": "committed-turn", "source_causal_id": headers["causal_id"],
-                                "turn_result": turn})
+            if not await self._bridge({"kind": "committed-turn", "source_causal_id": headers["causal_id"],
+                                      "turn_result": turn}):
+                return None, False
         return headers["causal_id"], True
 
     async def _ordinary(self, headers, body):
