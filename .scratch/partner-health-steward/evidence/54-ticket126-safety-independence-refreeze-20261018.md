@@ -50,3 +50,52 @@ root另运行 `/tmp/ticket126-owner-unknown-contact-cross-source-repro.py` 与�
 同一861 checkpoint新鲜双PASS，无新增阻塞。当前唯一设计blob `4a6ec81c94edab252936815cf0fc98925def3d0f` 不变；合同 `5c05dd6ca14afbd0365d1d9f17a3cc6b2092b0a2`、verifier `a97dc7893bdd802142ed943d02b975f305ee821e` 取代Evidence52旧对应项。授权产品作者仅在既有Core claim接缝修复同committed safety fact/source的主人unknown终态与当前contact独立投递；原一般UNKNOWN、不同来源、model、批准/route/head/fence门保留，不以排序替代、不新ledger/重试/ExecutionOverlapPermit。产品作者不得修改三件套。
 
 修复后仍须精确新source原样五门/131四门/124四门/full794/root23/标准编译/15冻结与闭包，最后仅复核此原P2的双轴实施后结论；本票仍claimed。130候选/新测试、128部署及127医学门不在本票完成声明中，未执行真实模型/微信/联系人/部署或主人验收。
+
+
+## R6.1：保留一般UNKNOWN的局部pause样例修正
+
+作者53行窄helper已局部证明同来源contact和原纠正可accepted、different-source仍拒绝；第三类却误沿用旧仅contact unknown时可执行的pause。原owner.prepare正确返回unavailable/effect-result-unknown，不能为此扩大普通settings权限。root只把pause限定于原两类owner accepted；新owner unknown仍执行同contact/重放/unknown保留和原safety.correct链。产品作者未改冻结门或一般权限。
+
+root独立原样运行`/tmp/ticket126-r6-independent-public-smoke.py`，日志`/tmp/ticket126-r6-root-independent-public-smoke.log`：contact及原纠正一次accepted、owner unknown保留无重发、不同来源当前contact有intent却无grant，health/model写入仍False。只是未提交53行产品候选的局部char，不是最高V05/794或闭票。
+
+最新clean checkpoint `687961d8c0aca7b907e90b5fa8e7383a093e07f0` / tree `e9fd998710bdb9404139f1f6c901952ffc8c61fe` 在`/tmp/health-steward-126-r61-clean`；该Git树仍为837产品，未把未提交helper混入编码前review。只修上述一条件及独立合同appendix，无其他产品/冻结票修改。
+
+### Spec R6.1
+
+**Spec：PASS。** 本次 R6.1 有界复审无 P0–P2 因果 finding。
+
+- 条件仅排除 owner unknown 类的普通 pause；原两类 pause/correction 保留。
+- 新类的同来源 contact、重放拒绝、owner unknown 保留及 correction 路径未删除；不同来源负例不变。
+- 合同附录与变更及既有诊断日志一致，未扩大一般 UNKNOWN 权限。
+
+干净 checkout 身份核对一致：
+
+```text
+commit   687961d8c0aca7b907e90b5fa8e7383a093e07f0
+tree     e9fd998710bdb9404139f1f6c901952ffc8c61fe
+design   4a6ec81c94edab252936815cf0fc98925def3d0f
+contract 4cf76b06ba455ee6034d8a5cb961d431cefbd18b
+verifier f971bb6a058945eeaab6daae5bebabda81d89c86
+```
+
+仅只读审查源码与已有证据；未运行新 V05/full794，不构成产品完成、真实外部验收或闭票结论。
+
+### Standards R6.1
+
+**Standards：PASS。** R6.1 有界一致性复审无 P0–P2 阻塞 finding。
+
+条件仅限制 pause：原两类 owner accepted 仍执行 pause及纠正；owner unknown 类保留 contact、重放拒绝、unknown 保留及纠正链检查。不同来源负例未变。契约附录与代码一致，未引入产品旁路或扩大一般 UNKNOWN 权限。
+
+已核对工作树干净、范围内 diff check 通过，精确身份：
+
+- Commit：`687961d8c0aca7b907e90b5fa8e7383a093e07f0`
+- Tree：`e9fd998710bdb9404139f1f6c901952ffc8c61fe`
+- Design blob：`4a6ec81c94edab252936815cf0fc98925def3d0f`
+- Contract blob：`4cf76b06ba455ee6034d8a5cb961d431cefbd18b`
+- Verifier blob：`f971bb6a058945eeaab6daae5bebabda81d89c86`
+
+仅只读源码及既有局部证据复核；未执行新 V05/full794，不代表产品完成、真实外部验证或闭票。
+
+### 最新Root权威
+
+同一687 checkpoint fresh双PASS，当前唯一设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`；合同 `4cf76b06ba455ee6034d8a5cb961d431cefbd18b`、测试 `f971bb6a058945eeaab6daae5bebabda81d89c86` 取代本证据前述R6对应两项。仅允许提交已表征的Core同安全fact/source终态unknown窄helper，原一般UNKNOWN/普通settings/model和不同来源门保持；未授权任何排序hack、新状态或重试。产品作者仍不得改三件套。新最终产品必须跑全部规定执行门和只原P2的双轴复核，当前未闭票。

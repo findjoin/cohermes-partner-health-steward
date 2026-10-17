@@ -65,3 +65,8 @@ root独立持有`../design/126-frozen-verification-contract.md`与`../../../test
 ## Latest bounded verifier refreeze R6 (2026-10-18)
 
 [Evidence53](../evidence/53-ticket126-formal-execution-20261018.md)记录精确837正式5/4/4/794及root23全绿；[Evidence54](../evidence/54-ticket126-safety-independence-refreeze-20261018.md)记录后继独立审查发现并由root实际复现的安全两路独立P2，故不能闭票。最新唯一冻结checkpoint `86115a5026a0549014326e4c4396c08e7e068846` / tree `f63ae993385df75821ee87f960b8a2078cbb7e06` fresh两轴PASS；design `4a6ec81c94edab252936815cf0fc98925def3d0f`，contract `5c05dd6ca14afbd0365d1d9f17a3cc6b2092b0a2`，verifier `a97dc7893bdd802142ed943d02b975f305ee821e`。仅原V05补同来源owner unknown不抑制当前contact及不同来源仍拒绝的等价类，保留旧五门。允许产品作者在既有Core claim接缝最小修此P2，仍须新精确执行全门/完整性及仅原finding双轴复核。旧837绿灯不冒充R6通过，未授权真实外部动作。
+
+
+## Latest bounded verifier refreeze R6.1 (2026-10-18)
+
+[Evidence54末节](../evidence/54-ticket126-safety-independence-refreeze-20261018.md#r61保留一般unknown的局部pause样例修正)记录新owner unknown样例误沿用旧pause权限的实际假红；仅条件化pause，原两类paused correction、新类原safety.correct与不同来源负例均保留。当前唯一checkpoint `687961d8c0aca7b907e90b5fa8e7383a093e07f0` / tree `e9fd998710bdb9404139f1f6c901952ffc8c61fe` fresh双PASS，design `4a6ec81c94edab252936815cf0fc98925def3d0f`，contract `4cf76b06ba455ee6034d8a5cb961d431cefbd18b`，verifier `f971bb6a058945eeaab6daae5bebabda81d89c86`。取代R6对应项，允许仅原P2的Core窄修复；新全门/闭包及原finding双轴复核仍待完成，不能扩大owner unknown一般权限或闭票。
