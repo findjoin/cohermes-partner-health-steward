@@ -47,3 +47,13 @@ Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-imple
 - `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob `fc563931fe822ca3cc1b4cd15a9f4dc6e81b9e1a`。
 - `tests/test_ticket124_live_entry.py` blob `6d8578bc79597eb7a5114186938c574efc7073cb`。
 - 允许最小实现既有process activation的真实registry选择、Publisher自身代码闭包与初始化前明确ordinary路由；不修改冻结门，不接真实服务，不自行闭票。
+
+## Updated frozen implementation authority (advanced replay, 2026-10-18)
+
+本节替代124此前三件套blob；产品和112既有隐私释放语义不变。
+
+- reviewed commit `78bfe92b3be3286f338969315ef8e44def54daf6`; tree `9af993bef6defdb9493c5ac8991b7f7dc0eea733`；fresh Spec/Standards均PASS，见 [Evidence43](../evidence/43-ticket124-redacted-replay-verifier-correction-20261018.md)。
+- `.scratch/partner-health-steward/design/124-live-entry-design.md` blob `b70c45df606c2379b361ba31377abadecd3d6357`。
+- `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob `6dc8430cb2c79436984be539e8ed84a27e696aad`。
+- `tests/test_ticket124_live_entry.py` blob `8253c76fd0d8e1edbe943c4250d31b17c0bdcb3c`。
+- V04等待 Core receipt advanced 后验证 accepted/redacted、无正文、原终态/record/transition/generation保持、无新bridge及unknown attempt仍一次；不得重建已释放回复。其余冻结验收保持，必须重跑执行门后才能实施后审查。
