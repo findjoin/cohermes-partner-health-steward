@@ -95,6 +95,8 @@ workflow/disclosure/callback身份基于账户、owner、conversation、entrypoi
 
 preconsent例外仅用于当前challenge、当前admission policy及同一owner route的固定披露。复用current head/fence/完整性/lease与原outbox，允许在尚无enabled settings时由Core从既有challenge+安装/admission绑定取得身份；不能伪造OwnerSettingsState为enabled、借用daily/task或让普通model/contact效果进入。route authority缺当前绑定时拒绝，不从caller猜测。
 
+Core渲染并授权的首次披露正文必须包含精确可复制指令`/health-init-confirm <workflow> <disclosure_id>`，其中两个占位符替换为该当前challenge的真实workflow和disclosure_id；这是既有独立确认协议的可观察操作入口，不调用模型或新增同意内容。
+
 独立新原生确认仍要匹配当前workflow/disclosure和明确同意文本，经原prepare→commit→finalize才enabled。旧challenge、其他sender/route和body伪造均不能确认。确认事件与第一事件各自source/cursor事实不混写；重复确认不重复enable或创建新披露effect。
 
 ## ACK、正文释放与现有兼容
