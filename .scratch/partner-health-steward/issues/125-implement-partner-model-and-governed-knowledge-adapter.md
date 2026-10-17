@@ -1,7 +1,7 @@
 # 125 - 实现 Partner 首跳模型与治理知识 Adapter
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-production-health-core-and-coreport-service.md)
 Unblocks: [127 - 取得医学内容权利与专业审核](127-obtain-medical-content-rights-and-review.md), [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -43,3 +43,12 @@ Unblocks: [127 - 取得医学内容权利与专业审核](127-obtain-medical-con
 - `tests/test_ticket125_partner_model.py` blob: `35519de98288911c4902db209245e4999fd7db63`。
 - 独立 verifier-owned 四门仍是缺公开生产 Module 的预期四红；既有 StrictPort 32/32，119+StrictPort 39/39 绿色。全量首次本机运行的阻塞来自正式 Linux/root/runtime/pinned-source 环境未装配，不把它们写成通过。
 - 允许在这份冻结设计内实现 `model_adapter.py`、`model_contract.py`、必要的 `answer_resolution.py` 原因闭集和既有 Core 报告接缝；不改冻结三件套，不改变 wire/业务权威，不接真实模型。实现验证后另做执行门和独立实施后审查，不能自行关闭本票。
+
+## Answer
+
+已实现绑定真实严格 profile 的最终 wire 计量、单次 Responses Adapter、raw 实际终态/usage/model回交、在途到期保真及不可变治理知识工件验证。此票保留严格容量证明模式；JOJO 已获主人选择的 ND 操作预算由131显式承接，真实模型验证仍归128。
+
+- 最终 reviewed commit `33a2feee711398cb3320d8a9b3140d24ce32068f`；tree `912888f090a3da0664c4ccad96e61854ee900c1e`。产品字节自6c49739不变；9个冻结blob保持各票最新权威。
+- 正式root/Python3.11环境：124四门、全量785门、root独立三组件14门均0failure/error/skip；compileall83文件PASS，7462项闭包后验未变；baseline/worktree diffcheck PASS，干净且普通push。
+- 执行证据：[Evidence44](../evidence/44-ticket124-125-129-formal-execution-20261018.md)。同一commit/tree fresh Spec PASS、Standards PASS，无阻塞项：[Evidence45](../evidence/45-ticket124-125-129-postimplementation-review-20261018.md)。
+- 顶层只追加闭票元数据，未改产品、冻结合同或旧门；后继可使用本票当前接口。

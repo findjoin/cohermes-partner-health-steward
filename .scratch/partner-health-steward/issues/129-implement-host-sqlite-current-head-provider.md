@@ -1,7 +1,7 @@
 # 129 - 实现 DMIT 宿主 SQLite current-head Provider
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [121 - 实现主机私有健康密钥与能力权威](121-implement-host-private-health-authorities.md)
 Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -57,3 +57,12 @@ Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owne
 - `.scratch/partner-health-steward/design/129-frozen-verification-contract.md` blob: `c8f30f68c6fb520a5dc43b0a01b09176a4dadec6`.
 - `tests/test_ticket129_host_current_head.py` blob: `40ee8f1fae15beaefaae63e803ad9f07fed0ad76`.
 - 允许严格按上述冻结设计实施；产品实施者不得修改冻结三件套或自行闭票。真实部署/外部效果仍按后继既有门，未被本次预审冒充通过。
+
+## Answer
+
+已实现显式 bootstrap/open-existing 的宿主 SQLite CurrentHeadPort，跨进程 CAS/exact receipts、capability hash、lease/typed overlap、正常崩溃恢复与失败关闭；生产组合如实投影 host-sqlite。整机旧快照防回滚不提供，这是主人已接受的限制；真实provisioning及受管数据删除/迁移证据仍归128。
+
+- 最终 reviewed commit `33a2feee711398cb3320d8a9b3140d24ce32068f`；tree `912888f090a3da0664c4ccad96e61854ee900c1e`。产品字节自6c49739不变；9个冻结blob保持各票最新权威。
+- 正式root/Python3.11环境：124四门、全量785门、root独立三组件14门均0failure/error/skip；compileall83文件PASS，7462项闭包后验未变；baseline/worktree diffcheck PASS，干净且普通push。
+- 执行证据：[Evidence44](../evidence/44-ticket124-125-129-formal-execution-20261018.md)。同一commit/tree fresh Spec PASS、Standards PASS，无阻塞项：[Evidence45](../evidence/45-ticket124-125-129-postimplementation-review-20261018.md)。
+- 顶层只追加闭票元数据，未改产品、冻结合同或旧门；后继可使用本票当前接口。

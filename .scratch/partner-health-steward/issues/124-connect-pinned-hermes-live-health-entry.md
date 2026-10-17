@@ -1,7 +1,7 @@
 # 124 - 接通 pinned Hermes 的真实健康入口
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-production-health-core-and-coreport-service.md)
 Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -57,3 +57,12 @@ Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-imple
 - `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob `6dc8430cb2c79436984be539e8ed84a27e696aad`。
 - `tests/test_ticket124_live_entry.py` blob `8253c76fd0d8e1edbe943c4250d31b17c0bdcb3c`。
 - V04等待 Core receipt advanced 后验证 accepted/redacted、无正文、原终态/record/transition/generation保持、无新bridge及unknown attempt仍一次；不得重建已释放回复。其余冻结验收保持，必须重跑执行门后才能实施后审查。
+
+## Answer
+
+已在真实 pinned Hermes Base/registry 与 Publisher 代码闭包中实现逐条健康入口、来源先行准入、独立原生消息同意、Core-approved cursor、重启重投隐私释放及 co-stop；生产 CorePort 装配同一 typed runtime。实际网络Transport与发送授权仍归126，真实目标与主人验收仍归128。
+
+- 最终 reviewed commit `33a2feee711398cb3320d8a9b3140d24ce32068f`；tree `912888f090a3da0664c4ccad96e61854ee900c1e`。产品字节自6c49739不变；9个冻结blob保持各票最新权威。
+- 正式root/Python3.11环境：124四门、全量785门、root独立三组件14门均0failure/error/skip；compileall83文件PASS，7462项闭包后验未变；baseline/worktree diffcheck PASS，干净且普通push。
+- 执行证据：[Evidence44](../evidence/44-ticket124-125-129-formal-execution-20261018.md)。同一commit/tree fresh Spec PASS、Standards PASS，无阻塞项：[Evidence45](../evidence/45-ticket124-125-129-postimplementation-review-20261018.md)。
+- 顶层只追加闭票元数据，未改产品、冻结合同或旧门；后继可使用本票当前接口。
