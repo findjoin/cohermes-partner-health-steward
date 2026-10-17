@@ -60,3 +60,8 @@ root独立持有`../design/126-frozen-verification-contract.md`与`../../../test
 ## Latest bounded verifier refreeze R5 (2026-10-18)
 
 [Evidence52](../evidence/52-ticket126-refusal-and-confirm-time-refreeze-20261018.md)记录两个局部verifier样例矛盾及root独立public复现、精确837 provisional5/5和新鲜双轴PASS。当前唯一冻结checkpoint `837ac4dba1ca6024ca81e3bdbab5f2193344f878` / tree `c178e4e7fb64b7cca2d5ba2591f5aa817864ea7d`；设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`，合同 `f824e8c2d2b00586c592edc1533ca5a03342813d`，verifier `a4d9b67366f3b0e52528f3c9f43562a6e50c80c7`。取代Evidence51旧合同/测试，不改产品或五方法/R3未知ACK。root允许在全新正式快照运行同精确source的五门/794/23/编译及闭包；尚未完成正式执行或实施后审查，不能闭票。磁盘失败无测试、临时验证副本清理和provisional证据的边界保留在Evidence52。
+
+
+## Latest bounded verifier refreeze R6 (2026-10-18)
+
+[Evidence53](../evidence/53-ticket126-formal-execution-20261018.md)记录精确837正式5/4/4/794及root23全绿；[Evidence54](../evidence/54-ticket126-safety-independence-refreeze-20261018.md)记录后继独立审查发现并由root实际复现的安全两路独立P2，故不能闭票。最新唯一冻结checkpoint `86115a5026a0549014326e4c4396c08e7e068846` / tree `f63ae993385df75821ee87f960b8a2078cbb7e06` fresh两轴PASS；design `4a6ec81c94edab252936815cf0fc98925def3d0f`，contract `5c05dd6ca14afbd0365d1d9f17a3cc6b2092b0a2`，verifier `a97dc7893bdd802142ed943d02b975f305ee821e`。仅原V05补同来源owner unknown不抑制当前contact及不同来源仍拒绝的等价类，保留旧五门。允许产品作者在既有Core claim接缝最小修此P2，仍须新精确执行全门/完整性及仅原finding双轴复核。旧837绿灯不冒充R6通过，未授权真实外部动作。
