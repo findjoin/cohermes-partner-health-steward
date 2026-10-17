@@ -17,3 +17,9 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 承接同一Core的controlled-effect、当前owner/route/profile同意、源绑定、typed候选与唯一提交。若模型做证据前抽取，先冻结最小候选阶段及其purpose、exact effect identity、重放/unknown/失败与后续问答的关系；不得直接在executor HTTP绕过Core授权，不新增第二业务状态/批准ledger。模型无数据库写权；既有七Skill runtime实际use proof与Core验证继续成立。任何未获批准的模型/owner资料路径保持关闭。
 
 本票当前只记录已复现的实现差额，是128非诊断产品可用性的前置输入；不提前冻结详细设计/测试，待124/125当前接口闭合后独立验证与双轴预审。医学许可及诊断激活仍归127，不被此票替代。
+
+## Cross-process characterization input
+
+独立只读核查补充：现有Core.execute_strict_health_model的lifecycle lock跨adapter.execute；daily_turn_runtime_preparation也跨yield执行executor。生产service逐连接串行，反向等Plugin callback会堵唯一socket。CorePort现有claim只交intent/grant metadata；terminal仅status/result_ref，缺完整StrictModelRequest/ModelTransportResult。开启model_authority时effect结果必须匹配Core进程自身观察的report，不能让Plugin自报成功绕过。
+
+可复用严格request/result codec、effect session/grant、已持久model_attempt_started、既有终态journal与lease释放，以及DailySkillRuntime.complete已有model_answer_resolution/model_reply_atoms参数。后继冻结需明确短调用的canonical request准备/开始标记、Plugin进程执行、同session完整terminal由Core重验、继续唯一typed提交；不能让Core持模型凭据或在executor发HTTP。现authority_for_digest只恢复route/profile/schema，不含生产measurement strategy，组合根也需实际typed绑定。这里仍只是阻塞接口事实，不提前定新wire/状态。

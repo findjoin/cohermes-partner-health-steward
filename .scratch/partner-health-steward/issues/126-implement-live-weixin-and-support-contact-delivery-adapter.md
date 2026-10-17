@@ -23,3 +23,11 @@ Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owne
 ## Delivery discipline
 
 编码前冻结 pinned iLink 可观察终态与 unknown 矩阵。若渠道不提供 delivered/read 证明，合同保留 unavailable/unknown，不用轮询或猜测扩展架构。通过后普通提交并推送。
+
+## 2026-10-18 characterization input
+
+124的committed-turn与initialization-disclosure bridge形状仅是请求发送授权。现有OwnerDeliveryWireAdapter只收Core已授权的payload_ref/digest/route/attempt/idempotency；Core的outbox binding现只承接复盘/task、lifecycle notice和owner decision，缺已finalized DailyTurnResult唯一回复及既有初始化disclosure challenge的binding。初始化披露发生在enabled前，现_current_owner_settings与claim_effect_execution均要求enabled，因此需要在本票明确冻结只绑定现存challenge的最小发送例外；不能伪造daily/task、先置enabled或承接任意caller文本。
+
+现有public主人投递链可复用：prepare→issue→claim→execute重新核验→complete将观察终态写回原effect/outbox。CorePort旧claim/terminal没有完整prepare/authorize/complete映射，需同三类kind中的固定purpose桥接。联系人仍用现有唯一联系人/批准与最小contact_alert，平台只证明interface accepted不能扩写delivered/read。
+
+Pinned低层_get_updates/_send_message各一次调用_api_post，可用于生产Transport；native高层仍有先持久化cursor、正文dedup/batch、retry/tokenless fallback，不得复用。初始化workflow及发送幂等identity还需绑定真实native事件而非可能变化的batch cursor；不把124离线bridge输入当发送权。下游详细冻结等待124现行接口与实际发布门闭合。
