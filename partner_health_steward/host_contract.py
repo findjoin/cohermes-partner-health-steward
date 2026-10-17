@@ -328,6 +328,7 @@ class _CorePortClient:
         try:
             with self._connect() as connection:
                 connection.sendall(frame)
+                connection.shutdown(socket.SHUT_WR)
                 header = self._recv_exact(connection, 4)
                 declared = struct.unpack(">I", header)[0]
                 if declared > 65536:
