@@ -1,7 +1,7 @@
 # 126 - 实现真实 Weixin 与支持联系人投递 Adapter
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md)
 Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -31,3 +31,11 @@ Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owne
 现有public主人投递链可复用：prepare→issue→claim→execute重新核验→complete将观察终态写回原effect/outbox。CorePort旧claim/terminal没有完整prepare/authorize/complete映射，需同三类kind中的固定purpose桥接。联系人仍用现有唯一联系人/批准与最小contact_alert，平台只证明interface accepted不能扩写delivered/read。
 
 Pinned低层_get_updates/_send_message各一次调用_api_post，可用于生产Transport；native高层仍有先持久化cursor、正文dedup/batch、retry/tokenless fallback，不得复用。初始化workflow及发送幂等identity还需绑定真实native事件而非可能变化的batch cursor；不把124离线bridge输入当发送权。下游详细冻结等待124现行接口与实际发布门闭合。
+
+## 2026-10-18 pre-code candidate
+
+124/125/129已按Evidence44/45闭合，当前产品基线`58453bf`；开始本票唯一增量设计，不进入产品编码。唯一设计`../design/126-live-delivery-design.md`；独立verification authority为root，合同`../design/126-frozen-verification-contract.md`及verifier-owned `../../../tests/test_ticket126_live_delivery.py`由其持有。
+
+当前直接链还证明：`live_weixin`只处理`meta.turn_result`，漏掉现有116 safety branch的主人最低提示/联系人接续；第一init分支返回`(None,False)`，需要原challenge/source receipt的可推进终态；daily advanced后会按旧112释放正文，实际授权交接必须先成立，不能在重投时重建。候选统一覆盖这些既有主人/联系人投递缺口，不另建发送账本。
+
+准备验证通过最高生产socket/真实pinned低层网络替身和真实115/116业务fixture，明确accepted/unknown而不伪造delivered/read。本阶段不读取真实账户秘密、不实际发微信、不改产品或冻结旧测试；同一checkpoint新鲜Spec/Standards及精确三件套冻结后才实施。
