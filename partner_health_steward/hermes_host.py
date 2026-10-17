@@ -204,7 +204,17 @@ def register(ctx: object) -> None:
         raise RuntimeError("Hermes PluginContext lacks platform registration")
     activation = _ActivationState()
 
-    def adapter_factory(config: object) -> _HealthWeixinAdapter:
+    def adapter_factory(config: object) -> object:
+        extra = getattr(config, "extra", None)
+        if type(extra) is dict and "admission_policy" in extra:
+            # The actual registry checks this before constructing an adapter;
+            # retain it here as well for callers holding the factory directly.
+            # Only the existing verified-release bootstrap can arm this state.
+            if not activation.can_create_adapter():
+                raise _HostVerificationFailure("health-activation-unproven")
+            from .live_weixin import LiveHealthWeixinAdapter
+
+            return LiveHealthWeixinAdapter(config)
         return _HealthWeixinAdapter(config, activation)
 
     def arm(capability: object, proof: object) -> None:
