@@ -49,6 +49,12 @@ profile_binding_digest 对 CapabilityProfile.to_wire() 除 evidence_refs 外的�
 
 生产 transport 只向 route.canonical_base_url 的固定 Responses endpoint POST；禁重定向、SDK/HTTP 自动重试、环境代理自动替换、自动 auth refresh 后重放与 fallback。限定超时及响应大小；credential 仅存在该一次请求的 auth header，不进入 body、异常文本、CorePort、release、报告或日志。不记录 prompt、raw response 或 transcript。
 
+计量证据的时间门只决定“此刻能否开始新的外部效果”，不能改写已经发生的效果。发送前已到期时仍由 Core/Adapter 前门返回既有 failed-closed/not-started/capacity-unavailable，transport 调用为零。若调用在有效期内获准且已发送、证据在 send 期间过期，随后收到权威 completed/incomplete/failed，则 resolve_transport_result 必须保留实际终态、actual model、response identity 与 usage 所绑定的 ModelTransportResult/report；不得因重复动态 preflight 把它改成 not-started，亦不得让 Core 将它替换成 unknown。
+
+过期后的 completed 不产生候选或业务提交，返回 failed-closed、model_effect=completed、candidate=None，并用精确的 capacity-evidence-expired 标明“效果完成但当前容量依据已失效”。该 reason 只作为 answer_resolution.ModelEffectReport 既有 completed rejection 闭集的一项增量，不增加 wire 字段。incomplete/failed 保留原权威终态及原失败/不完整原因，不伪装 schema 错误、not-started 或 unknown。真正缺失/不可信 terminal 才沿用 unknown；到期本身不是未知效果。
+
+这是独立 Spec 预审已复现的局部边界缺口：当前 resolve_transport_result 在 transport 返回后重跑动态 preflight，会在时钟跨 expires_at 时丢掉返回结果；Core 随后因缺 model_report 选择预先构造的 unknown。修复只在现有 resolver/report 接缝区分发送前准入与发送后事实裁决，保留 canonical request、既有授权和副作用次数。必要时允许 Core 的现有报告处理做最小衔接，不能改变 grant、CorePort、ModelTransportResult wire、业务状态机或持久账本。report.result_digest 继续绑定已观察 raw identity/model/usage，不另存 raw transcript。
+
 传输可接收 raw JSON response 或 SSE。SSE 只在取得唯一匹配 response ID 的 raw terminal event 后形成已知终态；delta 结束、EOF、HTTP 无错误或拼接出的 JSON 均不证明 completed。允许使用权威 output_item.done 的完整输出配合 terminal event；不把不完整 delta 当最终输出。冲突/重复不一致 terminal、响应 ID 不一致、工具输出或额外健康效果皆拒绝/unknown。
 
 - completed：raw response 明确 completed，且 id、实际 model、usage.input_tokens/output_tokens 都存在且类型合法；取得完整严格 JSON object，无拒绝/工具/截断，才产生 completed ModelTransportResult。actual_model 只能来自 raw terminal metadata，不回填 requested_model。最终对象继续由现有 StrictHealthLLM 与领域提交边界校验。
@@ -68,10 +74,10 @@ profile_binding_digest 对 CapabilityProfile.to_wire() 除 evidence_refs 外的�
 
 1. 真实标记 profile 经受限策略、canonical_copy 和现有 Plugin/Core exact grant 完成一次离线 transport；既有 synthetic 回归保持绿色。
 2. 无证据/错 hash/过期/route或profile drift、容量不足、schema漂移均在 Core/Adapter前门零 transport；当前真实profile若无窗口/计量证据继续零调用。
-3. exact wire 禁工具与 fallback；raw actual-model/usage/终态映射以及发送后 unknown 不重试；任意第二 send、requested冒充actual或delta冒充terminal必须使门失败。
+3. exact wire 禁工具与 fallback；raw actual-model/usage/终态映射以及发送后 unknown 不重试；在 send 内推进时钟跨计量 expiry 时，completed/incomplete/failed 仍保留实际 effect/report 终态，completed 不给候选且用精确到期 reason；任意第二 send、requested冒充actual、到期冒充 not-started/unknown 或 delta 冒充 terminal 必须使门失败。
 4. owner-independent知识工件精确hash、重新发布一致性、失效/撤回/未知字段失败关闭；当前包进入同一生产组合根，staged医学不自动激活。
 
-正式门、API fixture 与 mutation 由 verifier 独立维护；本候选未授权编码。待同一 checkpoint 的独立 Spec/Standards 预审通过后，再按有限门纵向实现。产品修改仅限 model_adapter.py 与 model_contract.py；生产组合根及发布装配接线由其现有文件负责人完成，双方共享公开合同而不并行改同一文件。
+正式门、API fixture 与 mutation 由 verifier 独立维护；本候选未授权编码。待同一 checkpoint 的独立 Spec/Standards 预审通过后，再按有限门纵向实现。产品修改主范围为 model_adapter.py 与 model_contract.py；预审已复现的跨 expiry 报告修复允许 answer_resolution.py 的精确 completed-rejection reason 闭集增量，以及必要的 Core 既有报告接缝最小修复。生产组合根及发布装配接线由其现有文件负责人完成，若需 Core 衔接先与该文件负责人串行交接，双方共享公开合同而不并行改同一文件。
 
 ## 停止规则
 

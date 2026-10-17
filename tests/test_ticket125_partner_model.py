@@ -334,6 +334,44 @@ class Ticket125ProductionModelVerificationTests(unittest.TestCase):
         self.assertEqual(first.model_effect, "unknown")
         self.assertEqual(second.model_effect, "not-started")
         self.assertEqual(len(transport.calls), 1)
+        # Admission may expire after a real attempt. Its observed terminal facts
+        # must not be rewritten as not-started or unknown by a second preflight.
+        for terminal in ("completed", "incomplete", "failed"):
+            with self.subTest(expired_after_attempt=terminal):
+                now = [_NOW]
+                class CrossExpiryTransport(_OfflineTransport):
+                    def send(self, body):
+                        result = super().send(body)
+                        now[0] = datetime(2026, 9, 2, tzinfo=timezone.utc)
+                        return result
+                _, _, _, _, request, llm, transport, adapter = self._context(
+                    transport=CrossExpiryTransport(_raw(terminal)), clock=lambda: now[0])
+                observed = adapter.execute(request.to_wire())
+                self.assertEqual(observed.status, terminal)
+                resolved = llm.resolve_transport_result(request, observed)
+                self.assertEqual(resolved.model_effect, terminal)
+                self.assertIsNone(resolved.candidate)
+                self.assertTrue(resolved.model_report.transport_attempted)
+                self.assertTrue(resolved.model_report.terminal_proven)
+                self.assertEqual(resolved.model_report.model_status, terminal)
+                self.assertEqual(resolved.model_report.actual_model, _route().requested_model)
+                self.assertEqual(resolved.model_report.result_digest, stable_digest(observed.to_wire()))
+                self.assertEqual(len(transport.calls), 1)
+        now = [_NOW]
+        class CoreCrossExpiryTransport(_OfflineTransport):
+            def send(self, body):
+                value = super().send(body)
+                now[0] = datetime(2026, 9, 2, tzinfo=timezone.utc)
+                return value
+        _, _, _, _, request, llm, transport, adapter = self._context(
+            transport=CoreCrossExpiryTransport(), clock=lambda: now[0])
+        base = self._core_fixture(llm)
+        source, grant = self._authorize(base, request, "expired-after-core-attempt")
+        expired_attempt = base.plugin.execute_strict_health_model(llm, request, source, grant, adapter)
+        self.assertEqual(expired_attempt.model_effect, "completed")
+        self.assertIsNone(expired_attempt.candidate)
+        self.assertEqual(expired_attempt.model_report.model_status, "completed")
+        self.assertEqual(len(transport.calls), 1)
 
     def test_v125_04_governed_artifact_republishes_exactly_without_owner_input(self):
         module = self._module()
