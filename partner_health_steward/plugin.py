@@ -89,6 +89,7 @@ from .rights import (
 )
 from .settings import OwnerSettingsState
 from .status import BusinessStatusResult
+from .storage import KeyUnavailable, StoreUnavailable
 
 
 def _wire_fields(
@@ -1315,7 +1316,7 @@ class HealthPlugin:
         return self._core.source_receipt(causal_id)
 
     def live_entry_preflight(self, headers: dict, *, generation: int, peer_id: str) -> dict[str, object]:
-        if peer_id != "plugin":
+        if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
         policy = self._admission_policy
         phase = self.initialization_status(peer_id=peer_id).phase
@@ -1340,17 +1341,17 @@ class HealthPlugin:
                 "initialization_phase": phase, "reason_code": reason}
 
     def live_entry_disclosure(self, workflow_id: str, *, peer_id: str) -> dict[str, object]:
-        if peer_id != "plugin":
+        if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
         return self._core.live_entry_disclosure(workflow_id, self._admission_policy)
 
     def live_entry_native_cursor(self, *, peer_id: str) -> str | None:
-        if peer_id != "plugin":
+        if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
         return self._core.live_entry_native_cursor(self._admission_policy)
 
     def live_entry_replay_source(self, message: RawWeixinMessage, *, peer_id: str) -> RawWeixinMessage:
-        if peer_id != "plugin":
+        if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
         policy = self._admission_policy
         if type(policy) is not AdmissionPolicy:
@@ -1360,6 +1361,40 @@ class HealthPlugin:
             raise AuthorityValidationError(reason)
         source = self._core.live_entry_replay_source(materialize_source(message), policy)
         return RawWeixinMessage(**source.to_storage())
+
+    def live_entry_receive_weixin(self, message: RawWeixinMessage, *, peer_id: str) -> Response:
+        """The live route adds explicit ordinary classification before consent.
+
+        The historical receive Interface retains its health-init-only,
+        zero-body capability rejection. This route grants no health write or
+        model permission to an uninitialized owner.
+        """
+        if type(peer_id) is not str or peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        policy = self._admission_policy
+        if type(policy) is not AdmissionPolicy:
+            return Response("unavailable", reason_code="admission-policy-unavailable")
+        reason = policy.rejection_reason(message, allowed_capabilities=("health-init", *DAILY_HEALTH_SKILL_NAMES))
+        if reason is not None:
+            return Response("rejected", reason_code=reason)
+        report = self.probe()
+        if report.state is not ProbeState.HEALTHY:
+            return Response("unavailable", reason_code=report.reason_code)
+        try:
+            message = self.live_entry_replay_source(message, peer_id=peer_id)
+        except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
+            return Response("rejected", reason_code="invalid-weixin-source")
+        if (self.initialization_status(peer_id=peer_id).phase == "uninitialized"
+                and message.requested_capability == "health-steward"):
+            if type(self._coarse_router) is not CoarseMessageRouter:
+                return Response("unavailable", reason_code="coarse-router-unavailable")
+            try:
+                classification = self._coarse_router.classify(message.body, "health-steward")
+            except Exception:
+                return Response("unavailable", reason_code="coarse-router-unavailable")
+            if classification == "ordinary":
+                return Response("accepted", message.causal_id, "ordinary-hermes-route")
+        return self.receive_weixin(message, peer_id=peer_id)
 
     def form_initialization_disclosure(
         self,

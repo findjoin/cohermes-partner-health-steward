@@ -398,6 +398,14 @@ class HermesReleasePublisher:
             ).encode("utf-8")
         for name in ("minimum-help", "knowledge", "safety", "diagnostic"):
             result[f"bundles/{name}.json"] = _static_json({"availability": "unavailable", "status": "staged"})
+        # Live Adapter imports must resolve within this same hash-bound release,
+        # including on hosts with no checkout on sys.path. This copies only
+        # source code; running profiles, databases and credentials are excluded.
+        for path in sorted(package.rglob("*.py")):
+            if path.is_symlink() or "__pycache__" in path.parts:
+                raise ValueError("release product source is unsafe")
+            relative = path.relative_to(package).as_posix()
+            result[f"plugin/health-weixin/partner_health_steward/{relative}"] = path.read_bytes()
         return result
 
     @staticmethod

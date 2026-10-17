@@ -100,11 +100,7 @@ class LiveHealthCoreOperations:
         if name == "receive-weixin":
             wire = _mapping(_mapping(data, {"message"})["message"], _MESSAGE)
             message = RawWeixinMessage(**wire)
-            try:
-                message = plugin.live_entry_replay_source(message, peer_id="plugin")
-            except AuthorityValidationError:
-                return {"response": Response("rejected", reason_code="invalid-weixin-source").to_wire()}
-            return {"response": plugin.receive_weixin(message, peer_id="plugin").to_wire()}
+            return {"response": plugin.live_entry_receive_weixin(message, peer_id="plugin").to_wire()}
         if name in {"initialization-disclosure", "initialization-consent"}:
             initialization = OwnerInitialization.from_storage(
                 _mapping(data, {"initialization"})["initialization"])
@@ -194,7 +190,9 @@ class LiveHealthRuntime:
             if "sha256:" + hashlib.sha256(content).hexdigest() != assets[name].asset_digest:
                 raise ValueError("live health asset digest drift")
             text = content.decode("utf-8").lower()
-            if not text.strip() or "staged-only" in text or "runtime-unavailable" in text:
+            markers = {line.strip() for line in text.splitlines()}
+            if (not text.strip() or "staged-only" in text or "runtime-unavailable" in text
+                    or {"status: staged", "availability: unavailable"} & markers):
                 raise ValueError("live health asset is staged")
 
     def core_dependencies(self):
