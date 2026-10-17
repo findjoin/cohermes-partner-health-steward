@@ -10,7 +10,7 @@ Tree: 2ef6d576519f69485de297b4dac0f794ce7cbc7b
 
 **PASS — bounded Spec PRE-CODE re-review.**
 
-Commit: `5f5286cfdddb358baec14a4bee17c2fa7f85417f`  
+Commit: `5f5286cfdddb358baec14a4bee17c2fa7f85417f`
 Tree: `2ef6d576519f69485de297b4dac0f794ce7cbc7b`
 
 The original P2 is resolved at the design/verification level: before-send expiry requires zero calls; after-send expiry preserves proven terminal facts and report identity, while completed candidates are refused with `capacity-evidence-expired`. V03 adds clock-crossing coverage for all three terminals and the real Core path.
@@ -25,7 +25,7 @@ The revised design resolves the original finding at the pre-code level: before-s
 
 The change preserves Core authorization, exact grants, one-shot execution, existing wire fields, and ledger ownership. Missing implementation and four expected failures are not blockers for this review.
 
-Reviewed commit: `5f5286cfdddb358baec14a4bee17c2fa7f85417f`  
+Reviewed commit: `5f5286cfdddb358baec14a4bee17c2fa7f85417f`
 Reviewed tree: `2ef6d576519f69485de297b4dac0f794ce7cbc7b`
 
 Read-only review; no files modified or services accessed.

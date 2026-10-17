@@ -14,7 +14,7 @@ No remaining findings within the requested scope. Read-only static **PRE-CODE sp
 
 ## Standards
 
-Commit: `fe9c058fcf634ebe624f98c1c72adde90a86032a`  
+Commit: `fe9c058fcf634ebe624f98c1c72adde90a86032a`
 Tree: `858f0cd397853138c226f35a968d1deef014dd28`
 
 - **Ticket124 — PASS (Standards PRE-CODE re-review).** All three original findings are closed: same-socket initialization and daily dependency exercise; registry-created Adapter initialization through a separate native confirmation against retained Core challenge; recreated Adapter’s first-poll cursor and retained replay identity. Bridge stubs remain explicitly bounded and establish no live acceptance.
