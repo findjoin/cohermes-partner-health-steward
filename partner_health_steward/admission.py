@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -11,6 +13,21 @@ from .authority import AuthorityValidationError, validate_opaque_text
 
 
 MAX_MESSAGE_BODY_BYTES = 16 * 1024
+
+
+def live_native_event_identity(headers: dict) -> str:
+    """Name one native event without poll cursor or delivery-local timing."""
+    if type(headers) is not dict:
+        raise AuthorityValidationError("invalid native event headers")
+    fields = ("partner_id", "sender_id", "conversation_id", "entrypoint", "message_id")
+    identity = {key: validate_opaque_text(headers.get(key), key) for key in fields}
+    timestamp = headers.get("protocol_timestamp")
+    if timestamp is not None:
+        _timestamp(timestamp, "protocol_timestamp")
+    identity["protocol_timestamp"] = timestamp
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8")
+    return "health-native-event:" + hashlib.sha256(canonical).hexdigest()
 
 
 class MessageBody(Protocol):

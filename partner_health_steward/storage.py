@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from cryptography.exceptions import InvalidTag
@@ -2673,6 +2673,10 @@ class EncryptedStateStore:
             return None
         return self._decode_health_command_receipt(causal_id, row[0], row[1])
 
+    def health_command_receipt(self, causal_id: str) -> HealthCommandReceipt | None:
+        """Read one original managed result by its existing exact causal key."""
+        return self._health_command_receipt_for_causal_id(causal_id)
+
     def lookup_health_command_receipt(
         self,
         command: TrustedHealthCommand,
@@ -3362,6 +3366,26 @@ class EncryptedStateStore:
             )
             self._refresh_integrity_manifest(connection)
             return receipt
+
+    def remember_live_disclosure_source(self, envelope: SourceEnvelope) -> SourceReceipt:
+        """Refresh only delivery-local cursor of a keyed, fixed disclosure event."""
+        if type(envelope) is not SourceEnvelope or envelope.body != "/health-init":
+            raise AuthorityValidationError("invalid live disclosure source")
+        with self.transaction():
+            receipt = self.source_receipt(envelope.causal_id)
+            if receipt is None:
+                return self.save_source_envelope(envelope)
+            digest = self._native_event_digest(envelope)
+            if receipt.native_event_digest is None or not hmac.compare_digest(receipt.native_event_digest, digest):
+                raise CausalIdConflict("causal-id-conflict")
+            if receipt.managed_cursor_state != "committed":
+                if not receipt.matches_exact_delivery(envelope, digest):
+                    raise CausalIdConflict("causal-id-conflict")
+                return receipt
+            if receipt.envelope.native_cursor == envelope.native_cursor:
+                return receipt
+            updated = replace(receipt, envelope=envelope.without_body(), native_cursor_state="ready")
+            return self._replace_source_receipt(updated)
 
     def source_receipt_matches_exact_delivery(
         self,

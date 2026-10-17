@@ -19,6 +19,7 @@ from .admission import (
     NativeCursorDirective,
     SourceEnvelope,
     SourceReceipt,
+    live_native_event_identity,
 )
 from .answer_resolution import (
     ModelAnswerResolution,
@@ -986,6 +987,14 @@ class InMemoryExecutionCapabilityVault:
 
         with self._lock:
             self._sessions.clear()
+
+
+@dataclass(frozen=True)
+class _LiveDisclosureOwner:
+    """Identity only; never enabled owner settings or a consent fact."""
+    owner_id: str
+    installation_id: str
+    current_configuration_generation: int = 1
 
 
 class HealthCore:
@@ -3040,12 +3049,12 @@ class HealthCore:
             )
         if command.action == "effect.request" and self._admission_policy is not None:
             initialization = self._store.initialization()
-            if initialization is None or initialization.phase != "enabled":
+            if (initialization is None or initialization.phase != "enabled") and not self._live_preconsent_request(command, head):
                 return _Handled(
                     Response("rejected", command.causal_id, "initialization-required"),
                     True,
                 )
-            if not self._initialization_configuration_matches(initialization.draft):
+            if initialization is not None and not self._initialization_configuration_matches(initialization.draft):
                 return _Handled(
                     Response(
                         "unavailable",
@@ -3089,6 +3098,7 @@ class HealthCore:
         if (
             command.action not in _PROBE_BYPASS_ACTIONS
             and not mandatory_owner_decision
+            and not self._live_exact_owner_request(command, head)
             and not lifecycle_notice
             and not ticket116_safety_admission
             and not ticket116_contact_authority_change
@@ -4458,6 +4468,12 @@ class HealthCore:
                 ),
                 False,
             )
+        if initialization.workflow_id.startswith("live-init:"):
+            first_id = "live-init-source:" + initialization.workflow_id.removeprefix("live-init:")
+            first = self._store.source_receipt(first_id)
+            if (first is None or source.message_id is None or source.message_id == first.envelope.message_id
+                    or first.managed_cursor_state != "committed" or not self._live_cursor_handoff_allowed(first_id)):
+                return _Handled(Response("rejected", command.causal_id, "independent-initialization-confirmation-required"), True)
         try:
             consent = OwnerConsentEvidence.from_message_body(source.body)
             consent_fact = consent.disclosure.skill_proof.skill_use
@@ -5285,7 +5301,7 @@ class HealthCore:
         if effect_kind == "owner-delivery":
             source_causal_id = payload.business_source_causal_id
             try:
-                settings = self._current_owner_settings(head)
+                settings = self._live_owner_binding(head, source_causal_id)
                 outbox = self._ticket115_outbox_state_open(settings)
                 outbox_record = outbox.record(source_causal_id)
                 outbox_intent = outbox_record.intent
@@ -5893,7 +5909,7 @@ class HealthCore:
                         or not self._initialization_configuration_matches(
                             initialization.draft
                         )
-                    ):
+                    ) and not self._live_preconsent_effect(requested_intent):
                         return None
                 if self._writer_entry_preflight() is not None:
                     return None
@@ -5973,7 +5989,7 @@ class HealthCore:
                             observed_at_utc = self._owner_delivery_clock_utc_open()
                             if observed_at_utc is None:
                                 return None
-                            settings = self._current_owner_settings(head)
+                            settings = self._live_owner_binding(head, candidate_intent.business_source_causal_id)
                             outbox = self._ticket115_outbox_state_open(settings)
                             outbox_record = outbox.record(
                                 candidate_intent.business_source_causal_id
@@ -6005,6 +6021,7 @@ class HealthCore:
                                 unresolved_effects != (intent.effect_id,)
                                 and not mandatory_overlap
                                 and not lifecycle_notice_overlap
+                                and not self._live_owner_contact_overlap(outbox_intent, unresolved_effects)
                             ):
                                 return None
                             if overlap_effect_id is not None:
@@ -6599,7 +6616,7 @@ class HealthCore:
 
     @contextmanager
     def _ticket115_write_authority(
-        self,
+        self, *, live_intent_id=None, live_challenge=None,
     ) -> Iterator[tuple[AuthoritySnapshot, OwnerSettingsState]]:
         """Hold the single-writer lane across one local Ticket 115 mutation."""
 
@@ -6645,7 +6662,9 @@ class HealthCore:
                     raise AuthorityValidationError(
                         "current-writer-holder-missing"
                     )
-                settings = self._current_owner_settings(head)
+                settings = (self._current_owner_settings(head)
+                            if live_intent_id is None and live_challenge is None
+                            else self._live_owner_binding(head, live_intent_id, live_challenge))
                 yield head, settings
             finally:
                 self._exit_current_head_guard()
@@ -9440,6 +9459,8 @@ class HealthCore:
             outbox = self._ticket115_outbox_state_open(settings)
             outbox_record = outbox.record(intent.intent_id)
             task_state = self._ticket115_task_state_open(settings)
+            if self._live_owner_intent(intent):
+                return self._live_owner_binding_open(intent, settings)
             if intent.payload_ref.startswith("lifecycle-notice:"):
                 operation_ref = intent.payload_ref.removeprefix(
                     "lifecycle-notice:"
@@ -9724,6 +9745,23 @@ class HealthCore:
         if binding is None:
             return None
         outbox, outbox_record, task_state, review = binding
+        if self._live_owner_intent(intent):
+            destination = self._owner_weixin_destination_open(settings)
+            preconsent = self._live_challenge_for_intent(intent) is not None
+            if (not preconsent and not self._owner_delivery_global_controls_allow_open(settings, observed_at_utc=observed_at_utc, mandatory=True)):
+                return None
+            if (intent.route_id != destination.route_id or intent.recipient_ref != destination.owner_sender_id
+                    or intent.route_generation != settings.current_configuration_generation or outbox_record.unknown_frozen):
+                return None
+            attempted = outbox_record.optional_fact("attempted")
+            if expected_attempt_ref is None:
+                if attempted is not None:
+                    return None
+            elif attempted is None or attempted.attempt_ref != expected_attempt_ref or outbox_record.current_layer != "attempted":
+                return None
+            if required_lease is not None and required_lease.intent_digest != intent.semantic_digest:
+                return None
+            return binding
         if intent.payload_ref.startswith("lifecycle-notice:"):
             try:
                 destination = self._owner_weixin_destination_open(settings)
@@ -9868,7 +9906,7 @@ class HealthCore:
 
         validate_opaque_text(intent_id, "owner delivery intent identifier")
         with self._lifecycle_lock:
-            with self._ticket115_write_authority() as (head, settings):
+            with self._ticket115_write_authority(live_intent_id=intent_id) as (head, settings):
                 intent = self._ticket115_outbox_state_open(settings).record(
                     intent_id
                 ).intent
@@ -10092,7 +10130,7 @@ class HealthCore:
             result_ref=completion.result_ref,
             evidence_ref=completion.evidence_ref,
         )
-        with self._ticket115_write_authority() as (head, settings):
+        with self._ticket115_write_authority(live_intent_id=completion.intent_id) as (head, settings):
             outbox = self._ticket115_outbox_state_open(settings)
             current = outbox.record(completion.intent_id)
             attempted = current.optional_fact("attempted")
@@ -10119,6 +10157,7 @@ class HealthCore:
                 if (
                     decision_kind is not None
                     or current.intent.payload_ref.startswith("lifecycle-notice:")
+                    or self._live_owner_intent(current.intent)
                     or completion.intent_id in task_state.delivery_unknown_refs
                 )
                 else TaskEngine.mark_delivery_unknown(
@@ -10132,6 +10171,7 @@ class HealthCore:
             if (
                 completion.status == "unknown"
                 and not current.intent.payload_ref.startswith("lifecycle-notice:")
+                and not self._live_owner_intent(current.intent)
             ):
                 delivery_state = self._owner_decision_delivery_request_state_open(
                     delivery_state,
@@ -10210,14 +10250,14 @@ class HealthCore:
         if current == stored:
             self._store.write_effect(effect_id, "unknown", terminal)
 
-    def recover_owner_delivery_attempts(self) -> tuple[DeliveryTransition, ...]:
+    def recover_owner_delivery_attempts(self, *, live_intent_id=None) -> tuple[DeliveryTransition, ...]:
         """Freeze attempts inherited from an earlier process without sending again."""
 
         recovered: list[DeliveryTransition] = []
         with self._lifecycle_lock:
             if self._closed:
                 return ()
-            with self._ticket115_write_authority() as (_, settings):
+            with self._ticket115_write_authority(live_intent_id=live_intent_id) as (_, settings):
                 orphan_attempts = tuple(
                     (record.intent, attempted)
                     for record in self._ticket115_outbox_state_open(settings).records
@@ -10328,7 +10368,7 @@ class HealthCore:
 
         validate_opaque_text(intent_id, "owner delivery intent identifier")
         with self._lifecycle_lock:
-            with self._ticket115_write_authority() as (head, settings):
+            with self._ticket115_write_authority(live_intent_id=intent_id) as (head, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 record = outbox.record(intent_id)
                 intent = record.intent
@@ -10433,7 +10473,7 @@ class HealthCore:
                 raise AuthorityValidationError(
                     "owner-delivery-authorization-required"
                 )
-            with self._ticket115_write_authority() as (_, settings):
+            with self._ticket115_write_authority(live_intent_id=intent_id) as (_, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 record = outbox.record(intent_id)
                 intent = record.intent
@@ -10536,7 +10576,7 @@ class HealthCore:
                 raise AuthorityValidationError(
                     "owner-delivery-authorization-required"
                 )
-            with self._ticket115_write_authority() as (_, settings):
+            with self._ticket115_write_authority(live_intent_id=completion.intent_id) as (_, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 current = outbox.record(completion.intent_id)
                 intent = current.intent
@@ -10570,7 +10610,7 @@ class HealthCore:
                     or "owner-delivery-effect-result-unavailable"
                 )
 
-            with self._ticket115_write_authority() as (head, settings):
+            with self._ticket115_write_authority(live_intent_id=completion.intent_id) as (head, settings):
                 outbox = self._ticket115_outbox_state_open(settings)
                 current = outbox.record(completion.intent_id)
                 if (
@@ -10597,6 +10637,7 @@ class HealthCore:
                     transport.status == "unknown"
                     and decision_kind is None
                     and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not self._live_owner_intent(intent)
                 ):
                     task_transition = TaskEngine.mark_delivery_unknown(
                         task_state,
@@ -10608,6 +10649,7 @@ class HealthCore:
                 if (
                     transport.status == "unknown"
                     and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not self._live_owner_intent(intent)
                 ):
                     delivery_state = self._owner_decision_delivery_request_state_open(
                         delivery_state,
@@ -10676,6 +10718,7 @@ class HealthCore:
                     kind == "unknown"
                     and decision_kind is None
                     and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not self._live_owner_intent(intent)
                     and not unresolved
                 ):
                     task_transition = TaskEngine.mark_delivery_unknown(
@@ -10687,6 +10730,7 @@ class HealthCore:
                 elif (
                     decision_kind is None
                     and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not self._live_owner_intent(intent)
                     and unresolved
                     and kind in {"delivered", "read", "rejected"}
                 ):
@@ -10704,6 +10748,7 @@ class HealthCore:
                 if (
                     kind == "unknown"
                     and not intent.payload_ref.startswith("lifecycle-notice:")
+                    and not self._live_owner_intent(intent)
                 ):
                     delivery_state = self._owner_decision_delivery_request_state_open(
                         delivery_state,
@@ -12096,7 +12141,7 @@ class HealthCore:
         """Release one exact native cursor only after its business transition finalizes."""
 
         with self._lifecycle_lock:
-            if self._closed or not self.health_writes_allowed():
+            if self._closed or (not self.health_writes_allowed() and not self._live_preconsent_source(causal_id)):
                 return None
             try:
                 receipt = self._store.source_receipt(causal_id)
@@ -12109,6 +12154,8 @@ class HealthCore:
                     or receipt.managed_cursor_state != "committed"
                     or receipt.native_cursor_state not in {"ready", "executing"}
                 ):
+                    return None
+                if not self._live_cursor_handoff_allowed(causal_id):
                     return None
                 directive = NativeCursorDirective(
                     source_causal_id=causal_id,
@@ -12164,7 +12211,518 @@ class HealthCore:
             if daily.terminal is None:
                 raise KeyUnavailable("daily terminal receipt missing")
             return daily.terminal.transition_id
+        live = self._live_business_reference(causal_id)
+        return live
+
+    def _live_exact_owner_request(self, command, head):
+        payload = command.payload
+        if command.action != "effect.request" or not isinstance(payload, EffectRequestPayload) or payload.effect_kind != "owner-delivery":
+            return False
+        try:
+            settings = self._live_owner_binding(head, payload.business_source_causal_id)
+            outbox = self._ticket115_outbox_state_open(settings)
+            intent = outbox.record(payload.business_source_causal_id).intent
+            unresolved = self._store.unresolved_effects()
+            return (self._live_owner_intent(intent) and command.causal_id == intent.effect_request_id
+                    and payload.request_digest == intent.semantic_digest
+                    and self._live_owner_binding_open(intent, settings) is not None
+                    and (not unresolved or self._live_owner_contact_overlap(intent, unresolved)))
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable):
+            return False
+
+    def _live_disclosure_mutation_challenge(self, mutation):
+        if (self._store.initialization() is not None or mutation.health_command_receipt is not None
+                or mutation.managed_effect_intent is not None or mutation.status_projection is not None
+                or mutation.task_state.tasks or mutation.review_state.completed or mutation.review_state.pending is not None
+                or not mutation.delivery_state.records):
+            return None
+        challenges = [self._live_challenge_for_intent(r.intent) for r in mutation.delivery_state.records]
+        if any(c is None for c in challenges) or any(c != challenges[0] for c in challenges):
+            return None
+        return challenges[0]
+
+    def _live_preconsent_request(self, command, head):
+        payload = command.payload
+        if not isinstance(payload, EffectRequestPayload) or payload.effect_kind != "owner-delivery":
+            return False
+        try:
+            settings = self._live_owner_binding(head, payload.business_source_causal_id)
+            intent = self._ticket115_outbox_state_open(settings).record(payload.business_source_causal_id).intent
+            return (command.causal_id == intent.effect_request_id and payload.request_digest == intent.semantic_digest
+                    and self._live_challenge_for_intent(intent) is not None)
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable):
+            return False
+
+    def _live_preconsent_source(self, causal_id):
+        try:
+            head = self._store.finalized_authority()
+            policy = self._admission_policy
+            if head is None or type(policy) is not AdmissionPolicy or self.probe().state is not ProbeState.HEALTHY:
+                return False
+            outbox = self._store.delivery_outbox_state(policy.owner_sender_id, head.installation_id)
+            records = [r for r in outbox.records if r.intent.source_ref == causal_id]
+            return (bool(records) and all(self._live_challenge_for_intent(r.intent) is not None
+                    and self._live_projection(r)["handoff_complete"] for r in records))
+        except (AuthorityValidationError, KeyUnavailable, DeliveryContractViolation):
+            return False
+
+    def _live_cursor_handoff_allowed(self, causal_id):
+        head = self._store.finalized_authority()
+        policy = self._admission_policy
+        if head is None or type(policy) is not AdmissionPolicy:
+            return True  # Historical trusted Core callers have no live binding.
+        outbox = self._store.delivery_outbox_state(policy.owner_sender_id, head.installation_id)
+        root = self._store.source_receipt(causal_id)
+        source = causal_id if root is None else root.business_causal_id
+        records = [r for r in outbox.records if r.intent.source_ref == source and self._live_owner_intent(r.intent)]
+        if not records:
+            return True
+        required = [r for r in outbox.records if r.intent.source_ref == source
+                    and (self._live_owner_intent(r.intent) or r.intent.authorization_kind == "ticket116-contact")]
+        return all(self._live_projection(r)["handoff_complete"] for r in required)
+
+    def _live_business_reference(self, causal_id):
+        head = self._store.finalized_authority()
+        policy = self._admission_policy
+        if head is None or type(policy) is not AdmissionPolicy:
+            return None
+        outbox = self._store.delivery_outbox_state(policy.owner_sender_id, head.installation_id)
+        for record in outbox.records:
+            if record.intent.source_ref == causal_id and self._live_owner_intent(record.intent):
+                effect = self._store.effect(self._effect_id(record.intent.effect_request_id))
+                if effect is not None and type(effect.payload) is TerminalEffect:
+                    return effect.payload.intent.authority.transition_id
         return None
+
+    @staticmethod
+    def _live_owner_intent(intent: OutboxIntent) -> bool:
+        return intent.payload_ref.startswith(("live-daily-reply:", "live-safety-reply:", "live-initialization-disclosure:"))
+
+    def _live_challenge_for_intent(self, intent: OutboxIntent):
+        if not intent.payload_ref.startswith("live-initialization-disclosure:"):
+            return None
+        challenge = self._store.initialization_disclosure_challenge(intent.business_fact_ref)
+        policy = self._admission_policy
+        if (challenge is None or type(policy) is not AdmissionPolicy
+                or self._store.initialization() is not None
+                or not challenge.issued_under(policy)
+                or intent.payload_ref != "live-initialization-disclosure:" + challenge.disclosure_id
+                or intent.source_ref != "live-init-source:" + challenge.workflow_id.removeprefix("live-init:")
+                or not challenge.disclosure.matches(challenge.initialization, self._health_init_asset)
+                or not self._health_init_verifier.verify(challenge.disclosure.skill_proof, challenge.initialization)):
+            return None
+        return challenge
+
+    def _live_owner_binding(self, head, intent_id=None, challenge=None):
+        if self._store.initialization() is not None:
+            return self._current_owner_settings(head)
+        if challenge is None and intent_id is not None:
+            policy = self._admission_policy
+            if type(policy) is not AdmissionPolicy:
+                raise AuthorityValidationError("live-disclosure-authority-unavailable")
+            outbox = self._store.delivery_outbox_state(policy.owner_sender_id, head.installation_id)
+            challenge = self._live_challenge_for_intent(outbox.record(intent_id).intent)
+        if (challenge is None or not challenge.issued_under(self._admission_policy)
+                or self._store.initialization() is not None
+                or not challenge.disclosure.matches(challenge.initialization, self._health_init_asset)
+                or not self._health_init_verifier.verify(challenge.disclosure.skill_proof, challenge.initialization)):
+            raise AuthorityValidationError("live-disclosure-authority-unavailable")
+        return _LiveDisclosureOwner(self._admission_policy.owner_sender_id, head.installation_id)
+
+    def _live_contact_fact(self, intent_id):
+        for receipt in self._store.health_command_receipts():
+            result = receipt.result
+            if result.get("_ticket116_action") not in {"safety.evaluate", "safety.correct"}:
+                continue
+            field = "contact_correction" if result.get("_ticket116_action") == "safety.correct" else "contact_alert"
+            alert = result.get(field)
+            if type(alert) is dict and alert.get("intent_id") == intent_id and type(result.get("_contact")) is dict:
+                return receipt, result, field == "contact_correction"
+        return None
+
+    def _live_outbox_record(self, intent_id, settings):
+        outbox = self._ticket115_outbox_state_open(settings)
+        contact = self._live_contact_fact(intent_id)
+        key = contact[1]["_contact"]["outbox_intent_id"] if contact is not None else intent_id
+        return outbox, outbox.record(key), contact
+
+    def _live_owner_payload(self, intent: OutboxIntent):
+        """Resolve original business facts; caller text never reaches this method."""
+        if intent.payload_ref.startswith("live-daily-reply:"):
+            turn = self._store.daily_turn(intent.source_ref)
+            if (turn is None or turn.phase != "finalized" or turn.terminal is None
+                    or turn.terminal.record_id != intent.business_fact_ref
+                    or turn.terminal.result_digest != intent.business_revision_digest):
+                raise AuthorityValidationError("live-daily-result-mismatch")
+            if turn.result is None:
+                return None
+            if stable_digest(turn.result.to_storage()) != intent.business_revision_digest:
+                raise AuthorityValidationError("live-daily-result-mismatch")
+            return {"text": turn.result.owner_reply}
+        if intent.payload_ref.startswith("live-safety-reply:"):
+            receipt = self._store.health_command_receipt(intent.business_fact_ref)
+            if (receipt is None or receipt.result.get("_ticket116_action") != "safety.evaluate"
+                    or receipt.result.get("_source_causal_id") != intent.source_ref
+                    or receipt.command_digest != intent.business_revision_digest):
+                raise AuthorityValidationError("live-safety-result-mismatch")
+            owner = receipt.result.get("owner_result")
+            assets = self._ticket116_assets
+            if type(owner) is not dict or assets is None or not minimum_help_current(assets):
+                raise AuthorityValidationError("live-safety-template-unavailable")
+            templates = assets["minimum_help_bundle"]["templates"]
+            matches = [v for v in templates.values() if type(v) is dict and v.get("template_ref") == owner.get("template_ref")]
+            if len(matches) != 1 or type(matches[0].get("text")) is not str:
+                raise AuthorityValidationError("live-safety-template-unavailable")
+            return {"text": matches[0]["text"]}
+        if intent.payload_ref.startswith("live-initialization-disclosure:"):
+            challenge = self._live_challenge_for_intent(intent)
+            if challenge is None or stable_digest(challenge.disclosure.to_storage()) != intent.business_revision_digest:
+                raise AuthorityValidationError("live-disclosure-authority-unavailable")
+            notices = challenge.disclosure.content.owner_visible_notices
+            text = "\n\n".join(notice.text for notice in notices)
+            text += "\n\n确认以上披露并同意后，请独立发送：\n/health-init-confirm " + challenge.workflow_id + " " + challenge.disclosure_id
+            return {"text": text}
+        if intent.payload_ref.startswith("owner-decision-payload:"):
+            return {"text": "上次投递结果无法确认，已停止自动重试，请主人决定后续处理。"}
+        if intent.payload_ref.startswith("owner-decision-status-payload:"):
+            return {"text": "健康管理状态已更新，请主人查看并确认当前状态。"}
+        if intent.payload_ref.startswith("lifecycle-notice:"):
+            return {"text": "健康管理数据操作状态已更新，请主人查看当前处理结果。"}
+        review = self._store.daily_review(intent.business_fact_ref)
+        if review is not None and review.result_digest == intent.business_revision_digest:
+            return {"text": "健康复盘已完成（" + review.key.local_date + "），请主人查看当前任务与复盘结果。"}
+        raise AuthorityValidationError("live-owner-payload-unavailable")
+
+    def _live_owner_binding_open(self, intent, settings):
+        try:
+            outbox = self._ticket115_outbox_state_open(settings)
+            record = outbox.record(intent.intent_id)
+            if record.intent != intent or intent.owner_id != settings.owner_id or intent.installation_id != settings.installation_id:
+                return None
+            receipt = self._store.source_receipt(intent.source_ref)
+            if receipt is None or receipt.managed_cursor_state != "committed":
+                return None
+            payload = self._live_owner_payload(intent)
+            if payload is None:
+                if record.current_layer not in {"accepted", "rejected", "unknown"}:
+                    return None
+            elif stable_digest(payload) != intent.payload_digest:
+                return None
+            return outbox, record, self._ticket115_task_state_open(settings), None
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable, TypeError, ValueError):
+            return None
+
+    def _live_preconsent_effect(self, intent):
+        try:
+            if type(intent) is not EffectIntent or intent.effect_kind != "owner-delivery":
+                return False
+            policy = self._admission_policy
+            if type(policy) is not AdmissionPolicy:
+                return False
+            outbox = self._store.delivery_outbox_state(policy.owner_sender_id, intent.authority.installation_id)
+            record = outbox.record(intent.business_source_causal_id)
+            return (record.intent.semantic_digest == intent.intent_digest
+                    and self._live_challenge_for_intent(record.intent) is not None
+                    and self._live_owner_binding_open(record.intent, _LiveDisclosureOwner(policy.owner_sender_id, intent.authority.installation_id)) is not None)
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable, TypeError, ValueError):
+            return False
+
+    def _live_owner_contact_overlap(self, intent, unresolved):
+        """Only an owner safety prompt may precede its own independent contact."""
+        try:
+            if not intent.payload_ref.startswith("live-safety-reply:"):
+                return False
+            allowed = {self._effect_id(intent.effect_request_id)}
+            for effect_id in unresolved:
+                contact = self._live_contact_fact(effect_id)
+                if contact is not None and contact[0].causal_id == intent.business_fact_ref:
+                    allowed.add(effect_id)
+            return set(unresolved).issubset(allowed)
+        except (AuthorityValidationError, KeyUnavailable):
+            return False
+
+    def _live_source_deliveries(self, source_id, settings):
+        outbox = self._ticket115_outbox_state_open(settings)
+        return [record for record in outbox.records if record.intent.source_ref == source_id
+                and (self._live_owner_intent(record.intent) or record.intent.authorization_kind == "ticket116-contact")]
+
+    def _live_projection(self, record, *, public_id=None):
+        intent = record.intent
+        effect_id = intent.effect_request_id if intent.authorization_kind == "ticket116-contact" else self._effect_id(intent.effect_request_id)
+        effect = self._store.effect(effect_id)
+        terminal = (record.current_layer in {"accepted", "rejected", "unknown"}
+                    and effect is not None and effect.state in {"accepted", "rejected", "unknown"})
+        return {"intent_id": public_id or (effect_id if intent.authorization_kind == "ticket116-contact" else intent.intent_id),
+                "recipient_role": "support-contact" if intent.authorization_kind == "ticket116-contact" else "owner",
+                "source_causal_id": intent.source_ref, "current_layer": record.current_layer,
+                "unknown_frozen": record.unknown_frozen, "handoff_complete": terminal}
+
+    def _live_handoff(self, source_id, settings):
+        records = self._live_source_deliveries(source_id, settings)
+        return bool(records) and all(self._live_projection(r)["handoff_complete"] for r in records)
+
+    def bind_live_delivery(self, reference):
+        """Bind a closed business reference to the original committed outbox."""
+        if type(reference) is not dict or type(reference.get("kind")) is not str:
+            raise ProtocolViolation("invalid live delivery reference")
+        kind = reference["kind"]
+        fields = {"committed-turn": {"kind", "source_causal_id", "record_id", "transition_id"},
+                  "committed-safety": {"kind", "source_causal_id", "result_ref"},
+                  "initialization-disclosure": {"kind", "source_causal_id", "workflow_id", "disclosure_id", "headers"},
+                  "owner-outbox": {"kind", "intent_id"}, "contact-alert": {"kind", "intent_id"}}
+        if kind not in fields or set(reference) != fields[kind]:
+            raise ProtocolViolation("invalid live delivery reference fields")
+        with self._lifecycle_lock:
+            challenge = None
+            source = None
+            source_id = reference.get("source_causal_id")
+            if source_id is not None:
+                validate_opaque_text(source_id, "live delivery source")
+            if kind == "initialization-disclosure":
+                headers = reference["headers"]
+                if type(headers) is not dict or set(headers) != {"causal_id", "channel", "partner_id", "sender_id", "conversation_id", "chat_type", "entrypoint", "message_id", "protocol_timestamp", "received_at", "native_cursor"}:
+                    raise ProtocolViolation("invalid live disclosure headers")
+                identity = live_native_event_identity(headers)
+                if (source_id != "live-init-source:" + identity or headers["causal_id"] != source_id
+                        or reference["workflow_id"] != "live-init:" + identity):
+                    raise AuthorityValidationError("live-disclosure-source-mismatch")
+                challenge = self._store.initialization_disclosure_challenge(reference["disclosure_id"])
+                if (challenge is None or challenge.workflow_id != reference["workflow_id"]
+                        or challenge.initialization.admission_causal_id != "live-init-confirm:" + identity):
+                    raise AuthorityValidationError("live-disclosure-source-mismatch")
+                source = SourceEnvelope(**headers, requested_capability="health-init", generation=self._store.finalized_authority().generation, body="/health-init")
+                if not self._admission_policy.accepts(source, allowed_capabilities=("health-init",)):
+                    raise AuthorityValidationError("unique-private-source-denied")
+            with self._ticket115_write_authority(live_challenge=challenge) as (head, settings):
+                if source is not None:
+                    if self._store.initialization() is not None or not challenge.issued_under(self._admission_policy):
+                        raise AuthorityValidationError("live-disclosure-authority-unavailable")
+                    self._store.remember_live_disclosure_source(source)
+                outbox = self._ticket115_outbox_state_open(settings)
+                if kind in {"owner-outbox", "contact-alert"}:
+                    _, record, contact = self._live_outbox_record(reference["intent_id"], settings)
+                    if (kind == "contact-alert") != (contact is not None):
+                        raise AuthorityValidationError("live-delivery-role-mismatch")
+                    records = [record]
+                    source_id = record.intent.source_ref
+                    mutation = None
+                else:
+                    receipt = self._store.source_receipt(source_id)
+                    if receipt is None:
+                        raise AuthorityValidationError("live-delivery-source-unavailable")
+                    # A proven native alias resolves to the original business source.
+                    root = receipt.business_causal_id
+                    if root != source_id:
+                        source_id = root
+                    if kind == "committed-turn":
+                        turn = self._store.daily_turn(source_id)
+                        if (turn is None or turn.phase != "finalized" or turn.terminal is None
+                                or turn.terminal.record_id != reference["record_id"]
+                                or turn.terminal.transition_id != reference["transition_id"]):
+                            raise AuthorityValidationError("live-daily-result-mismatch")
+                        fact_ref, revision, prefix = turn.terminal.record_id, turn.terminal.result_digest, "live-daily-reply:"
+                        payload = None if turn.result is None else {"text": turn.result.owner_reply}
+                    elif kind == "committed-safety":
+                        managed = self._store.health_command_receipt(reference["result_ref"])
+                        if (managed is None or managed.result.get("_ticket116_action") != "safety.evaluate"
+                                or managed.result.get("_source_causal_id") != source_id):
+                            raise AuthorityValidationError("live-safety-result-mismatch")
+                        fact_ref, revision, prefix = managed.causal_id, managed.command_digest, "live-safety-reply:"
+                        owner = managed.result.get("owner_result")
+                        if owner is None:
+                            records = self._live_source_deliveries(source_id, settings)
+                            return {"deliveries": [self._live_projection(r) for r in records], "source_causal_id": source_id,
+                                    "handoff_complete": bool(records) and self._live_handoff(source_id, settings)}
+                        templates = self._ticket116_assets["minimum_help_bundle"]["templates"]
+                        found = [v for v in templates.values() if v.get("template_ref") == owner.get("template_ref")]
+                        if len(found) != 1 or not minimum_help_current(self._ticket116_assets):
+                            raise AuthorityValidationError("live-safety-template-unavailable")
+                        payload = {"text": found[0]["text"]}
+                    else:
+                        fact_ref, revision, prefix = challenge.disclosure_id, stable_digest(challenge.disclosure.to_storage()), "live-initialization-disclosure:"
+                        text = "\n\n".join(n.text for n in challenge.disclosure.content.owner_visible_notices)
+                        payload = {"text": text + "\n\n确认以上披露并同意后，请独立发送：\n/health-init-confirm " + challenge.workflow_id + " " + challenge.disclosure_id}
+                    existing = [r for r in outbox.records if r.intent.payload_ref == prefix + fact_ref and r.intent.source_ref == source_id]
+                    if len(existing) > 1:
+                        raise AuthorityValidationError("duplicate live delivery binding")
+                    mutation = None
+                    if not existing:
+                        if payload is None:
+                            raise AuthorityValidationError("live-owner-payload-unavailable")
+                        destination = self._owner_weixin_destination_open(settings)
+                        observed = self._owner_delivery_clock_utc_open()
+                        if observed is None:
+                            raise AuthorityValidationError("live-delivery-clock-unavailable")
+                        identity = stable_digest({"kind": kind, "source": source_id, "fact": fact_ref}).removeprefix("sha256:")
+                        intent = OwnerDeliveryEngine.form_intent(effect_kind="owner-delivery", owner_id=settings.owner_id,
+                            installation_id=settings.installation_id, effect_request_id="live-owner-delivery:" + identity,
+                            business_fact_ref=fact_ref, business_revision_digest=revision, source_ref=source_id,
+                            recipient_ref=destination.owner_sender_id, route_id=destination.route_id,
+                            route_generation=settings.current_configuration_generation, payload_ref=prefix + fact_ref,
+                            payload_digest=stable_digest(payload), formed_at_utc=observed)
+                        submitted = OwnerDeliveryEngine.submit(outbox, intent, submitted_at_utc=observed)
+                        mutation = self._prepare_ticket115_facts_open(head, settings, delivery_state=submitted.state)
+                    records = []
+            self._complete_ticket115_mutation(mutation)
+            if source_id is not None and kind not in {"owner-outbox", "contact-alert"}:
+                receipt = self._store.source_receipt(source_id)
+                if receipt is not None and receipt.managed_cursor_state != "committed":
+                    self._store.mark_source_business_committed(source_id)
+            with self._ticket115_write_authority(live_challenge=challenge) as (_, settings):
+                if kind not in {"owner-outbox", "contact-alert"}:
+                    records = self._live_source_deliveries(source_id, settings)
+                return {"deliveries": [self._live_projection(r) for r in records], "source_causal_id": source_id,
+                        "handoff_complete": self._live_handoff(source_id, settings)}
+
+    def prepare_live_delivery(self, intent_id, *, attempted_at_utc):
+        validate_opaque_text(intent_id, "live delivery intent")
+        status = self.live_delivery_status(intent_id)
+        if status is None or status["handoff_complete"] or status["unknown_frozen"]:
+            return {"delivery": status, "send_intent": None, "effect_intent": None}
+        with self._lifecycle_lock:
+            contact = self._live_contact_fact(intent_id)
+            if contact is not None:
+                with self._ticket115_write_authority() as (head, settings):
+                    _, record, _ = self._live_outbox_record(intent_id, settings)
+                    current = self._ticket116_contact_current(settings, correction=contact[2])
+                    internal = contact[1]["_contact"]
+                    if (current is None or current.expected_authority_binding() != internal["contact_binding"]
+                            or current.method_kind != "weixin_user" or not current.method_value
+                            or record.current_layer != "submitted"):
+                        return {"delivery": self._live_projection(record), "send_intent": None, "effect_intent": None}
+                    stored = self._store.effect(intent_id)
+                    if stored is None or stored.state != "intent" or type(stored.payload) is not EffectIntent:
+                        return {"delivery": self._live_projection(record), "send_intent": None, "effect_intent": None}
+                    effect = replace(stored.payload, authority=head)
+                    if effect.intent_digest != record.intent.semantic_digest:
+                        raise AuthorityValidationError("live-contact-effect-mismatch")
+                    self._store.write_effect(intent_id, "intent", effect)
+                    self._mark_owner_delivery_attempt_started(record.intent.intent_id, _OWNER_DELIVERY_ATTEMPT_PREPARED)
+                    return {"delivery": self._live_projection(record), "send_intent": {"destination": internal["destination"], "contact_alert": internal["contact_alert"]}, "effect_intent": effect}
+            send = self.prepare_owner_delivery_attempt(intent_id, attempted_at_utc=attempted_at_utc)
+            response = self.issue_owner_delivery_effect(intent_id)
+            if response.status not in {"accepted", "replayed"} or not isinstance(response.meta, EffectIntentMeta):
+                return {"delivery": self.live_delivery_status(intent_id), "send_intent": None, "effect_intent": None}
+            return {"delivery": self.live_delivery_status(intent_id), "send_intent": send.to_wire(), "effect_intent": response.meta.intent}
+
+    def authorize_live_delivery(self, intent_id, grant, *, attempted_at_utc):
+        contact = self._live_contact_fact(intent_id)
+        if contact is not None:
+            with self._lifecycle_lock:
+                with self._ticket115_write_authority() as (_, settings):
+                    outbox, record, _ = self._live_outbox_record(intent_id, settings)
+                    internal = contact[1]["_contact"]
+                    current = self._ticket116_contact_current(settings, correction=contact[2])
+                    execution = self._validated_effect_execution(grant, record.intent.semantic_digest, effect_kind="owner-delivery")
+                    if (execution is None or execution.intent.effect_id != intent_id or current is None
+                            or current.expected_authority_binding() != internal["contact_binding"]
+                            or current.method_kind != "weixin_user" or not current.method_value
+                            or self._owner_delivery_attempt_phase(record.intent.intent_id) != _OWNER_DELIVERY_ATTEMPT_PREPARED
+                            or record.current_layer != "submitted"):
+                        return None
+                    claimed = OwnerDeliveryEngine.claim(outbox, record.intent.intent_id,
+                        holder_id=grant.lease.holder_id, lease_id=grant.lease.lease_id, acquired_at_utc=attempted_at_utc)
+                    attempted = OwnerDeliveryEngine.mark_attempted(claimed.state, record.intent.intent_id,
+                        lease_id=grant.lease.lease_id, attempt_ref=grant.lease.lease_id, attempted_at_utc=attempted_at_utc)
+                    self._store.remember_delivery_outbox(replace(attempted.state, version=outbox.version + 1))
+                    self._mark_owner_delivery_attempt_started(record.intent.intent_id, _OWNER_DELIVERY_ATTEMPT_AUTHORIZED)
+                    wire = {"destination": internal["destination"], "contact_alert": internal["contact_alert"]}
+                    payload = {"contact_alert": internal["contact_alert"]}
+                    purpose = "contact-correction" if contact[2] else "contact-alert"
+                    route_id, route_generation = current.route_id, current.route_generation
+        else:
+            try:
+                send = self.authorize_owner_delivery_attempt(intent_id, grant, attempted_at_utc=attempted_at_utc)
+            except AuthorityValidationError:
+                return None
+            with self._ticket115_write_authority(live_intent_id=intent_id) as (_, settings):
+                _, record, _ = self._live_outbox_record(intent_id, settings)
+                payload = self._live_owner_payload(record.intent)
+                if payload is None:
+                    return None
+                wire = send.to_wire()
+                purpose = ("initialization-disclosure" if record.intent.payload_ref.startswith("live-initialization-disclosure:")
+                           else "owner-reply" if self._live_owner_intent(record.intent) else "owner-outbox")
+                route_id, route_generation = record.intent.route_id, record.intent.route_generation
+        lease = grant.lease
+        return {"purpose": purpose, "recipient_role": "support-contact" if contact else "owner",
+                "account_id": self._admission_policy.partner_id, "intent_id": intent_id,
+                "send_intent": wire, "payload": payload, "payload_digest": stable_digest(payload),
+                "route_id": route_id, "route_generation": route_generation,
+                "execution": {"lease_id": lease.lease_id, "effect_id": lease.effect_id, "intent_digest": lease.intent_digest,
+                              "generation": lease.authority.generation, "writer_fence": lease.authority.writer_fence}}
+
+    def complete_live_delivery(self, intent_id, grant, result, *, observed_at_utc):
+        if type(result) is not OwnerDeliveryTransportResult:
+            raise AuthorityValidationError("invalid live delivery observation")
+        contact = self._live_contact_fact(intent_id)
+        with self._lifecycle_lock:
+            if contact is not None:
+                with self._ticket115_write_authority() as (_, settings):
+                    outbox, record, _ = self._live_outbox_record(intent_id, settings)
+                    execution = self._validated_effect_execution(grant, record.intent.semantic_digest, effect_kind="owner-delivery")
+                    attempted = record.optional_fact("attempted")
+                    if (execution is None or execution.intent.effect_id != intent_id or attempted is None
+                            or attempted.attempt_ref != grant.lease.lease_id
+                            or self._owner_delivery_attempt_phase(record.intent.intent_id) != _OWNER_DELIVERY_ATTEMPT_AUTHORIZED):
+                        raise AuthorityValidationError("live-contact-completion-mismatch")
+                    transition = OwnerDeliveryEngine.record_transport_result(outbox, record.intent.intent_id,
+                        attempt_ref=attempted.attempt_ref, result=result, observed_at_utc=observed_at_utc)
+                    self._store.remember_delivery_outbox(transition.state)
+                response = self.handle(self._owner_delivery_effect_result_command(execution, grant, result))
+                if response.status not in {"accepted", "rejected", "unknown", "replayed"}:
+                    raise AuthorityValidationError("live-contact-completion-unavailable")
+                self._clear_owner_delivery_attempt_started(record.intent.intent_id)
+            else:
+                with self._ticket115_write_authority(live_intent_id=intent_id) as (_, settings):
+                    record = self._ticket115_outbox_state_open(settings).record(intent_id)
+                    attempted = record.fact("attempted")
+                completion = OwnerDeliveryCompletion(intent_id=intent_id, attempt_ref=attempted.attempt_ref,
+                    status=result.status, result_ref=result.result_ref, evidence_ref=result.evidence_ref, observed_at_utc=observed_at_utc)
+                self.complete_owner_delivery_attempt(completion, grant)
+            delivery = self.live_delivery_status(intent_id)
+            with self._ticket115_write_authority(live_intent_id=None if contact else intent_id) as (_, settings):
+                return {"delivery": delivery, "source_causal_id": record.intent.source_ref,
+                        "handoff_complete": self._live_handoff(record.intent.source_ref, settings)}
+
+    def _recover_live_contact(self, intent_id):
+        """A lost contact handoff has one conservative terminal, never a resend."""
+        with self._ticket115_write_authority() as (_, settings):
+            outbox, record, contact = self._live_outbox_record(intent_id, settings)
+            if (contact is None or record.current_layer != "attempted"
+                    or self._owner_delivery_attempt_is_active(record.intent.intent_id)):
+                return
+            attempted = record.fact("attempted")
+            stored = self._store.effect(intent_id)
+            if stored is None or stored.state not in {"executing", "accepted", "rejected", "unknown"}:
+                return
+            observed = self._owner_delivery_clock_utc_open()
+            if observed is None:
+                raise AuthorityValidationError("live-contact-clock-unavailable")
+            result = OwnerDeliveryTransportResult(status="unknown",
+                result_ref="contact-orphan-result:" + stable_digest({"intent_id": intent_id, "attempt_ref": attempted.attempt_ref}).removeprefix("sha256:"),
+                evidence_ref="contact-orphan-observation:" + stable_digest({"intent_id": intent_id, "observed_at_utc": observed}).removeprefix("sha256:"))
+            if stored.state == "executing":
+                if type(stored.payload) is not ExecutingEffect or stored.payload.lease.lease_id != attempted.attempt_ref:
+                    raise AuthorityValidationError("live-contact-attempt-mismatch")
+                self._release_orphan_ticket115_execution_leases()
+                terminal = TerminalEffect(execution=stored.payload, status="unknown", result_digest=stable_digest(result.to_wire()))
+                self._store.write_effect(intent_id, "unknown", terminal)
+            transition = OwnerDeliveryEngine.record_transport_result(outbox, record.intent.intent_id,
+                attempt_ref=attempted.attempt_ref, result=result, observed_at_utc=observed)
+            self._store.remember_delivery_outbox(transition.state)
+
+    def live_delivery_status(self, intent_id):
+        validate_opaque_text(intent_id, "live delivery intent")
+        with self._lifecycle_lock:
+            contact = self._live_contact_fact(intent_id)
+            if contact is None:
+                self.recover_owner_delivery_attempts(live_intent_id=intent_id)
+            else:
+                self._recover_live_contact(intent_id)
+            with self._ticket115_write_authority(live_intent_id=None if contact else intent_id) as (_, settings):
+                _, record, _ = self._live_outbox_record(intent_id, settings)
+                return self._live_projection(record, public_id=intent_id)
 
     def probe(self) -> ProbeReport:
         with self._lifecycle_lock:
@@ -12634,12 +13192,11 @@ class HealthCore:
                 if type(record.payload) is CommittedTransition
                 else None
             )
+            live_challenge = self._live_disclosure_mutation_challenge(ticket115_mutation)
             if (
-                initialization is None
-                or initialization.phase != "enabled"
-                or not self._initialization_configuration_matches(
-                    initialization.draft
-                )
+                (live_challenge is None and (initialization is None
+                 or initialization.phase != "enabled"
+                 or not self._initialization_configuration_matches(initialization.draft)))
                 or type(record_authority) is not PreparedTransition
                 or record_authority != ticket115_mutation.prepared
                 or not self._store.ticket115_mutation_base_is_current(
@@ -12648,9 +13205,8 @@ class HealthCore:
             ):
                 return None
             try:
-                settings = self._current_owner_settings(
-                    record_authority.base
-                )
+                settings = (self._current_owner_settings(record_authority.base) if live_challenge is None
+                            else self._live_owner_binding(record_authority.base, challenge=live_challenge))
             except (AuthorityValidationError, SettingsContractViolation):
                 return None
             if (

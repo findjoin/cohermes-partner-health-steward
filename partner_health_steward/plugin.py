@@ -294,6 +294,7 @@ class HealthPlugin:
                             "ticket116-safety-result",
                             {
                                 "branch": safety["branch"],
+                                "result_ref": "ticket116-inbound-safety:" + envelope.causal_id,
                                 "owner_result": safety["owner_result"],
                                 "contact_alert": safety["contact_alert"],
                             },
@@ -349,6 +350,7 @@ class HealthPlugin:
                             "ticket116-safety-result",
                             {
                                 "branch": safety["branch"],
+                                "result_ref": "ticket116-inbound-safety:" + envelope.causal_id,
                                 "owner_result": safety["owner_result"],
                                 "contact_alert": safety["contact_alert"],
                             },
@@ -1315,6 +1317,31 @@ class HealthPlugin:
             return None
         return self._core.source_receipt(causal_id)
 
+    def bind_live_delivery(self, reference, *, peer_id):
+        if peer_id != "plugin" or not self._core.admission_policy_matches(self._admission_policy):
+            raise ProtocolViolation("untrusted live delivery peer")
+        return self._core.bind_live_delivery(reference)
+
+    def prepare_live_delivery(self, intent_id, *, attempted_at_utc, peer_id):
+        if peer_id != "plugin" or not self._core.admission_policy_matches(self._admission_policy):
+            raise ProtocolViolation("untrusted live delivery peer")
+        return self._core.prepare_live_delivery(intent_id, attempted_at_utc=attempted_at_utc)
+
+    def authorize_live_delivery(self, intent_id, grant, *, attempted_at_utc, peer_id):
+        if peer_id != "plugin" or not self._core.admission_policy_matches(self._admission_policy):
+            raise ProtocolViolation("untrusted live delivery peer")
+        return self._core.authorize_live_delivery(intent_id, grant, attempted_at_utc=attempted_at_utc)
+
+    def complete_live_delivery(self, intent_id, grant, result, *, observed_at_utc, peer_id):
+        if peer_id != "plugin" or not self._core.admission_policy_matches(self._admission_policy):
+            raise ProtocolViolation("untrusted live delivery peer")
+        return self._core.complete_live_delivery(intent_id, grant, result, observed_at_utc=observed_at_utc)
+
+    def live_delivery_status(self, intent_id, *, peer_id):
+        if peer_id != "plugin" or not self._core.admission_policy_matches(self._admission_policy):
+            raise ProtocolViolation("untrusted live delivery peer")
+        return self._core.live_delivery_status(intent_id)
+
     def live_entry_preflight(self, headers: dict, *, generation: int, peer_id: str) -> dict[str, object]:
         if type(peer_id) is not str or peer_id != "plugin":
             raise ProtocolViolation("untrusted peer")
@@ -1642,6 +1669,7 @@ class HealthPlugin:
                 causal_id=self._native_cursor_result_causal_id(
                     directive.source_causal_id,
                     status,
+                    directive.native_cursor,
                 ),
                 generation=directive.authority_generation,
                 scope=("cursor:result",),
@@ -1652,10 +1680,11 @@ class HealthPlugin:
         return self.invoke(command, peer_id=peer_id)
 
     @staticmethod
-    def _native_cursor_result_causal_id(source_causal_id: str, status: str) -> str:
+    def _native_cursor_result_causal_id(source_causal_id: str, status: str, native_cursor: str | None = None) -> str:
         digest = stable_digest(
             {
-                "source_causal_id": source_causal_id,
+                "source_causal_id": (source_causal_id + ":" + stable_digest(native_cursor)
+                                     if source_causal_id.startswith("live-init-source:") and native_cursor is not None else source_causal_id),
                 "status": status,
             }
         )

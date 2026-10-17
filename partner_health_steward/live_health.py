@@ -65,6 +65,9 @@ class LiveHealthCoreOperations:
 
     def _read(self, name, data):
         plugin = self._plugin
+        if name == "health-entry-delivery":
+            intent_id = _mapping(data, {"intent_id"})["intent_id"]
+            return {"delivery": plugin.live_delivery_status(intent_id, peer_id="plugin")}
         if name == "health-entry-preflight":
             headers = _mapping(data, {"headers"})["headers"]
             _mapping(headers, _HEADERS)
@@ -97,6 +100,9 @@ class LiveHealthCoreOperations:
 
     def _command(self, name, data):
         plugin = self._plugin
+        if name == "delivery-bind":
+            reference = _mapping(data, {"binding"})["binding"]
+            return plugin.bind_live_delivery(reference, peer_id="plugin")
         if name == "receive-weixin":
             wire = _mapping(_mapping(data, {"message"})["message"], _MESSAGE)
             message = RawWeixinMessage(**wire)

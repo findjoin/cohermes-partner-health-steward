@@ -627,19 +627,25 @@ class Ticket116SafetyMeta(ResponseMeta):
     branch: str
     owner_result: Mapping[str, object] | None
     contact_alert: Mapping[str, object] | None
+    result_ref: str | None = None
 
     def __post_init__(self) -> None:
         _bounded_text(self.branch, "safety branch")
+        if self.result_ref is not None:
+            _bounded_text(self.result_ref, "safety result reference")
         for value in (self.owner_result, self.contact_alert):
             if value is not None and type(value) is not dict:
                 raise ProtocolViolation("invalid safety metadata")
 
     def to_wire(self) -> dict[str, object]:
-        return {
+        value = {
             "branch": self.branch,
             "owner_result": self.owner_result,
             "contact_alert": self.contact_alert,
         }
+        if self.result_ref is not None:
+            value["result_ref"] = self.result_ref
+        return value
 
 
 def _parse_response_meta(value: object) -> ResponseMeta:
@@ -675,7 +681,7 @@ def _parse_response_meta(value: object) -> ResponseMeta:
                 "business_source_causal_id",
             )
         )
-    if keys == {"branch", "owner_result", "contact_alert"}:
+    if keys in ({"branch", "owner_result", "contact_alert"}, {"branch", "owner_result", "contact_alert", "result_ref"}):
         owner_result = value["owner_result"]
         contact_alert = value["contact_alert"]
         if owner_result is not None and type(owner_result) is not dict:
@@ -686,6 +692,7 @@ def _parse_response_meta(value: object) -> ResponseMeta:
             _bounded_text(value["branch"], "safety branch"),
             owner_result,
             contact_alert,
+            None if "result_ref" not in value else _bounded_text(value["result_ref"], "safety result reference"),
         )
     effect_fields = {"effect_id", "effect_kind", "intent_digest", "authority"}
     if keys in (effect_fields, effect_fields | {"business_source_causal_id"}):

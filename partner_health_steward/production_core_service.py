@@ -34,6 +34,7 @@ from .authority import (
 )
 from .contract import CommandEnvelope, EffectResultPayload, ProtocolViolation, Response, StateCommitPayload
 from .core import HealthCore
+from .delivery import OwnerDeliveryTransportResult
 from .dynamodb_current_head import DynamoDBCurrentHead
 from .host_authority import (
     HostPrivateExecutionCapabilityVault,
@@ -1278,7 +1279,49 @@ class ProductionCoreService:
                 candidates.append(stored.payload)
         return candidates[0] if len(candidates) == 1 else None
 
+    def _live_controlled_delivery(self, wire):
+        if (not self._assets_current or self._live_operations is None or self._plugin is None
+                or set(wire) != {"interface", "operation", "payload"}
+                or wire.get("interface") != "health-entry-v1" or type(wire.get("payload")) is not dict):
+            return None
+        name, data = wire["operation"], wire["payload"]
+        fields = {"delivery-prepare": {"intent_id", "attempted_at_utc"},
+                  "delivery-authorize": {"intent_id", "grant", "attempted_at_utc"},
+                  "delivery-complete": {"intent_id", "grant", "result", "observed_at_utc"}}
+        if name not in fields or set(data) != fields[name]:
+            return None
+        plugin = self._plugin
+        intent_id = validate_opaque_text(data["intent_id"], "delivery intent")
+        if name == "delivery-prepare":
+            prepared = plugin.prepare_live_delivery(intent_id, attempted_at_utc=data["attempted_at_utc"], peer_id="plugin")
+            intent = prepared["effect_intent"]
+            grant = None if intent is None else plugin.claim_effect_execution(intent)
+            result = {"delivery": prepared["delivery"], "send_intent": None, "intent": None, "grant": None}
+            if grant is not None:
+                session_id = "effect-session:" + uuid.uuid4().hex
+                self._effect_sessions[session_id] = (intent, grant)
+                result.update(send_intent=prepared["send_intent"], intent=self._intent_wire(intent), grant=self._grant_wire(session_id, grant))
+            return result
+        candidate = data["grant"]
+        if type(candidate) is not dict or set(candidate) != {"session_id", "lease_id", "effect_id", "intent_digest", "generation", "writer_fence"}:
+            return None
+        cached = self._effect_sessions.get(candidate.get("session_id"))
+        if cached is None:
+            return None
+        intent, grant = cached
+        if candidate != self._grant_wire(candidate["session_id"], grant):
+            return None
+        if name == "delivery-authorize":
+            authorization = plugin.authorize_live_delivery(intent_id, grant, attempted_at_utc=data["attempted_at_utc"], peer_id="plugin")
+            return {"delivery": plugin.live_delivery_status(intent_id, peer_id="plugin"), "authorization": authorization}
+        observed = OwnerDeliveryTransportResult.from_wire(data["result"])
+        result = plugin.complete_live_delivery(intent_id, grant, observed, observed_at_utc=data["observed_at_utc"], peer_id="plugin")
+        self._effect_sessions.pop(candidate["session_id"], None)
+        return result
+
     def _controlled_effect(self, payload: object) -> dict[str, object] | None:
+        if type(payload) is dict and payload.get("interface") == "health-entry-v1":
+            return self._live_controlled_delivery(payload)
         if type(payload) is not dict or set(payload) != {"phase"} | ({"terminal"} if payload.get("phase") == "terminal" else set()):
             return None
         phase = payload.get("phase")
