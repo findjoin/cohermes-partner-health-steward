@@ -97,7 +97,7 @@ Core 侧新增 `LiveHealthCoreOperations(plugin, *, current_generation=callable,
 
 对一份 getupdates 响应逐条处理，不合并同文。保留每条 message_id、来源与协议时间，因果 ID 不由正文 hash 去重。native cursor 只能在该 batch 所有需处理的来源均获得 core 已提交 directive 后 acknowledge；一条 unknown/failure 即不推进整个 cursor。外部准入排除可作为明确 ignored 处理，但不得触碰正文或伪造健康 receipt。空 batch 可无内容推进；重启从 core 已批准 cursor 恢复，不把先前 native sync 文件当作单独业务真相。
 
-同一 source replay 只能读回已有业务/发送状态，不能产生第二条业务事实或第二次未知发送。ack 完成后把 native cursor result 回交 core；结果未知时保留可恢复状态。wake/reconnect/disconnect 使用同一规则。失去 core/peer/required asset/current head 时关闭健康接收和效果，不让 Gateway 普通存活掩盖故障。
+同一 source replay 只能读回已有业务/发送状态，不能产生第二条业务事实或第二次未知发送。ack 完成后把 native cursor result 回交 core；必须由同一Core receipt的native_cursor_state=advanced证明回交完成，裸transport ack不是该证明。沿既有112隐私规则，advanced后daily result可以被清除；重放可仅返回accepted/daily-turn-result-redacted及已finalized的无正文terminal身份，不重建已释放的reply、turn result或再次调用delivery bridge。record/transition及terminal身份仍须保持相同。结果未知时保留可恢复状态。wake/reconnect/disconnect 使用同一规则。失去 core/peer/required asset/current head 时关闭健康接收和效果，不让 Gateway 普通存活掩盖故障。
 
 ## 6. 模型候选阶段的具体阻塞与实现边界
 
@@ -175,3 +175,9 @@ Pinned `platform_registry.create_adapter:293` 在factory前执行check_fn。独�
 ### 同次返冻结：初始化前 ordinary 的明确 Core 路由
 
 既有Plugin.receive_weixin在未初始化时只允许health-init，因此Adapter把所有非初始化请求交health-steward会连普通聊天一起拒绝，违反本票已选行为。最小修复只在LiveOps的固定receive操作调用一个Plugin侧live-entry接缝：先在正文前核验同一技术policy；仅在当前phase为uninitialized且capability为health-steward时，允许既有CoarseMessageRouter对已准入正文明确返回ordinary，才形成accepted/ordinary-hermes-route。health/mixed/uncertain、classifier缺失/失败均不能ordinary fallback，也不写健康状态或触发未同意模型。其余来源继续既有receive_weixin。111旧公开receive的capability/零正文门不改，不新增RPC、状态或分类服务。门在真实未初始化Core的同一Adapter上观察一条明确普通消息进入ordinary handler，健康消息不能进入；独立确认/初始化原门不变。
+
+### 有界返冻结：ACK 后沿用既有日常结果释放
+
+正式V04已到实际重建/重投链，暴露验证假红：旧112的store._replace_source_receipt在native_cursor_state=advanced时释放daily.result正文，只留DailyTurnTerminalReceipt；Core.daily_turn_result可合法返回None，Plugin回accepted/daily-turn-result-redacted。这是已验证隐私行为，不能为124重放再重建旧reply。
+
+因此ACK后的同事件重放只需证明既有finalized record/transition保持相同，不能要求再次返回已释放turn_result或再次调用发送bridge。未ACK且现有result仍可释放时继续原完整结果重放；unknown发送由126持有的已有effect/outbox事实保持冻结，不能靠重新构造旧reply或补做业务重发。此返冻结只修V04的相反预期，保留“无第二业务/无第二尝试/无第二状态账本”；不改变产品、111/112释放规则或真实投递验收。

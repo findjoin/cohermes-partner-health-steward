@@ -594,6 +594,7 @@ class _RealRPC:
             fixture.plugin, current_generation=lambda: fixture.head.read().head.generation)
         self.calls = []
         self.turns = []
+        self.responses = []
 
     def request(self, kind, payload, *, request_id=None):
         self.calls.append((kind, copy.deepcopy(payload)))
@@ -606,6 +607,8 @@ class _RealRPC:
         else:
             result = self.operations.dispatch(kind, payload)
         if type(result) is dict and type(result.get("response")) is dict:
+            if payload.get("operation") == "receive-weixin":
+                self.responses.append(copy.deepcopy(result["response"]))
             turn = (result["response"].get("meta") or {}).get("turn_result")
             if turn is not None: self.turns.append(copy.deepcopy(turn))
         return {"protocol_version": 1, "kind": kind, "request_id": request_id or "offline-real-rpc",
@@ -710,12 +713,24 @@ async def _real_adapter_initialization_and_restart(create_registered, PlatformCo
         health["create_time_ms"] = int(datetime(2026, 8, 24, 1, 5, tzinfo=timezone.utc).timestamp() * 1000)
         health["item_list"][0]["text_item"]["text"] = "我昨晚没睡好"
         second_ingress.queue.put_nowait({"ret": 0, "msgs": [health], "get_updates_buf": "cursor-approved-by-core"})
+        def committed_cursor_advanced():
+            if not rpc.turns:
+                return False
+            receipt = fixture.plugin.source_receipt(rpc.turns[-1]["source_causal_id"], peer_id="plugin")
+            return receipt is not None and receipt.native_cursor_state == "advanced"
         await _wait(lambda: len(rpc.turns) > 0 and len(delivery.attempts) == 1
-                    and "cursor-approved-by-core" in second_ingress.acknowledged)
+                    and "cursor-approved-by-core" in second_ingress.acknowledged
+                    and committed_cursor_advanced())
         committed = rpc.turns[-1]
         approved = rpc.operations.dispatch("managed-read", _read("health-entry-native-cursor"))["native_cursor"]
         assert approved == "cursor-approved-by-core"
         assert fixture.plugin.source_receipt(committed["source_causal_id"], peer_id="plugin").native_cursor_state == "advanced"
+        terminal = fixture.core.daily_turn_status(committed["source_causal_id"])
+        assert terminal.phase == "finalized" and terminal.draft is None and terminal.result is None
+        assert terminal.terminal.record_id == committed["record_id"]
+        assert terminal.terminal.transition_id == committed["transition_id"]
+        assert fixture.core.daily_turn_result(committed["source_causal_id"]) is None
+        generation = fixture.head.read().head.generation
         effects = copy.deepcopy(delivery.effects)
         await second.disconnect()
         adapters.remove(second)
@@ -726,12 +741,21 @@ async def _real_adapter_initialization_and_restart(create_registered, PlatformCo
         assert third_ingress.cursors[0] == approved
         before = len(rpc.turns)
         before_bridge = len(delivery.calls)
+        before_responses = len(rpc.responses)
+        before_polls = len(third_ingress.cursors)
         third_ingress.queue.put_nowait({"ret": 0, "msgs": [copy.deepcopy(health)], "get_updates_buf": approved})
-        await _wait(lambda: len(rpc.turns) > before and len(delivery.calls) > before_bridge)
-        assert rpc.turns[-1]["record_id"] == committed["record_id"]
-        assert rpc.turns[-1]["transition_id"] == committed["transition_id"]
+        await _wait(lambda: len(rpc.responses) > before_responses and len(third_ingress.cursors) > before_polls)
+        replay = rpc.responses[-1]
+        assert replay["status"] == "accepted" and replay["reason_code"] == "daily-turn-result-redacted"
+        assert (replay.get("meta") or {}).get("turn_result") is None
+        after = fixture.core.daily_turn_status(committed["source_causal_id"])
+        assert after == terminal
+        assert fixture.core.daily_turn_result(committed["source_causal_id"]) is None
+        assert fixture.head.read().head.generation == generation
+        assert len(rpc.turns) == before
+        assert len(delivery.calls) == before_bridge
         assert delivery.effects == effects
-        assert len(delivery.attempts) == 1  # retained unknown is read, never sent again
+        assert len(delivery.attempts) == 1  # retained unknown is never sent again
     finally:
         for adapter in reversed(adapters): await adapter.disconnect()
         fixture.tearDown()

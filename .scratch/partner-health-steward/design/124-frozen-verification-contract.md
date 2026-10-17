@@ -22,7 +22,7 @@
 | 124-V01 | 未初始化时只允许显式 health-init；披露、主人实际准入的同意来源、prepare/commit/finalize 及当前状态读回形成一次初始化。没有实际消息同意时 caller 的布尔值不启动；初始化后合法健康来源产生现有 Core 结果。杀死“Adapter 假装完成初始化／绕过真实同意／第二业务真相”。 | 真实 HealthCore + HealthPlugin，经公开 LiveHealthCoreOperations |
 | 124-V02 | live runtime 在同一生产 Core/Plugin 装配；披露、真实来源同意、初始化三步和一次 evidence/portrait 日常提交全部越过同一 AF_UNIX 字节流，必须使用注入的初始化及日常依赖；错绑资产在接受业务前拒绝，未知操作不可成为任意 RPC；不破坏 123 staged、ACL、peer、release 闭包。杀死“保留无依赖 HealthPlugin(core)／直调测试对象冒充生产装配／caller 任意方法访问”。 | ProductionCoreService.start/endpoint/close + 三类 CorePort |
 | 124-V03 | pinned registry 唯一注册 health_weixin，经过真实 create_adapter 的 check_fn：未 arm staged 不可创建，既有 same-process capability 与 exact 离线 release proof 经 _ticket118_arm 绑定后，合法 admission_policy 才创建 Live；无效 policy 不回退，无 policy 仍为旧 probe；满足 pinned lifecycle。header preflight 在正文访问前拒绝外部来源；同文不同消息不合批、不按正文去重；健康内容不进入普通 handler/Memory。杀死“直接调用 factory 绕过实际 Gateway 选择／check 永假或一刀 True／旧探针冒充 Live／复用 native 前置路径”。 | pinned plugin registration + registry.create_adapter + LiveHealthWeixinAdapter 接收生命周期 |
-| 124-V04 | cursor 只在 Core 确认的 directive 下 acknowledge 并回交，未知时不越过该 cursor；实际 registry Adapter 的 /health-init 先形成真实 Core challenge，保持 uninitialized；重建 Adapter 后，独立原生来源的匹配 /health-init-confirm 才经真实 Core 同意边界成为 enabled；提交日常后再重建 Adapter，第一 poll 使用 Core 已批准 cursor，重放仍读相同 record/transition，保留 unknown bridge effect 不再发送；wake 只唤醒当前 Core、disconnect/co-stop 后不处理下一条。杀死“无初始化适配／内存 challenge 或 cursor／恢复补做业务／失去 Core 后继续”。 | registry Adapter + verifier-owned transport + 保留状态的真实 Core tracer |
+| 124-V04 | cursor 只在 Core 确认的 directive 下 acknowledge 并回交，未知时不越过该 cursor；实际 registry Adapter 的 /health-init 先形成真实 Core challenge，保持 uninitialized；重建后独立原生来源的匹配确认才 enabled；日常提交并等同一Core receipt=advanced后重建，第一 poll 使用 Core 已批准 cursor；沿112红action重放仅返回daily-turn-result-redacted、相同finalized terminal record/transition，无turn/reply重建、无新业务推进或bridge调用，保留unknown attempt仍为一次；wake/disconnect/co-stop维持边界。杀死“无初始化适配／内存 challenge 或 cursor／恢复补做业务或复活已释放正文／失去 Core 后继续”。 | registry Adapter + verifier-owned transport + 保留状态的真实 Core tracer |
 
 每门只使用能杀死独立现实错误的正向 tracer 与必要负向等价类。不按字段或故障点做笛卡尔积；不以测试方法数量代替充分性。
 
@@ -43,6 +43,8 @@ V02 包装既有 123 fixture，在临时目录中发布自洽的实质合成 Ski
 游标成功的既有 receipt 状态为 advanced；accepted 仅指外层 Response.status。恢复 tracer 沿真实 Core 记录及固定投影读回，不新增 accepted receipt state。
 
 同次 bounded 返冻结在 V04 增加初始化前的一对路由等价类：真实 Core fixture 的既有 coarse classifier 明确普通的合成 greeting 经 registry Adapter 到普通 handler 一次；明确 health 的合成输入不进入 ordinary、未提交日常且仍 uninitialized。该目的限定 live-entry 路由不改111旧 receive 的零正文权限门，不新建 RPC/state，不将未知、mixed 或 uncertain 当作 ordinary。
+
+V04最终ACK兼容修订仅纠正旧门与112隐私红action的矛盾及观测时序：等待同一Core的advanced回交，而非只看transport append；advanced后既有store清除daily result，故不要求重放再次携带turn_result或调用bridge。改由实际receive响应的redacted状态、公开daily_turn_status的完整无正文terminal及不变head generation证明同一业务；result继续为None、bridge calls不增、unknown attempts仍一。未修改产品或旧112，也未放宽无第二业务/发送的不变量。
 
 测试不访问真实 AWS、模型、微信、主人或联系人，不读取健康资料、普通历史、凭据或目标配置。所有通道与正文均为 verifier 合成输入。pinned 原生 iLink 无法证明 delivered/read 时，测试不要求或伪造该事实；真实投递留给 126，真实目标绑定与主人验收留给 128。
 
