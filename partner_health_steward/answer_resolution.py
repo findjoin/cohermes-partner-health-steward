@@ -10,9 +10,9 @@ resolution make different claims.  This module keeps those claims separate:
 * :class:`ModelAnswerResolution` records either a fixed failed-closed outcome
   or the digests of an already validated, deterministically rendered answer.
 
-No type in this module can carry model output, candidate content, or reply
-text.  The only reply text exposed here is the fixed failed-closed owner
-prompt returned by :func:`render_failed_closed`.
+No type in this module can carry model output, candidate content, or free reply
+text. Its owner-visible text is limited to the fixed failed-closed prompt and
+the fixed non-diagnostic context-guarantee notice.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 
 class AnswerResolutionViolation(ValueError):
@@ -40,6 +41,7 @@ _COMPLETED_REJECTION_REASONS = frozenset(
         "model-output-truncated",
         "strict-schema-error",
         "capacity-evidence-expired",
+        "operation-budget-expired",
     }
 )
 
@@ -96,6 +98,38 @@ def _stable_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+ND_OPERATION_MODE = "non-diagnostic-operational-budget"
+ND_OPERATION_PURPOSE = "non-diagnostic-health"
+ND_WIRE_BYTE_LIMIT = 65536
+ND_OUTPUT_RESERVATION = 2048
+ND_CONTEXT_GUARANTEE = "not-provided"
+ND_CONTEXT_DISCLOSURE = "不提供共同上下文保证"
+
+
+def _validated_model_use_disclosure(value: object) -> Mapping[str, object]:
+    if type(value) not in {dict, MappingProxyType} or set(value) != {
+        "mode", "purpose", "budget_digest", "owner_decision_ref",
+        "max_final_wire_bytes", "output_reservation_tokens",
+        "context_guarantee", "context_disclosure",
+    }:
+        raise AnswerResolutionViolation("invalid model use disclosure")
+    fixed = {
+        "mode": ND_OPERATION_MODE, "purpose": ND_OPERATION_PURPOSE,
+        "max_final_wire_bytes": ND_WIRE_BYTE_LIMIT,
+        "output_reservation_tokens": ND_OUTPUT_RESERVATION,
+        "context_guarantee": ND_CONTEXT_GUARANTEE,
+        "context_disclosure": ND_CONTEXT_DISCLOSURE,
+    }
+    if any(type(value[key]) is not type(expected) or value[key] != expected
+           for key, expected in fixed.items()):
+        raise AnswerResolutionViolation("invalid model use guarantee")
+    return MappingProxyType({
+        **fixed,
+        "budget_digest": _sha(value["budget_digest"], "operation budget digest"),
+        "owner_decision_ref": _text(value["owner_decision_ref"], "owner decision reference"),
+    })
+
+
 FAILED_CLOSED_TEMPLATE_ID = "health-answer-failed-closed"
 FAILED_CLOSED_TEMPLATE_VERSION = "1"
 FAILED_CLOSED_REPLY_TEXT = "这次健康处理无法安全完成，且没有形成或记录健康回答。"
@@ -129,8 +163,12 @@ class ModelEffectReport:
     reason_code: str | None
     result_digest: str
     candidate_digest: str | None = None
+    model_use_disclosure: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
+        if self.model_use_disclosure is not None:
+            object.__setattr__(self, "model_use_disclosure",
+                               _validated_model_use_disclosure(self.model_use_disclosure))
         if type(self.model_status) is not str or self.model_status not in MODEL_EFFECT_STATUSES:
             raise AnswerResolutionViolation("invalid inner model status")
         for value, name in (
@@ -212,7 +250,7 @@ class ModelEffectReport:
         return _stable_digest(self.to_storage())
 
     def to_storage(self) -> dict[str, object]:
-        return {
+        value = {
             "model_status": self.model_status,
             "transport_attempted": self.transport_attempted,
             "terminal_proven": self.terminal_proven,
@@ -224,9 +262,15 @@ class ModelEffectReport:
             "result_digest": self.result_digest,
             "candidate_digest": self.candidate_digest,
         }
+        if self.model_use_disclosure is not None:
+            value["model_use_disclosure"] = dict(self.model_use_disclosure)
+        return value
 
     @classmethod
     def from_storage(cls, value: object) -> "ModelEffectReport":
+        has_disclosure = type(value) is dict and "model_use_disclosure" in value
+        if has_disclosure and value["model_use_disclosure"] is None:
+            raise AnswerResolutionViolation("invalid model use disclosure")
         fields = _mapping(
             value,
             frozenset(
@@ -242,7 +286,7 @@ class ModelEffectReport:
                     "result_digest",
                     "candidate_digest",
                 }
-            ),
+            ) | (frozenset({"model_use_disclosure"}) if has_disclosure else frozenset()),
             "model effect report",
         )
         return cls(
@@ -268,6 +312,7 @@ class ModelEffectReport:
                 if fields["candidate_digest"] is None
                 else _sha(fields["candidate_digest"], "model candidate digest")
             ),
+            model_use_disclosure=fields.get("model_use_disclosure"),
         )
 
 

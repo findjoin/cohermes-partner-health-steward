@@ -98,6 +98,7 @@ from .health_commands import (
 from .knowledge import KnowledgeRelease
 from .model_contract import (
     FirstHopRoute,
+    NonDiagnosticOperationalBudget,
     ModelMessage,
     ModelTransportResult,
     StrictHealthLLM,
@@ -254,6 +255,7 @@ _PRECALL_FAILED_CLOSED_REASONS = frozenset(
         "output-reservation-drift",
         "strict-schema-drift",
         "capacity-unavailable",
+        "operation-budget-unavailable",
         "model-effect-authorization-required",
     }
 )
@@ -5746,6 +5748,9 @@ class HealthCore:
                             execution_candidate = managed
                             break
                     ticket116_execution = execution_candidate is not None
+                    if (ticket116_execution
+                            and type(canonical_request.capability_profile) is NonDiagnosticOperationalBudget):
+                        return self._model_authorization_failure()
                     if (
                         (
                             not ticket116_execution
@@ -7112,6 +7117,14 @@ class HealthCore:
         }
         if set(payload) != required or type(payload.get("minimum_evidence")) is not dict:
             raise ProtocolViolation("invalid diagnosis preparation fields")
+        model_authority = (None if self._model_authority_digest is None
+                           else StrictHealthLLM.authority_for_digest(self._model_authority_digest))
+        if (model_authority is not None
+                and type(model_authority[1]) is NonDiagnosticOperationalBudget):
+            return self._commit_ticket116_result(command, {
+                "_ticket116_action": command.action, "status": "rejected",
+                "run_receipt_ref": payload.get("run_receipt_ref"),
+            })
         knowledge_currentness = self._reconcile_ticket116_diagnostic_basis()
         assets = self._ticket116_assets
         if assets is None:

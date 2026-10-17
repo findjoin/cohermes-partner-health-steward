@@ -21,8 +21,8 @@ from .knowledge import (
 )
 from .model_contract import (
     CapabilityProfile, FirstHopRoute, ModelContractViolation,
-    ModelTransportResult, StrictHealthLLM, StrictModelRequest,
-    _freeze_json, _thaw_json,
+    ModelTransportResult, StrictHealthLLM, StrictModelRequest, ModelMessage,
+    NonDiagnosticOperationalBudget, _budget_time, _freeze_json, _thaw_json,
 )
 
 
@@ -36,6 +36,29 @@ _BODY_FIELDS = frozenset({
     "model", "instructions", "input", "store", "stream", "max_output_tokens", "text",
 })
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+NONDIAGNOSTIC_OPERATION_SCHEMA_NAME = "nondiagnostic-operational-candidate-v1"
+
+
+def nondiagnostic_operation_schema() -> dict:
+    """Return only the existing typed ND candidate shape, without overrides."""
+    props = {}
+    for key, role in (("owner_fact_refs", "owner-fact"), ("knowledge_refs", "general-knowledge")):
+        props[key] = {"type": "array", "items": {
+            "type": "object", "properties": {
+                "card_id": {"type": "string", "minLength": 1},
+                "version": {"type": "string", "minLength": 1},
+                "role": {"type": "string", "const": role},
+            }, "required": ["card_id", "version", "role"], "additionalProperties": False,
+        }}
+    for key in ("support", "opposition", "unknowns", "limitations", "next_steps", "claim_ids"):
+        props[key] = {"type": "array", "items": {"type": "string", "minLength": 1}}
+    props["template_id"] = {"type": "string", "minLength": 1}
+    return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
+
+
+NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST = stable_digest(nondiagnostic_operation_schema())
 
 
 def _canonical(value: object) -> bytes:
@@ -151,6 +174,101 @@ def _matches(value: object, schema: dict) -> bool:
     return True
 
 
+def _responses_body(route, messages, output_reservation, schema_name, schema):
+    """Build the same final Responses bytes for strict and explicit ND modes."""
+    instructions, inputs, seen_input = [], [], False
+    for message in messages:
+        if type(message) is not ModelMessage:
+            raise ModelContractViolation("invalid production model message")
+        ModelMessage.__post_init__(message)
+        if not message.content.strip():
+            raise ModelContractViolation("empty production model message")
+        if message.role == "system":
+            if seen_input:
+                raise ModelContractViolation("interleaved production system message")
+            instructions.append(message.content)
+        else:
+            seen_input = True
+            inputs.append({"role": message.role, "content": [{
+                "type": "output_text" if message.role == "assistant" else "input_text",
+                "text": message.content,
+            }]})
+    if not instructions or not inputs:
+        raise ModelContractViolation("incomplete production model input")
+    return {
+        "model": route.requested_model, "instructions": "\n\n".join(instructions),
+        "input": inputs, "store": False, "stream": True,
+        "max_output_tokens": output_reservation,
+        "text": {"format": {"type": "json_schema", "name": schema_name, "schema": schema, "strict": True}},
+    }
+
+
+@dataclass(frozen=True, init=False, repr=False)
+class NonDiagnosticBudgetInputMeasurementStrategy:
+    _profile: NonDiagnosticOperationalBudget
+    _clock: Callable[[], datetime]
+    _schema: object
+
+    def __init__(self, budget, *, clock=None):
+        if type(budget) is not NonDiagnosticOperationalBudget or clock is not None and not callable(clock):
+            raise ModelContractViolation("invalid ND budget measurement authority")
+        budget = NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(budget))
+        object.__setattr__(self, "_profile", budget)
+        object.__setattr__(self, "_clock", clock or (lambda: datetime.now(timezone.utc)))
+        object.__setattr__(self, "_schema", _freeze_json(nondiagnostic_operation_schema(), "ND schema"))
+
+    def canonical_copy(self):
+        if type(self) is not NonDiagnosticBudgetInputMeasurementStrategy:
+            raise ModelContractViolation("invalid ND budget measurement strategy")
+        return NonDiagnosticBudgetInputMeasurementStrategy(
+            object.__getattribute__(self, "_profile"), clock=object.__getattribute__(self, "_clock"))
+
+    def _now(self):
+        now = object.__getattribute__(self, "_clock")()
+        if type(now) is not datetime or now.utcoffset() is None:
+            raise ModelContractViolation("invalid ND budget clock")
+        return now
+
+    def _body(self, request):
+        request = StrictModelRequest.canonical_copy(request)
+        budget = object.__getattribute__(self, "_profile")
+        if type(request.capability_profile) is not NonDiagnosticOperationalBudget or request.capability_profile != budget:
+            raise ModelContractViolation("ND budget authority drift")
+        return _responses_body(request.route, request.messages, request.output_reservation_tokens,
+                               request.strict_schema_name, nondiagnostic_operation_schema())
+
+    def prepare_request(self, messages):
+        strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(self)
+        budget = object.__getattribute__(strategy, "_profile")
+        if type(messages) is not tuple or not messages:
+            raise ModelContractViolation("invalid ND messages")
+        body = _responses_body(budget.route, messages, budget.output_reservation_tokens,
+                               NONDIAGNOSTIC_OPERATION_SCHEMA_NAME, nondiagnostic_operation_schema())
+        request = StrictModelRequest(
+            budget.route, budget, messages,
+            stable_digest({"messages": [ModelMessage.to_wire(item) for item in messages]}),
+            None, budget.output_reservation_tokens, NONDIAGNOSTIC_OPERATION_SCHEMA_NAME,
+            NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST, len(_canonical(body)),
+        )
+        NonDiagnosticBudgetInputMeasurementStrategy.measure(strategy, request)
+        return request
+
+    def measure(self, request):
+        strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(self)
+        body = NonDiagnosticBudgetInputMeasurementStrategy._body(strategy, request)
+        budget = object.__getattribute__(strategy, "_profile")
+        now = NonDiagnosticBudgetInputMeasurementStrategy._now(strategy)
+        if not _budget_time(budget.issued_at) <= now < _budget_time(budget.expires_at):
+            raise ModelContractViolation("ND operation budget is not current")
+        return len(_canonical(body))
+
+    def _expired_after_attempt(self, request):
+        strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(self)
+        NonDiagnosticBudgetInputMeasurementStrategy._body(strategy, request)
+        budget = object.__getattribute__(strategy, "_profile")
+        return NonDiagnosticBudgetInputMeasurementStrategy._now(strategy) >= _budget_time(budget.expires_at)
+
+
 @dataclass(frozen=True, init=False, repr=False)
 class ProfileBoundInputMeasurementStrategy:
     """A specific approved measurement method, never an arbitrary callback."""
@@ -220,32 +338,8 @@ class ProfileBoundInputMeasurementStrategy:
                 or request.strict_schema_digest != stable_digest(schema)
                 or request.output_reservation_tokens != profile.output_reservation_tokens):
             raise ModelContractViolation("production measurement authority drift")
-        instructions = []
-        messages = []
-        seen_input = False
-        for message in request.messages:
-            if not message.content.strip():
-                raise ModelContractViolation("empty production model message")
-            if message.role == "system":
-                if seen_input:
-                    raise ModelContractViolation("interleaved production system message")
-                instructions.append(message.content)
-            else:
-                seen_input = True
-                messages.append({
-                    "role": message.role,
-                    "content": [{"type": "output_text" if message.role == "assistant" else "input_text",
-                                 "text": message.content}],
-                })
-        if not instructions or not messages:
-            raise ModelContractViolation("incomplete production model input")
-        return {
-            "model": request.route.requested_model, "instructions": "\n\n".join(instructions),
-            "input": messages, "store": False, "stream": True,
-            "max_output_tokens": request.output_reservation_tokens,
-            "text": {"format": {"type": "json_schema", "name": request.strict_schema_name,
-                                "schema": schema, "strict": True}},
-        }
+        return _responses_body(request.route, request.messages, request.output_reservation_tokens,
+                               request.strict_schema_name, schema)
 
     def measure(self, request: StrictModelRequest) -> int:
         strategy = ProfileBoundInputMeasurementStrategy.canonical_copy(self)
@@ -363,11 +457,17 @@ class ProductionModelAdapter:
     """Execute the exact authorized request once and retain raw terminal facts."""
 
     def __init__(self, route, profile, *, transport, measurement_strategy):
-        if type(route) is not FirstHopRoute or type(profile) is not CapabilityProfile:
+        if type(route) is not FirstHopRoute or type(profile) not in {CapabilityProfile, NonDiagnosticOperationalBudget}:
             raise ModelContractViolation("invalid production model binding")
         self._route = FirstHopRoute.from_wire(route.to_wire())
-        self._profile = CapabilityProfile.from_wire(profile.to_wire())
-        self._strategy = ProfileBoundInputMeasurementStrategy.canonical_copy(measurement_strategy)
+        if type(profile) is NonDiagnosticOperationalBudget:
+            self._profile = NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(profile))
+            if type(measurement_strategy) is not NonDiagnosticBudgetInputMeasurementStrategy:
+                raise ModelContractViolation("invalid ND budget strategy")
+            self._strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(measurement_strategy)
+        else:
+            self._profile = CapabilityProfile.from_wire(profile.to_wire())
+            self._strategy = ProfileBoundInputMeasurementStrategy.canonical_copy(measurement_strategy)
         if object.__getattribute__(self._strategy, "_profile") != self._profile:
             raise ModelContractViolation("production model profile drift")
         if getattr(transport, "route", None) != self._route or not callable(getattr(transport, "send", None)):
@@ -382,11 +482,13 @@ class ProductionModelAdapter:
                               request.strict_schema_digest, measurement_strategy=self._strategy)
         if StrictHealthLLM.preflight(llm, request) is not None:
             raise ModelContractViolation("production model preflight rejected")
-        body = ProfileBoundInputMeasurementStrategy._body(self._strategy, request)
+        strategy_type = type(self._strategy)
+        body = strategy_type._body(self._strategy, request)
         # Check immediately before the irreversible send, including exact bytes.
-        if (getattr(self._transport, "route", None) != self._route
-                or ProfileBoundInputMeasurementStrategy.measure(self._strategy, request)
-                > request.final_input_upper_bound_tokens):
+        measured = strategy_type.measure(self._strategy, request)
+        declared = (request.final_wire_bytes if type(self._profile) is NonDiagnosticOperationalBudget
+                    else request.final_input_upper_bound_tokens)
+        if getattr(self._transport, "route", None) != self._route or measured > declared:
             raise ModelContractViolation("production model authority changed")
         try:
             raw = self._transport.send(body)

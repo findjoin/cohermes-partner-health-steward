@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
-from .answer_resolution import ModelEffectReport
+from .answer_resolution import (
+    ModelEffectReport, ND_OPERATION_MODE, ND_OPERATION_PURPOSE, ND_WIRE_BYTE_LIMIT,
+    ND_OUTPUT_RESERVATION, ND_CONTEXT_GUARANTEE, ND_CONTEXT_DISCLOSURE,
+)
 from .initialization import stable_digest
 from .nondiagnostic import NonDiagnosticCandidate, NonDiagnosticContractViolation
 
@@ -147,6 +151,101 @@ class FirstHopRoute:
         )
 
 
+def _budget_time(value: object) -> datetime:
+    try:
+        result = datetime.fromisoformat(_text(value, "operation budget time"))
+    except (TypeError, ValueError):
+        raise ModelContractViolation("invalid operation budget time") from None
+    if result.utcoffset() != timedelta(0):
+        raise ModelContractViolation("operation budget time must be UTC")
+    return result
+
+
+@dataclass(frozen=True)
+class NonDiagnosticOperationalBudget:
+    """A local ND request limit, with no assertion about provider capacity."""
+
+    budget_id: str
+    budget_version: str
+    route: FirstHopRoute
+    allowed_actual_models: tuple[str, ...]
+    owner_decision_ref: str
+    issued_at: str
+    expires_at: str
+
+    def __post_init__(self) -> None:
+        for value in (self.budget_id, self.budget_version, self.owner_decision_ref):
+            _text(value, "operation budget metadata")
+        if type(self.route) is not FirstHopRoute:
+            raise ModelContractViolation("invalid operation budget route")
+        FirstHopRoute.__post_init__(self.route)
+        if type(self.allowed_actual_models) is not tuple:
+            raise ModelContractViolation("invalid operation budget actual models")
+        _texts(list(self.allowed_actual_models), "operation budget actual models")
+        if _budget_time(self.issued_at) >= _budget_time(self.expires_at):
+            raise ModelContractViolation("invalid operation budget validity")
+
+    @property
+    def output_reservation_tokens(self) -> int:
+        return ND_OUTPUT_RESERVATION
+
+    @property
+    def max_final_wire_bytes(self) -> int:
+        return ND_WIRE_BYTE_LIMIT
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "contract": "nondiagnostic-operational-budget-v1",
+            "budget_id": self.budget_id, "budget_version": self.budget_version,
+            "route": FirstHopRoute.to_wire(self.route),
+            "allowed_actual_models": list(self.allowed_actual_models),
+            "owner_decision_ref": self.owner_decision_ref,
+            "issued_at": self.issued_at, "expires_at": self.expires_at,
+            "mode": ND_OPERATION_MODE, "purpose": ND_OPERATION_PURPOSE,
+            "max_final_wire_bytes": ND_WIRE_BYTE_LIMIT,
+            "output_reservation_tokens": ND_OUTPUT_RESERVATION,
+            "context_guarantee": ND_CONTEXT_GUARANTEE,
+            "context_disclosure": ND_CONTEXT_DISCLOSURE,
+        }
+
+    @classmethod
+    def from_wire(cls, value: object) -> "NonDiagnosticOperationalBudget":
+        fields = _mapping(value, frozenset({
+            "contract", "budget_id", "budget_version", "route", "allowed_actual_models",
+            "owner_decision_ref", "issued_at", "expires_at", "mode", "purpose",
+            "max_final_wire_bytes", "output_reservation_tokens", "context_guarantee",
+            "context_disclosure",
+        }), "non-diagnostic operation budget")
+        fixed = {
+            "contract": "nondiagnostic-operational-budget-v1", "mode": ND_OPERATION_MODE,
+            "purpose": ND_OPERATION_PURPOSE, "max_final_wire_bytes": ND_WIRE_BYTE_LIMIT,
+            "output_reservation_tokens": ND_OUTPUT_RESERVATION,
+            "context_guarantee": ND_CONTEXT_GUARANTEE, "context_disclosure": ND_CONTEXT_DISCLOSURE,
+        }
+        if any(type(fields[key]) is not type(expected) or fields[key] != expected
+               for key, expected in fixed.items()):
+            raise ModelContractViolation("invalid operation budget guarantee")
+        return cls(fields["budget_id"], fields["budget_version"],
+                   FirstHopRoute.from_wire(fields["route"]),
+                   _texts(fields["allowed_actual_models"], "operation budget actual models"),
+                   fields["owner_decision_ref"], fields["issued_at"], fields["expires_at"])
+
+    @property
+    def digest(self) -> str:
+        return stable_digest(NonDiagnosticOperationalBudget.to_wire(self))
+
+    @property
+    def model_use_disclosure(self) -> dict[str, object]:
+        return {
+            "mode": ND_OPERATION_MODE, "purpose": ND_OPERATION_PURPOSE,
+            "budget_digest": self.digest, "owner_decision_ref": self.owner_decision_ref,
+            "max_final_wire_bytes": ND_WIRE_BYTE_LIMIT,
+            "output_reservation_tokens": ND_OUTPUT_RESERVATION,
+            "context_guarantee": ND_CONTEXT_GUARANTEE,
+            "context_disclosure": ND_CONTEXT_DISCLOSURE,
+        }
+
+
 @dataclass(frozen=True)
 class CapabilityProfile:
     profile_id: str
@@ -275,16 +374,18 @@ class ModelMessage:
 @dataclass(frozen=True)
 class StrictModelRequest:
     route: FirstHopRoute
-    capability_profile: CapabilityProfile
+    capability_profile: CapabilityProfile | NonDiagnosticOperationalBudget
     messages: tuple[ModelMessage, ...]
     final_input_digest: str
-    final_input_upper_bound_tokens: int
+    final_input_upper_bound_tokens: int | None
     output_reservation_tokens: int
     strict_schema_name: str
     strict_schema_digest: str
+    final_wire_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        if type(self.route) is not FirstHopRoute or type(self.capability_profile) is not CapabilityProfile:
+        if (type(self.route) is not FirstHopRoute
+                or type(self.capability_profile) not in {CapabilityProfile, NonDiagnosticOperationalBudget}):
             raise ModelContractViolation("invalid strict model authority")
         if type(self.messages) is not tuple or not self.messages or any(type(item) is not ModelMessage for item in self.messages):
             raise ModelContractViolation("invalid model messages")
@@ -293,12 +394,43 @@ class StrictModelRequest:
             {"messages": [ModelMessage.to_wire(item) for item in self.messages]}
         ):
             raise ModelContractViolation("final input digest does not match messages")
-        _integer(self.final_input_upper_bound_tokens, "final input upper bound tokens", positive=True)
+        if type(self.capability_profile) is NonDiagnosticOperationalBudget:
+            budget = self.capability_profile
+            NonDiagnosticOperationalBudget.__post_init__(budget)
+            from .model_adapter import (
+                NONDIAGNOSTIC_OPERATION_SCHEMA_NAME, NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST,
+                nondiagnostic_operation_schema, _responses_body, _canonical,
+            )
+            if (self.route != budget.route or self.final_input_upper_bound_tokens is not None
+                    or self.output_reservation_tokens != ND_OUTPUT_RESERVATION
+                    or self.strict_schema_name != NONDIAGNOSTIC_OPERATION_SCHEMA_NAME
+                    or self.strict_schema_digest != NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST):
+                raise ModelContractViolation("invalid ND request binding")
+            measured = len(_canonical(_responses_body(
+                self.route, self.messages, self.output_reservation_tokens,
+                self.strict_schema_name, nondiagnostic_operation_schema())))
+            _integer(self.final_wire_bytes, "final wire bytes", positive=True)
+            if self.final_wire_bytes != measured or measured > ND_WIRE_BYTE_LIMIT:
+                raise ModelContractViolation("invalid ND final wire budget")
+        else:
+            _integer(self.final_input_upper_bound_tokens, "final input upper bound tokens", positive=True)
+            if self.final_wire_bytes is not None:
+                raise ModelContractViolation("strict request cannot carry byte budget")
         _integer(self.output_reservation_tokens, "output reservation tokens", positive=True)
         _text(self.strict_schema_name, "strict schema name")
         _sha(self.strict_schema_digest, "strict schema digest")
 
     def to_wire(self) -> dict[str, object]:
+        if type(self.capability_profile) is NonDiagnosticOperationalBudget:
+            return {
+                "contract": "nondiagnostic-operational-request-v1",
+                "route": FirstHopRoute.to_wire(self.route),
+                "operational_budget": NonDiagnosticOperationalBudget.to_wire(self.capability_profile),
+                "messages": [ModelMessage.to_wire(item) for item in self.messages],
+                "final_input_digest": self.final_input_digest, "final_wire_bytes": self.final_wire_bytes,
+                "output_reservation_tokens": self.output_reservation_tokens,
+                "strict_schema_name": self.strict_schema_name, "strict_schema_digest": self.strict_schema_digest,
+            }
         return {
             "route": FirstHopRoute.to_wire(self.route),
             "capability_profile": CapabilityProfile.to_wire(
@@ -328,13 +460,18 @@ class StrictModelRequest:
         messages = object.__getattribute__(self, "messages")
         if (
             type(route) is not FirstHopRoute
-            or type(capability_profile) is not CapabilityProfile
+            or type(capability_profile) not in {CapabilityProfile, NonDiagnosticOperationalBudget}
             or type(messages) is not tuple
             or not messages
             or any(type(item) is not ModelMessage for item in messages)
         ):
             raise ModelContractViolation("invalid strict model authority")
         FirstHopRoute.__post_init__(route)
+        if type(capability_profile) is NonDiagnosticOperationalBudget:
+            NonDiagnosticOperationalBudget.__post_init__(capability_profile)
+            for item in messages:
+                ModelMessage.__post_init__(item)
+            return StrictModelRequest.from_wire(StrictModelRequest.to_wire(self))
         CapabilityProfile.__post_init__(capability_profile)
         for item in messages:
             ModelMessage.__post_init__(item)
@@ -370,6 +507,20 @@ class StrictModelRequest:
 
     @classmethod
     def from_wire(cls, value: object) -> "StrictModelRequest":
+        if type(value) is dict and value.get("contract") == "nondiagnostic-operational-request-v1":
+            fields = _mapping(value, frozenset({
+                "contract", "route", "operational_budget", "messages", "final_input_digest",
+                "final_wire_bytes", "output_reservation_tokens", "strict_schema_name", "strict_schema_digest",
+            }), "ND model request")
+            if type(fields["messages"]) is not list or not fields["messages"]:
+                raise ModelContractViolation("invalid model messages")
+            return cls(
+                FirstHopRoute.from_wire(fields["route"]),
+                NonDiagnosticOperationalBudget.from_wire(fields["operational_budget"]),
+                tuple(ModelMessage.from_wire(item) for item in fields["messages"]),
+                fields["final_input_digest"], None, fields["output_reservation_tokens"],
+                fields["strict_schema_name"], fields["strict_schema_digest"], fields["final_wire_bytes"],
+            )
         fields = _mapping(value, frozenset({
             "route", "capability_profile", "messages", "final_input_digest",
             "final_input_upper_bound_tokens", "output_reservation_tokens",
@@ -546,12 +697,40 @@ class StrictHealthLLM:
     def __init__(
         self,
         route: FirstHopRoute,
-        capability_profile: CapabilityProfile,
+        capability_profile: CapabilityProfile | NonDiagnosticOperationalBudget,
         strict_schema_name: str = SYNTHETIC_STRICT_SCHEMA_NAME,
         strict_schema_digest: str = SYNTHETIC_STRICT_SCHEMA_DIGEST,
         *,
         measurement_strategy: object = None,
     ) -> None:
+        if type(capability_profile) is NonDiagnosticOperationalBudget:
+            from .model_adapter import (
+                NonDiagnosticBudgetInputMeasurementStrategy, NONDIAGNOSTIC_OPERATION_SCHEMA_NAME,
+                NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST,
+            )
+            if type(route) is not FirstHopRoute:
+                raise ModelContractViolation("invalid current ND model route")
+            budget = NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(capability_profile))
+            if (route != budget.route or strict_schema_name != NONDIAGNOSTIC_OPERATION_SCHEMA_NAME
+                    or strict_schema_digest != NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST):
+                raise ModelContractViolation("invalid current ND model authority")
+            self._route = FirstHopRoute.from_wire(FirstHopRoute.to_wire(route))
+            self._capability_profile = budget
+            self._strict_schema_name, self._strict_schema_digest = strict_schema_name, strict_schema_digest
+            self._measurement_strategy = None
+            if measurement_strategy is not None:
+                if type(measurement_strategy) is not NonDiagnosticBudgetInputMeasurementStrategy:
+                    raise ModelContractViolation("invalid ND measurement authority")
+                strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(measurement_strategy)
+                if object.__getattribute__(strategy, "_profile") != budget:
+                    raise ModelContractViolation("ND measurement budget drift")
+                self._measurement_strategy = strategy
+            _STRICT_MODEL_AUTHORITIES[self.model_authority_digest] = {
+                "route": FirstHopRoute.to_wire(self._route),
+                "operational_budget": NonDiagnosticOperationalBudget.to_wire(budget),
+                "strict_schema_name": strict_schema_name, "strict_schema_digest": strict_schema_digest,
+            }
+            return
         if type(route) is not FirstHopRoute or type(capability_profile) is not CapabilityProfile:
             raise ModelContractViolation("invalid current model authority")
         route_facts = (
@@ -604,6 +783,12 @@ class StrictHealthLLM:
     def model_authority_digest(self) -> str:
         """Bind the current route, profile, consent, and strict output schema."""
 
+        if type(self._capability_profile) is NonDiagnosticOperationalBudget:
+            return stable_digest({
+                "route": FirstHopRoute.to_wire(self._route),
+                "operational_budget": NonDiagnosticOperationalBudget.to_wire(self._capability_profile),
+                "strict_schema_name": self._strict_schema_name, "strict_schema_digest": self._strict_schema_digest,
+            })
         return stable_digest(
             {
                 "route": FirstHopRoute.to_wire(self._route),
@@ -615,10 +800,18 @@ class StrictHealthLLM:
             }
         )
 
+    @property
+    def model_use_disclosure(self) -> dict[str, object] | None:
+        profile = object.__getattribute__(self, "_capability_profile")
+        if type(profile) is NonDiagnosticOperationalBudget:
+            budget = NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(profile))
+            return NonDiagnosticOperationalBudget.model_use_disclosure.fget(budget)
+        return None
+
     @staticmethod
     def authority_for_digest(
         digest: str,
-    ) -> tuple[FirstHopRoute, CapabilityProfile, str, str] | None:
+    ) -> tuple[FirstHopRoute, CapabilityProfile | NonDiagnosticOperationalBudget, str, str] | None:
         """Resolve one already-validated in-process authority by digest."""
 
         value = _STRICT_MODEL_AUTHORITIES.get(digest)
@@ -627,7 +820,8 @@ class StrictHealthLLM:
         try:
             return (
                 FirstHopRoute.from_wire(value["route"]),
-                CapabilityProfile.from_wire(value["capability_profile"]),
+                (NonDiagnosticOperationalBudget.from_wire(value["operational_budget"])
+                 if "operational_budget" in value else CapabilityProfile.from_wire(value["capability_profile"])),
                 _text(value["strict_schema_name"], "strict schema name"),
                 _sha(value["strict_schema_digest"], "strict schema digest"),
             )
@@ -641,6 +835,14 @@ class StrictHealthLLM:
             raise ModelContractViolation("invalid current model authority")
         route = object.__getattribute__(self, "_route")
         capability_profile = object.__getattribute__(self, "_capability_profile")
+        if type(route) is FirstHopRoute and type(capability_profile) is NonDiagnosticOperationalBudget:
+            return StrictHealthLLM(
+                FirstHopRoute.from_wire(FirstHopRoute.to_wire(route)),
+                NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(capability_profile)),
+                object.__getattribute__(self, "_strict_schema_name"),
+                object.__getattribute__(self, "_strict_schema_digest"),
+                measurement_strategy=object.__getattribute__(self, "_measurement_strategy"),
+            )
         if (
             type(route) is not FirstHopRoute
             or type(capability_profile) is not CapabilityProfile
@@ -670,6 +872,7 @@ class StrictHealthLLM:
         reason_code: str | None,
         *,
         candidate_digest: str | None = None,
+        model_use_disclosure: Mapping[str, object] | None = None,
     ) -> ModelEffectReport:
         result_identity = ModelTransportResult.to_wire(result)
         return ModelEffectReport(
@@ -683,6 +886,7 @@ class StrictHealthLLM:
             reason_code=reason_code,
             result_digest=stable_digest(result_identity),
             candidate_digest=candidate_digest,
+            model_use_disclosure=model_use_disclosure,
         )
 
     def preflight(
@@ -762,6 +966,18 @@ class StrictHealthLLM:
                 reason_code="strict-schema-drift",
                 candidate=None,
             )
+        if type(request.capability_profile) is NonDiagnosticOperationalBudget:
+            from .model_adapter import NonDiagnosticBudgetInputMeasurementStrategy
+            strategy = object.__getattribute__(self, "_measurement_strategy")
+            try:
+                if type(strategy) is not NonDiagnosticBudgetInputMeasurementStrategy:
+                    raise ModelContractViolation("ND measurement authority required")
+                measured = NonDiagnosticBudgetInputMeasurementStrategy.measure(strategy, request)
+                if measured != request.final_wire_bytes:
+                    raise ModelContractViolation("ND exact wire drift")
+            except Exception:
+                return StrictModelOutcome("failed-closed", "not-started", "operation-budget-unavailable", None)
+            return None
         required_capacity = (
             request.final_input_upper_bound_tokens
             + request.capability_profile.fixed_wrapper_tokens
@@ -822,6 +1038,7 @@ class StrictHealthLLM:
         if preflight is not None:
             return preflight
         report = ModelEffectReport(
+            model_use_disclosure=StrictHealthLLM.model_use_disclosure.fget(self),
             model_status="unknown",
             transport_attempted=True,
             terminal_proven=False,
@@ -854,13 +1071,26 @@ class StrictHealthLLM:
     ) -> StrictModelOutcome:
         """Validate one already-observed exact transport result without I/O."""
 
+        def report_result(result, reason_code, *, candidate_digest=None):
+            return StrictHealthLLM._report(
+                result, reason_code, candidate_digest=candidate_digest,
+                model_use_disclosure=StrictHealthLLM.model_use_disclosure.fget(self))
+
         preflight = StrictHealthLLM.preflight(self, request)
         expired_after_attempt = False
         if preflight is not None:
             # Expiry is an admission boundary, not evidence that a completed
             # external attempt never happened.  Preserve its observed result.
             strategy = object.__getattribute__(self, "_measurement_strategy")
-            if not request.capability_profile.synthetic and preflight.reason_code == "capacity-unavailable":
+            if type(request.capability_profile) is NonDiagnosticOperationalBudget:
+                from .model_adapter import NonDiagnosticBudgetInputMeasurementStrategy
+                if (preflight.reason_code == "operation-budget-unavailable"
+                        and type(strategy) is NonDiagnosticBudgetInputMeasurementStrategy):
+                    try:
+                        expired_after_attempt = NonDiagnosticBudgetInputMeasurementStrategy._expired_after_attempt(strategy, request)
+                    except Exception:
+                        pass
+            elif not request.capability_profile.synthetic and preflight.reason_code == "capacity-unavailable":
                 from .model_adapter import ProfileBoundInputMeasurementStrategy
 
                 if type(strategy) is ProfileBoundInputMeasurementStrategy:
@@ -873,7 +1103,7 @@ class StrictHealthLLM:
         if type(result) is not ModelTransportResult:
             return StrictHealthLLM.transport_unknown_outcome(self, request)
         if result.status == "unknown":
-            report = StrictHealthLLM._report(result, "model-effect-unknown")
+            report = report_result(result, "model-effect-unknown")
             return StrictModelOutcome(
                 disposition="unknown",
                 model_effect="unknown",
@@ -882,7 +1112,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.requested_model != request.route.requested_model:
-            report = StrictHealthLLM._report(
+            report = report_result(
                 result,
                 "transport-requested-model-drift",
             )
@@ -894,7 +1124,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.fallback_observed:
-            report = StrictHealthLLM._report(result, "fallback-observed")
+            report = report_result(result, "fallback-observed")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -903,7 +1133,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.actual_model not in request.capability_profile.allowed_actual_models:
-            report = StrictHealthLLM._report(result, "actual-model-drift")
+            report = report_result(result, "actual-model-drift")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -912,7 +1142,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.truncated:
-            report = StrictHealthLLM._report(result, "model-output-truncated")
+            report = report_result(result, "model-output-truncated")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect=result.status,
@@ -922,24 +1152,27 @@ class StrictHealthLLM:
             )
         if result.status == "completed" and not result.truncated:
             if expired_after_attempt:
-                report = StrictHealthLLM._report(result, "capacity-evidence-expired")
+                expiry_reason = ("operation-budget-expired" if type(request.capability_profile) is NonDiagnosticOperationalBudget
+                                 else "capacity-evidence-expired")
+                report = report_result(result, expiry_reason)
                 return StrictModelOutcome(
                     disposition="failed-closed",
                     model_effect="completed",
-                    reason_code="capacity-evidence-expired",
+                    reason_code=expiry_reason,
                     candidate=None,
                     model_report=report,
                 )
             candidate = _thaw_json(result.structured_output)
             if not isinstance(candidate, Mapping):
                 raise ModelContractViolation("completed result lacks structured output")
-            if request.strict_schema_name == SYNTHETIC_STRICT_SCHEMA_NAME:
+            if (type(request.capability_profile) is NonDiagnosticOperationalBudget
+                    or request.strict_schema_name == SYNTHETIC_STRICT_SCHEMA_NAME):
                 try:
                     validated_candidate = NonDiagnosticCandidate.from_wire(
                         candidate
                     ).to_wire()
                 except NonDiagnosticContractViolation:
-                    report = StrictHealthLLM._report(
+                    report = report_result(
                         result,
                         "strict-schema-error",
                     )
@@ -956,7 +1189,7 @@ class StrictHealthLLM:
                 # name/digest and terminal candidate digest here.
                 validated_candidate = candidate
             candidate_digest = stable_digest(validated_candidate)
-            report = StrictHealthLLM._report(
+            report = report_result(
                 result,
                 None,
                 candidate_digest=candidate_digest,
@@ -969,7 +1202,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.status == "incomplete":
-            report = StrictHealthLLM._report(result, "model-incomplete")
+            report = report_result(result, "model-incomplete")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect="incomplete",
@@ -979,7 +1212,7 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.status == "failed":
-            report = StrictHealthLLM._report(result, "model-failed")
+            report = report_result(result, "model-failed")
             return StrictModelOutcome(
                 disposition="failed-closed",
                 model_effect="failed",
