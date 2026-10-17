@@ -44,7 +44,7 @@ answer沿原NonDiagnosticCandidate/current owner-card与governed KnowledgeReleas
 - `start_nondiagnostic_stage(source_causal_id, stage, grant) -> {stage, state, request, attempt_ref}`；Core重验真实typed grant、当前head/fence/route/budget/schema与exact request，先持久原ExecutingEffect.model_attempt_started，再返回一次性attempt引用和request。它不执行网络，不持Core lock等待Plugin。
 - `complete_nondiagnostic_stage(source_causal_id, stage, grant, attempt_ref, result: ModelTransportResult) -> {stage, state, reason_code}`；Core规范重验完整结果，自己调用StrictHealthLLM.resolve_transport_result生成report，绑定原grant/request/source/stage并经原effect.result终态/lease释放。不能接受Plugin提供ModelEffectReport、candidate digest或“成功”布尔值代替完整结果。
 - `abort_nondiagnostic_stage(source_causal_id, stage, grant, attempt_ref, *, reason_code) -> {stage, state, reason_code}`；只承接下节闭集传输/adapter异常观察，未start不伪造attempt，已start无完整结果沿原unknown；已有完整terminal不可覆盖。
-- `advance_governed_source(source_causal_id) -> {response, next_stage, model_use_disclosure}`；只用本Core已经观察的候选推进原typed日常阶段/唯一提交，返回原Response wire及intake/answer/null。最终response沿原turn_result，可交126受控投递，不直接网络send。
+- `advance_governed_source(source_causal_id) -> {response, next_stage, model_use_disclosure, delivery_refs}`；只用本Core已经观察的候选推进原typed日常阶段/唯一提交，返回原Response wire及intake/answer/null。最终response沿原turn_result，可交126受控投递，不直接网络send。
 - `nondiagnostic_source_status(source_causal_id) -> {source_causal_id, next_stage, state, reason_code, model_use_disclosure}`；投影无健康正文/凭据，不能补造候选或report。
 
 公开短方法返回state闭集为`ready/attempted/completed/failed-closed/unknown/owner-decision-required/finalized`，只是原source/effect/daily事实的投影，不新增持久状态机。attempt_ref来自原effect/lease的单次关联，不是第二个批准、重试令牌或跨服务私有session ledger。
@@ -61,7 +61,7 @@ interface沿`health-entry-v1`；未知op/field拒绝。command/controlled-effect
 
 | kind / op | 精确payload | 精确返回payload |
 |---|---|---|
-|command `governed-receive`|`{message}`，同现RawWeixinMessage wire|`{response,next_stage,model_use_disclosure}`；只准入/纯计算，不HTTP|
+|command `governed-receive`|`{message}`，同现RawWeixinMessage wire|`{response,next_stage,model_use_disclosure,delivery_refs}`；只准入/纯计算，不HTTP|
 |command `governed-advance`|`{source_causal_id}`|同advance_governed_source|
 |controlled-effect `nondiagnostic-prepare`|`{source_causal_id,stage}`|`{stage,state,request_transfer,intent,grant}`；request_transfer为descriptor或null，intent/grant为原service metadata或null；不回full request|
 |controlled-effect `nondiagnostic-request-chunk`|`{source_causal_id,stage,grant,index}`|`{request_transfer,index,bytes_b64,next_index}`；仅该session下一片|
@@ -98,6 +98,16 @@ intake成功后只有本Core验证过的candidate可以驱动证据提交；可�
 提醒时间按主人已设置时区解析当地日期时间，支持明确日期或今天/明天加时刻；缺日期/时刻、DST歧义或过时不猜，返回固定补问。`health-task-once`是主人明确请求的单次自有提醒：当前披露显示只向当前主人/当前Weixin route发送一次、固定目的/范围/期限和取消方式。Core从该原生显式命令生成现ExecutionScopeApproval与TaskCandidate，max_attempts=1、唯一当前接收方，不授权联系人或任意外部调用；自然语言intake本身不能生成该批准。重复native事件返回原task/approval，不新建第二任务。固定`command/governed-wake payload={}`由Core当前时钟推进现due任务并形成原outbox，返回`{delivery_refs,task_status}`；现调度/轮询实际调用它，126只投递Core返回的`owner-outbox`引用，不新建timer/后台队列或直接send。wake还按主人时区计算现LocalDayKey，实际接原DailyReviewEngine.prepare/commit以及现task claim/advance/solve；只处理当前due任务及当前当地日，复用completed review key/原outbox幂等，无补跑过期日、无模型第三阶段或新调度ledger。暂停/撤销/过期route或scope不投递，unknown维持原冻结。系统timer安装及运行target精确批准留128，但130必须交付可直接调用的真实当前wake。
 
 Core公开`governed_owner_command(source_causal_id) -> {response,delivery_refs}`及`governed_wake_current() -> {delivery_refs,task_status}`分别映射上述owner/wake wire，不接caller context、任意callback或测试用预执行结果。`command/governed-owner-command payload={source_causal_id}`只解析该源实际原文和上述闭集，返回`{response,delivery_refs}`；不接自由action/payload/context。删除仍复用原lifecycle的独立新事件确认、当前target/operation绑定、purge/terminal/通知，普通“删掉”模型候选不能触发删除。资料查看、导出、纠正均是本票必需项：查看走managed_rights_read_current及原ManagedObject当前版本/撤销边界；纠正走managed_correction_draft→原PendingCorrectionDraft/OwnerMutationRequest与Ticket112完整原子链，引用实际admitted纠正source，replacement只来自主人明确更正原文/已验证有限抽取，受影响判断先降级，不写替代事实到另一个store。一般问答不能暗变成纠正；资料查看/导出不调用模型。
+
+### 主人实际可见的固定结果
+
+所有governed receive/advance统一返回`{response,next_stage,model_use_disclosure,delivery_refs}`，owner-command返回`{response,delivery_refs}`；delivery_refs只含Core已提交的原`owner-outbox`引用，不能含caller text、任意to或裸发送callback。Core从该native source对应的真实command receipt、已finalized业务或原terminal事实确定性渲染固定中文结果，沿当前批准模板/同outbox/effect提交并交126 prepare/authorize/complete；结果需要的受管事实与outbox关联同成同败，不新增另一个result状态或持久ledger。重复native source或反复读取只返回同一个既有引用，不产生第二次业务/发送。
+
+初始化独立confirm native source经过原consent/commit/finalize后，Live Adapter必须调用同`governed-advance {source_causal_id}`。Core重新核验该原confirm source与OwnerInitialization.workflow/disclosure/admission因果绑定，以及同一真实initialization finalized transition与enabled readback；仅仅UI读到enabled、收到ACK或caller声称成功均不能生成此结果。Core在原owner-outbox绑定该source/transition，唯一固定说明实际包含“健康管家已初始化；诊断未启用”及Core当前131模型使用/上下文限制。Adapter只交此outbox引用给126 Bridge并读回handoff后才推进该confirm source的native cursor；不自行send成功文案，不把Core enabled误写成主人已看到消息。重投相同confirm只复用原结果；初次披露和confirm成功结果保持两个实际独立native来源。
+
+暂停/恢复、停止/恢复记录、提醒创建/取消、当前状态、查看/纠正/导出/删除结果，以及模型已知失败/限制/未知提示，均须实际形成Core授权主人可见结果；不能仅在RPC返回reason_code、内存回调或状态projection里存在。正文取原业务事实/固定模板，控制成功必须在同真实commit读回后才能说“已停止记录”等，失败/未知明确说无法确认，不夸大已执行；资料查看可含当前获准对象，导出结果另附下节文件，删除仍沿原lifecycle允许的最小无健康正文终止通知。
+
+对模型unknown/候选丢失等尚未取得DailyTurnResult的来源，Core只依据已持久原model effect/report/receipt，沿原mandatory-owner-decision/status机制形成该来源的一次最小固定限制提示；不能重建模型答案、补证据或绕日常唯一提交。所需窄权威只覆盖该确切未知事实的当前owner/route、无健康正文的固定通知，不恢复一般health/model/outbound写入；current head/fence本身无法证明时仍不发送。该提示自己的网络结果若未知，保留原outbox unknown，不递归生成另一个“提示未知”的通知或自动重发。发出限制提示不将原未知模型来源改为成功，不凭此ACK原本仍需owner decision的NL来源。初始化/控制命令的cursor也仍须其原业务终态和Core handoff双条件，网络accepted永不冒称主人已读。
 
 正式JSON导出走原managed_rights_export→ManagedExport.to_wire规范对象，保留snapshot/source_state/object版本/修订引用，不能让模型拼JSON或重新导入作为权威。Core生成canonical UTF-8 JSON，以现认证加密纳入同一store的原rights受管registry，标记server-export副本并由原lifecycle purge覆盖；当前纯ManagedExport还没有附件字节存取接缝，这是本票必需的有限增量，不能把现纯对象或opaque引用当文件已交付。不另开export DB或通用文件服务。固定上限8388608明文字节（8 MiB），超限明确“未导出，请选择更小资料范围”，不能静默截断、自动拆包或宣称文件完整。文件名固定为`health-export-<64hex>.json`（canonical文件SHA256去掉sha256:前缀），不接受调用者路径、文件名、扩展名或任意字节。导出对象与其原owner命令回执/outbox绑定同成同败；重投同native source只引用原snapshot和原效果，不能重新生成一个文件并补发。资料查看返回当前真实受管对象；单次文本不能完整表示请求内容时明确请缩小范围或导出，不把截断预览称完整资料。
 

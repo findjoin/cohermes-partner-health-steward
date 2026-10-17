@@ -35,3 +35,5 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 2026-10-18由deployment_audit承接只读characterization与[受控NL唯一设计候选](../design/130-governed-live-nondiagnostic-runtime-design.md)。候选明确同源intake/answer、同budget/stage关系、短Core调用与Plugin125网络、真实主人有限入口；独立verification authority为implementation_audit。当前尚未冻结、未实现，候选接口与最小权利等价类需同一checkpoint预审后固定；不改变131或126冻结权威。
 
 候选在同一引用内收口：原64KiB CorePort不变，以同effect session短内存、8MiB总量/32768-byte片传完整request/result；真实owner rights包含受管JSON附件的单次固定Weixin媒体链，8MiB本地文件上限（同export effect session有限分片）与不可远程证明的CDN删除限制明确披露。真实due/localday review wake、停止记录正文短寿命和内部纯executor仍为必需验收输入。该补充不构成实现、冻结或闭票。
+
+初始化独立确认、控制/权利及失败未知提示的实际主人结果也由同候选收口：原native source/业务transition→Core固定结果→原owner-outbox→126受控发送，不以enabled projection/ACK或RPC返回代替实际交接；131限制说明实际随成功结果显示。
