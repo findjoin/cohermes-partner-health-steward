@@ -127,7 +127,7 @@ Type: wayfinder:map
 - [Ticket 129：实现 DMIT 宿主 SQLite current-head Provider](issues/129-implement-host-sqlite-current-head-provider.md#answer) — 已解决：已实现显式 bootstrap/open-existing 的宿主 SQLite CurrentHeadPort，跨进程 CAS/exact receipts、capability hash、lease/typed overlap、正常崩溃恢复与失败关闭；生产组合如实投影 host-sqlite。整机旧快照防回滚不提供，这是主人已接受的限制；真实provisioning及受管数据删除/迁移证据仍归128。（执行全绿及双轴PASS见票内Answer）。
 
 - [Ticket 130：接通受控自然语言日常 Runtime](issues/130-connect-governed-natural-language-daily-runtime.md) — 2026-10-18实查未有生产typed executor，且证据前抽取与现有模型授权阶段存在明确差额；在同一受控效果与唯一提交链中补齐，不以测试executor或有限parser冒充完整自然语言能力。
-- [Ticket 131：支持明确标识的非诊断模型操作预算](issues/131-support-explicit-nondiagnostic-model-operational-budget.md) — 主人于 2026-10-18 选择继续 JOJO，并接受仅非诊断、最终请求长度固定、禁自动切换／重试、不完整停止及不提供共同上下文保证；[ADR 0024](../../docs/adr/0024-allow-owner-selected-nondiagnostic-model-operational-budget.md)记录该决定。125 闭票后才冻结详细设计；本票先于 130／128，保留 full／诊断严格 profile 与证明模式，不把配置窗口或风险接受冒充容量依据。
+- [Ticket 131：支持明确标识的非诊断模型操作预算](issues/131-support-explicit-nondiagnostic-model-operational-budget.md) — 主人于 2026-10-18 选择继续 JOJO，并接受仅非诊断、最终请求长度固定、禁自动切换／重试、不完整停止及不提供共同上下文保证；[ADR 0024](../../docs/adr/0024-allow-owner-selected-nondiagnostic-model-operational-budget.md)记录该决定。125 已闭票，现有唯一设计候选与独立 verifier 待同一 checkpoint 预审，尚未实施；本票先于 130／128，保留 full／诊断严格 profile 与证明模式，不把配置窗口或风险接受冒充容量依据。
 
 ### 已完成的 staged 基线
 

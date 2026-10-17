@@ -10,7 +10,7 @@
 
 ## 已确认的产品边界与候选增量
 
-在同一模型 Module 和同一 Core exact intent 内，后继可增加明确标识的 **非诊断模型操作预算**：对最终序列化 wire 的字节长度使用固定上限，同时限定输出预留，绑定当前 route、provider、requested model 和配置代际。数值、公开 codec、最小跨进程接缝与独立验证须在 Ticket 125 闭票、当前代码可 characterization 后由 Ticket 131 唯一设计冻结；本 ADR 不提前选择字段或另建预算／批准账本。
+在同一模型 Module 和同一 Core exact intent 内增加明确标识的 **非诊断模型操作预算**：对最终序列化 wire 的字节长度使用固定上限，同时限定输出预留，绑定当前 route、provider、requested model 和配置代际。Ticket 125 已于 `58453bf` 闭票；[Ticket 131 唯一设计候选](../../.scratch/partner-health-steward/design/131-nondiagnostic-operational-budget-design.md) 选择保守本地预算 65536 final wire bytes／2048 output tokens，以及固定现有 NonDiagnosticCandidate 用途。数值是本地限制，不是 token 计量或服务端容量。公开 codec 和独立验证仍须同一 checkpoint 双轴预审后才能实施；本 ADR 不另建预算／批准账本。
 
 该预算只控制本地允许发送的请求范围，必须公开并记录“**不提供共同上下文保证**”。它不证明 tokenizer、服务端实际窗口、上游路由集合、完整接收或模型实际考虑了全部输入。即使收到 `completed`，也不能把这一限制写成已经消失；主人不能被告知“完整上下文已保证”。超预算请求停止，不静默截断、移除证据或拆成自动重试。
 
@@ -20,7 +20,7 @@
 
 ## 与现行权威的关系
 
-[ADR 0022](0022-select-current-health-steward-route-after-seven-skill-can-closure.md) 的唯一 Module、三类 CorePort、Core 业务权威、首跳隔离、无 fallback、治理知识、unknown 和医学激活边界保留。现行 Spec 的共同容量门与 Ticket 125 的严格模式继续如实有效。本次主人决定为非诊断提供一个公开较弱保证的后继输入；Ticket 131 冻结时必须在同一 Spec／验收 Module 中准确区分两种保证，不能静默删掉原容量要求，也不新增第二模型路由器、批准 ledger 或产品状态。
+[ADR 0022](0022-select-current-health-steward-route-after-seven-skill-can-closure.md) 的唯一 Module、三类 CorePort、Core 业务权威、首跳隔离、无 fallback、治理知识、unknown 和医学激活边界保留。现行 Spec 的共同容量门与 Ticket 125 的严格模式继续如实有效。该主人决定已同步到同一 [Spec](../../.scratch/partner-health-steward/spec.md) 的显式 ND 预算范围，准确区分两种保证；不能静默删掉原容量要求，也不新增第二模型路由器、批准 ledger 或产品状态。131 只提供公开可记录声明与真实诊断源门，130／128 承接真实日常流程、展示与主人验收，不能把候选设计当作产品已可用。
 
 部署仍在 Ticket 128 的 default 阶段 A；full／诊断仍受严格证明及 Ticket 127 的医学权利、审核和真实验收门禁。产品取舍不等于 G10/G11 passed，不替代同一 target/release/run/config 的实际验证和批准。凭据、完整配置、响应 body 和健康资料不进入本记录。
 

@@ -1,7 +1,7 @@
 # 131 - 支持明确标识的非诊断模型操作预算
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家有限实施链](../map.md)
 Blocked by: [125 - 生产模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md)
 Unblocks: [130 - 受控自然语言日常 Runtime](130-connect-governed-natural-language-daily-runtime.md), [128 - 主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -22,6 +22,12 @@ raw response identity、actual model、usage、完成／不完整／失败／未
 
 ## Timing and proof boundary
 
-本票当前只记录已确认的主人决定与后继验收输入，不提前冻结详细设计、验证合同或测试，不修改产品。Ticket 125 闭票后才对当前代码 characterization，形成唯一有限设计和独立 verifier-owned 门，并对同一 checkpoint 完成 fresh Spec／Standards 预审。届时同步现有 Spec 与验收 Module，明确区分非诊断操作预算与 full／诊断严格证明，不竞争或改写旧证据。
+Ticket 125 已于 `58453bf` 正式闭票（Evidence44／45，785 全量门与独立 14 门、双轴终审通过）。本票现进入当前代码 characterization／唯一设计候选与独立验证合同阶段；未通过同一 checkpoint 的 fresh Spec／Standards 预审前不得改产品。现有 Spec 已按 ADR 0024 区分非诊断操作预算与 full／诊断严格证明，不竞争或改写旧证据。
 
 真实调用仍须同一 target/release/run/config 的既有精确批准和执行验证；此选择不伪造 G10/G11 passed、不授权读取健康资料或凭据，也不证明部署、初始化或主人可用。唯一部署目标继续是用户 default Hermes，不触碰 partner。医学权利与诊断激活仍归 Ticket 127，主人验收仍归 Ticket 128。
+
+## 2026-10-18 pre-code candidate
+
+唯一设计：[131-nondiagnostic-operational-budget-design.md](../design/131-nondiagnostic-operational-budget-design.md)。独立 verification authority 为 implementation_audit，独占合同与测试；正式有限门／预期红灯尚待其发布，不把缺 Module 的预期红写成实现失败或通过。
+
+当前旧严格 CapabilityProfile／request／strategy 不支持诚实的仅字节预算；同一最终 wire builder、单次 transport、raw decoder、Core exact intent／grant／持久 attempt／report 可以复用。候选公开 ND budget 和 request codec 没有共同容量字段，使用固定 65536 bytes／2048 output、本次唯一 ND answer schema、公示与报告无保证声明，实际 diagnosis.prepare 源入口和诊断执行均拒绝该模式。产品范围和必要回归在唯一设计中，不改旧125冻结三件套或原测试。

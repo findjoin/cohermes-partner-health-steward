@@ -67,7 +67,9 @@ Skill 提供版本化说明、目的限定的最小只读上下文和候选结�
 
 ### 模型、知识、诊断与安全
 
-模型只能通过窄的 `StrictHealthLLM` host interface 使用同一 Partner 的获准首跳路线。接口在最终 wire payload 上绑定 provider、canonical base URL、API mode、model、配置代际、同意指纹、容量 profile、结构和终态；禁止跨首跳 fallback、路线外 Web Search、MCP、普通 Tool、任意 HTTP 或主人派生医学查询。`completed`、`incomplete`、`failed` 及原因必须可证明，不能用静态窗口、粗略 token 估算或事后 usage 冒充完整性。
+模型只能通过窄的 `StrictHealthLLM` host interface 使用同一 Partner 的获准首跳路线。接口在最终 wire payload 上绑定 provider、canonical base URL、API mode、model、配置代际、同意指纹、严格容量 profile 或下述显式非诊断操作预算、结构和终态；禁止跨首跳 fallback、路线外 Web Search、MCP、普通 Tool、任意 HTTP 或主人派生医学查询。`completed`、`incomplete`、`failed` 及原因必须可证明，不能用静态窗口、粗略 token 估算或事后 usage 冒充完整性。
+
+主人于 2026-10-18 选择继续 JOJO 并接受 [ADR 0024](../../docs/adr/0024-allow-owner-selected-nondiagnostic-model-operational-budget.md) 的有限风险：仅非诊断可由 Ticket 131 在同一模型 Module／Core exact intent 内使用明确操作预算，固定最终 canonical wire 上限 65536 bytes、输出预留 2048 tokens，禁止自动切换和重试，不完整即停止，并公开／记录“不提供共同上下文保证”。该预算不是共同窗口、tokenizer 或完整接收证明，`completed` 不能消除该限制；旧严格 profile／证明模式继续保留给 full／诊断。真实 diagnosis.prepare 源入口必须拒绝 ND 预算，不能只依赖 schema 名称或展示提示；实现、验证及真实调用批准仍由 131／128 分别完成。
 
 通用医学知识由不读取主人数据的离线 `KnowledgePublisher` 生成不可变 release，带来源、版本、许可、中文状态、适用范围、专业审核状态和 hash。主人消息不能触发任意网络检索；知识缺失或过期形成知识缺口。
 
@@ -192,7 +194,8 @@ Skill 提供版本化说明、目的限定的最小只读上下文和候选结�
 - `StrictHealthLLM` 使用同一 Partner 的获准首跳路线，锁定 provider、canonical base URL、API mode、model、配置代际和主人同意指纹。
 - 首跳 provider、canonical base URL、API mode、model、配置代际或接收方路线变化时，先暂停受影响健康处理，向主人重新说明并取得当前同意；旧同意不能自动沿用。
 - 禁止跨首跳 fallback、任意 provider/base URL、路线外 Web Search、MCP、普通 Tool、任意 HTTP 和主人派生医学查询。
-- 在最终 wire payload 上检查共同容量下界、输出预留、严格结构和 `completed`/`incomplete`/`failed` 终态；不使用静态窗口或事后 token 估算代替完整性。
+- 严格模式在最终 wire payload 上检查共同容量下界、输出预留、严格结构和 `completed`/`incomplete`/`failed` 终态；不使用静态窗口或事后 token 估算代替完整性。full／诊断不能使用较弱预算替代该模式。
+- 主人已接受的显式 ND 操作预算只允许固定非诊断候选用途，按最终 canonical wire 精确字节和输出预留限制请求，绑定当前 route／provider／requested model／config／同意／有效期。公开和同一受控效果报告保留“不提供共同上下文保证”；不写虚构共同容量或把 actual model 未知补成 requested model。超限／失效在发送前停止，在途失效保留真实终态且拒绝候选；raw identity／actual model／usage／完整终态、无自动重试与 unknown 冻结规则不降低。
 - `KnowledgePublisher` 离线产生不可变 staged release，release 绑定来源、版本、许可、中文状态、适用范围、专业审核状态和 hash；没有合格知识时返回知识缺口。
 
 ### 9. 非诊断回答与诊断门禁
