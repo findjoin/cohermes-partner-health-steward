@@ -47,3 +47,7 @@ root独立持有`../design/126-frozen-verification-contract.md`与`../../../test
 ## Frozen implementation authority (2026-10-18)
 
 [Evidence47](../evidence/47-ticket126-precode-review-20261018.md)记录初审三个验证缺口和R2有界修正。最新唯一冻结checkpoint `3b53ed23389159a88f31459e6e9437edebebac9c` / tree `10c6fc19da6bb78d45c0a3c707915a1ad58b1ea1` 两轴PASS。三件套blob依次为设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`、独立合同 `5b0b5336f27343192708869cb4591f67b7802ccd`、verifier `1559c548bf9b42af85f221bae67d2db9e7f65c5b`；覆盖旧候选，授权在此边界内实施。5个prerequisite红灯不代表内部路径已执行；未授权改动冻结门或真实渠道。root为验证权威，闭票仍需完整执行门与有界实施后双轴审查。
+
+## Bounded verifier refreeze R3 (2026-10-18)
+
+[Evidence50](../evidence/50-ticket126-unknown-cursor-refreeze-20261018.md)记录持久unknown/handoff后exact source cursor被总门错误阻断的独立复现与有界验证补齐。最新checkpoint `c54deceed45807f4c3397f4b07ceac23242bb660` / tree `fbbe72c2450f05ee52d9b03302b3de44373e32bb` 双轴PASS；设计blob不变，合同 `f80433a1c639b0747717274bbfd8f35b3dfe8eb0`、verifier `87577caefcc087c6c0e64034a5b365168e3605ff` 取代旧对应项。允许仅按既有设计修复该unknown ACK边界，保留一般写入／模型和重试冻结；仍未完成产品门。旧DynamoDB网络替身只识别占位release摘要另交独立验证修正，不改旧冻结文件或生产Provider。
