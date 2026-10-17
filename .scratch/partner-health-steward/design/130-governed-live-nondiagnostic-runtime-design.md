@@ -20,7 +20,7 @@ intake不能通过更换source/causal ID绕过旧单效果限制。只在原effe
 
 ## intake 的有限语义和后续真实七Skill
 
-新增纯typed `NonDiagnosticIntakeCandidate`，schema根字段精确为`operation/facts/question`。operation固定`record/question/mixed/clarify`；facts最多8项，每项精确`start/end/quote/topic_ref/time_start/time_end`；question为null或精确`start/end/quote`。offset按Python Unicode code-point索引，Core从原admitted body重新切片验证quote完全相同、范围合法、非空且不交叉；模型不能给出改写、证据ID、draft/record/proof ID、诊断、药物建议或自由最终答复。topic_ref为null或现有PORTRAIT_TOPIC_REFS的45项；它只是归档建议，不是医学结论。
+新增纯typed `NonDiagnosticIntakeCandidate`，schema根字段精确为`operation/facts/question`。operation固定`record/question/mixed/clarify`；facts最多8项，每项精确`start/end/quote/topic_ref/time_start/time_end`；question为null或精确`start/end/quote`。offset按Python Unicode code-point索引，Core从原admitted body重新切片验证quote完全相同、范围合法、非空且不交叉；fact span必须覆盖确定性分句的完整陈述（含否定/条件/时间限定），不能截取“没有失眠”中的“失眠”或从“是不是糖尿病”取疾病词作事实；疑问/祈使诊断语句只进入question/clarify。分句/疑问guard是来源防升级验证，不能代替模型intake并称NL抽取。模型不能给出改写、证据ID、draft/record/proof ID、诊断、药物建议或自由最终答复。topic_ref为null或现有PORTRAIT_TOPIC_REFS的45项；它只是归档建议，不是医学结论。
 
 时间只从time_start/time_end指向的原文和原protocol timestamp/主人时区按固定可重算规则解析：明确ISO日期以及今天/昨天/昨晚/今早/今晚；不能可靠重算时固定unknown，不接受模型自由日期。原文未提供的次数、时长、原因、趋势、测量方法和可靠性都保持unknown。数值句在本票仅作主人陈述，不自动升级为verified measurement、BMI/full或clinical conclusion。
 
@@ -59,7 +59,7 @@ interface沿`health-entry-v1`；未知op/field拒绝。command/controlled-effect
 |controlled-effect `nondiagnostic-complete`|`{source_causal_id,stage,grant,attempt_ref,result}`，result为现完整ModelTransportResult wire|`{stage,state,reason_code}`|
 |managed-read `health-entry-nondiagnostic`|`{source_causal_id}`|同nondiagnostic_source_status|
 
-生产live receive选择已配置的governed路径；旧typed同步receive/executor仍供原冻结兼容，不作为生产NL授权后门。Bridge流程为receive→prepare/claim→start持久attempt→离开Core调用125一次→complete完整terminal→advance；全程无Core/executor锁内网络、无反向RPC callback。Core已有prepared/evidence/finalized事实均由相同Plugin/Core完成，不用测试port自报业务成功。actual registry和Publisher发布包必须证明整条组合可达。
+生产live receive选择已配置的governed路径；旧typed同步receive/executor仍供原冻结兼容，不作为生产NL授权后门。Bridge流程为receive→prepare/claim→start持久attempt→离开Core调用125一次→complete完整terminal→advance；全程无Core/executor锁内网络、无反向RPC callback。Core按stage明确选用runtime中两个真实LLM及各自不同schema authority digest；不能继续只用一个_model_authority_digest或authority_for_digest四元组冒充intake配置。Core已有prepared/evidence/finalized事实均由相同Plugin/Core完成，不用测试port自报业务成功。actual registry和Publisher发布包必须证明整条组合可达。
 
 ## 重放、失败与正文寿命
 
@@ -79,7 +79,13 @@ intake成功后只有本Core验证过的candidate可以驱动证据提交；可�
 
 `command/governed-owner-command payload={source_causal_id}`只解析该源实际原文和上述闭集，返回`{response,delivery_refs}`；不接自由action/payload/context。删除仍复用原lifecycle的独立新事件确认、当前target/operation绑定、purge/terminal/通知，普通“删掉”模型候选不能触发删除。资料查看、导出、纠正均是本票必需项：查看走managed_rights_read_current及原ManagedObject当前版本/撤销边界；纠正走managed_correction_draft→原PendingCorrectionDraft/OwnerMutationRequest与Ticket112完整原子链，引用实际admitted纠正source，replacement只来自主人明确更正原文/已验证有限抽取，受影响判断先降级，不写替代事实到另一个store。一般问答不能暗变成纠正；资料查看/导出不调用模型。
 
-正式JSON导出走原managed_rights_export→ManagedExport.to_wire规范对象，保留snapshot/source_state/object版本/修订引用，不能让模型拼JSON或重新导入作为权威。Core生成导出工件时只使用现认证加密和原server-exports受管registry，删除/撤销清理范围必须包含该工件；路径/token不进入普通Session、模型或日志。原生导出命令至少真实生成该受管工件、返回精确artifact_ref与状态；受管read可按snapshot_ref与明确页范围读取原canonical JSON，不截断后冒称完整导出。当前126仅单次文本、无文件附件，因此主人拿到完整JSON工件的实际渠道必须在本候选冻结前明确：使用原受管工件读取入口，或另行固定并验证最小附件transport；不能把‘文件已生成’称为微信已交付，也不临时增加公共HTTP服务/共享链接。这是当前transport事实差额，待root在同一候选内定最小交付，不能以130闭票留待扩入。
+正式JSON导出走原managed_rights_export→ManagedExport.to_wire规范对象，保留snapshot/source_state/object版本/修订引用，不能让模型拼JSON或重新导入作为权威。Core生成canonical UTF-8 JSON，并以现认证加密纳入原server-exports受管registry；本地导出上限固定16384明文字节，超限明确“未导出，请选择更小资料范围”，不能静默截断、自动拆包或宣称文件完整。文件名由Core固定生成`health-export-<snapshot_digest>.json`，调用者不能选路径、扩展名或任意字节。删除/撤销清理包含全部受管副本，路径/token不进入普通Session、模型或日志。
+
+主人必须实际能取得JSON附件，opaque工件引用或分页预览不算完成。130增加唯一`export-artifact` purpose，复用同Weixin provider/原owner outbox/effect/lease/registry，不改变126现有文本purpose或另开HTTP服务。只有真实admitted主人明确“导出资料”命令授权该exact snapshot；Core批准文件名、字节digest/大小、当前owner/account/route及同effect单attempt。Plugin只在authorize后通过同一CorePort的受管短寿命读取取得该exact字节（上限兼容现64KiB帧，可用base64作为wire表示），只在内存中交固定附件transport；Core不网络，Plugin不使用任意文件路径，也不把复制的JSON落非受管明文缓存。
+
+初步pinned只读证据为gateway/platforms/weixin.py的_get_upload_url(549)、AES128 ECB bytes加密helper(209)、_upload_ciphertext(581)及原sendmessage _api_post(399)；原高层_send_file会Path.read_bytes，生产不复用其高层自动重试/文件路径。附件只走固定media-file ticket→单次CDN密文上传→单次原owner文件消息，不因ticket/upload成功就当文件已发送。各物理步骤都属于原一个effect attempt；部分上传、超时、响应丢失或最后发送未确认都按unknown冻结，零自动重试/第二sender。
+
+授权wire可在130既有controlled-effect固定增加`export-artifact-prepare/start/read/complete`闭集：输入只为Core snapshot/effect/grant引用，read只返回已批准filename/size/digest/bytes_b64，complete沿完整原transport观察，不接受caller新路径/URL/正文。精确公开factory/API和允许provider/CDN源须以网络作者对固定pinned底层的剩余characterization完成后在本唯一候选收口；任何dynamic upload URL只能来自该provider ticket且通过固定HTTPS origin allowlist，禁止redirect/envproxy/任意URL。独立verifier须实际走纯bytes加密/低层upload/file-send的网络边界替身及同Core授权，不能只断言文件存在或只测文本路径。该附件交付是本票原导出权利的必要增量，不重开126的已冻结文本门。
 
 ## 主人可见限制与验收输入
 
