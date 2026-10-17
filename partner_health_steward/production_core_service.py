@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import socket
 import stat
 import struct
@@ -42,6 +43,7 @@ from .host_authority import (
 )
 from .host_contract import HostReleaseContract
 from .lifecycle import LIFECYCLE_PURGE_BINDINGS, LIFECYCLE_REGISTRY_FAMILIES
+from .live_health import LiveHealthCoreOperations, LiveHealthRuntime
 from .plugin import HealthPlugin
 from .probe import ProbeState
 from .release_deployment import (
@@ -661,13 +663,26 @@ class FilesystemMigrationArtifactAdapter:
 class ProductionCoreService:
     """One deep production composition root for Ticket 123 only."""
 
-    def __init__(self, binding: Mapping[str, object], *, current_head: object) -> None:
+    def __init__(self, binding: Mapping[str, object], *, current_head: object,
+                 live_runtime: LiveHealthRuntime | None = None) -> None:
         if type(binding) is not dict:
             raise TypeError("production core binding must be a plain mapping")
-        if type(current_head) is not DynamoDBCurrentHead:
-            raise TypeError("production core requires DynamoDBCurrentHead")
+        supported = (DynamoDBCurrentHead,)
+        try:
+            from .host_current_head import HostSQLiteCurrentHead
+        except ModuleNotFoundError as exc:
+            if exc.name != __package__ + ".host_current_head":
+                raise
+        else:
+            supported += (HostSQLiteCurrentHead,)
+        if type(current_head) not in supported:
+            raise TypeError("production core requires an explicit production current-head provider")
+        if live_runtime is not None and type(live_runtime) is not LiveHealthRuntime:
+            raise TypeError("production core requires a typed live runtime")
         self._binding = copy.deepcopy(binding)
-        self._current_head: DynamoDBCurrentHead = current_head
+        self._current_head = current_head
+        self._live_runtime = live_runtime
+        self._live_operations: LiveHealthCoreOperations | None = None
         self._lock = threading.RLock()
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -880,6 +895,9 @@ class ProductionCoreService:
             if self._listener is not None or self._closing:
                 raise RuntimeError("production core service is already started")
             resources = self._validated_resources()
+            live = self._live_runtime
+            if live is not None:
+                live.validate_release(self._binding["release_root"], resources["release"])
             store: EncryptedStateStore | None = None
             core: HealthCore | None = None
             try:
@@ -890,6 +908,7 @@ class ProductionCoreService:
                     execution_capability_vault=resources["execution_vault"],
                     writer_fence_vault=resources["writer_vault"],
                     lifecycle_config=resources["lifecycle_config"],  # type: ignore[arg-type]
+                    **({} if live is None else live.core_dependencies()),
                 )
                 report = core.probe()
                 if report.state is ProbeState.UNAVAILABLE:
@@ -898,7 +917,9 @@ class ProductionCoreService:
                 self._assets_current = resources["release"].get("state") == "current"  # type: ignore[index]
                 self._store = store
                 self._core = core
-                self._plugin = HealthPlugin(core)
+                self._plugin = HealthPlugin(core) if live is None else live.plugin(core)
+                self._live_operations = None if live is None else LiveHealthCoreOperations(
+                    self._plugin, current_generation=lambda: self._current_head.read().head.generation)
                 self._socket_path = resources["socket_path"]  # type: ignore[assignment]
                 self._stop.clear()
                 listener = self._open_socket(self._socket_path)
@@ -918,6 +939,7 @@ class ProductionCoreService:
                 self._store = None
                 self._core = None
                 self._plugin = None
+                self._live_operations = None
                 self._socket_path = None
                 self._socket_identity = None
                 raise
@@ -946,6 +968,7 @@ class ProductionCoreService:
             self._thread = None
             self._core = None
             self._plugin = None
+            self._live_operations = None
             self._store = None
             self._effect_sessions.clear()
             if core is not None:
@@ -1154,6 +1177,10 @@ class ProductionCoreService:
     def _command(self, payload: object) -> dict[str, object] | None:
         if payload == {"operation": "health-runtime-probe"}:
             return {"projection": self._runtime_projection()}
+        if type(payload) is dict and payload.get("interface") == "health-entry-v1":
+            if self._live_operations is None or not self._assets_current:
+                return None
+            return self._live_operations.dispatch("command", payload)
         if type(payload) is not dict or set(payload) != {"interface", "command"} or payload.get("interface") != "command-v1":
             return None
         command = CommandEnvelope.from_wire(payload["command"])
@@ -1200,12 +1227,17 @@ class ProductionCoreService:
             "health_writes_allowed": allowed,
             "model_effects_allowed": allowed,
             "outbound_effects_allowed": allowed,
-            "current_head_provider": "dynamodb",
+            "current_head_provider": ("dynamodb" if type(self._current_head) is DynamoDBCurrentHead
+                                      else self._current_head.provider_kind),
             "managed_lifecycle_ready": self._lifecycle_ready,
             "content": None,
         }
 
     def _managed_read(self, payload: object) -> dict[str, object] | None:
+        if type(payload) is dict and payload.get("interface") == "health-entry-v1":
+            if self._live_operations is None or not self._assets_current:
+                return None
+            return self._live_operations.dispatch("managed-read", payload)
         if payload != {"projection": "health-runtime"}:
             return None
         return self._runtime_projection()
@@ -1392,12 +1424,52 @@ def _load_binding(path: Path) -> dict[str, object]:
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ticket 123 production HealthCore service")
     parser.add_argument("--binding", required=True, help="canonical, non-secret service binding")
+    parser.add_argument("--head-binding", help="explicit production provider binding; defaults to sibling current-head.json")
     args = parser.parse_args(argv)
-    _load_binding(Path(args.binding))
-    # A current-head adapter is intentionally injected by the enclosing host
-    # process.  This launcher never creates a credential loader or silently
-    # substitutes an in-memory provider.
-    raise RuntimeError("DynamoDBCurrentHead injection is required")
+    binding_path = Path(args.binding)
+    binding = _load_binding(binding_path)
+    head_path = Path(args.head_binding) if args.head_binding else binding_path.parent / "current-head.json"
+    selection = _load_binding(head_path)
+    if (set(selection) != {"contract", "provider", "binding"}
+            or selection["contract"] != "health-current-head-binding-v1"
+            or type(selection["binding"]) is not dict):
+        raise ValueError("invalid explicit current-head selection")
+    values = selection["binding"]
+    if selection["provider"] == "host-sqlite":
+        from .host_current_head import HostHeadBinding, HostSQLiteCurrentHead
+        if set(values) != {"database_path", "installation_id", "local_site", "local_writer_fence_ref"}:
+            raise ValueError("invalid host current-head selection")
+        head = HostSQLiteCurrentHead(HostHeadBinding(**values))
+        close_provider = head.close
+    elif selection["provider"] == "dynamodb":
+        from .dynamodb_current_head import DynamoHeadBinding
+        from botocore.config import Config
+        import boto3
+        if set(values) != {"region", "table_name", "table_arn", "table_id", "installation_id",
+                           "local_site", "local_writer_fence_ref"}:
+            raise ValueError("invalid DynamoDB current-head selection")
+        head_binding = DynamoHeadBinding(**values)
+        client = boto3.client("dynamodb", region_name=head_binding.region,
+                              config=Config(retries={"total_max_attempts": 1},
+                                            connect_timeout=5, read_timeout=10))
+        head = DynamoDBCurrentHead(client, head_binding)
+        close_provider = client.close
+    else:
+        raise ValueError("unsupported explicit current-head provider")
+    stop = threading.Event()
+    previous = {}
+    service = ProductionCoreService(binding, current_head=head)
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(signum, lambda *_: stop.set())
+        service.start()
+        stop.wait()
+    finally:
+        service.close()
+        close_provider()
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    return 0
 
 
 if __name__ == "__main__":

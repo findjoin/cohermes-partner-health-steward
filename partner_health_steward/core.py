@@ -12001,6 +12001,57 @@ class HealthCore:
                 and configured == policy
             )
 
+    def live_entry_disclosure(self, workflow_id: str, policy: AdmissionPolicy) -> dict[str, object]:
+        """Read one retained pre-consent challenge, never enumerate owner data."""
+        validate_opaque_text(workflow_id, "initialization workflow identifier")
+        with self._lifecycle_lock:
+            empty = {"initialization": None, "disclosure": None}
+            if self._closed or not self.admission_policy_matches(policy):
+                return empty
+            if self.initialization_status().phase != "uninitialized":
+                return empty
+            challenge = self._store.initialization_disclosure_for_workflow(workflow_id)
+            if challenge is None:
+                return empty
+            disclosure, _ = self.initialization_disclosure_replay(challenge.initialization, policy)
+            if disclosure is None:
+                return empty
+            return {"initialization": challenge.initialization.to_storage(),
+                    "disclosure": disclosure.to_storage()}
+
+    def live_entry_native_cursor(self, policy: AdmissionPolicy) -> str | None:
+        """Derive a complete accepted batch from the existing source receipts."""
+        with self._lifecycle_lock:
+            if self._closed or not self.admission_policy_matches(policy):
+                return None
+            if self._probe_open().state is not ProbeState.HEALTHY:
+                return None
+            with self._store.serialized():
+                receipts = self._store.native_cursor_receipts()
+                groups: dict[str, list[SourceReceipt]] = {}
+                for receipt in receipts:
+                    if policy.accepts(receipt.envelope, allowed_capabilities=("health-init", *DAILY_HEALTH_SKILL_NAMES)):
+                        groups.setdefault(receipt.envelope.native_cursor, []).append(receipt)
+                for cursor in reversed(groups):
+                    if all(r.native_cursor_state == "advanced"
+                           and r.managed_cursor_state == "committed"
+                           and self._business_transition_id_for_source(r.envelope.causal_id) is not None
+                           for r in groups[cursor]):
+                        return cursor
+                return None
+
+    def live_entry_replay_source(self, source: SourceEnvelope, policy: AdmissionPolicy) -> SourceEnvelope:
+        """Normalize a proven redelivery to its first exact receipt, read-only."""
+        with self._lifecycle_lock:
+            if (self._closed or not self.admission_policy_matches(policy)
+                    or not policy.accepts(source, allowed_capabilities=("health-init", *DAILY_HEALTH_SKILL_NAMES))):
+                raise AuthorityValidationError("unique-private-source-denied")
+            with self._store.serialized():
+                try:
+                    return self._store.canonical_native_redelivery(source)
+                except CausalIdConflict:
+                    raise AuthorityValidationError("causal-id-conflict") from None
+
     def initialization_prepare_replay(
         self,
         initialization: OwnerInitialization,

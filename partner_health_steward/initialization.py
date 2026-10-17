@@ -1338,6 +1338,11 @@ class HealthInitRuntime:
     def asset(self) -> HealthInitAsset:
         return self._asset
 
+    @property
+    def verifier(self) -> HealthInitAttestor:
+        """Keep composition bound to the same runtime's attestation authority."""
+        return self._attestor
+
     def form_disclosure(
         self,
         initialization: OwnerInitialization,

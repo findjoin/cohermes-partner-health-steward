@@ -3455,6 +3455,39 @@ class EncryptedStateStore:
                 held.append(receipt)
         return tuple(held)
 
+    def native_cursor_receipts(self) -> tuple[SourceReceipt, ...]:
+        """Core-only arrival order for deriving an existing accepted cursor."""
+        rows = self._execute(
+            "SELECT causal_id FROM source_envelopes_v1 ORDER BY rowid"
+        ).fetchall()
+        result = []
+        for (causal_id,) in rows:
+            receipt = self.source_receipt(causal_id)
+            if receipt is None:
+                raise KeyUnavailable("native cursor receipt is unavailable")
+            result.append(receipt)
+        return tuple(result)
+
+    def canonical_native_redelivery(self, envelope: SourceEnvelope) -> SourceEnvelope:
+        """Reuse a receipt only after proving the complete native event matches.
+
+        Receipt time and generation are delivery-local. They must not rewrite
+        the first receipt on a subsequent poll or reopen. The keyed fingerprint
+        still binds the original security scope, protocol time and exact body.
+        """
+        if type(envelope) is not SourceEnvelope:
+            raise AuthorityValidationError("invalid native redelivery")
+        receipt = self.source_receipt(envelope.causal_id)
+        if receipt is None:
+            return envelope
+        if (envelope.message_id is None or receipt.native_event_digest is None
+                or not hmac.compare_digest(receipt.native_event_digest,
+                                           self._native_event_digest(envelope))):
+            raise CausalIdConflict("causal-id-conflict")
+        original = receipt.envelope.to_storage()
+        original["body"] = envelope.body
+        return SourceEnvelope.from_storage(original)
+
     def supersede_initialization_resolution_source(
         self,
         causal_id: str,

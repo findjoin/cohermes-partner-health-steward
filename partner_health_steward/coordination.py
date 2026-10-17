@@ -6331,6 +6331,14 @@ class DailySkillRuntime:
         self._executor = executor
         self._clock = clock or (lambda: datetime.now().astimezone())
 
+    @property
+    def bundle(self) -> DailySkillBundle:
+        return self._bundle
+
+    @property
+    def verifier(self) -> DailySkillAttestor:
+        return self._attestor
+
     def _used_at(self) -> str:
         value = self._clock()
         if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:

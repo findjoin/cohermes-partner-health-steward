@@ -1314,6 +1314,53 @@ class HealthPlugin:
             return None
         return self._core.source_receipt(causal_id)
 
+    def live_entry_preflight(self, headers: dict, *, generation: int, peer_id: str) -> dict[str, object]:
+        if peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        policy = self._admission_policy
+        phase = self.initialization_status(peer_id=peer_id).phase
+        reason = None
+        try:
+            message = RawWeixinMessage(**headers, generation=generation,
+                                      requested_capability="health-init", body="header-preflight")
+            if type(policy) is not AdmissionPolicy:
+                reason = "admission-policy-unavailable"
+            else:
+                reason = policy.rejection_reason(message)
+            if reason is None:
+                materialize_source(message)  # header validation, no native body
+            report = self.probe()
+            if reason is None and report.state is not ProbeState.HEALTHY:
+                reason = report.reason_code
+            if reason is None and phase not in {"uninitialized", "enabled"}:
+                reason = "initialization-state-unavailable"
+        except (AuthorityValidationError, TypeError, ValueError):
+            reason = "invalid-weixin-source"
+        return {"allowed": reason is None, "current_generation": generation,
+                "initialization_phase": phase, "reason_code": reason}
+
+    def live_entry_disclosure(self, workflow_id: str, *, peer_id: str) -> dict[str, object]:
+        if peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        return self._core.live_entry_disclosure(workflow_id, self._admission_policy)
+
+    def live_entry_native_cursor(self, *, peer_id: str) -> str | None:
+        if peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        return self._core.live_entry_native_cursor(self._admission_policy)
+
+    def live_entry_replay_source(self, message: RawWeixinMessage, *, peer_id: str) -> RawWeixinMessage:
+        if peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+        policy = self._admission_policy
+        if type(policy) is not AdmissionPolicy:
+            raise AuthorityValidationError("admission-policy-unavailable")
+        reason = policy.rejection_reason(message, allowed_capabilities=("health-init", *DAILY_HEALTH_SKILL_NAMES))
+        if reason is not None:
+            raise AuthorityValidationError(reason)
+        source = self._core.live_entry_replay_source(materialize_source(message), policy)
+        return RawWeixinMessage(**source.to_storage())
+
     def form_initialization_disclosure(
         self,
         initialization: OwnerInitialization,
