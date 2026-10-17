@@ -124,6 +124,7 @@ Type: wayfinder:map
 - [Ticket 126：实现真实 Weixin 与支持联系人投递 Adapter](issues/126-implement-live-weixin-and-support-contact-delivery-adapter.md) — 闭合分层投递、幂等、unknown 冻结和最小联系人 payload。
 - [Ticket 127：取得医学内容权利与专业审核](issues/127-obtain-medical-content-rights-and-review.md) — 人类权威票；只门禁 BMI 诊断 bundle 进入 activation-ready 及完整首发，Agent 不得伪造许可或审核，不阻止非诊断健康管家使用。
 - [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 分两阶段执行：先部署、初始化并验收非诊断健康管家；127 闭合后再激活 BMI、完成 G12 与完整首发，明确不触碰 partner Hermes。
+- [Ticket 129：实现 DMIT 宿主 SQLite current-head Provider](issues/129-implement-host-sqlite-current-head-provider.md) — 主人于 2026-10-18 明确选择仅 DMIT 并接受整机旧快照恢复限制；在现有九方法 Port 内实现真实受限宿主 head，保留正常删除、CAS、lease、fencing 与 unknown；候选尚待独立冻结/实现/验收，旧 DynamoDB 代码与外部证据不冒充本模式证明。
 
 ### 已完成的 staged 基线
 
