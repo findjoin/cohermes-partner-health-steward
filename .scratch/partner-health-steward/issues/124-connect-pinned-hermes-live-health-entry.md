@@ -37,3 +37,13 @@ Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-imple
 - `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob: `dfa4d0a283f4703ff5ee47262c345febe8f5e36d`.
 - `tests/test_ticket124_live_entry.py` blob: `34ea7c8d8797e8b77df9a9ab5109a6ba309c0a7f`.
 - 允许严格按上述冻结设计实施；产品实施者不得修改冻结三件套或自行闭票。真实部署/外部效果仍按后继既有门，未被本次预审冒充通过。
+
+## Updated frozen implementation authority (published registry, 2026-10-18)
+
+本节替代本票此前三件套blob；前次无关Core装配仍有效，129权威不变。
+
+- reviewed commit `13d18a18754ed2a39a50e30d3f56358ed30409cf`; tree `9da5b6330b852f7e8ad884cfeaaaed47c5480695`；fresh Spec/Standards均PASS，见Evidence41。
+- `.scratch/partner-health-steward/design/124-live-entry-design.md` blob `e26f4212f74b6c1fdd737e77af39137a429bfc44`。
+- `.scratch/partner-health-steward/design/124-frozen-verification-contract.md` blob `fc563931fe822ca3cc1b4cd15a9f4dc6e81b9e1a`。
+- `tests/test_ticket124_live_entry.py` blob `6d8578bc79597eb7a5114186938c574efc7073cb`。
+- 允许最小实现既有process activation的真实registry选择、Publisher自身代码闭包与初始化前明确ordinary路由；不修改冻结门，不接真实服务，不自行闭票。
