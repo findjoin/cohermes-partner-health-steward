@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from partner_health_steward.initialization import HealthInitRuntime, OwnerConsen
 from partner_health_steward.release_deployment import HermesReleasePublisher
 from tests import test_ticket112_seven_skill_daily_turn as daily_fixture
 from tests import test_ticket119_integration as release_fixture
+from tests import test_ticket122_dynamodb_current_head as head_fixture
 from tests import test_ticket123_production_core_service as service_fixture
 
 
@@ -84,6 +86,76 @@ class _SocketPort:
         return response["payload"]
 
 
+class _ReleaseCapableDynamo(head_fixture._ScriptedDynamo):
+    """126's AWS boundary: retain actual Core release digests and conditions.
+
+    The inherited 122 fake intentionally recognizes two placeholder release
+    digests. Other transactions still use that unchanged fixture; only this
+    real-Core release transaction needs a general conditional HTTP boundary.
+    """
+
+    def transact_write_items(self, **request):
+        actions = request["TransactItems"]
+        updates = [action["Update"] for action in actions if "Update" in action]
+        leases = [update for update in updates
+                  if update["Key"]["SK"]["S"].startswith("LEASE#")]
+        if not leases:
+            return super().transact_write_items(**request)
+        self.calls.append(("TransactWriteItems", copy.deepcopy(request)))
+        if self.transact_error is not None:
+            raise self.transact_error
+        guards = [update for update in updates
+                  if update["Key"]["SK"]["S"] == "LEASE-GUARD"]
+        if len(actions) != 2 or len(updates) != 2 or len(leases) != 1 or len(guards) != 1:
+            raise AssertionError("release must atomically update one lease and its guard")
+        lease, guard = leases[0], guards[0]
+        stored = self.records.get(lease["Key"]["SK"]["S"])
+        if stored is None:
+            raise head_fixture._AwsError("ConditionalCheckFailedException")
+        pairs = self._equality_pairs(lease)
+        if not {"lease_id", "holder_id", "released"} <= pairs.keys():
+            raise AssertionError("release condition must bind lease, holder and unreleased state")
+        if pairs["released"] != {"BOOL": False}:
+            raise AssertionError("release must require an unreleased lease")
+        if (lease["Key"]["PK"] != stored["PK"]
+                or guard["Key"]["PK"] != stored["PK"]
+                or any(pairs[name] != stored[name] for name in ("lease_id", "holder_id", "released"))):
+            raise head_fixture._AwsError("ConditionalCheckFailedException")
+        changes = self._update_operations(lease)["SET"]
+        operation = changes.get("released_operation_digest")
+        if (changes.get("released") != {"BOOL": True}
+                or type(operation) is not dict or set(operation) != {"S"}
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", operation["S"]) is None):
+            raise AssertionError("release must store its actual SHA256 operation digest")
+        condition = self._normalized_expression(lease)
+        if (pairs.get("released_operation_digest") != operation
+                or re.search(r"\(\s*attribute_not_exists\s*\(\s*released_operation_digest\s*\)"
+                             r"\s+OR\s+released_operation_digest\s*=\s*:[A-Za-z0-9_]+\s*\)", condition) is None):
+            raise AssertionError("release must conditionally bind exact operation ownership")
+        previous = stored.get("released_operation_digest")
+        if previous is not None and previous != operation:
+            raise head_fixture._AwsError("ConditionalCheckFailedException")
+        effect = stored["effect_id"]["S"]
+        tokens = re.findall(r"\bcontains\s*\(\s*active_effect_ids\s*,\s*(:[A-Za-z0-9_]+)\s*\)",
+                            self._normalized_expression(guard))
+        values = guard.get("ExpressionAttributeValues", {})
+        deletion = self._update_operations(guard)["DELETE"].get("active_effect_ids")
+        if (not any(values.get(token) == {"S": effect} for token in tokens)
+                or deletion != {"SS": [effect]}):
+            raise AssertionError("release must condition on and delete only its active effect")
+        if effect not in self.active_effects:
+            raise head_fixture._AwsError("ConditionalCheckFailedException")
+        # No mutation occurs before every conditional check has passed.
+        self.records[lease["Key"]["SK"]["S"]] = {
+            **stored, "released": {"BOOL": True},
+            "released_operation_digest": copy.deepcopy(operation),
+        }
+        self.active_effects.remove(effect)
+        if self.transact_error_after_apply is not None:
+            raise self.transact_error_after_apply
+        return {}
+
+
 @contextmanager
 def _service(*, core_options=None):
     """Publish substantive synthetic assets using the existing real 123 fixture."""
@@ -99,7 +171,7 @@ def _service(*, core_options=None):
     try:
         with tempfile.TemporaryDirectory(prefix="ticket126-coreport-") as directory:
             root = Path(directory)
-            _, binding, head, client = fixture._fixture(root)
+            _, binding, head, client = fixture._fixture(root, client_factory=_ReleaseCapableDynamo)
             draft = root / "live-release-draft"
             shutil.copytree(binding["release_root"], draft)
             names = ("health-init", *(a.canonical_name for a in daily.daily_bundle.assets))

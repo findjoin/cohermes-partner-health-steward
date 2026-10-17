@@ -53,3 +53,11 @@ V05的verifier RPC只封装JSON-value和临时session映射，所有typed Effect
 独立verifier仅在V04补两条同因果tracer：实际registry Adapter／生产Bridge／pinned HTTP替身在唯一send响应超时后，由真实Core持久unknown并确认handoff，仍能持久推进其exact source cursor，重投零第二发送；原complete丢失并重建后，未知终态读回真实handoff，再经原cursor指令及结果短调用推进该条cursor，旧session仍拒绝。HTTP替身只改变网络是否返回，不伪造Core终态或ACK。未知投递的原intent/unknown_frozen及禁止重发语义保留。
 
 独立正式旧门在精确cd5bcb3为5run、3fail、0error/skip（V01/V05绿，V02/V04 connect与V03 submitted为已覆盖产品错误），未运行full794。新V04内部unknown ACK路径尚未经过最高接口执行；局部公开Core复现只证明缺口，不声称修订门已绿。新verifier编译／diff通过后，须同一checkpoint fresh有界双轴审查并更新精确合同／测试blob，才允许修复此unknown ACK缺口；设计blob不变，原三项已覆盖实现错误仍可按原门修复。五门数量及原旧冻结门不变，最终完整794全量仍必需。
+
+## 实施阶段有界夹具修正：真实release摘要
+
+上节记录的精确cd5bcb3旧门5run、3fail、0error/skip及未执行full794仍为实际结果；其中V03的产品错误归因在此更正。真实Core已完成prepare／authorize／单次send，complete调用生产DynamoDBCurrentHead释放实际执行租约时，123默认复用的122 `_ScriptedDynamo`只识别`sha256:release`与`sha256:different-release`两个人工占位摘要，真实Core操作摘要触发`StopIteration`，被生产边界正确处理为`HeadUnknown`，所以bridge返回submitted／handoff=false。独立诊断见`/tmp/dmit-connection-audit/formal-126-integrationcd5-diagnose2.log`；不能为此修改生产摘要、放宽unknown、伪成功或更改旧122／123冻结文件。
+
+本修正只在126 verifier定义`_ReleaseCapableDynamo`，经123既有`client_factory`接缝供`_service`使用。非release事务委托原有替身；release边界保存真实请求，检查lease_id／holder／unreleased／同一operation ownership，以及同一事务中的guard contains和仅删除该effect，全部条件满足后才原子写入真实`released_operation_digest`并移除活动租约。拒绝不修改记录／活动集合；不改摘要、不制造Core授权／终态／handoff，不改生产helper或旧冻结门。R3的unknown ACK断言及五个验收方法全部不变，设计不变。
+
+局部独立characterization使用实际HealthCore／Plugin与生产DynamoDBCurrentHead：真实初始化、证据阶段、model effect intent／typed grant／实际观察报告及effect.result经过该边界，得到accepted终态并原样存储71字符SHA256操作摘要；同操作重放只读恢复，异操作owner被HeadConflict拒绝。另验证lease_id、holder、已released、异operation owner、缺active effect、错误DELETE六类条件均原子拒绝。命令`python3 -I -B /tmp/ticket126-r4-fixture-characterization.py`，日志`/tmp/ticket126-r4-fixture-characterization.log`。这是局部租约／终态链与夹具语义证明，未执行新最高socket／Publisher／Adapter五门或full794，不声称其已绿；须同一新checkpoint进行仅此夹具修正的fresh有界双轴复审后再正式执行。
