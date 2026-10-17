@@ -55,3 +55,8 @@ root独立持有`../design/126-frozen-verification-contract.md`与`../../../test
 ## Latest bounded verifier refreeze R4 (2026-10-18)
 
 [Evidence51](../evidence/51-ticket126-release-fixture-refreeze-20261018.md)：最新checkpoint `1158d51d100bbf45339414059e6c358a29d549a4` / tree `bd8cb08c42812ba60802bac15fdb1c6220f43d60` 两轴PASS，仅修正external DynamoDB fake对真实operation摘要的支持；五门及R3 unknown ACK方法AST不变，旧122/123与产品门禁不变。**当前唯一三件套**：设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`，合同 `6bbc200afaa676fd42c8b76f68a3b7c422fdd89b`，verifier `df3427c9add51fe82456adf99f33ba7b9adfa272`；取代所有旧对应项。允许使用精确干净最新产品快照执行五门／794全量与编译／闭包，再进行有界实施后审查；当前尚未通过，不声称完成。
+
+
+## Latest bounded verifier refreeze R5 (2026-10-18)
+
+[Evidence52](../evidence/52-ticket126-refusal-and-confirm-time-refreeze-20261018.md)记录两个局部verifier样例矛盾及root独立public复现、精确837 provisional5/5和新鲜双轴PASS。当前唯一冻结checkpoint `837ac4dba1ca6024ca81e3bdbab5f2193344f878` / tree `c178e4e7fb64b7cca2d5ba2591f5aa817864ea7d`；设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`，合同 `f824e8c2d2b00586c592edc1533ca5a03342813d`，verifier `a4d9b67366f3b0e52528f3c9f43562a6e50c80c7`。取代Evidence51旧合同/测试，不改产品或五方法/R3未知ACK。root允许在全新正式快照运行同精确source的五门/794/23/编译及闭包；尚未完成正式执行或实施后审查，不能闭票。磁盘失败无测试、临时验证副本清理和provisional证据的边界保留在Evidence52。
