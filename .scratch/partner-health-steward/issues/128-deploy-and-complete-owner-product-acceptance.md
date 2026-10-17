@@ -3,7 +3,7 @@
 Type: task
 Status: ready-for-agent
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
-Blocked by: [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md), [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
+Blocked by: [130 - 受控自然语言与主人操作真实入口](130-connect-governed-natural-language-daily-runtime.md), [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md), [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 
 **What to do:** 对一个新内容寻址 release 在用户的 default Hermes 上分两阶段完成真实部署与验收。阶段 A 在诊断范围保持 staged 时完成 target binding、最小 canary、主人初始化和非诊断能力验收，使主人可以先使用健康记录、画像、非诊断问答、提醒、任务、安全提示、控制和数据权利；阶段 B 仅在 Ticket 127 闭合后完成 BMI 诊断激活、完整 G12 和完整首发验收。明确禁止访问或部署女友的 partner Hermes。
 

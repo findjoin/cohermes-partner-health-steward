@@ -25,3 +25,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 独立只读核查补充：现有Core.execute_strict_health_model的lifecycle lock跨adapter.execute；daily_turn_runtime_preparation也跨yield执行executor。生产service逐连接串行，反向等Plugin callback会堵唯一socket。CorePort现有claim只交intent/grant metadata；terminal仅status/result_ref，缺完整StrictModelRequest/ModelTransportResult。开启model_authority时effect结果必须匹配Core进程自身观察的report，不能让Plugin自报成功绕过。
 
 可复用严格request/result codec、effect session/grant、已持久model_attempt_started、既有终态journal与lease释放，以及DailySkillRuntime.complete已有model_answer_resolution/model_reply_atoms参数。后继冻结需明确短调用的canonical request准备/开始标记、Plugin进程执行、同session完整terminal由Core重验、继续唯一typed提交；不能让Core持模型凭据或在executor发HTTP。现authority_for_digest只恢复route/profile/schema，不含生产measurement strategy，组合根也需实际typed绑定。这里仍只是阻塞接口事实，不提前定新wire/状态。
+
+## Live owner-operation characterization input
+
+当前 `HealthPlugin.health_operation`（plugin.py约939–977）虽可构造TrustedHealthCommand，真实 `receive_weixin` 在初始化后只进入safety/coarse/daily路径；`LiveHealthCoreOperations`与`LiveHealthWeixinAdapter`未映射主人任务、控制及数据权利操作。因此仅提供NL证据executor仍不能完成128阶段A所列的提醒/任务/暂停/停止记录/权利的真实入口。后继只在同一Module/同三类kind内承接受真实admitted owner source绑定的有限显式命令或typed候选；现有Core命令权威、批准和回执不变，不能把模型抽取的文本当成主人已批准的不可逆动作，也不能从普通handler直接调用健康写入。这里仅记录现行公开链的实现差额，不提前冻结详细命令API或测试。
