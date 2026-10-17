@@ -757,8 +757,8 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
         self._run_child("safety-routing")
         from partner_health_steward.delivery import OwnerDeliveryTransportResult
         from tests import test_ticket116_integration as contact_fixture
-        for unknown, owner_unknown in ((False, False), (True, False), (False, True)):
-            with self.subTest(response_lost=unknown, owner_response_lost=owner_unknown):
+        for unknown, owner_unknown, unrelated in ((False, False, False), (True, False, False), (False, True, False), (False, True, True)):
+            with self.subTest(response_lost=unknown, owner_response_lost=owner_unknown, unrelated_contact=unrelated):
                 fixture = contact_fixture.Ticket116VerificationTests()
                 fixture.setUp()
                 try:
@@ -798,6 +798,24 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
                     owner_authorized, _ = execute(owner["intent_id"], lost=owner_unknown)
                     self.assertEqual(owner_authorized["payload"], {
                         "text": assets["minimum_help_bundle"]["templates"]["danger_owner"]["text"]})
+                    if unrelated:
+                        # The narrow same-safety exception cannot unblock a
+                        # different event merely because its contact is current.
+                        other = fixture._health("safety.evaluate", {
+                            "source_causal_id": "ticket126-unrelated-owner-unknown",
+                            "event_time": "2026-08-24T03:50:02+00:00",
+                            "owner_recognizable_name": "合成主人称呼",
+                            "safety_rule_bundle_hash": fixture.safety_bundle_hash,
+                            "facts": {"safety_capability": "available", "danger": "confirmed", "scope": "in-scope"}},
+                            suffix="126-unrelated-after-owner-unknown")
+                        other_id = other["contact_alert"]["intent_id"]
+                        core.bind_live_delivery({"kind": "contact-alert", "intent_id": other_id})
+                        other_prepared = core.prepare_live_delivery(other_id,
+                            attempted_at_utc="2026-08-24T03:50:02+00:00")
+                        self.assertIsNotNone(other_prepared["effect_intent"])
+                        self.assertIsNone(fixture.plugin.claim_effect_execution(other_prepared["effect_intent"]))
+                        self.assertEqual(len(calls), 1)
+                        continue
                     contact = next(p for p in bound["deliveries"] if p["recipient_role"] == "support-contact")
                     authorization, result = execute(contact["intent_id"], lost=unknown)
                     self.assertEqual(authorization["recipient_role"], "support-contact")
