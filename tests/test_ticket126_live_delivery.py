@@ -41,7 +41,7 @@ from partner_health_steward.contract import ProtocolViolation
 from partner_health_steward.delivery import OwnerDeliveryTransportResult
 from partner_health_steward.live_health import LiveHealthCoreOperations
 from partner_health_steward.coordination import DailySkillBundle, DailySkillRuntime
-from partner_health_steward.host_contract import HostReleaseContract, _CorePortClient
+from partner_health_steward.host_contract import HostReleaseContract, _CorePortClient, _HostVerificationFailure
 from partner_health_steward.initialization import HealthInitRuntime, OwnerConsentEvidence, InitializationDisclosure
 from partner_health_steward.release_deployment import HermesReleasePublisher
 from tests import test_ticket112_seven_skill_daily_turn as daily_fixture
@@ -971,9 +971,20 @@ async def _registered_gate(config):
                     for bad in (dict(copy.deepcopy(initial), text="CALLER-PLAINTEXT"), copy.deepcopy(initial)):
                         if "text" not in bad:
                             bad["headers"]["sender_id"] = "outside-owner"
-                        denied = core.request("command", _operation("delivery-bind", {"binding": bad}),
-                                              request_id="ticket126-negative-init-binding")
+                        try:
+                            denied = core.request("command", _operation("delivery-bind", {"binding": bad}),
+                                                  request_id="ticket126-negative-init-binding")
+                        except _HostVerificationFailure as exc:
+                            # Only these deliberately invalid bindings may be
+                            # rejected by closing the strict framed connection.
+                            assert str(exc) == "core-frame-truncated"
+                            assert "CALLER-PLAINTEXT" not in repr(exc)
+                            assert "outside-owner" not in repr(exc)
+                            denied = None
                         assert denied is None or not denied.get("payload", {}).get("handoff_complete", False)
+                        assert denied is None or denied.get("payload", {}).get("status") != "accepted"
+                        assert len(router.sends) == 1
+                        assert projection("health-entry-initialization")["initialization"]["phase"] == "uninitialized"
                     assert len(router.sends) == 1
                     router.enqueue("cursor-init-replay", first)
                     await _wait_until(lambda: "cursor-init-replay" in router.cursors)

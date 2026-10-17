@@ -61,3 +61,11 @@ V05的verifier RPC只封装JSON-value和临时session映射，所有typed Effect
 本修正只在126 verifier定义`_ReleaseCapableDynamo`，经123既有`client_factory`接缝供`_service`使用。非release事务委托原有替身；release边界保存真实请求，检查lease_id／holder／unreleased／同一operation ownership，以及同一事务中的guard contains和仅删除该effect，全部条件满足后才原子写入真实`released_operation_digest`并移除活动租约。拒绝不修改记录／活动集合；不改摘要、不制造Core授权／终态／handoff，不改生产helper或旧冻结门。R3的unknown ACK断言及五个验收方法全部不变，设计不变。
 
 局部独立characterization使用实际HealthCore／Plugin与生产DynamoDBCurrentHead：真实初始化、证据阶段、model effect intent／typed grant／实际观察报告及effect.result经过该边界，得到accepted终态并原样存储71字符SHA256操作摘要；同操作重放只读恢复，异操作owner被HeadConflict拒绝。另验证lease_id、holder、已released、异operation owner、缺active effect、错误DELETE六类条件均原子拒绝。命令`python3 -I -B /tmp/ticket126-r4-fixture-characterization.py`，日志`/tmp/ticket126-r4-fixture-characterization.log`。这是局部租约／终态链与夹具语义证明，未执行新最高socket／Publisher／Adapter五门或full794，不声称其已绿；须同一新checkpoint进行仅此夹具修正的fresh有界双轴复审后再正式执行。
+
+## 实施阶段有界拒绝观察修正：故意非法binding的EOF
+
+R4正式冻结后的精确`6752fad`新sealed runtime执行126五门为5run、1fail、0error/skip、27.487秒：V01／V03／V04／V05绿，含真实release摘要与R3 unknown ACK；V02已完成真实披露及一次发送，但在两个故意非法binding的负例处，实际Publisher包`_CorePortClient.request`按既有严格帧合同抛出固定`_HostVerificationFailure("core-frame-truncated")`，原verifier误按123另一transport helper的`None`拒绝面观察而未捕获。Service对非法binding关闭连接是正确拒绝，不修改生产客户端／Service使其伪成功或放宽帧。131／124专项及full794尚未启动；源87／冻结15／运行环境7464文件的失败后哈希守卫均通过。证据`/tmp/dmit-connection-audit/formal-6752fad-126-131-{full-results,postfailure-guard}.log`。
+
+本R5候选仅在两个故意非法输入的调用周围捕获具体`_HostVerificationFailure`，并断言唯一允许的固定EOF原因及异常不包含caller正文／非owner输入；正常连接、披露、后续查询、重放与独立确认路径不捕获异常。原无handoff拒绝断言保留，显式accepted业务结果仍拒绝；每个负例后证明无新send、真实查询仍可读且初始化仍uninitialized。设计、产品、R3 unknown ACK及其余验收不变，旧122／123冻结文件不改。
+
+R5尚未冻结。允许对精确6752产品字节加候选verifier的全新隔离快照做provisional最高V02／必要五门characterization，须单独标明候选Git身份及未冻结边界；该证据不替代fresh有界双轴审查后的正式五门／full794。此时不启动full794，也不声称R5正式门已绿。
