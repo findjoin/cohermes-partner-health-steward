@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -23,8 +24,21 @@ from pathlib import Path
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
 if __name__ == "__main__" and "--pinned-gate" in sys.argv:
+    # Only the verifier fixture namespace comes from the checkout. Every
+    # product import must resolve inside the actual Publisher-built Plugin.
+    sys.path[:] = [p for p in sys.path if Path(p or os.getcwd()).resolve()
+                   not in {_REPOSITORY, _REPOSITORY / "tests"}]
     sys.path.insert(0, os.environ["TICKET124_PINNED_SOURCE"])
-    sys.path.insert(0, str(_REPOSITORY))
+    sys.path.insert(0, os.environ["TICKET124_PUBLISHED_PLUGIN"])
+    fixture_tests = types.ModuleType("tests")
+    fixture_tests.__path__ = [str(_REPOSITORY / "tests")]
+    fixture_tests.__package__ = "tests"
+    sys.modules["tests"] = fixture_tests
+    import partner_health_steward as published_product
+    published_package = Path(os.environ["TICKET124_PUBLISHED_PLUGIN"]) / "partner_health_steward"
+    assert Path(published_product.__file__).resolve().is_relative_to(published_package.resolve())
+    assert all(Path(p).resolve().is_relative_to(published_package.resolve())
+               for p in published_product.__path__)
 
 from partner_health_steward.contract import DailyTurnMeta, Response
 from partner_health_steward import HealthCore, HealthPlugin
@@ -290,11 +304,17 @@ class Ticket124LiveEntryVerificationTests(unittest.TestCase):
         pinned = Path(os.environ.get("TICKET118_PINNED_HERMES_SOURCE", "/tmp/health-steward-hermes-pinned"))
         self.assertTrue((pinned / "gateway/platforms/base.py").is_file(), "pinned Hermes source is required")
         with tempfile.TemporaryDirectory(prefix="ticket124-hermes-home-") as home:
+            release_output = Path(home) / "releases"
+            publication = HermesReleasePublisher(_REPOSITORY).build(release_output).to_wire()
+            release_root = release_output / publication["release_digest"].removeprefix("sha256:")
+            plugin_root = release_root / "plugin" / "health-weixin"
             env = {key: os.environ[key] for key in ("PATH", "LANG", "SYSTEMROOT") if key in os.environ}
             env.update({"HOME": home, "HERMES_HOME": home, "HERMES_CONFIG": str(Path(home) / "config.yaml"),
-                        "PYTHONDONTWRITEBYTECODE": "1", "TICKET124_PINNED_SOURCE": str(pinned)})
+                        "PYTHONDONTWRITEBYTECODE": "1", "TICKET124_PINNED_SOURCE": str(pinned),
+                        "TICKET124_PUBLISHED_PLUGIN": str(plugin_root),
+                        "TICKET124_HOST_RELEASE_DIGEST": publication["host_release_digest"]})
             run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--pinned-gate", gate],
-                                 cwd=_REPOSITORY, env=env, capture_output=True, text=True, timeout=30)
+                                 cwd=home, env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn(f"TICKET124-{gate}-PASS", run.stdout)
 
@@ -456,6 +476,9 @@ async def _pinned_gate(gate):
     from partner_health_steward.admission import AdmissionPolicy
     from partner_health_steward.live_weixin import LiveHealthWeixinAdapter
     from partner_health_steward import hermes_host
+    from partner_health_steward.host_contract import (
+        _CURRENT_PROCESS_ACTIVATION_CAPABILITY, _activation_proof,
+    )
     class Context:
         def register_platform(self, **fields):
             platform_registry.register(PlatformEntry(**fields))
@@ -469,7 +492,32 @@ async def _pinned_gate(gate):
         "ingress_transport": ingress, "delivery_transport": delivery,
     })
     entry = platform_registry.get("health_weixin")
-    adapter = entry.adapter_factory(config)
+    # This is Gateway's actual selection path: an unarmed registration is
+    # staged, regardless of whether its factory could construct an object.
+    assert platform_registry.create_adapter("health_weixin", config) is None
+    release_digest = os.environ["TICKET124_HOST_RELEASE_DIGEST"]
+    release_root = Path(os.environ["TICKET124_PUBLISHED_PLUGIN"]).parents[1]
+    host_manifest = json.loads((release_root / "host-release-manifest.json").read_text())
+    assert host_manifest["release_digest"] == release_digest
+    proof = _activation_proof(release_digest)
+    activation = {"registry": platform_registry,
+                  "activation_capability": _CURRENT_PROCESS_ACTIVATION_CAPABILITY,
+                  "activation_proof": proof}
+    arm = getattr(entry.check_fn, "_ticket118_arm")
+    def create_registered(selected_config):
+        # The offline trusted composition fixture re-arms the same exact
+        # release after disconnect; the Adapter cannot issue this authority.
+        arm(_CURRENT_PROCESS_ACTIVATION_CAPABILITY, proof)
+        selected_config.extra.update(activation)
+        return platform_registry.create_adapter("health_weixin", selected_config)
+    invalid = PlatformConfig(enabled=True, extra={**config.extra, "admission_policy": {}})
+    assert create_registered(invalid) is None  # no fallback to the old probe
+    legacy = create_registered(PlatformConfig(enabled=True, extra={
+        "core_port_endpoint": {"transport": "af-unix", "path": str(Path(os.environ["HERMES_HOME"]) / "unused.sock"),
+                               "protocol": "ticket118-core-port-v1"}}))
+    assert isinstance(legacy, hermes_host._HealthWeixinAdapter)
+    assert not isinstance(legacy, LiveHealthWeixinAdapter)
+    adapter = create_registered(config)
     assert isinstance(adapter, LiveHealthWeixinAdapter)
     assert isinstance(adapter, BasePlatformAdapter)
     ordinary = []
@@ -529,7 +577,11 @@ async def _pinned_gate(gate):
     await asyncio.sleep(0.03)
     assert len(rpc.messages) == before
     if gate == "V04":
-        await _real_adapter_initialization_and_restart(entry, PlatformConfig)
+        await _real_adapter_initialization_and_restart(create_registered, PlatformConfig)
+    published_package = (Path(os.environ["TICKET124_PUBLISHED_PLUGIN"]) / "partner_health_steward").resolve()
+    for name, module in tuple(sys.modules.items()):
+        if name == "partner_health_steward" or name.startswith("partner_health_steward."):
+            assert Path(module.__file__).resolve().is_relative_to(published_package), name
     print(f"TICKET124-{gate}-PASS")
 
 
@@ -584,7 +636,7 @@ def _uninitialized_real_fixture():
     return base
 
 
-async def _real_adapter_initialization_and_restart(entry, PlatformConfig):
+async def _real_adapter_initialization_and_restart(create_registered, PlatformConfig):
     fixture = _uninitialized_real_fixture()
     rpc, delivery = _RealRPC(fixture), _Delivery(unknown=True)
     template = replace(fixture.initialization_request(), owner_consent=False,
@@ -594,13 +646,38 @@ async def _real_adapter_initialization_and_restart(entry, PlatformConfig):
         config = PlatformConfig(enabled=True, extra={
             "admission_policy": fixture.policy.to_storage(), "initialization_template": template,
             "core_port": rpc, "ingress_transport": ingress, "delivery_transport": delivery})
-        adapter = entry.adapter_factory(config)
+        adapter = create_registered(config)
+        assert adapter is not None
         adapters.append(adapter)
         return adapter
     try:
         first_ingress = _Ingress()
         first = create(first_ingress)
+        ordinary = []
+        async def ordinary_handler(event): ordinary.append(event)
+        first.set_message_handler(ordinary_handler)
         assert await first.connect(is_reconnect=False)
+        # Before health initialization, an explicit ordinary classification
+        # still reaches the host; a health classification must never fall back.
+        fixture.route_classification = "ordinary"
+        greeting = _native("ordinary-before-init")
+        greeting["item_list"][0]["text_item"]["text"] = "你好"
+        first_ingress.queue.put_nowait({"ret": 0, "msgs": [greeting], "get_updates_buf": "cursor-ordinary"})
+        await _wait(lambda: len(ordinary) == 1)
+        await _wait(lambda: len(first_ingress.cursors) >= 2)
+        assert fixture.plugin.initialization_status(peer_id="plugin").phase == "uninitialized"
+        fixture.route_classification = "health"
+        blocked_health = _native("health-before-init")
+        blocked_health["item_list"][0]["text_item"]["text"] = "我昨晚没睡好"
+        before_health = len(rpc.calls)
+        before_health_polls = len(first_ingress.cursors)
+        first_ingress.queue.put_nowait({"ret": 0, "msgs": [blocked_health], "get_updates_buf": "cursor-health-blocked"})
+        await _wait(lambda: len(first_ingress.cursors) > before_health_polls and any(payload.get("operation") == "receive-weixin"
+                    and payload["payload"]["message"]["message_id"] == "health-before-init"
+                    for _, payload in rpc.calls[before_health:]))
+        assert len(ordinary) == 1
+        assert rpc.turns == [] and delivery.effects == {}
+        assert fixture.plugin.initialization_status(peer_id="plugin").phase == "uninitialized"
         begin = _native("begin-init")
         begin["item_list"][0]["text_item"]["text"] = "/health-init"
         first_ingress.queue.put_nowait({"ret": 0, "msgs": [begin], "get_updates_buf": "cursor-before-consent"})
@@ -638,6 +715,7 @@ async def _real_adapter_initialization_and_restart(entry, PlatformConfig):
         committed = rpc.turns[-1]
         approved = rpc.operations.dispatch("managed-read", _read("health-entry-native-cursor"))["native_cursor"]
         assert approved == "cursor-approved-by-core"
+        assert fixture.plugin.source_receipt(committed["source_causal_id"], peer_id="plugin").native_cursor_state == "advanced"
         effects = copy.deepcopy(delivery.effects)
         await second.disconnect()
         adapters.remove(second)
@@ -660,8 +738,6 @@ async def _real_adapter_initialization_and_restart(entry, PlatformConfig):
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--pinned-gate":
-    sys.path.insert(0, os.environ["TICKET124_PINNED_SOURCE"])
-    sys.path.insert(0, str(_REPOSITORY))
     asyncio.run(_pinned_gate(sys.argv[2]))
 elif __name__ == "__main__":
     unittest.main()

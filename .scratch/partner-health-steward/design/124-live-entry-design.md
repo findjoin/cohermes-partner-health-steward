@@ -158,6 +158,20 @@ managed-read 固定投影 `health-entry-cursor-directive`，payload 只有 `sour
 2. 实际registry-created Adapter必须走明确初始化和下一独立native确认：`/health-init`，随后 `/health-init-confirm <workflow_id> <disclosure_id>`。宿主 `config.extra.initialization_template` 是既有OwnerInitialization规范storage，两项consent必须false；首次来源只稳定派生workflow_id及预分配callback causal_id，不默认同意。确认来源保留实际native message_id和时间，绑定core读回的同一challenge后才转换既有OwnerConsentEvidence。模板、challenge不匹配或状态未知均不提交；不因首次请求自动确认。
 3. Adapter重建后第一poll的cursor必须从同一Core的已接受source receipts派生读回；同一来源重放仍稳定，不靠内存保存身份或单独cursor账本。
 
-为上述既有行为增加两个目的限定managed-read投影，仍使用相同health-entry-v1 wrapper：`health-entry-native-cursor` payload `{}` 返回 `{"native_cursor":<str|null>}`；`health-entry-disclosure` payload `{"workflow_id":<str>}` 返回 `{"initialization":<原OwnerInitialization storage|null>,"disclosure":<既有disclosure storage|null>}`。后者仅核验并读回既有加密challenge，前者从完整、已提交业务且native_cursor_state=accepted的既有receipt派生，不新增持久字段/表。Core/Plugin/storage可增加对应固定purpose getter，不能把通用SQL、所有source/body或任意store方法暴露给Adapter。初始无已接受cursor用空poll cursor；unknown不能推进。
+为上述既有行为增加两个目的限定managed-read投影，仍使用相同health-entry-v1 wrapper：`health-entry-native-cursor` payload `{}` 返回 `{"native_cursor":<str|null>}`；`health-entry-disclosure` payload `{"workflow_id":<str>}` 返回 `{"initialization":<原OwnerInitialization storage|null>,"disclosure":<既有disclosure storage|null>}`。后者仅核验并读回既有加密challenge，前者从完整、已提交业务且native_cursor_state=advanced（外层Response为accepted）的既有receipt派生，不新增持久字段/表。Core/Plugin/storage可增加对应固定purpose getter，不能把通用SQL、所有source/body或任意store方法暴露给Adapter。初始无已接受cursor用空poll cursor；unknown不能推进。
 
 同一126 `send_committed` bridge的有限输入区分：披露为 `{"kind":"initialization-disclosure","workflow_id":<str>,"disclosure":<storage>}`，日常为 `{"kind":"committed-turn","source_causal_id":<str>,"turn_result":<已提交meta.turn_result>}`。这些输入只请求126形成/读回已有受控发送授权，不是自行取得grant或任意文本发送权。124离线门可以记录core形成物并返回not-authorized；不得将此写成实际发送、接口接受、delivered或初始化成功。门中的第二合成owner确认只证明消息映射与Core同意边界，不替代126/128真实呈现/主人验收。框架send仍不能发送任意健康文本。
+
+### 实施期返冻结：真实 registry activation 选择门
+
+Pinned `platform_registry.create_adapter:293` 在factory前执行check_fn。独立门原先直接调用entry.adapter_factory，漏掉未arm导致真实Gateway仍选不到Live的现实路径。沿用118/120同process activation capability与release proof、`_ticket118_arm`，不新增持久批准或一刀将check_fn设True。未arm staged registration必须不能经registry创建；可信release-verified组合根arm后，实际registry.create_adapter在显式合法policy配置下取得Live，错误policy失败不回退旧probe。live factory也执行既有armed检查，不能通过直调绕过。无policy继续118旧probe兼容；真实default的验证/arm调用由既有128生产bootstrap装配，不把离线arm fixture当作真实上线证据。该返冻结只补实际registry路径门，不重开其他已通过finding，不暂停无关Core目的装配。
+
+### 同次返冻结：发布物中的真实 Adapter 依赖闭包
+
+现有Publisher仅在release-local Plugin package放__init__/hermes_host/host_contract，新增Live工厂的 `.live_weixin` 及typed依赖会在实际安装包中缺失。V03必须从实际Publisher.build产生的release-local包导入产品，不能靠仓库product路径掩盖缺文件。最小修复沿用当前Publisher/内容寻址file manifest，逐字包含现有项目Python模块作为同一发布物的完整代码闭包；不复制运行配置、健康库或秘密，不新建包管理器/第二release权威。Plugin只在其职责执行，包含Core的代码不授予其数据/密钥/网络权限。旧staged状态和七Skill unavailable标记保持原语义；缺生产运行绑定不被额外文件改成已激活。
+
+游标“accepted”指既有外层Response.status；唯一已实现的receipt native_cursor_state为advanced。目的限定恢复投影只读advanced业务receipt，不增加accepted新状态或改111旧合同。
+
+### 同次返冻结：初始化前 ordinary 的明确 Core 路由
+
+既有Plugin.receive_weixin在未初始化时只允许health-init，因此Adapter把所有非初始化请求交health-steward会连普通聊天一起拒绝，违反本票已选行为。最小修复只在LiveOps的固定receive操作调用一个Plugin侧live-entry接缝：先在正文前核验同一技术policy；仅在当前phase为uninitialized且capability为health-steward时，允许既有CoarseMessageRouter对已准入正文明确返回ordinary，才形成accepted/ordinary-hermes-route。health/mixed/uncertain、classifier缺失/失败均不能ordinary fallback，也不写健康状态或触发未同意模型。其余来源继续既有receive_weixin。111旧公开receive的capability/零正文门不改，不新增RPC、状态或分类服务。门在真实未初始化Core的同一Adapter上观察一条明确普通消息进入ordinary handler，健康消息不能进入；独立确认/初始化原门不变。
