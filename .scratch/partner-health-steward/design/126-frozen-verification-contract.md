@@ -33,3 +33,15 @@ Verifier候选`tests/test_ticket126_live_delivery.py`；命令`PYTHONDONTWRITEBY
 V04包含实际socket reply→send已观察accepted→仅丢失CorePort complete请求→不给cursor→关闭/重建同持久Core→原attempt转unknown并冻结，零第二发送。受信fixture只改变网络是否回交，不伪造业务终态。V05沿真实116公开配置/批准/接收危险来源形成safety managed receipt和contact intent；同一Core必经短方法形成主人固定模板及最小联系人授权、完整回交与纠正。该direct业务fixture不冒充已完成contact真实socket/目标验证，socket/session公共装配另由V04证明；真正主人配置与渠道留128。
 
 编码前命令`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_ticket126_live_delivery -v`为5个明确prerequisite failure，0error/skip（`/tmp/ticket126-precode-red.log`）；产品Module未实现，因此新增内部路径未执行。新测试compile PASS、diffcheck PASS。继承绿灯为已闭票Evidence44/45的785全量与14专项；另由独立implementation_audit在`/tmp/ticket126-contact-characterization.py`实际运行116公开accepted/response-loss/replay/pause/correction及中断后的attempted→unknown保留，日志同目录，不涉及实际用户或网络。唯一design和三件套需同commit/tree新鲜双轴预审后才冻结。
+
+## 编码前有界修订：真实Adapter失败交接与安全引用
+
+`2ef6271` fresh Spec/Standards指出三个已声明验收的验证缺口，未重开架构：原V04失败回交只测Bridge而未杀死Adapter吞结果继续ACK；原V05只测直接Core安全binding，未杀死实际Adapter因缺turn_result丢弃safety；原V03在prepare前就使head失败，未证明发送前authorize重新读当前性。
+
+本修订保持五门与设计不变：V04实际registry/生产Bridge/同socket/真pinned低层送出一次后，仅丢弃delivery-complete请求，观察Core与后继poll cursor都不前进，再重建同Core确认unknown冻结/零重发；V03先观察真实prepare/claim grant，再使合成current-head网络依赖不可用，继续authorize且零发送；V05增加实际registry Adapter+生产Bridge的安全引用抽取tracer，输入为真正Plugin接收危险消息的Response，owner模板与现有contact intent各自经过Core公开短方法授权/终态。
+
+V05的verifier RPC只封装JSON-value和临时session映射，所有typed EffectIntent、EffectExecutionGrant、authorize结果与handoff都直接来自同一个真实Core；不制造grant/批准/active/业务成功，不持网络锁发消息，不声称这条fixture就是生产AF_UNIX服务。真实Service/ACL/同版本发布路径与session失效仍由V04独立验证。新helper包含在同一个verifier文件的冻结blob中；它不是生产替代实现或第二业务权威。
+
+另修正正向transport授权fixture的owner/contact route：分别与原OwnerWeixinDestination.route_id和既有contact destination.route_id一致，wire payload digest与原业务digest仍故意分层，避免要求生产接受自相矛盾的route。Session替身接受真实aiohttp的默认trust_env=False，不把显式写默认参数作为额外实现要求；仍拒绝打开环境代理和HTTP重定向。
+
+修订门仍为5个明确缺公开Module prerequisite failure，0error/skip（`/tmp/ticket126-precode-red-r2.log`），compile/diffcheck PASS。独立helper的既有116 probe/read/receive smoke已执行，新增126短方法尚无产品实现，未声称新增内链绿色。修订后只复核上述缺口/fixture一致性，原已审范围不重新开放。

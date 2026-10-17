@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
 import types
 import unittest
 from contextlib import contextmanager
@@ -33,6 +35,10 @@ if __name__ == "__main__" and "--pinned-gate" in sys.argv:
     tests.__package__ = "tests"
     sys.modules["tests"] = tests
 
+from partner_health_steward.authority import EffectExecutionGrant, EffectIntent
+from partner_health_steward.contract import ProtocolViolation
+from partner_health_steward.delivery import OwnerDeliveryTransportResult
+from partner_health_steward.live_health import LiveHealthCoreOperations
 from partner_health_steward.coordination import DailySkillBundle, DailySkillRuntime
 from partner_health_steward.host_contract import HostReleaseContract, _CorePortClient
 from partner_health_steward.initialization import HealthInitRuntime, OwnerConsentEvidence, InitializationDisclosure
@@ -144,6 +150,166 @@ def _service(*, core_options=None):
         daily.tearDown()
 
 
+# Test transport only: every authorization/grant/result below comes from real Core.
+_GRANT_FIELDS = {
+    "session_id", "lease_id", "effect_id", "intent_digest", "generation", "writer_fence",
+}
+
+
+def _exact(value, fields):
+    if type(value) is not dict or set(value) != set(fields):
+        raise ProtocolViolation("invalid verifier CorePort shape")
+    return value
+
+
+def _wire_copy(value):
+    """Accept JSON values, never carry a typed capability across the port."""
+    return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False))
+
+
+def _grant_wire(session_id, grant):
+    lease = grant.lease
+    return {
+        "session_id": session_id, "lease_id": lease.lease_id,
+        "effect_id": lease.effect_id, "intent_digest": lease.intent_digest,
+        "generation": lease.authority.generation, "writer_fence": lease.authority.writer_fence,
+    }
+
+
+def _intent_wire(intent):
+    # The existing service exposes a deliberately bounded intent projection,
+    # not a serialized completion bearer or arbitrary effect object.
+    return {
+        "effect_id": intent.effect_id, "intent_digest": intent.intent_digest,
+        "effect_kind": intent.effect_kind,
+        "authority": {"source": "core", "generation": intent.authority.generation,
+                      "writer_fence": intent.authority.writer_fence},
+    }
+
+
+class _RealCoreRPC:
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.operations = LiveHealthCoreOperations(
+            fixture.plugin,
+            current_generation=lambda: fixture.base.head.read().head.generation,
+        )
+        self.calls = []
+        self.responses = []
+        self._sessions = {}
+        self._lock = threading.RLock()
+
+    def _runtime(self):
+        plugin = self.fixture.plugin
+        probe = plugin.probe()
+        return {
+            "state": probe.state.value, "reason_code": probe.reason_code,
+            "generation": self.fixture.base.head.read().head.generation,
+            "health_writes_allowed": plugin.health_writes_allowed(),
+            "model_effects_allowed": plugin.model_effects_allowed(),
+            "outbound_effects_allowed": plugin.outbound_effects_allowed(),
+            "content": None,
+        }
+
+    def request(self, kind, payload, *, request_id=None):
+        if kind not in {"command", "managed-read", "controlled-effect"}:
+            raise ProtocolViolation("invalid verifier CorePort kind")
+        if request_id is None:
+            request_id = "ticket126-offline-rpc:" + uuid.uuid4().hex
+        if type(request_id) is not str or not request_id:
+            raise ProtocolViolation("invalid verifier CorePort request identifier")
+        payload = _wire_copy(payload)
+        if type(payload) is not dict:
+            raise ProtocolViolation("invalid verifier CorePort payload")
+        # The real service is a bounded serial dispatcher. Do not hold this
+        # transport lock or a Core lock while waiting for external network I/O.
+        with self._lock:
+            self.calls.append((kind, copy.deepcopy(payload), request_id))
+            if kind == "command" and payload == {"operation": "health-runtime-probe"}:
+                result = {"projection": self._runtime()}
+            elif kind == "managed-read" and payload == {"projection": "health-runtime"}:
+                result = self._runtime()
+            elif kind in {"command", "managed-read"}:
+                result = self.operations.dispatch(kind, payload)
+            else:
+                result = self._controlled(payload)
+            # 'accepted' here means a processed RPC envelope, exactly as in
+            # ProductionCoreService. Business statuses remain inside result.
+            response = {
+                "protocol_version": 1, "kind": kind, "request_id": request_id,
+                "status": "accepted", "payload": _wire_copy(result),
+            }
+            self.responses.append(copy.deepcopy(response))
+            return response
+
+    def _session_grant(self, intent_id, supplied):
+        _exact(supplied, _GRANT_FIELDS)
+        if (type(supplied["generation"]) is not int or supplied["generation"] < 1
+                or any(type(supplied[key]) is not str or not supplied[key]
+                       for key in _GRANT_FIELDS - {"generation"})):
+            raise ProtocolViolation("invalid verifier effect session")
+        held = self._sessions.get(supplied["session_id"])
+        if held is None:
+            raise ProtocolViolation("unknown verifier effect session")
+        held_intent_id, _intent, grant = held
+        if held_intent_id != intent_id or _grant_wire(supplied["session_id"], grant) != supplied:
+            raise ProtocolViolation("verifier effect session binding mismatch")
+        return grant
+
+    def _controlled(self, value):
+        _exact(value, {"interface", "operation", "payload"})
+        if value["interface"] != "health-entry-v1":
+            raise ProtocolViolation("invalid verifier delivery interface")
+        operation, data = value["operation"], value["payload"]
+        core = self.fixture.core
+        if operation == "delivery-prepare":
+            _exact(data, {"intent_id", "attempted_at_utc"})
+            prepared = core.prepare_live_delivery(
+                data["intent_id"], attempted_at_utc=data["attempted_at_utc"])
+            _exact(prepared, {"delivery", "send_intent", "effect_intent"})
+            intent = prepared["effect_intent"]
+            if intent is None:
+                return {"delivery": prepared["delivery"], "send_intent": None,
+                        "intent": None, "grant": None}
+            if type(intent) is not EffectIntent:
+                raise ProtocolViolation("invalid Core-issued effect intent")
+            grant = self.fixture.plugin.claim_effect_execution(intent)
+            if grant is None:
+                return {"delivery": core.live_delivery_status(data["intent_id"]),
+                        "send_intent": None, "intent": None, "grant": None}
+            if (type(grant) is not EffectExecutionGrant
+                    or grant.lease.effect_id != intent.effect_id
+                    or grant.lease.intent_digest != intent.intent_digest
+                    or grant.lease.authority != intent.authority):
+                raise ProtocolViolation("invalid Core-issued execution grant")
+            session = "effect-session:ticket126-verifier:" + uuid.uuid4().hex
+            self._sessions[session] = (data["intent_id"], intent, grant)
+            return {"delivery": prepared["delivery"],
+                    "send_intent": prepared["send_intent"], "intent": _intent_wire(intent),
+                    "grant": _grant_wire(session, grant)}
+        if operation == "delivery-authorize":
+            _exact(data, {"intent_id", "grant", "attempted_at_utc"})
+            grant = self._session_grant(data["intent_id"], data["grant"])
+            authorization = core.authorize_live_delivery(
+                data["intent_id"], grant, attempted_at_utc=data["attempted_at_utc"])
+            return {"delivery": core.live_delivery_status(data["intent_id"]),
+                    "authorization": authorization}
+        if operation == "delivery-complete":
+            _exact(data, {"intent_id", "grant", "result", "observed_at_utc"})
+            grant = self._session_grant(data["intent_id"], data["grant"])
+            result = core.complete_live_delivery(
+                data["intent_id"], grant, OwnerDeliveryTransportResult.from_wire(data["result"]),
+                observed_at_utc=data["observed_at_utc"])
+            _exact(result, {"delivery", "source_causal_id", "handoff_complete"})
+            # Keep no reusable transport session after a Core-proven handoff.
+            # If completion raises, no terminal/handoff is invented here.
+            if result["handoff_complete"] is True:
+                self._sessions.pop(data["grant"]["session_id"], None)
+            return result
+        raise ProtocolViolation("unsupported verifier delivery operation")
+
+
 class _Response:
     def __init__(self, value, *, status=200):
         self.value, self.status = value, status
@@ -202,7 +368,7 @@ def _authorization():
              "generation": 7, "writer_fence": "writer-fence:ticket126"}
     return {"purpose": "owner-reply", "recipient_role": "owner", "account_id": "account-offline", "intent_id": intent.intent_id,
             "send_intent": intent.to_wire(), "payload": payload, "payload_digest": _sha(_canonical(payload)),
-            "route_id": "health_weixin", "route_generation": 1, "execution": execution}
+            "route_id": intent.destination.route_id, "route_generation": 1, "execution": execution}
 
 
 async def _transport_gate():
@@ -245,7 +411,7 @@ async def _transport_gate():
         assert sent["context_token"] == "synthetic-context"
         assert sent["item_list"] == [{"type": 1, "text_item": {"text": authorization["payload"]["text"]}}]
         assert http.posts[0]["options"].get("allow_redirects") is False
-        assert all(options.get("trust_env") is False for options in http.options)
+        assert all(options.get("trust_env", False) is False for options in http.options)
         observations.append(sent["client_id"])
     assert len(set(observations)) == 1, "same Core identity must not become random native IDs"
     http = _HTTP()
@@ -264,7 +430,7 @@ async def _transport_gate():
     contact = copy.deepcopy(authorization)
     alert = {"owner_recognizable_name": "合成主人称呼", "event_time": "2026-08-24T03:50:00+00:00",
              "fixed_urgent_help_request": "请尽快联系并协助主人获得紧急帮助。"}
-    contact.update(purpose="contact-alert", recipient_role="support-contact",
+    contact.update(purpose="contact-alert", recipient_role="support-contact", route_id="weixin-ilink-partner",
         payload={"contact_alert": alert}, payload_digest=_sha(_canonical({"contact_alert": alert})),
         send_intent={"destination": {"contact_id": "support-contact:offline", "identity_label": "合成联系人",
             "method_kind": "weixin_user", "method_value": "wxid_offline_contact",
@@ -442,14 +608,24 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
         with _service() as fixture:
             _initialize(fixture)
             turn = _daily_result(fixture, "head-unavailable")
-            fixture.client.get_error = TimeoutError("synthetic current-head unavailable")
+            prepared_grants = []
+            class FailHeadAfterPrepare:
+                def request(self, kind, payload, *, request_id=None):
+                    result = fixture.port.request(kind, payload, request_id=request_id)
+                    if payload.get("operation") == "delivery-prepare" and type(result) is dict:
+                        grant = result.get("payload", {}).get("grant")
+                        if grant is not None:
+                            prepared_grants.append(grant)
+                            fixture.client.get_error = TimeoutError("synthetic current-head unavailable after claim")
+                    return result
             calls = []
             try:
-                result = asyncio.run(_bridge(fixture.port, calls).send_committed(_turn_reference(turn)))
+                result = asyncio.run(_bridge(FailHeadAfterPrepare(), calls).send_committed(_turn_reference(turn)))
             except Exception:
                 pass
             else:
                 self.assertFalse(result["handoff_complete"])
+            self.assertTrue(prepared_grants, "negative class must reach a real prepare/claim first")
             self.assertEqual(calls, [])
 
     def test_v126_04_real_socket_registry_handoff_and_unknown_restart_do_not_resend(self):
@@ -462,33 +638,24 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
             self.assertTrue(result["handoff_complete"])
         with _service() as fixture:
             _initialize(fixture)
-            turn = _daily_result(fixture, "unknown")
-            calls = []
-            class DropCompletionPort:
-                def request(self, kind, payload, *, request_id=None):
-                    if payload.get("operation") == "delivery-complete":
-                        raise ConnectionResetError("synthetic lost Core completion request")
-                    return fixture.port.request(kind, payload, request_id=request_id)
-            bridge = _bridge(DropCompletionPort(), calls)
-            result = asyncio.run(bridge.send_committed(_turn_reference(turn)))
-            self.assertFalse(result["handoff_complete"], result)
-            self.assertEqual(len(calls), 1)
-            intent = calls[0]["intent_id"]
+            lost = self._run_child("daily-loss", fixture)
+            self.assertEqual(lost["sends"], 1)
+            self.assertFalse(lost["handoff_complete"])
+            intent = lost["intent_id"]
             fixture.service.close()
             from partner_health_steward.production_core_service import ProductionCoreService
             restarted = ProductionCoreService(fixture.binding, current_head=fixture.head, live_runtime=fixture.runtime)
             fixture.service = restarted; fixture.port = _SocketPort(restarted.start())
             try:
-                result = asyncio.run(_bridge(fixture.port, calls).send_committed(_turn_reference(turn)))
+                calls = []
+                result = asyncio.run(_bridge(fixture.port, calls).send_committed(lost["binding"]))
                 self.assertTrue(result["handoff_complete"])
-                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls, [], "an already attempted delivery cannot cross the network again")
                 status = fixture.port.exchange("managed-read", _projection("health-entry-delivery", {"intent_id": intent}))["delivery"]
                 self.assertEqual(status["current_layer"], "unknown")
                 self.assertTrue(status["unknown_frozen"])
-                # A previous service's session cannot become a completion grant.
-                stale = {"session_id": "effect-session:invented", **calls[0]["execution"]}
                 denied = fixture.port.request("controlled-effect", _operation("delivery-complete", {
-                    "intent_id": intent, "grant": stale,
+                    "intent_id": intent, "grant": lost["grant"],
                     "result": {"status": "accepted", "result_ref": "forged", "evidence_ref": "forged"},
                     "observed_at_utc": datetime.now(timezone.utc).isoformat()}))
                 self.assertTrue(denied is None or denied.get("payload", {}).get("delivery", {}).get("current_layer") != "accepted")
@@ -497,6 +664,7 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
 
     def test_v126_05_real_contact_authority_minimal_alert_unknown_and_bounded_correction(self):
         self._modules()
+        self._run_child("safety-routing")
         from partner_health_steward.delivery import OwnerDeliveryTransportResult
         from tests import test_ticket116_integration as contact_fixture
         for unknown in (False, True):
@@ -603,12 +771,12 @@ class _HTTPRouter:
         self.batches, self.posts, self.cursors, self.sends, self.sessions = [], [], [], [], []
 
     def factory(self, **options):
-        assert options.get("trust_env") is False
+        assert options.get("trust_env", False) is False
         router = self
         class Session:
             def __init__(self):
                 self.closed = False
-                self.loop = None
+                self.loop = id(asyncio.get_running_loop())
             async def __aenter__(self):
                 self.loop = id(asyncio.get_running_loop())
                 return self
@@ -656,24 +824,22 @@ async def _wait_until(predicate):
 
 async def _registered_gate(config):
     from unittest.mock import patch
-    from gateway.config import PlatformConfig
-    from gateway.platform_registry import platform_registry, PlatformEntry
-    from gateway.platforms.weixin import ContextTokenStore
-    from partner_health_steward import hermes_host
     from partner_health_steward.live_weixin import LiveHealthWeixinAdapter
-    from partner_health_steward.host_contract import _CURRENT_PROCESS_ACTIVATION_CAPABILITY, _activation_proof
-    class Context:
-        def register_platform(self, **fields):
-            platform_registry.register(PlatformEntry(**fields))
-    hermes_host.register(Context())
+    from gateway.platforms.weixin import ContextTokenStore
     core = _CorePortClient(config["endpoint"])
-    kinds, completions, bindings = [], [], []
+    kinds, completions, bindings, prepared = [], [], [], []
+    lost_completions = []
     class Port:
         def request(self, kind, payload, *, request_id=None):
             kinds.append(kind)
             if payload.get("operation") == "delivery-bind":
                 bindings.append(copy.deepcopy(payload["payload"]["binding"]))
+            if config["gate"] == "daily-loss" and payload.get("operation") == "delivery-complete":
+                lost_completions.append(copy.deepcopy(payload))
+                raise ConnectionResetError("synthetic lost Core completion request")
             result = core.request(kind, payload, request_id=request_id)
+            if payload.get("operation") == "delivery-prepare" and type(result) is dict and result["payload"].get("grant"):
+                prepared.append(copy.deepcopy(result["payload"]))
             if payload.get("operation") == "delivery-complete" and type(result) is dict:
                 completions.append(copy.deepcopy(result["payload"]))
             return result
@@ -688,14 +854,8 @@ async def _registered_gate(config):
              "initialization_template": config["initialization"],
              "weixin_transport_binding": {"account_id": config["policy"]["partner_id"],
                                           "base_url": "https://ilink.offline.invalid"}}
-    entry = platform_registry.get("health_weixin")
-    proof = _activation_proof(os.environ["TICKET126_HOST_RELEASE_DIGEST"])
-    getattr(entry.check_fn, "_ticket118_arm")(_CURRENT_PROCESS_ACTIVATION_CAPABILITY, proof)
-    extra.update(registry=platform_registry, activation_capability=_CURRENT_PROCESS_ACTIVATION_CAPABILITY,
-                 activation_proof=proof)
     with patch("aiohttp.ClientSession", router.factory):
-        adapter = platform_registry.create_adapter("health_weixin", PlatformConfig(
-            enabled=True, token="synthetic-token", extra=extra))
+        adapter = _create_registered(extra)
         assert isinstance(adapter, LiveHealthWeixinAdapter), "actual registry did not select production Live Adapter"
         adapter.set_message_handler(lambda event: None)
         assert await adapter.connect(is_reconnect=False)
@@ -734,22 +894,34 @@ async def _registered_gate(config):
                     router.enqueue("cursor-confirm", confirm)
                     await _wait_until(lambda: projection("health-entry-initialization")["initialization"]["phase"] == "enabled")
                     result = {"new_disclosure_sends": len(router.sends)}
-            elif gate == "daily":
+            elif gate in {"daily", "daily-loss"}:
                 native = _native_message("ticket126-native-daily-socket", "我昨晚没睡好", config["policy"])
+                approved = projection("health-entry-native-cursor")["native_cursor"]
                 router.enqueue("cursor-live-daily", native)
-                await _wait_until(lambda: "cursor-live-daily" in router.cursors)
-                assert len(router.sends) == 1
-                assert completions and completions[-1]["handoff_complete"] is True
-                committed = projection("health-entry-delivery", {"intent_id": completions[-1]["delivery"]["intent_id"]})["delivery"]
-                assert committed["current_layer"] == "accepted" and committed["handoff_complete"] is True
-                assert projection("health-entry-native-cursor")["native_cursor"] == "cursor-live-daily"
-                # A redacted replay cannot become a second network send.
-                before_polls = len(router.cursors)
-                router.enqueue("cursor-live-daily", native)
-                await _wait_until(lambda: len(router.cursors) >= before_polls + 3)
-                assert len(router.sends) == 1
-                result = {"sends": len(router.sends), "kinds": sorted(set(kinds)),
-                          "handoff_complete": committed["handoff_complete"]}
+                if gate == "daily-loss":
+                    await _wait_until(lambda: router.sends and lost_completions and len(router.cursors) >= 4)
+                    assert len(router.sends) == 1
+                    assert "cursor-live-daily" not in router.cursors, "failed handoff must not advance the next poll cursor"
+                    assert projection("health-entry-native-cursor")["native_cursor"] == approved
+                    assert prepared and bindings
+                    delivery = projection("health-entry-delivery", {"intent_id": prepared[-1]["delivery"]["intent_id"]})["delivery"]
+                    assert not delivery["handoff_complete"]
+                    result = {"sends": 1, "handoff_complete": delivery["handoff_complete"],
+                              "intent_id": delivery["intent_id"], "binding": bindings[-1],
+                              "grant": prepared[-1]["grant"]}
+                else:
+                    await _wait_until(lambda: "cursor-live-daily" in router.cursors)
+                    assert len(router.sends) == 1
+                    assert completions and completions[-1]["handoff_complete"] is True
+                    committed = projection("health-entry-delivery", {"intent_id": completions[-1]["delivery"]["intent_id"]})["delivery"]
+                    assert committed["current_layer"] == "accepted" and committed["handoff_complete"] is True
+                    assert projection("health-entry-native-cursor")["native_cursor"] == "cursor-live-daily"
+                    before_polls = len(router.cursors)
+                    router.enqueue("cursor-live-daily", native)
+                    await _wait_until(lambda: len(router.cursors) >= before_polls + 3)
+                    assert len(router.sends) == 1
+                    result = {"sends": len(router.sends), "kinds": sorted(set(kinds)),
+                              "handoff_complete": committed["handoff_complete"]}
             else:
                 raise AssertionError(gate)
         finally:
@@ -758,11 +930,84 @@ async def _registered_gate(config):
     return result
 
 
+def _create_registered(extra):
+    from gateway.config import PlatformConfig
+    from gateway.platform_registry import platform_registry, PlatformEntry
+    from partner_health_steward import hermes_host
+    from partner_health_steward.host_contract import _CURRENT_PROCESS_ACTIVATION_CAPABILITY, _activation_proof
+    class Context:
+        def register_platform(self, **fields):
+            platform_registry.register(PlatformEntry(**fields))
+    hermes_host.register(Context())
+    entry = platform_registry.get("health_weixin")
+    config = PlatformConfig(enabled=True, token="synthetic-token", extra=extra)
+    assert platform_registry.create_adapter("health_weixin", config) is None
+    proof = _activation_proof(os.environ["TICKET126_HOST_RELEASE_DIGEST"])
+    getattr(entry.check_fn, "_ticket118_arm")(_CURRENT_PROCESS_ACTIVATION_CAPABILITY, proof)
+    extra.update(registry=platform_registry, activation_capability=_CURRENT_PROCESS_ACTIVATION_CAPABILITY,
+                 activation_proof=proof)
+    return platform_registry.create_adapter("health_weixin", config)
+
+
+async def _safety_routing_gate():
+    from tests import test_ticket116_integration as contact_fixture
+    from partner_health_steward.live_weixin import LiveHealthWeixinAdapter
+    from partner_health_steward.live_delivery import LiveWeixinDeliveryBridge
+    fixture = contact_fixture.Ticket116VerificationTests()
+    fixture.setUp()
+    adapter = None
+    try:
+        assets = fixture._synthetic_assets()
+        fixture._restart_with_assets(assets)
+        fixture._configure_synthetic_contact(); fixture._grant_contact_authority()
+        rpc, calls = _RealCoreRPC(fixture), []
+        bridge = LiveWeixinDeliveryBridge(rpc, lambda authorization: _RecordingWire(authorization, calls),
+            clock=lambda: fixture.base.owner_clock_value.astimezone(timezone.utc))
+        class Ingress:
+            def __init__(self):
+                self.queue = asyncio.Queue(); self.acknowledged = []
+            async def connect(self): return True
+            async def disconnect(self): return None
+            async def get_updates(self, cursor): return await self.queue.get()
+            async def acknowledge_cursor(self, cursor): self.acknowledged.append(cursor)
+        ingress = Ingress()
+        adapter = _create_registered({"admission_policy": fixture.base.policy.to_storage(),
+            "core_port": rpc, "ingress_transport": ingress, "delivery_transport": bridge})
+        assert isinstance(adapter, LiveHealthWeixinAdapter)
+        assert await adapter.connect()
+        native = _native_message("ticket126-routed-danger", "SYNTHETIC:DANGER_CONFIRMED", fixture.base.policy.to_storage())
+        ingress.queue.put_nowait({"ret": 0, "msgs": [native], "get_updates_buf": "cursor-safety-routed"})
+        await _wait_until(lambda: len(calls) == 2 and "cursor-safety-routed" in ingress.acknowledged)
+        owner = next(a for a in calls if a["recipient_role"] == "owner")
+        contact = next(a for a in calls if a["recipient_role"] == "support-contact")
+        assert owner["payload"] == {"text": assets["minimum_help_bundle"]["templates"]["danger_owner"]["text"]}
+        assert set(contact["payload"]["contact_alert"]) == {"owner_recognizable_name", "event_time", "fixed_urgent_help_request"}
+        safety_refs = [payload["payload"]["binding"] for kind, payload, _ in rpc.calls
+                       if kind == "command" and payload.get("operation") == "delivery-bind"]
+        assert len(safety_refs) == 1 and set(safety_refs[0]) == {"kind", "source_causal_id", "result_ref"}
+        assert safety_refs[0]["kind"] == "committed-safety"
+        receive = next(reply["payload"]["response"] for reply in rpc.responses
+                       if type(reply.get("payload")) is dict and type(reply["payload"].get("response")) is dict
+                       and reply["payload"]["response"].get("reason_code") == "ticket116-safety-result")
+        assert receive["meta"]["result_ref"] == safety_refs[0]["result_ref"]
+        assert receive["causal_id"] == safety_refs[0]["source_causal_id"]
+        for authorization in calls:
+            status = fixture.core.live_delivery_status(authorization["intent_id"])
+            assert status["current_layer"] == "accepted" and status["handoff_complete"] is True
+        return {"owner_sends": 1, "contact_sends": 1}
+    finally:
+        if adapter is not None:
+            await adapter.disconnect()
+        fixture.tearDown()
+
+
 async def _child_main(path):
     config = json.loads(Path(path).read_text())
     if config["gate"] == "transport":
         await _transport_gate()
         result = {}
+    elif config["gate"] == "safety-routing":
+        result = await _safety_routing_gate()
     else:
         result = await _registered_gate(config)
     published = (Path(os.environ["TICKET126_PUBLISHED_PLUGIN"]) / "partner_health_steward").resolve()
