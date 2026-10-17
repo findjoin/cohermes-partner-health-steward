@@ -46,3 +46,8 @@ Blocked by: [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-d
 ## Delivery discipline
 
 部署前分别冻结阶段 A 与阶段 B 的精确 release、target、run、回滚点和测试序列；阶段授权不得互相借用。每个阶段完成后提交无正文证据、更新 Ticket/Map、普通 push；不得把批准、秘密或主人资料写入 Git。
+
+## 2026-10-18 verified implementation inputs
+
+- 用户已明确选择仅DMIT并接受整机旧快照恢复限制；129实现该Provider，部署不再以AWS账号为前提，不伪造历史DynamoDB证据。真实初始化披露必须说明当前受管删除与整机旧快照限制，并显示诊断未启用；可用既有HealthInitRuntime executor形成该已批准内容，不改写旧frozen111披露历史。
+- Ticket130记录真实生产typed executor/受控自然语言候选阶段缺口，是本票非诊断产品可用性的前置实现，不将fixture或124装配单独宣称为完整产品。

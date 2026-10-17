@@ -126,6 +126,8 @@ Type: wayfinder:map
 - [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 分两阶段执行：先部署、初始化并验收非诊断健康管家；127 闭合后再激活 BMI、完成 G12 与完整首发，明确不触碰 partner Hermes。
 - [Ticket 129：实现 DMIT 宿主 SQLite current-head Provider](issues/129-implement-host-sqlite-current-head-provider.md) — 主人于 2026-10-18 明确选择仅 DMIT 并接受整机旧快照恢复限制；在现有九方法 Port 内实现真实受限宿主 head，保留正常删除、CAS、lease、fencing 与 unknown；候选尚待独立冻结/实现/验收，旧 DynamoDB 代码与外部证据不冒充本模式证明。
 
+- [Ticket 130：接通受控自然语言日常 Runtime](issues/130-connect-governed-natural-language-daily-runtime.md) — 2026-10-18实查未有生产typed executor，且证据前抽取与现有模型授权阶段存在明确差额；在同一受控效果与唯一提交链中补齐，不以测试executor或有限parser冒充完整自然语言能力。
+
 ### 已完成的 staged 基线
 
 - [Ticket 118：完成 Hermes/Weixin 宿主合同发布与回滚准备](issues/118-complete-hermes-weixin-host-contract-release-and-rollback-preparation.md)已完成可重现 release manifest、固定 Hermes lifecycle、唯一 `health_weixin` 宿主边界、三类 CorePort 及失败关闭的 install/upgrade/rollback readiness 本地合成合同；真实 Partner/Linux/Weixin/model、外部批准、生产迁移与主人验收继续由 Ticket 119 闭合。
