@@ -71,3 +71,8 @@ Blocked by: [130 - 受控自然语言与主人操作真实入口](130-connect-go
 只读tracked product/tools及资源清单未发现可正式装载的项目自有ND claim/template资源包或最低安全content bundle；不能把测试publication或历史ops资源当当前生产内容。已有的是`nondiagnostic.py:143/171`的ApprovedClaimAtom/ApprovedReplyTemplate类型、`knowledge.py:236`的KnowledgePublisher和`model_adapter.py:603`的exact artifact loader；Core当前从真实构造依赖接收这些值（`core.py:1095—1126`），没有自动从仓库装载生产内容的factory。产品确有`answer_resolution.py:106`的131上下文说明及`:133—136`的版本化失败关闭文案，它们可复用，但不是完整非诊断claims/最低安全模板发布包。Publisher生成的四份bundle仍只有staged/unavailable标记（`release_deployment.py:399`）。
 
 `tests/test_ticket116_integration.py:181` publication明确使用synthetic source/review，且示例expires_at为2026-08-25；`:261`最低帮助为“[合成测试]”及approved-synthetic，顶层synthetic=True/production_approval=False。这些只能证明接口，不能复制或改布尔值后上线。KnowledgePublisher在`knowledge.py:243—248`要求真实rights approved、reviewed-chinese与professional_review approved；`safety_diagnosis.py:154`要求最低帮助rights/review/parse当前。项目自有固定非诊断治理/最低安全文案必须在128阶段A以实际内容、版本、digest、来源/使用权和真实适用审阅引用绑定同release，不能伪造医学审核，亦不能借ND去激活未授权诊断包。没有主人支持联系人配置时保持该能力unavailable，不猜身份、不借default/partner资料；联系人可选，不作为非诊断初始化的强制前提。
+
+
+### Verified default service scope
+
+2026-10-18 root只读现场核查已确认：DMIT实际default `hermes-gateway.service`属于root用户级systemd，而非系统级；只查系统级得到LoadState=not-found不能据此宣称实际网关已停止。既有无秘密metadata脚本为`/tmp/dmit-connection-audit/dmit_deployment_metadata.sh`；精确只读查询上下文为`env XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus systemctl --user show hermes-gateway.service`。后继任何状态核查、启动/重启或回滚必须先识别并绑定真实service scope；当前120默认controller调用的系统级systemctl不能未经核验直接当作该目标的控制器。该记录仅补现场事实，不执行service操作、不读取配置或秘密，不新增部署方案。
