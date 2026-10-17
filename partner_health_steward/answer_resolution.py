@@ -39,6 +39,7 @@ _COMPLETED_REJECTION_REASONS = frozenset(
         "actual-model-drift",
         "model-output-truncated",
         "strict-schema-error",
+        "capacity-evidence-expired",
     }
 )
 

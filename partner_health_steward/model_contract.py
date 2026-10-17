@@ -549,6 +549,8 @@ class StrictHealthLLM:
         capability_profile: CapabilityProfile,
         strict_schema_name: str = SYNTHETIC_STRICT_SCHEMA_NAME,
         strict_schema_digest: str = SYNTHETIC_STRICT_SCHEMA_DIGEST,
+        *,
+        measurement_strategy: object = None,
     ) -> None:
         if type(route) is not FirstHopRoute or type(capability_profile) is not CapabilityProfile:
             raise ModelContractViolation("invalid current model authority")
@@ -574,6 +576,16 @@ class StrictHealthLLM:
         self._capability_profile = capability_profile
         self._strict_schema_name = _text(strict_schema_name, "strict schema name")
         self._strict_schema_digest = _sha(strict_schema_digest, "strict schema digest")
+        self._measurement_strategy = None
+        if measurement_strategy is not None:
+            from .model_adapter import ProfileBoundInputMeasurementStrategy
+
+            if capability_profile.synthetic or type(measurement_strategy) is not ProfileBoundInputMeasurementStrategy:
+                raise ModelContractViolation("invalid production measurement authority")
+            strategy = ProfileBoundInputMeasurementStrategy.canonical_copy(measurement_strategy)
+            if object.__getattribute__(strategy, "_profile") != capability_profile:
+                raise ModelContractViolation("production measurement profile drift")
+            self._measurement_strategy = strategy
         # Core receives the existing hash-bound model authority seam.  Keep a
         # primitive-safe process-local resolver so an internal managed action
         # can form the exact request without accepting caller-supplied route or
@@ -649,6 +661,7 @@ class StrictHealthLLM:
                 self,
                 "_strict_schema_digest",
             ),
+            measurement_strategy=object.__getattribute__(self, "_measurement_strategy"),
         )
 
     @staticmethod
@@ -754,21 +767,33 @@ class StrictHealthLLM:
             + request.capability_profile.fixed_wrapper_tokens
             + request.output_reservation_tokens
         )
-        measured_input_upper_bound = len(
-            json.dumps(
-                [item.to_wire() for item in request.messages],
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        )
-        if (
-            not request.capability_profile.synthetic
-            or request.capability_profile.input_measurement_method
-            not in {
+        if request.capability_profile.synthetic:
+            measured_input_upper_bound = len(
+                json.dumps(
+                    [item.to_wire() for item in request.messages],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            measurement_valid = request.capability_profile.input_measurement_method in {
                 "synthetic-utf8-byte-upper-bound-v1",
                 "synthetic-exact-upper-bound-v1",
             }
+        else:
+            from .model_adapter import ProfileBoundInputMeasurementStrategy
+
+            strategy = object.__getattribute__(self, "_measurement_strategy")
+            measurement_valid = False
+            measured_input_upper_bound = 0
+            if type(strategy) is ProfileBoundInputMeasurementStrategy:
+                try:
+                    measured_input_upper_bound = ProfileBoundInputMeasurementStrategy.measure(strategy, request)
+                    measurement_valid = True
+                except Exception:
+                    pass
+        if (
+            not measurement_valid
             or request.final_input_upper_bound_tokens < measured_input_upper_bound
             or (
                 request.capability_profile.input_measurement_method
@@ -830,8 +855,21 @@ class StrictHealthLLM:
         """Validate one already-observed exact transport result without I/O."""
 
         preflight = StrictHealthLLM.preflight(self, request)
+        expired_after_attempt = False
         if preflight is not None:
-            return preflight
+            # Expiry is an admission boundary, not evidence that a completed
+            # external attempt never happened.  Preserve its observed result.
+            strategy = object.__getattribute__(self, "_measurement_strategy")
+            if not request.capability_profile.synthetic and preflight.reason_code == "capacity-unavailable":
+                from .model_adapter import ProfileBoundInputMeasurementStrategy
+
+                if type(strategy) is ProfileBoundInputMeasurementStrategy:
+                    try:
+                        expired_after_attempt = ProfileBoundInputMeasurementStrategy._expired_after_attempt(strategy, request)
+                    except Exception:
+                        pass
+            if not expired_after_attempt:
+                return preflight
         if type(result) is not ModelTransportResult:
             return StrictHealthLLM.transport_unknown_outcome(self, request)
         if result.status == "unknown":
@@ -883,6 +921,15 @@ class StrictHealthLLM:
                 model_report=report,
             )
         if result.status == "completed" and not result.truncated:
+            if expired_after_attempt:
+                report = StrictHealthLLM._report(result, "capacity-evidence-expired")
+                return StrictModelOutcome(
+                    disposition="failed-closed",
+                    model_effect="completed",
+                    reason_code="capacity-evidence-expired",
+                    candidate=None,
+                    model_report=report,
+                )
             candidate = _thaw_json(result.structured_output)
             if not isinstance(candidate, Mapping):
                 raise ModelContractViolation("completed result lacks structured output")
