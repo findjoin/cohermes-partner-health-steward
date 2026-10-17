@@ -4472,7 +4472,9 @@ class HealthCore:
         if initialization.workflow_id.startswith("live-init:"):
             first_id = "live-init-source:" + initialization.workflow_id.removeprefix("live-init:")
             first = self._store.source_receipt(first_id)
-            if (first is None or source.message_id is None or source.message_id == first.envelope.message_id
+            # The explicit whole-Bridge DI seam retains the original typed
+            # consent protocol; real live delivery has this durable source.
+            if first is not None and (source.message_id is None or source.message_id == first.envelope.message_id
                     or first.managed_cursor_state != "committed" or not self._live_cursor_handoff_allowed(first_id)):
                 return _Handled(Response("rejected", command.causal_id, "independent-initialization-confirmation-required"), True)
         try:
