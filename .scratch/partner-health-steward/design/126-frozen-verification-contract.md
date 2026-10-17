@@ -45,3 +45,11 @@ V05的verifier RPC只封装JSON-value和临时session映射，所有typed Effect
 另修正正向transport授权fixture的owner/contact route：分别与原OwnerWeixinDestination.route_id和既有contact destination.route_id一致，wire payload digest与原业务digest仍故意分层，避免要求生产接受自相矛盾的route。Session替身接受真实aiohttp的默认trust_env=False，不把显式写默认参数作为额外实现要求；仍拒绝打开环境代理和HTTP重定向。
 
 修订门仍为5个明确缺公开Module prerequisite failure，0error/skip（`/tmp/ticket126-precode-red-r2.log`），compile/diffcheck PASS。独立helper的既有116 probe/read/receive smoke已执行，新增126短方法尚无产品实现，未声称新增内链绿色。修订后只复核上述缺口/fixture一致性，原已审范围不重新开放。
+
+## 实施阶段有界验证补齐：持久unknown的exact cursor交接
+
+原设计第106行明确“持久unknown可形成终态交接”。产品作者在精确cd5bcb3公开Core smoke发现unknown/handoff_complete=true后native_cursor_directive仍为None；root独立重跑复现，日志 `/tmp/t126-root-unknown-ack-reproduction.log`。这是既有126-V04的现实边界缺口，不扩模型／健康写入权限、不重新设计unknown状态。旧V04仅证明重启unknown、无重发与handoff=true，未杀死全局UNKNOWN总门把该条已终态来源ACK永久卡住的错误。
+
+独立verifier仅在V04补两条同因果tracer：实际registry Adapter／生产Bridge／pinned HTTP替身在唯一send响应超时后，由真实Core持久unknown并确认handoff，仍能持久推进其exact source cursor，重投零第二发送；原complete丢失并重建后，未知终态读回真实handoff，再经原cursor指令及结果短调用推进该条cursor，旧session仍拒绝。HTTP替身只改变网络是否返回，不伪造Core终态或ACK。未知投递的原intent/unknown_frozen及禁止重发语义保留。
+
+独立正式旧门在精确cd5bcb3为5run、3fail、0error/skip（V01/V05绿，V02/V04 connect与V03 submitted为已覆盖产品错误），未运行full794。新V04内部unknown ACK路径尚未经过最高接口执行；局部公开Core复现只证明缺口，不声称修订门已绿。新verifier编译／diff通过后，须同一checkpoint fresh有界双轴审查并更新精确合同／测试blob，才允许修复此unknown ACK缺口；设计blob不变，原三项已覆盖实现错误仍可按原门修复。五门数量及原旧冻结门不变，最终完整794全量仍必需。

@@ -659,8 +659,26 @@ class Ticket126LiveDeliveryVerificationTests(unittest.TestCase):
                     "result": {"status": "accepted", "result_ref": "forged", "evidence_ref": "forged"},
                     "observed_at_utc": datetime.now(timezone.utc).isoformat()}))
                 self.assertTrue(denied is None or denied.get("payload", {}).get("delivery", {}).get("current_layer") != "accepted")
+                # Recovery has proven the source's durable unknown handoff.
+                # A general UNKNOWN write guard must not strand this exact ACK.
+                directive = fixture.port.exchange("managed-read", _projection(
+                    "health-entry-cursor-directive", {"source_causal_id": lost["binding"]["source_causal_id"]}))["directive"]
+                self.assertIsNotNone(directive, "durable unknown handoff must permit its exact source cursor")
+                self.assertEqual(directive["native_cursor"], "cursor-live-daily")
+                acknowledged = fixture.port.exchange("command", _operation("native-cursor-result", {
+                    "source_causal_id": lost["binding"]["source_causal_id"], "status": "advanced"}))["response"]
+                self.assertIn(acknowledged["status"], {"accepted", "replayed"})
+                self.assertEqual(fixture.port.exchange("managed-read", _projection(
+                    "health-entry-native-cursor"))["native_cursor"], "cursor-live-daily")
+                self.assertEqual(calls, [], "cursor handoff never reissues the uncertain send")
             finally:
                 restarted.close()
+        with _service() as fixture:
+            _initialize(fixture)
+            result = self._run_child("daily-unknown", fixture)
+            self.assertEqual(result["sends"], 1)
+            self.assertTrue(result["handoff_complete"])
+            self.assertTrue(result["unknown_frozen"])
 
     def test_v126_05_real_contact_authority_minimal_alert_unknown_and_bounded_correction(self):
         self._modules()
@@ -767,8 +785,9 @@ class _PollResponse(_Response):
 
 class _HTTPRouter:
     """One HTTP router shared by independent session objects and event loops."""
-    def __init__(self):
+    def __init__(self, *, send_unknown=False):
         self.batches, self.posts, self.cursors, self.sends, self.sessions = [], [], [], [], []
+        self.send_unknown = send_unknown
 
     def factory(self, **options):
         assert options.get("trust_env", False) is False
@@ -797,6 +816,8 @@ class _HTTPRouter:
                     return _PollResponse(value)
                 assert "sendmessage" in url, url
                 router.sends.append(copy.deepcopy(body["msg"]))
+                if router.send_unknown:
+                    return _Response(TimeoutError("synthetic send response unconfirmed"))
                 return _Response({"ret": 0, "errcode": 0})
         session = Session()
         self.sessions.append(session)
@@ -849,7 +870,7 @@ async def _registered_gate(config):
         return response["payload"]
     token_store = ContextTokenStore(os.environ["HERMES_HOME"])
     token_store.set(config["policy"]["partner_id"], config["policy"]["owner_sender_id"], "synthetic-context")
-    router = _HTTPRouter()
+    router = _HTTPRouter(send_unknown=config["gate"] == "daily-unknown")
     extra = {"admission_policy": config["policy"], "core_port": Port(),
              "initialization_template": config["initialization"],
              "weixin_transport_binding": {"account_id": config["policy"]["partner_id"],
@@ -894,7 +915,7 @@ async def _registered_gate(config):
                     router.enqueue("cursor-confirm", confirm)
                     await _wait_until(lambda: projection("health-entry-initialization")["initialization"]["phase"] == "enabled")
                     result = {"new_disclosure_sends": len(router.sends)}
-            elif gate in {"daily", "daily-loss"}:
+            elif gate in {"daily", "daily-loss", "daily-unknown"}:
                 native = _native_message("ticket126-native-daily-socket", "我昨晚没睡好", config["policy"])
                 approved = projection("health-entry-native-cursor")["native_cursor"]
                 router.enqueue("cursor-live-daily", native)
@@ -914,14 +935,17 @@ async def _registered_gate(config):
                     assert len(router.sends) == 1
                     assert completions and completions[-1]["handoff_complete"] is True
                     committed = projection("health-entry-delivery", {"intent_id": completions[-1]["delivery"]["intent_id"]})["delivery"]
-                    assert committed["current_layer"] == "accepted" and committed["handoff_complete"] is True
+                    expected_layer = "unknown" if gate == "daily-unknown" else "accepted"
+                    assert committed["current_layer"] == expected_layer and committed["handoff_complete"] is True
+                    assert committed["unknown_frozen"] is (gate == "daily-unknown")
                     assert projection("health-entry-native-cursor")["native_cursor"] == "cursor-live-daily"
                     before_polls = len(router.cursors)
                     router.enqueue("cursor-live-daily", native)
                     await _wait_until(lambda: len(router.cursors) >= before_polls + 3)
                     assert len(router.sends) == 1
                     result = {"sends": len(router.sends), "kinds": sorted(set(kinds)),
-                              "handoff_complete": committed["handoff_complete"]}
+                              "handoff_complete": committed["handoff_complete"],
+                              "unknown_frozen": committed["unknown_frozen"]}
             else:
                 raise AssertionError(gate)
         finally:
