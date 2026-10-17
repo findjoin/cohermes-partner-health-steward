@@ -122,8 +122,8 @@ Type: wayfinder:map
 - [Ticket 124：接通 pinned Hermes 的真实健康入口](issues/124-connect-pinned-hermes-live-health-entry.md) — 实现逐条消息、回复、cursor、七 Skill 调度和 Cron 唤醒，闭合唯一入口与无旁路的 G05/G09。
 - [Ticket 125：实现 Partner 首跳模型与治理知识 Adapter](issues/125-implement-partner-model-and-governed-knowledge-adapter.md) — 绑定真实 capability profile、严格终态和不可变知识发布；不激活医学范围。
 - [Ticket 126：实现真实 Weixin 与支持联系人投递 Adapter](issues/126-implement-live-weixin-and-support-contact-delivery-adapter.md) — 闭合分层投递、幂等、unknown 冻结和最小联系人 payload。
-- [Ticket 127：取得医学内容权利与专业审核](issues/127-obtain-medical-content-rights-and-review.md) — 人类权威票；把精确 bundle 推进到 activation-ready，Agent 不得伪造许可或审核。
-- [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 完成 G10—G12、真实 `health-init` 和主人验收，明确不触碰 partner Hermes。
+- [Ticket 127：取得医学内容权利与专业审核](issues/127-obtain-medical-content-rights-and-review.md) — 人类权威票；只门禁 BMI 诊断 bundle 进入 activation-ready 及完整首发，Agent 不得伪造许可或审核，不阻止非诊断健康管家使用。
+- [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 分两阶段执行：先部署、初始化并验收非诊断健康管家；127 闭合后再激活 BMI、完成 G12 与完整首发，明确不触碰 partner Hermes。
 
 ### 已完成的 staged 基线
 

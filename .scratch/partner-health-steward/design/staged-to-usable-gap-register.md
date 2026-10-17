@@ -29,8 +29,8 @@
 | Hermes Plugin 只有注册和 lifecycle 探针，没有把真实逐条微信消息、回复和 Cron 唤醒接入 `HealthPlugin` | `hermes_host.py` | 124 | pinned default Hermes 的唯一健康入口、七 Skill 调度、cursor 和无旁路合同真实成立 |
 | `StrictModelAdapter` 只有 Interface，没有绑定当前 Partner 首跳的生产 Adapter | `model_contract.py` | 125 | 当前 capability profile 下真实模型请求、严格终态、actual-model 与无 fallback 可证明 |
 | 主人／联系人投递只有 wire Interface，没有真实 Weixin Transport Adapter | `delivery.py` | 126 | 形成、尝试、接口接受、送达／已读／unknown 分层，且 unknown 不盲重发 |
-| 医学知识、最低帮助、危险规则和 BMI bundle 尚无实际权利与相称审核 | Ticket 119 G07；发布声明仍为 staged/unavailable | 127 | 精确 bundle digest 最多进入 `activation-ready`；不自动变成 active |
-| 没有同一 release/run 的 G10—G12 真实证据和主人验收 | Ticket 119；当前仅 staged 安装 | 128 | 仅 default Hermes 从 staged 进入主人可用，并完成初始化与功能验收 |
+| BMI 中文诊断 bundle 尚无实际内容权利与相称专业审核 | Ticket 119 G07；BMI 范围仍为 staged/unavailable | 127 | 精确 BMI bundle digest 最多进入 `activation-ready`；不自动变成 active，也不阻止非诊断能力使用 |
+| Ticket 119 只有 G07 前置的完整首发 run，且没有同一 release/run 的真实部署、初始化和主人验收 | Ticket 119；当前仅 staged 安装 | 128 | 在同一验收 Module 内增加固定非诊断 run 分支；阶段 A 先证明 default Hermes 的非诊断健康管家可用，127 闭合后阶段 B 再走原完整分支证明诊断激活与完整首发 |
 
 以上八项是本轮完整清单。实施中发现的问题只有满足以下任一条件才可新增门或新票：现有验收可复现失败、会导致数据／权限／外部效果越界、或使当前冻结架构无法工作。代码风格偏好、理论风险、替代架构更优和未复现猜测都不能扩大范围。
 
@@ -42,13 +42,14 @@
 122 Dynamo current-head ┘                                     ├─> 128 部署与主人验收
 123 CorePort 服务 ─────────────> 125 真实模型与知识 Adapter ──┤
 124 Hermes 入口 ───────────────> 126 微信／联系人 Adapter ────┤
-125 精确发布 bundle ───────────> 127 权利与医学审核 ──────────┘
+125 精确发布 bundle ───────────> 127 权利与医学审核 ──> 128 阶段 B
+124 + 125 + 126 ─────────────────────────────────────> 128 阶段 A
 ```
 
 - 121 与 122 可在各自冻结设计完成后并行。
 - 125 与 126 在 123／124 的接口稳定后可并行。
-- 127 是 `ready-for-human`：Agent 可以整理证据、校验 hash 和执行机械门，但不能伪造许可或医学专业审核。
-- 128 之前不再让主人输入真实健康资料。128 只部署到 default Hermes，不触碰 partner Hermes。
+- 127 是 `ready-for-human`：Agent 可以整理证据、校验 hash 和执行机械门，但不能伪造许可或医学专业审核；它只门禁 128 阶段 B。
+- 128 阶段 A 之前不再让主人输入真实健康资料。阶段 A 只部署到 default Hermes，不触碰 partner Hermes，并保持诊断 staged。
 
 ## 每票统一停止规则
 
@@ -58,6 +59,6 @@
 4. 每票通过自己的冻结门和受影响回归即可交审；项目全量测试只在最终交审运行一次，避免每个小修改重复数百项测试。
 5. 真实 AWS、模型、微信、联系人、部署、删除、迁移和主人动作分别需要 Ticket 119 已定义的精确批准；缺批准为 `not-authorized`，不是代码失败。
 
-## “可以使用”的唯一判定
+## “可以使用”的分层判定
 
-只有 Ticket 128 对同一 release digest 完成以下事实，才通知主人重新发送“初始化健康管家”：Plugin 已加载、health-core 真实健康、current-head 与 writer fence 当前、最低安全资产可用、真实模型／渠道门通过、`health-init` 形成并提交初始化事实，且读回状态为 enabled。此前任何自然语言“已初始化”都不是产品事实。
+只有 Ticket 128 阶段 A 对同一 release digest 完成以下事实，才通知主人重新发送“初始化健康管家”：Plugin 已加载、health-core 真实健康、current-head 与 writer fence 当前、项目自有或已明确授权的最低安全资产可用、真实模型／渠道门通过、`health-init` 形成并提交初始化事实，且读回状态为 enabled。此后可以声明“非诊断健康管家可用”，但必须同时显示 BMI 诊断仍 staged。只有阶段 B 再闭合 Ticket 127、诊断验收和完整 G12，才可声明“完整首发／产品验收通过”。此前任何自然语言“已初始化”都不是产品事实。
