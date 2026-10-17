@@ -1,7 +1,7 @@
 # 131 - 支持明确标识的非诊断模型操作预算
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家有限实施链](../map.md)
 Blocked by: [125 - 生产模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md)
 Unblocks: [130 - 受控自然语言日常 Runtime](130-connect-governed-natural-language-daily-runtime.md), [128 - 主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -39,3 +39,11 @@ Ticket 125 已于 `58453bf` 正式闭票（Evidence44／45，785 全量门与独
 - `.scratch/partner-health-steward/design/131-frozen-verification-contract.md` blob `2c7063b7c62cd3901ec0905ddcd46ecd2eac55d6`。
 - `tests/test_ticket131_nondiagnostic_budget.py` blob `8e77b3cac85bd8ea4c4f3fecb73b0af10161692e`。
 - 允许同一模型Module中的显式ND预算/固定schema/报告声明/真实诊断源门最小实现；产品作者不得改冻结三件套或自行闭票。4门及旧回归、全量/compile/diff/closure执行门之后才实施后审查。
+
+## Answer
+
+已完成明确标识的非诊断模型操作预算。精确产品commit `1fd554f3543cc16be98759a54e5a470c042c28fc` / tree `50e8d285e59d520fb896b6a7d451ad65b175acf9`，冻结三件套与Evidence46相同。固定65536 final UTF-8 wire bytes／2048 output tokens，沿原request／Core授权／单次attempt／终态报告保留“不提供共同上下文保证”，真实诊断源及执行边界均拒绝ND模式；旧严格模式及typed唯一提交不变。
+
+[Evidence48](../evidence/48-ticket131-formal-execution-20261018.md)：该精确干净历史产品快照的131四门、124四门、全量789、compile84／source84／12冻结blob／7462 runtime闭包全绿，0skip；root独立18门全绿。[Evidence49](../evidence/49-ticket131-postimplementation-review-20261018.md)：fresh Spec与Standards对同一commit/tree均PASS，无阻塞finding，root仅元数据闭票。该checkpoint尚无后继126五门，不声称126或当前794通过；其最终整合另行全量验证。
+
+131解除130的本票前提。尚未证明真实JOJO推理、实际主人已看到说明、生产自然语言／跨进程、微信、部署或主人验收；130/128仍负责这些结果。full／诊断的严格容量和127医学权利／审核门槛保留。
