@@ -43,3 +43,7 @@ Pinned低层_get_updates/_send_message各一次调用_api_post，可用于生产
 ## Independent verification candidate (2026-10-18)
 
 root独立持有`../design/126-frozen-verification-contract.md`与`../../../tests/test_ticket126_live_delivery.py`五个有限门，唯一设计为`../design/126-live-delivery-design.md`。真pinned低层/HTTP-only替身、同socket与Publisher registry、preconsent stable native事件、Core exact daily/safety回复、unknown回交丢失重启及唯一contact批准/纠正均在公开生产接口验证；当前产品缺失为5明确prerequisite failure、0error/skip，新内链尚未执行。compile/diffcheck通过，继承785/14及独立contact旧链char见合同。等待同一checkpoint fresh Spec/Standards；不授权产品编码，不接真实渠道，不改旧冻结门。
+
+## Frozen implementation authority (2026-10-18)
+
+[Evidence47](../evidence/47-ticket126-precode-review-20261018.md)记录初审三个验证缺口和R2有界修正。最新唯一冻结checkpoint `3b53ed23389159a88f31459e6e9437edebebac9c` / tree `10c6fc19da6bb78d45c0a3c707915a1ad58b1ea1` 两轴PASS。三件套blob依次为设计 `4a6ec81c94edab252936815cf0fc98925def3d0f`、独立合同 `5b0b5336f27343192708869cb4591f67b7802ccd`、verifier `1559c548bf9b42af85f221bae67d2db9e7f65c5b`；覆盖旧候选，授权在此边界内实施。5个prerequisite红灯不代表内部路径已执行；未授权改动冻结门或真实渠道。root为验证权威，闭票仍需完整执行门与有界实施后双轴审查。
