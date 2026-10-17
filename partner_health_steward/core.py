@@ -6079,6 +6079,8 @@ class HealthCore:
                         if any(
                             not effect_id.startswith("effect:ticket116-contact")
                             for effect_id in unresolved_effects
+                        ) and not self._live_contact_owner_unknown_overlap(
+                            contact_outbox, unresolved_effects, head, settings
                         ):
                             return None
                     elif unresolved_effects != (intent.effect_id,):
@@ -12480,6 +12482,57 @@ class HealthCore:
                     allowed.add(effect_id)
             return set(unresolved).issubset(allowed)
         except (AuthorityValidationError, KeyUnavailable):
+            return False
+
+    def _live_contact_owner_unknown_overlap(self, intent, unresolved, head, settings):
+        """A terminal owner send cannot suppress its own safety contact chain."""
+        try:
+            contact = self._live_contact_fact(intent.effect_request_id)
+            if (contact is None or intent.authorization_kind != "ticket116-contact"
+                    or contact[0].causal_id != intent.business_fact_ref
+                    or contact[0].command_digest != intent.business_revision_digest
+                    or contact[1]["_contact"]["outbox_intent_id"] != intent.intent_id):
+                return False
+            # A correction retains its original alert's safety fact, rather
+            # than borrowing an unrelated unknown owner's send permission.
+            if contact[2]:
+                contact = self._live_contact_fact(contact[1]["source_alert_intent_id"])
+            if contact is None or contact[2]:
+                return False
+            fact, result, _ = contact
+            source_id = result.get("_source_causal_id")
+            outbox = self._ticket115_outbox_state_open(settings)
+            original = outbox.record(result["_contact"]["outbox_intent_id"]).intent
+            if (original.business_fact_ref != fact.causal_id
+                    or original.business_revision_digest != fact.command_digest
+                    or original.source_ref != source_id):
+                return False
+            owners = [record for record in outbox.records
+                      if record.intent.payload_ref == "live-safety-reply:" + fact.causal_id
+                      and record.intent.business_fact_ref == fact.causal_id
+                      and record.intent.business_revision_digest == fact.command_digest
+                      and record.intent.source_ref == source_id]
+            foreign = {effect_id for effect_id in unresolved
+                       if not effect_id.startswith("effect:ticket116-contact")}
+            if len(owners) != 1:
+                return False
+            owner = owners[0]
+            effect_id = self._effect_id(owner.intent.effect_request_id)
+            terminal = self._store.effect(effect_id)
+            if (foreign != {effect_id} or terminal is None or terminal.state != "unknown"
+                    or type(terminal.payload) is not TerminalEffect
+                    or terminal.payload.status != "unknown"
+                    or terminal.payload.intent.effect_kind != "owner-delivery"
+                    or terminal.payload.intent.business_source_causal_id != owner.intent.intent_id
+                    or terminal.payload.intent.intent_digest != owner.intent.semantic_digest
+                    or owner.current_layer != "unknown" or not owner.unknown_frozen
+                    or self._live_owner_binding_open(owner.intent, settings) is None):
+                return False
+            authority = terminal.payload.lease.authority
+            return (authority.installation_id == head.installation_id
+                    and authority.site == head.site and authority.writer_fence == head.writer_fence)
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable,
+                KeyError, TypeError, ValueError):
             return False
 
     def _live_source_deliveries(self, source_id, settings):
