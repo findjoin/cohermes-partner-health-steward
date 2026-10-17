@@ -1,7 +1,7 @@
 # 124 - 接通 pinned Hermes 的真实健康入口
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [123 - 实现生产 health-core 与 CorePort 服务](123-implement-production-health-core-and-coreport-service.md)
 Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -24,3 +24,7 @@ Unblocks: [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-imple
 ## Delivery discipline
 
 编码前以 pinned Hermes 实际接口做 characterization 并冻结最小 Adapter 设计；若 pinned 接口缺少必需语义，以精确接口证据停止，不在健康项目中重写 Hermes。通过后普通提交并推送，不激活 default。
+
+## 2026-10-18 pre-code checkpoint candidate
+
+唯一设计 `../design/124-live-entry-design.md`；独立验证合同 `../design/124-frozen-verification-contract.md` 与 verifier-owned `../../../tests/test_ticket124_live_entry.py`。基线19417da保留111/112已验证业务与123生产装配；124公开Module缺失使新门4个预期failure、0error/skip。正式运行要求可核验pinned Git来源、root和Python3.11 runtime，尚未以本机替代环境冒充通过。产品实现等待同一commit/tree新鲜双轴预审；真实模型、微信、部署另按既有后继门执行。
