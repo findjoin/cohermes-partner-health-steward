@@ -33,3 +33,13 @@ Unblocks: [127 - 取得医学内容权利与专业审核](127-obtain-medical-con
 - characterization：既有 StrictPort 32/32 绿色；nonsynthetic profile 无生产计量策略时 capacity-unavailable、0 调用；model_adapter 尚不存在。
 - 预期红灯：新门 4 failures、0 errors/skips，根因均为公开生产 Adapter 尚不存在。尚未授权生产编码，等待同一 commit/tree 的 fresh-context Spec/Standards 预审。
 - 真实模型、配置、批准、容量依据和医学内容未被测试 fixture 冒充；任何未获目标证明的真实路径继续失败关闭。
+
+## Frozen implementation authority (2026-10-18)
+
+- reviewed pre-code commit: `5f5286cfdddb358baec14a4bee17c2fa7f85417f`; tree `2ef6d576519f69485de297b4dac0f794ce7cbc7b`。
+- Fresh-context Spec: PASS；Fresh-context Standards: PASS；证据见 `../evidence/39-ticket125-precode-review-20261018.md`。
+- `.scratch/partner-health-steward/design/125-production-model-design.md` blob: `7cc317bd2c98a88b40024d355f7bde9b25224643`。
+- `.scratch/partner-health-steward/design/125-frozen-verification-contract.md` blob: `e4ed2a9eb90f20880bc0cb632920e126368b47d2`。
+- `tests/test_ticket125_partner_model.py` blob: `35519de98288911c4902db209245e4999fd7db63`。
+- 独立 verifier-owned 四门仍是缺公开生产 Module 的预期四红；既有 StrictPort 32/32，119+StrictPort 39/39 绿色。全量首次本机运行的阻塞来自正式 Linux/root/runtime/pinned-source 环境未装配，不把它们写成通过。
+- 允许在这份冻结设计内实现 `model_adapter.py`、`model_contract.py`、必要的 `answer_resolution.py` 原因闭集和既有 Core 报告接缝；不改冻结三件套，不改变 wire/业务权威，不接真实模型。实现验证后另做执行门和独立实施后审查，不能自行关闭本票。
