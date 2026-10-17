@@ -13,13 +13,15 @@ Provider 的内部 SQL 表名、codec、行布局和 helper 不作测试隐藏�
 | Gate / Ticket 验收 | 必须观察的结果 | 独立现实错误 |
 |---|---|---|
 | 129-V01 / A1 | 普通打开缺失文件不创建；唯一显式 bootstrap 创建 generation1 并读回；既有文件/错误 installation 零覆盖；symlink/hardlink/公开 mode/非 private parent 拒绝。 | 丢文件或坏 namespace 被当作新安装，软链接/权限使 authority 失去唯一性 |
-| 129-V02 / A2 | 两个独立进程竞争同一个 expected，只有一个 CAS 成功；live head、exact AppliedTransition 同时成立；错误 operation/失败竞争者无伪 receipt；重开读回一致。 | 只用进程锁或缓存 CAS，head/receipt 分开提交、恢复凭相似 ID 猜测 |
+| 129-V02 / A2 | 两个独立进程竞争同一个 expected，只有一个 CAS 成功；live head、exact AppliedTransition 同时成立；错误 operation/失败竞争者无伪 receipt；保持 transition/operation lookup key 不变而改变 revision 的请求仍不能继承回执；重开读回一致。 | 只用进程锁或缓存 CAS，head/receipt 分开提交、只按回执 key 猜测 exact recovery |
 | 129-V03 / A3 | public fence 相等不能替代 capability hash；伪 proof 零推进；新 head 后旧 generation proof/请求拒绝，当前 holder proof 可用。 | 持公开字符串即可写、只验构造时的旧 head |
-| 129-V04 / A3–A4 | lease exact acquire/replay/lookup、默认独占；现有受信 overlap 可推进，generation 进步但同 fence 的合法旧 lease 可释放；release digest 冲突拒绝；transfer 轮换到精确预配 target fence，旧 receipt 保留但旧 acquire/release 失去活体权限；active lease 不可越过 terminal。 | 历史 receipt 复活权限、释放门过严卡住合法 overlap、旧 holder 越过 transfer/terminal |
+| 129-V04 / A3–A4 | lease exact acquire/replay/lookup、默认独占；受信 overlap 可推进，同 fence 新 generation 下旧 acquire 拒绝、原 exact lookup 可读、旧 lease 可释放；仅命名唯一 active effect 的既有 permit 可加入第二 lease，错误 permit 与第三 lease 拒绝，释放一个后余下 lease 仍阻 terminal；保持 lease effect key/lifecycle operation key 不变而改变 intent/revision 不能继承回执；release digest 冲突拒绝；transfer 后旧历史保留但 acquire/release 无活体权限。 | 历史 receipt 复活权限、释放门过严、只匹配 key、拒绝合法并行或任意 permit 无限并行、释放一个就清空 guard、旧 holder 越过 transfer/terminal |
 | 129-V05 / A5 | 实际子进程 commit 后、返回业务结果前 SIGKILL，重开靠 exact lookup/readback 恢复；真实 SQLite 写锁导致 typed conflict/timeout且无 receipt；已开文件换 inode及损坏失败关闭，不重新 bootstrap。 | 崩溃后盲重做、锁错误假成功、已替换文件继续作 authority、自动修复坏库 |
 | 129-V06 / A6 | 文件/sidecar/错误与日志不保存 writer capability；真实生产 CorePort 组合接受 Host Provider，运行投影准确为 host-sqlite，staged 仍不可写；不伪造 DynamoDB 或域外保证。 | request/proof repr 入库、公开身份硬编码 DynamoDB、用内存对象或阶段探针冒充宿主生产 |
 
 每门按可独立杀死的现实 mutation 取正例和必要等价类，不做字段/故障笛卡尔积。V04 区分 acquire replay（必须 exact live HEAD）与 release（同一 live writer fence 内的合法 overlap 可跨 generation）；不得将这两种 currentness 混成一项。
+
+本次冻结前修订只闭合 fresh Spec/Standards 的三项有限 finding：同 fence stale acquire；固定 key 下 advance/lifecycle/lease 的非 key identity 不符；既有 bounded parallel-acquire permit 的正反例与部分释放后 guard。公开接口及唯一产品设计不变，门数仍为六。
 
 ## 命令、环境与停止
 

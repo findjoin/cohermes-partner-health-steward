@@ -151,3 +151,13 @@ managed-read 固定投影 `health-entry-cursor-directive`，payload 只有 `sour
 ### 唯一 registry 工厂选择
 
 既有 `register()` 的 `adapter_factory` 在 `config.extra` 显式包含 `admission_policy` 时创建 `LiveHealthWeixinAdapter`；值必须是既有 `AdmissionPolicy.to_storage()` 的规范形状，无效配置失败且不得回落旧探针。可选 `core_port`、`ingress_transport`、`delivery_transport` 仅为宿主 Python 显式注入的测试/组合根对象；实际 endpoint 由 `core_port_endpoint` 固定提供。未提供 admission_policy 时保留118旧探针兼容；该探针不获得 live activation。独立门必须经真实 registry factory 取得 live 实例。
+
+### 三项预审缺口的最小闭合（候选修订）
+
+1. 生产socket门须在同一AF_UNIX服务完成真实初始化与一次typed日常提交，证明依赖真的注入同一Core/Plugin，不能只读uninitialized。
+2. 实际registry-created Adapter必须走明确初始化和下一独立native确认：`/health-init`，随后 `/health-init-confirm <workflow_id> <disclosure_id>`。宿主 `config.extra.initialization_template` 是既有OwnerInitialization规范storage，两项consent必须false；首次来源只稳定派生workflow_id及预分配callback causal_id，不默认同意。确认来源保留实际native message_id和时间，绑定core读回的同一challenge后才转换既有OwnerConsentEvidence。模板、challenge不匹配或状态未知均不提交；不因首次请求自动确认。
+3. Adapter重建后第一poll的cursor必须从同一Core的已接受source receipts派生读回；同一来源重放仍稳定，不靠内存保存身份或单独cursor账本。
+
+为上述既有行为增加两个目的限定managed-read投影，仍使用相同health-entry-v1 wrapper：`health-entry-native-cursor` payload `{}` 返回 `{"native_cursor":<str|null>}`；`health-entry-disclosure` payload `{"workflow_id":<str>}` 返回 `{"initialization":<原OwnerInitialization storage|null>,"disclosure":<既有disclosure storage|null>}`。后者仅核验并读回既有加密challenge，前者从完整、已提交业务且native_cursor_state=accepted的既有receipt派生，不新增持久字段/表。Core/Plugin/storage可增加对应固定purpose getter，不能把通用SQL、所有source/body或任意store方法暴露给Adapter。初始无已接受cursor用空poll cursor；unknown不能推进。
+
+同一126 `send_committed` bridge的有限输入区分：披露为 `{"kind":"initialization-disclosure","workflow_id":<str>,"disclosure":<storage>}`，日常为 `{"kind":"committed-turn","source_causal_id":<str>,"turn_result":<已提交meta.turn_result>}`。这些输入只请求126形成/读回已有受控发送授权，不是自行取得grant或任意文本发送权。124离线门可以记录core形成物并返回not-authorized；不得将此写成实际发送、接口接受、delivered或初始化成功。门中的第二合成owner确认只证明消息映射与Core同意边界，不替代126/128真实呈现/主人验收。框架send仍不能发送任意健康文本。

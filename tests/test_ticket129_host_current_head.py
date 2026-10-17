@@ -176,6 +176,10 @@ class Ticket129HostCurrentHeadVerificationTests(unittest.TestCase):
                 port.lookup_transition(requests[1 - winner].identity())
             with self.assertRaises((TransitionNotFound, HeadConflict)):
                 port.lookup_transition(replace(requests[winner].identity(), operation_digest="sha256:wrong-operation"))
+            # Keep the full lookup key unchanged; matching a key is not proof
+            # that the recorded conditional request is this exact request.
+            with self.assertRaises((TransitionNotFound, HeadConflict)):
+                port.lookup_transition(replace(requests[winner].identity(), revision_digest="sha256:wrong-revision"))
             reopened = module.HostSQLiteCurrentHead(binding)
             try:
                 self.assertEqual(reopened.lookup_transition(requests[winner].identity()), receipt)
@@ -211,6 +215,8 @@ class Ticket129HostCurrentHeadVerificationTests(unittest.TestCase):
         receipt = port.acquire_execution_lease(request)
         self.assertEqual(port.acquire_execution_lease(request), receipt)
         self.assertEqual(port.lookup_execution_lease(request.identity()), receipt)
+        with self.assertRaises((TransitionNotFound, HeadConflict)):
+            port.lookup_execution_lease(replace(request.identity(), intent_digest="sha256:wrong-intent"))
         with self.assertRaises(HeadConflict):
             port.acquire_execution_lease(replace(request, effect_id="effect:v129-competitor"))
         with self.assertRaises(HeadConflict):
@@ -219,13 +225,35 @@ class Ticket129HostCurrentHeadVerificationTests(unittest.TestCase):
         advanced = port.conditional_advance(self._advance(
             initial, proof, "permitted-overlap",
             _execution_overlap=_ExecutionOverlapPermit(request.effect_id)))
+        # Same site/fence remains live, but the old full authority does not.
+        with self.assertRaises(HeadConflict): port.acquire_execution_lease(request)
+        self.assertEqual(port.lookup_execution_lease(request.identity()), receipt)
+        current_proof = holder.proof_for(advanced.as_authority())
+        parallel = ExecutionLeaseRequest(
+            advanced.as_authority(), "effect:v129-parallel", "sha256:v129-parallel-intent",
+            advanced.writer_fence, "holder:v129-parallel-effect", current_proof,
+            _execution_overlap=_ExecutionOverlapPermit(request.effect_id))
+        with self.assertRaises(HeadConflict):
+            port.acquire_execution_lease(replace(
+                parallel, _execution_overlap=_ExecutionOverlapPermit("effect:v129-not-active")))
+        parallel_receipt = port.acquire_execution_lease(parallel)
+        self.assertEqual(port.lookup_execution_lease(parallel.identity()), parallel_receipt)
+        with self.assertRaises(HeadConflict):
+            port.acquire_execution_lease(replace(parallel, effect_id="effect:v129-third"))
         release = ExecutionLeaseRelease(receipt.lease, proof, "sha256:v129-release")
         released = port.release_execution_lease(release)
         self.assertTrue(released.released)
         self.assertEqual(port.release_execution_lease(release), released)
         with self.assertRaises(HeadConflict):
             port.release_execution_lease(replace(release, operation_digest="sha256:conflicting-release"))
-        current_proof = holder.proof_for(advanced.as_authority())
+        overlap_deletion = LifecycleTransitionRequest(
+            "terminal-delete", advanced.as_authority(), "operation:v129-overlap-delete",
+            "transition:v129-overlap-delete", "sha256:v129-overlap-delete", advanced.writer_fence,
+            "sha256:v129-overlap-delete-operation", current_proof)
+        with self.assertRaises(HeadConflict): port.conditional_lifecycle_transition(overlap_deletion)
+        self.assertFalse(port.lookup_execution_lease(parallel.identity()).released)
+        port.release_execution_lease(ExecutionLeaseRelease(
+            parallel_receipt.lease, current_proof, "sha256:v129-parallel-release"))
         active = ExecutionLeaseRequest(advanced.as_authority(), "effect:v129-transfer", "sha256:v129-transfer-intent",
                                        advanced.writer_fence, "holder:v129-transfer-effect", current_proof)
         active_receipt = port.acquire_execution_lease(active)
@@ -238,6 +266,8 @@ class Ticket129HostCurrentHeadVerificationTests(unittest.TestCase):
         transferred = port.conditional_lifecycle_transition(transfer)
         self.assertEqual((transferred.site, transferred.writer_fence), (target_site, target_fence))
         self.assertEqual(port.lookup_lifecycle_transition(transfer.identity()).applied, transferred)
+        with self.assertRaises((TransitionNotFound, HeadConflict)):
+            port.lookup_lifecycle_transition(replace(transfer.identity(), revision_digest="sha256:wrong-lifecycle-revision"))
         self.assertEqual(port.lookup_execution_lease(active.identity()), active_receipt)
         with self.assertRaises((HeadConflict, HeadTerminal)):
             port.acquire_execution_lease(active)

@@ -27,6 +27,10 @@ if __name__ == "__main__" and "--pinned-gate" in sys.argv:
     sys.path.insert(0, str(_REPOSITORY))
 
 from partner_health_steward.contract import DailyTurnMeta, Response
+from partner_health_steward import HealthCore, HealthPlugin
+from partner_health_steward.admission import AdmissionPolicy
+from partner_health_steward.core import InMemoryWriterFenceVault
+from partner_health_steward.current_head import InMemoryCurrentHead
 from partner_health_steward.coordination import (
     DailySkillBundle, DailySkillDisclosure, DailySkillRuntime, DailyTurnResult,
 )
@@ -35,6 +39,7 @@ from partner_health_steward.initialization import (
     HealthInitRuntime, InitializationDisclosure, InitializationProjection, OwnerConsentEvidence,
 )
 from partner_health_steward.release_deployment import HermesReleasePublisher
+from partner_health_steward.storage import EncryptedStateStore, StaticKeyProvider
 from tests import test_ticket111_admission_initialization as init_fixture
 from tests import test_ticket112_seven_skill_daily_turn as daily_fixture
 from tests import test_ticket119_integration as release_fixture
@@ -212,7 +217,9 @@ class Ticket124LiveEntryVerificationTests(unittest.TestCase):
             bundle = DailySkillBundle(tuple(replace(a, asset_digest=digests[a.canonical_name])
                                            for a in daily.daily_bundle.assets))
             daily_runtime = DailySkillRuntime(bundle, daily.daily_attestor,
-                                             executor=daily.turn_executor)
+                                             executor=daily.turn_executor,
+                                             clock=lambda: datetime(2026, 8, 24, 1, 6, tzinfo=timezone.utc))
+            daily.route_classification = "health"
             runtime = module.LiveHealthRuntime(
                 daily.policy, init_runtime, daily.router, daily_runtime, asset_paths=paths,
             )
@@ -224,6 +231,44 @@ class Ticket124LiveEntryVerificationTests(unittest.TestCase):
                            "payload": _read("health-entry-initialization")}
                 result = fixture._request(endpoint, request)
                 self.assertEqual(result["payload"]["initialization"]["phase"], "uninitialized")
+                def exchange(kind, payload):
+                    envelope = {"protocol_version": 1, "kind": kind,
+                                "request_id": "ticket124-real-socket", "payload": payload}
+                    observed = fixture._request(endpoint, envelope)
+                    self.assertIsNotNone(observed, payload)
+                    return observed["payload"]
+                initialization = daily.initialization_request()
+                disclosure = InitializationDisclosure.from_storage(exchange("command", _command(
+                    "initialization-disclosure", {"initialization": replace(
+                        initialization, owner_consent=False, first_hop_route_consent=False).to_storage()}))["disclosure"])
+                consent = OwnerConsentEvidence.for_initialization(
+                    initialization, init_runtime.asset, disclosure,
+                    owner_confirmed=True, first_hop_route_confirmed=True)
+                raw = daily.message("offline", generation=head.read().head.generation)
+                admitted = exchange("command", _command("receive-weixin", {
+                    "message": _message_wire(raw, consent.to_message_body())}))
+                self.assertEqual(admitted["response"]["status"], "accepted", admitted)
+                for operation, payload in (
+                    ("initialization-consent", {"initialization": initialization.to_storage()}),
+                    ("initialization-commit", {}), ("initialization-finalize", {}),
+                ):
+                    response = exchange("command", _command(operation, payload))
+                    self.assertIn(response["response"]["status"], {"accepted", "replayed"}, response)
+                self.assertEqual(exchange("managed-read", _read("health-entry-initialization"))[
+                    "initialization"]["phase"], "enabled")
+                health = daily.message(
+                    "offline", causal_id="ticket124-production-daily", generation=head.read().head.generation,
+                    requested_capability="health-steward", message_id="native-production-daily",
+                    protocol_timestamp="2026-08-24T09:05:00+08:00", received_at="2026-08-24T09:05:01+08:00",
+                    native_cursor="cursor-production-daily")
+                daily_result = exchange("command", _command("receive-weixin", {
+                    "message": _message_wire(health, "我昨晚没睡好")}))
+                self.assertEqual(daily_result["response"]["status"], "accepted", daily_result)
+                committed = daily_result["response"]["meta"]["turn_result"]
+                self.assertTrue(committed["evidence_ids"])
+                self.assertTrue(committed["portrait_topics"])
+                self.assertEqual({item["canonical_name"] for item in committed["skill_disclosures"]},
+                                 {"health-steward", "health-evidence", "health-portrait"})
                 request["payload"] = _command("call-any-method", {"method": "__dict__"})
                 request["kind"] = "command"
                 self.assertIsNone(fixture._request(endpoint, request))
@@ -333,6 +378,8 @@ class _RPC:
                       "initialization_phase": "enabled", "reason_code": None}
         elif projection == "health-entry-initialization":
             result = {"initialization": InitializationProjection.uninitialized().to_storage()}
+        elif projection == "health-entry-native-cursor":
+            result = {"native_cursor": self.ingress.acknowledged[-1] if self.ingress.acknowledged else None}
         elif projection == "health-entry-cursor-directive":
             source = data["source_causal_id"]
             msg = next(m for m in self.messages if m["causal_id"] == source)
@@ -372,14 +419,26 @@ class _RPC:
 
 
 class _Delivery:
-    def __init__(self):
+    def __init__(self, *, unknown=False):
         self.calls = []
         self.effects = {}
+        self.presentations = []
+        self.attempts = []
+        self.unknown = unknown
     async def send_committed(self, intent):
         self.calls.append(copy.deepcopy(intent))
+        if intent.get("kind") == "initialization-disclosure":
+            self.presentations.append(copy.deepcopy(intent))
+            return {"status": "not-authorized", "reason_code": "ticket126-authorization-required"}
         # The 126 effect bridge owns stable identity/idempotency. 124 may ask
         # it to read an existing effect; a repeated call is not a second send.
-        self.effects.setdefault(_sha(_canonical(intent)), copy.deepcopy(intent))
+        turn = intent["turn_result"]
+        identity = (turn["record_id"], turn["transition_id"])
+        if identity not in self.effects:
+            self.attempts.append(copy.deepcopy(intent))
+            self.effects[identity] = copy.deepcopy(intent)
+        if self.unknown:
+            return {"status": "unknown", "reason_code": "offline-response-lost"}
         return {"status": "accepted", "result_ref": "offline-accepted", "evidence_ref": "offline-evidence"}
 
 
@@ -469,7 +528,135 @@ async def _pinned_gate(gate):
     ingress.queue.put_nowait({"ret": 0, "msgs": [_native("after-stop")], "get_updates_buf": "after-stop"})
     await asyncio.sleep(0.03)
     assert len(rpc.messages) == before
+    if gate == "V04":
+        await _real_adapter_initialization_and_restart(entry, PlatformConfig)
     print(f"TICKET124-{gate}-PASS")
+
+
+class _RealRPC:
+    """The transport fake is real operations over an actual retained Core."""
+    def __init__(self, fixture):
+        from partner_health_steward.live_health import LiveHealthCoreOperations
+        self.fixture = fixture
+        self.operations = LiveHealthCoreOperations(
+            fixture.plugin, current_generation=lambda: fixture.head.read().head.generation)
+        self.calls = []
+        self.turns = []
+
+    def request(self, kind, payload, *, request_id=None):
+        self.calls.append((kind, copy.deepcopy(payload)))
+        if payload == {"operation": "health-runtime-probe"} or payload == {"projection": "health-runtime"}:
+            probe = self.fixture.plugin.probe()
+            result = {"state": probe.state.value,
+                      "health_writes_allowed": self.fixture.plugin.health_writes_allowed(),
+                      "model_effects_allowed": self.fixture.plugin.model_effects_allowed(),
+                      "outbound_effects_allowed": self.fixture.plugin.outbound_effects_allowed()}
+        else:
+            result = self.operations.dispatch(kind, payload)
+        if type(result) is dict and type(result.get("response")) is dict:
+            turn = (result["response"].get("meta") or {}).get("turn_result")
+            if turn is not None: self.turns.append(copy.deepcopy(turn))
+        return {"protocol_version": 1, "kind": kind, "request_id": request_id or "offline-real-rpc",
+                "status": "accepted", "payload": result}
+
+
+def _uninitialized_real_fixture():
+    base = daily_fixture.Ticket112SevenSkillDailyTurnTests()
+    base.setUp()
+    base.core.close(); base.store.close()
+    base.policy = AdmissionPolicy("partner-offline", "owner-offline", "owner-offline")
+    base.store = EncryptedStateStore(f"file:ticket124-real-{id(base)}?mode=memory&cache=shared",
+                                    StaticKeyProvider(b"k" * 32, key_id="ticket124-offline-key"))
+    base.head = InMemoryCurrentHead("partner-installation", "partner-site",
+                                     writer_capability=base.writer_capability)
+    authority = base.head.read().head.as_authority()
+    base.store.seed_finalized_authority(authority)
+    base.writer_vault = InMemoryWriterFenceVault()
+    base.writer_vault.bind(authority, base.writer_capability)
+    base.core = HealthCore(base.store, base.head, writer_fence_vault=base.writer_vault,
+        admission_policy=base.policy, health_init_verifier=base.init_attestor,
+        health_init_asset=base.init_asset, daily_skill_verifier=base.daily_attestor,
+        daily_skill_bundle=base.daily_bundle)
+    base.route_classification = "health"
+    base.plugin = HealthPlugin(base.core, admission_policy=base.policy,
+        health_init_runtime=base.init_runtime, coarse_router=base.router,
+        daily_skill_runtime=base.daily_runtime)
+    return base
+
+
+async def _real_adapter_initialization_and_restart(entry, PlatformConfig):
+    fixture = _uninitialized_real_fixture()
+    rpc, delivery = _RealRPC(fixture), _Delivery(unknown=True)
+    template = replace(fixture.initialization_request(), owner_consent=False,
+                       first_hop_route_consent=False).to_storage()
+    adapters = []
+    def create(ingress):
+        config = PlatformConfig(enabled=True, extra={
+            "admission_policy": fixture.policy.to_storage(), "initialization_template": template,
+            "core_port": rpc, "ingress_transport": ingress, "delivery_transport": delivery})
+        adapter = entry.adapter_factory(config)
+        adapters.append(adapter)
+        return adapter
+    try:
+        first_ingress = _Ingress()
+        first = create(first_ingress)
+        assert await first.connect(is_reconnect=False)
+        begin = _native("begin-init")
+        begin["item_list"][0]["text_item"]["text"] = "/health-init"
+        first_ingress.queue.put_nowait({"ret": 0, "msgs": [begin], "get_updates_buf": "cursor-before-consent"})
+        await _wait(lambda: len(delivery.presentations) > 0)
+        presentation = delivery.presentations[-1]
+        assert set(presentation) == {"kind", "workflow_id", "disclosure"}
+        assert fixture.plugin.initialization_status(peer_id="plugin").phase == "uninitialized"
+        assert delivery.effects == {}  # formed presentation is not a real accepted send
+        workflow = presentation["workflow_id"]
+        retained = rpc.operations.dispatch("managed-read", _read("health-entry-disclosure", {"workflow_id": workflow}))
+        assert retained["disclosure"] == presentation["disclosure"]
+        assert retained["initialization"]["owner_consent"] is False
+        assert retained["initialization"]["first_hop_route_consent"] is False
+        disclosure = InitializationDisclosure.from_storage(retained["disclosure"])
+        callback_source = retained["initialization"]["admission_causal_id"]
+        await first.disconnect()
+        adapters.remove(first)
+        # No Adapter memory survives. The challenge is reloaded from Core.
+        second_ingress = _Ingress()
+        second = create(second_ingress)
+        assert await second.connect(is_reconnect=True)
+        confirm = _native("independent-native-confirmation")
+        confirm["create_time_ms"] = int(datetime(2026, 8, 24, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        confirm["item_list"][0]["text_item"]["text"] = f"/health-init-confirm {workflow} {disclosure.disclosure_id}"
+        second_ingress.queue.put_nowait({"ret": 0, "msgs": [confirm], "get_updates_buf": "cursor-after-consent"})
+        await _wait(lambda: fixture.plugin.initialization_status(peer_id="plugin").phase == "enabled")
+        receipt = fixture.plugin.source_receipt(callback_source, peer_id="plugin")
+        assert receipt.envelope.message_id == "independent-native-confirmation"
+        health = _native("retained-daily-source")
+        health["create_time_ms"] = int(datetime(2026, 8, 24, 1, 5, tzinfo=timezone.utc).timestamp() * 1000)
+        health["item_list"][0]["text_item"]["text"] = "我昨晚没睡好"
+        second_ingress.queue.put_nowait({"ret": 0, "msgs": [health], "get_updates_buf": "cursor-approved-by-core"})
+        await _wait(lambda: len(rpc.turns) > 0 and len(delivery.attempts) == 1
+                    and "cursor-approved-by-core" in second_ingress.acknowledged)
+        committed = rpc.turns[-1]
+        approved = rpc.operations.dispatch("managed-read", _read("health-entry-native-cursor"))["native_cursor"]
+        assert approved == "cursor-approved-by-core"
+        effects = copy.deepcopy(delivery.effects)
+        await second.disconnect()
+        adapters.remove(second)
+        third_ingress = _Ingress()
+        third = create(third_ingress)
+        assert await third.connect(is_reconnect=True)
+        await _wait(lambda: len(third_ingress.cursors) > 0)
+        assert third_ingress.cursors[0] == approved
+        before = len(rpc.turns)
+        before_bridge = len(delivery.calls)
+        third_ingress.queue.put_nowait({"ret": 0, "msgs": [copy.deepcopy(health)], "get_updates_buf": approved})
+        await _wait(lambda: len(rpc.turns) > before and len(delivery.calls) > before_bridge)
+        assert rpc.turns[-1]["record_id"] == committed["record_id"]
+        assert rpc.turns[-1]["transition_id"] == committed["transition_id"]
+        assert delivery.effects == effects
+        assert len(delivery.attempts) == 1  # retained unknown is read, never sent again
+    finally:
+        for adapter in reversed(adapters): await adapter.disconnect()
+        fixture.tearDown()
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--pinned-gate":
