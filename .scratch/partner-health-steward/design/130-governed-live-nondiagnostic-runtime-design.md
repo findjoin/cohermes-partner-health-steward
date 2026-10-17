@@ -20,7 +20,7 @@ intake不能通过更换source/causal ID绕过旧单效果限制。只在原effe
 
 ## intake 的有限语义和后续真实七Skill
 
-新增纯typed `NonDiagnosticIntakeCandidate`，schema根字段精确为`operation/facts/question`。operation固定`record/question/mixed/clarify`；facts最多8项，每项精确`start/end/quote/topic_ref/time_start/time_end`；question为null或精确`start/end/quote`。offset按Python Unicode code-point索引，Core从原admitted body重新切片验证quote完全相同、范围合法、非空且不交叉；fact span必须覆盖确定性分句的完整陈述（含否定/条件/时间限定），不能截取“没有失眠”中的“失眠”或从“是不是糖尿病”取疾病词作事实；疑问/祈使诊断语句只进入question/clarify。分句/疑问guard是来源防升级验证，不能代替模型intake并称NL抽取。模型不能给出改写、证据ID、draft/record/proof ID、诊断、药物建议或自由最终答复。topic_ref为null或现有PORTRAIT_TOPIC_REFS的45项；它只是归档建议，不是医学结论。
+新增纯typed `NonDiagnosticIntakeCandidate`，schema根字段精确为`operation/facts/question`。operation固定`record/question/mixed/clarify`；facts最多8项，每项精确`start/end/quote/topic_ref/time_start/time_end`；time_start/time_end为同一事实内原文时间片段的成对offset，未提供时两者均null；question为null或精确`start/end/quote`。record要求非空facts且question为null，question要求facts为空且question非null，mixed要求两者均非空，clarify只允许空facts及原question/null，矛盾组合拒绝。offset按Python Unicode code-point索引，Core从原admitted body重新切片验证quote完全相同、范围合法、非空且不交叉；fact span必须覆盖确定性分句的完整陈述（含否定/条件/时间限定），不能截取“没有失眠”中的“失眠”或从“是不是糖尿病”取疾病词作事实；疑问/祈使诊断语句只进入question/clarify。分句/疑问guard是来源防升级验证，不能代替模型intake并称NL抽取。模型不能给出改写、证据ID、draft/record/proof ID、诊断、药物建议或自由最终答复。topic_ref为null或现有PORTRAIT_TOPIC_REFS的45项；它只是归档建议，不是医学结论。
 
 时间只从time_start/time_end指向的原文和原protocol timestamp/主人时区按固定可重算规则解析：明确ISO日期以及今天/昨天/昨晚/今早/今晚；不能可靠重算时固定unknown，不接受模型自由日期。原文未提供的次数、时长、原因、趋势、测量方法和可靠性都保持unknown。数值句在本票仅作主人陈述，不自动升级为verified measurement、BMI/full或clinical conclusion。
 
@@ -34,32 +34,52 @@ answer沿原NonDiagnosticCandidate/current owner-card与governed KnowledgeReleas
 
 新增纯typed `GovernedNonDiagnosticRuntime(intake_llm, answer_llm, measurement_strategy, *, bundle, attestor, clock=None)`；两LLM必须为真实StrictHealthLLM，profile为相同concrete NonDiagnosticOperationalBudget，策略为同budget的真实NonDiagnosticBudgetInputMeasurementStrategy，bundle/attestor分别是同release实际DailySkillBundle/DailySkillAttestor。该类内部从Core已验证candidate构造纯executor和真实DailySkillRuntime，不能接受任意DailySkillRuntime.callback再改名为生产executor。构造重验两个schema、route和strategy，不接受可替换HTTP callback/任意executor作为生产批准。approved claims/templates、知识release和当前owner设置沿现Core依赖装配，不另建资源truth。
 
-`LiveHealthRuntime(..., governed_nondiagnostic_runtime=None)`显式装配该纯运行时。Core不持模型凭据/HTTP adapter。Hermes Plugin进程装配`LiveNonDiagnosticModelBridge(core_port, adapter)`，adapter为已绑定同budget/strategy的真实ProductionModelAdapter；网络替身只能在125现有transport边界。公开`async advance_source(source_causal_id) -> dict`只驱动Core指定的下一固定阶段，不决定另起source或第三次调用。
+`LiveHealthRuntime(..., governed_nondiagnostic_runtime=None)`显式装配该纯运行时。Core不持模型凭据/HTTP adapter。公开Module固定为`partner_health_steward.governed_nondiagnostic`（纯typed候选/运行时）和`partner_health_steward.live_nondiagnostic`（Plugin短RPC/model Bridge）。Hermes Plugin进程装配`LiveNonDiagnosticModelBridge(core_port, adapter)`，adapter为已绑定同budget/strategy的真实ProductionModelAdapter；网络替身只能在125现有transport边界。公开`async advance_source(source_causal_id) -> dict`只驱动Core指定的下一固定阶段，不决定另起source或第三次调用。
 
-Core必经公开短方法为：
+`create_live_nondiagnostic_model_bridge(core_port, *, route, budget, credential_provider)`是唯一生产模型factory：重建真实FirstHopRoute/NonDiagnosticOperationalBudget和同budget的真实measurement strategy，以`BoundResponsesTransport(route, credential_provider=...)`构造125 ProductionModelAdapter，再构造Bridge；不接受executor、任意HTTP callback、caller模型结果或任意schema factory。Live Adapter的受信Python组合配置`extra.nondiagnostic_model_binding`精确为`{route, budget, credential_provider}`，前二项为原wire，credential_provider为当前已批准Hermes profile的短寿命取密钥能力，只能由受信启动组合注入，不是JSON/native消息可提供的callback。实际registry factory存在该配置时调用上述公开factory并显式选择governed receive/wake；缺少任一依赖、route与budget不符或Core未装配该runtime时失败关闭，不退回旧typed/synthetic executor或普通Session。密钥能力不进入Core、wire、发布物或日志；128负责把实际profile资源绑定到该已有能力，不能借别的profile/default环境补配置。
+
+真实入站Facade固定为`HealthPlugin.receive_governed_weixin(message: RawWeixinMessage, *, peer_id) -> dict`，经同原admission/safety/coarse/init；enabled来源的上述闭集主人命令先派发到Core有限owner入口，其余健康/混合源只held供本票两阶段推进。普通source仍须原coarse明确非健康证明，不能因模型/分片失败转普通。Core必经公开短方法为：
 
 - `prepare_nondiagnostic_stage(source_causal_id, stage) -> {stage, state, request, effect_intent}`；request为canonical StrictModelRequest wire或null，effect_intent为真实typed EffectIntent或null。intake必须原源仍held且无已完成intake；answer必须同源evidence-finalized且intake结果已被本Core验证并提交使用。重复、错阶段或当前批准失效返回无新intent。
 - `start_nondiagnostic_stage(source_causal_id, stage, grant) -> {stage, state, request, attempt_ref}`；Core重验真实typed grant、当前head/fence/route/budget/schema与exact request，先持久原ExecutingEffect.model_attempt_started，再返回一次性attempt引用和request。它不执行网络，不持Core lock等待Plugin。
 - `complete_nondiagnostic_stage(source_causal_id, stage, grant, attempt_ref, result: ModelTransportResult) -> {stage, state, reason_code}`；Core规范重验完整结果，自己调用StrictHealthLLM.resolve_transport_result生成report，绑定原grant/request/source/stage并经原effect.result终态/lease释放。不能接受Plugin提供ModelEffectReport、candidate digest或“成功”布尔值代替完整结果。
+- `abort_nondiagnostic_stage(source_causal_id, stage, grant, attempt_ref, *, reason_code) -> {stage, state, reason_code}`；只承接下节闭集传输/adapter异常观察，未start不伪造attempt，已start无完整结果沿原unknown；已有完整terminal不可覆盖。
 - `advance_governed_source(source_causal_id) -> {response, next_stage, model_use_disclosure}`；只用本Core已经观察的候选推进原typed日常阶段/唯一提交，返回原Response wire及intake/answer/null。最终response沿原turn_result，可交126受控投递，不直接网络send。
 - `nondiagnostic_source_status(source_causal_id) -> {source_causal_id, next_stage, state, reason_code, model_use_disclosure}`；投影无健康正文/凭据，不能补造候选或report。
 
 公开短方法返回state闭集为`ready/attempted/completed/failed-closed/unknown/owner-decision-required/finalized`，只是原source/effect/daily事实的投影，不新增持久状态机。attempt_ref来自原effect/lease的单次关联，不是第二个批准、重试令牌或跨服务私有session ledger。
 
-## 同三kind的精确CorePort候选
+## 同三kind的精确CorePort与有限分片候选
 
-interface沿`health-entry-v1`；未知op/field拒绝。command/controlled-effect仍`{interface,operation,payload}`，managed-read仍`{interface,projection,payload}`。同ProductionCoreService原_effect_sessions保存真正typed grant/capability；Plugin只接有界metadata。
+interface沿`health-entry-v1`；未知op/field拒绝。command/controlled-effect仍`{interface,operation,payload}`，managed-read仍`{interface,projection,payload}`。同ProductionCoreService原_effect_sessions保存真正typed intent/grant/capability。上节Core进程内短方法仍处理完整StrictModelRequest/ModelTransportResult；下列wire只解决跨进程有限传输，不能把chunk、caller digest或buffer当candidate/report权威。
 
-| kind / op | payload | 返回payload |
+旧118/123单frame的65536-byte上限不变。131最终HTTP请求65536-byte预算与StrictModelRequest.to_wire大小是不同量；已纯内存复现合法HTTP body 1527 bytes而request wire 67067 bytes、合法ModelTransportResult wire 66004 bytes，所以不能在prepare/start直接回full request、在complete直接塞full result，或靠2048 output tokens猜测帧一定够。固定两种模型传输内容，仅为canonical UTF-8 JSON的原StrictModelRequest.to_wire和原ModelTransportResult.to_wire：JSON参数为ensure_ascii=False/sort_keys=True/separators=(",",":")/allow_nan=False，解析拒绝重复键、尾随内容及非canonical字节。
+
+每份完整传输上限固定8388608 bytes（8 MiB），原始bytes每片固定32768 bytes，只有末片可更短。切片按bytes，允许在UTF-8多字节字符中间切开；单片仅严格base64解码，不独立UTF-8/JSON解析，拼齐后才进行完整解码。request/result方向各自固定，在该grant下不能互换，即使digest相同也不跨用途拼接。descriptor/receipt精确为`{size_bytes,digest,chunk_count}`；digest为全部canonical bytes的`sha256:<64hex>`，chunk_count为ceil(size_bytes/32768)，范围1..256。所有片之外的完整CorePort envelope元数据（把bytes_b64置为空串后）最多16384 canonical bytes，实际完整frame仍须先编码确认不超过65536 bytes；不放宽旧framing。若request本体、descriptor或该grant所需控制元数据不合上限，start前失败关闭，模型attempt=0。8 MiB不是新HTTP预算：125原4 MiB raw-terminal限制、原字符串上限和完整typed转换仍成立；本票验证该125边界合法结果规范化后的上界，不通过接受更大raw响应绕过。
+
+同一grant只允许一份request传输和一份result传输，分别固定从index=0按next-index顺序递增；最后next_index为null。grant沿原`session_id/lease_id/effect_id/intent_digest/generation/writer_fence`，每步必须与同source/stage的原typed session逐字段相符；不存在独立transfer ID、上传token、可续传任务或新批准。错序、重复片、metadata变化、非法base64、长度不符或错digest均拒绝并关闭该传输，不能覆盖旧片、跨grant拼接或用另一source/stage完成。一次request读片响应丢失可使本次关闭，但不会产生模型attempt；start之后传输不完整则保持原attempt未知冻结，不能自动重调模型。
+
+| kind / op | 精确payload | 精确返回payload |
 |---|---|---|
 |command `governed-receive`|`{message}`，同现RawWeixinMessage wire|`{response,next_stage,model_use_disclosure}`；只准入/纯计算，不HTTP|
 |command `governed-advance`|`{source_causal_id}`|同advance_governed_source|
-|controlled-effect `nondiagnostic-prepare`|`{source_causal_id,stage}`|`{stage,state,request,intent,grant}`；原service exact intent/grant metadata或null|
-|controlled-effect `nondiagnostic-start`|`{source_causal_id,stage,grant}`|`{stage,state,request,attempt_ref}`|
-|controlled-effect `nondiagnostic-complete`|`{source_causal_id,stage,grant,attempt_ref,result}`，result为现完整ModelTransportResult wire|`{stage,state,reason_code}`|
-|managed-read `health-entry-nondiagnostic`|`{source_causal_id}`|同nondiagnostic_source_status|
+|controlled-effect `nondiagnostic-prepare`|`{source_causal_id,stage}`|`{stage,state,request_transfer,intent,grant}`；request_transfer为descriptor或null，intent/grant为原service metadata或null；不回full request|
+|controlled-effect `nondiagnostic-request-chunk`|`{source_causal_id,stage,grant,index}`|`{request_transfer,index,bytes_b64,next_index}`；仅该session下一片|
+|controlled-effect `nondiagnostic-start`|`{source_causal_id,stage,grant,request_receipt}`|`{stage,state,request_digest,attempt_ref}`；不回full request|
+|controlled-effect `nondiagnostic-result-chunk`|`{source_causal_id,stage,grant,attempt_ref,result_transfer,index,bytes_b64}`|`{stage,state,next_index}`；result_transfer为上述descriptor，首片建立有限短内存buffer|
+|controlled-effect `nondiagnostic-complete`|`{source_causal_id,stage,grant,attempt_ref,result_receipt}`|`{stage,state,reason_code}`；Service收齐并规范重验全部bytes后，才调用Core完整typed complete|
+|controlled-effect `nondiagnostic-abort`|`{source_causal_id,stage,grant,attempt_ref,reason_code}`|`{stage,state,reason_code}`；attempt_ref为start前null或原start引用；reason_code仅`request-transfer-aborted/result-transfer-aborted/adapter-precall-unconfirmed`|
+|managed-read `health-entry-nondiagnostic`|`{source_causal_id}`|同nondiagnostic_source_status，无正文或分片|
 
-生产live receive选择已配置的governed路径；旧typed同步receive/executor仍供原冻结兼容，不作为生产NL授权后门。Bridge流程为receive→prepare/claim→start持久attempt→离开Core调用125一次→complete完整terminal→advance；全程无Core/executor锁内网络、无反向RPC callback。Core按stage明确选用runtime中两个真实LLM及各自不同schema authority digest；不能继续只用一个_model_authority_digest或authority_for_digest四元组冒充intake配置。Core已有prepared/evidence/finalized事实均由相同Plugin/Core完成，不用测试port自报业务成功。actual registry和Publisher发布包必须证明整条组合可达。
+prepare在原service claim后产生唯一grant/descriptor；Service在首次输出前检查可安全传输。Plugin必须收齐request全部片，独立验证descriptor/规范bytes并以StrictModelRequest.from_wire重建exact request，才发送start和相同request_receipt。Service同时验证自己已按序交出全部片、该receipt等于原Core request；Core再查当前head/fence/route/schema/budget并持久model_attempt_started。start成功才可在Core之外`await asyncio.to_thread(ProductionModelAdapter.execute, adapter, exact_request_wire)`一次；不在Core/executor/socket锁内网络，不反向RPC callback。start响应丢失时不执行模型，原持久attempt仍按未知收口，不重start。
+
+Plugin对每个实际返回的ModelTransportResult使用类级canonical_copy/to_wire保留全部字段及completed/incomplete/failed/unknown事实，分片传完后发送complete；不能截断structured_output、只传digest/report或把已观察completed改成unknown。Service拼齐后验证总长/SHA256/canonical codec，完整typed result才交Core纯resolve生成report并写原journal。任何已观察完整terminal都必须走这条路径；不得用旧generic-terminal跳过完整resolve。complete回复丢失只查同source状态及原terminal，不再次execute。若完整result违反已验证传输上界，属于关闭本次组合的实现/合同失败，保留已观察typed result到该短寿命结束并报告传输失败，禁止伪造替代ModelTransportResult或宣称模型未完成；不得据此放宽上限或重调。
+
+125.execute在transport.send之前还会重新preflight/measure；该段异常目前在其try之外。Core start后若这一步抛异常、Plugin未得到typed result，Bridge调用固定adapter-precall-unconfirmed abort，Core按已持久attempt而未观察完整结果的事实关闭原effect/lease并冻结；不能退款、宣称not-started或第二次send。abort不是Plugin自报模型report，不接受模型status/candidate字段；若Core已有完整terminal，abort只读回原事实，不能覆盖completed。request未start的abort只释放原claim与buffer并failed-closed，模型attempt仍为0。
+
+传输buffer只附着于同Service既有_effect_sessions/该stage的短寿命内存；请求本来就在Core内存，不另存持久正文，不新增transfer表、ledger或第四kind。每次RPC正常EOF只是一次短调用结束；真正peer进程退出、原lease到期、Service/Core关闭、explicit abort或任何校验失败都清理buffer。start后missing片/断开/重启沿原executing/terminal unknown恢复，不从digest补结果、不让Plugin缓存成为恢复权威。未知收口、失败或阶段完成及时释放buffer和其停止记录source的原transient持有，不能因为分片延长原lease。
+
+生产Live Adapter在上述配置存在时必须显式调用governed-receive；遇到held/next_stage时等待Bridge.advance_source，直到Core唯一finalized结果再交126，而不是继续要求receive立即有turn_result或回退ordinary。governed-wake返回的delivery_refs也须逐个交126 Bridge并读回handoff；不能只probe成功或忽略投递结果。原初始化/安全分支仍执行126既有准确业务引用。Core按stage选择两个真实LLM及各自不同schema authority digest，不能只用一个_model_authority_digest或authority_for_digest四元组冒充intake配置。actual registry和Publisher发布包必须证明整条组合可达。
 
 ## 重放、失败与正文寿命
 
@@ -77,18 +97,38 @@ intake成功后只有本Core验证过的candidate可以驱动证据提交；可�
 
 提醒时间按主人已设置时区解析当地日期时间，支持明确日期或今天/明天加时刻；缺日期/时刻、DST歧义或过时不猜，返回固定补问。`health-task-once`是主人明确请求的单次自有提醒：当前披露显示只向当前主人/当前Weixin route发送一次、固定目的/范围/期限和取消方式。Core从该原生显式命令生成现ExecutionScopeApproval与TaskCandidate，max_attempts=1、唯一当前接收方，不授权联系人或任意外部调用；自然语言intake本身不能生成该批准。重复native事件返回原task/approval，不新建第二任务。固定`command/governed-wake payload={}`由Core当前时钟推进现due任务并形成原outbox，返回`{delivery_refs,task_status}`；现调度/轮询实际调用它，126只投递Core返回的`owner-outbox`引用，不新建timer/后台队列或直接send。wake还按主人时区计算现LocalDayKey，实际接原DailyReviewEngine.prepare/commit以及现task claim/advance/solve；只处理当前due任务及当前当地日，复用completed review key/原outbox幂等，无补跑过期日、无模型第三阶段或新调度ledger。暂停/撤销/过期route或scope不投递，unknown维持原冻结。系统timer安装及运行target精确批准留128，但130必须交付可直接调用的真实当前wake。
 
-`command/governed-owner-command payload={source_causal_id}`只解析该源实际原文和上述闭集，返回`{response,delivery_refs}`；不接自由action/payload/context。删除仍复用原lifecycle的独立新事件确认、当前target/operation绑定、purge/terminal/通知，普通“删掉”模型候选不能触发删除。资料查看、导出、纠正均是本票必需项：查看走managed_rights_read_current及原ManagedObject当前版本/撤销边界；纠正走managed_correction_draft→原PendingCorrectionDraft/OwnerMutationRequest与Ticket112完整原子链，引用实际admitted纠正source，replacement只来自主人明确更正原文/已验证有限抽取，受影响判断先降级，不写替代事实到另一个store。一般问答不能暗变成纠正；资料查看/导出不调用模型。
+Core公开`governed_owner_command(source_causal_id) -> {response,delivery_refs}`及`governed_wake_current() -> {delivery_refs,task_status}`分别映射上述owner/wake wire，不接caller context、任意callback或测试用预执行结果。`command/governed-owner-command payload={source_causal_id}`只解析该源实际原文和上述闭集，返回`{response,delivery_refs}`；不接自由action/payload/context。删除仍复用原lifecycle的独立新事件确认、当前target/operation绑定、purge/terminal/通知，普通“删掉”模型候选不能触发删除。资料查看、导出、纠正均是本票必需项：查看走managed_rights_read_current及原ManagedObject当前版本/撤销边界；纠正走managed_correction_draft→原PendingCorrectionDraft/OwnerMutationRequest与Ticket112完整原子链，引用实际admitted纠正source，replacement只来自主人明确更正原文/已验证有限抽取，受影响判断先降级，不写替代事实到另一个store。一般问答不能暗变成纠正；资料查看/导出不调用模型。
 
-正式JSON导出走原managed_rights_export→ManagedExport.to_wire规范对象，保留snapshot/source_state/object版本/修订引用，不能让模型拼JSON或重新导入作为权威。Core生成canonical UTF-8 JSON，并以现认证加密纳入原server-exports受管registry；本地导出上限固定16384明文字节，超限明确“未导出，请选择更小资料范围”，不能静默截断、自动拆包或宣称文件完整。文件名由Core固定生成`health-export-<snapshot_digest>.json`，调用者不能选路径、扩展名或任意字节。删除/撤销清理包含全部受管副本，路径/token不进入普通Session、模型或日志。
+正式JSON导出走原managed_rights_export→ManagedExport.to_wire规范对象，保留snapshot/source_state/object版本/修订引用，不能让模型拼JSON或重新导入作为权威。Core生成canonical UTF-8 JSON，以现认证加密纳入同一store的原rights受管registry，标记server-export副本并由原lifecycle purge覆盖；当前纯ManagedExport还没有附件字节存取接缝，这是本票必需的有限增量，不能把现纯对象或opaque引用当文件已交付。不另开export DB或通用文件服务。固定上限8388608明文字节（8 MiB），超限明确“未导出，请选择更小资料范围”，不能静默截断、自动拆包或宣称文件完整。文件名固定为`health-export-<64hex>.json`（canonical文件SHA256去掉sha256:前缀），不接受调用者路径、文件名、扩展名或任意字节。导出对象与其原owner命令回执/outbox绑定同成同败；重投同native source只引用原snapshot和原效果，不能重新生成一个文件并补发。资料查看返回当前真实受管对象；单次文本不能完整表示请求内容时明确请缩小范围或导出，不把截断预览称完整资料。
 
-主人必须实际能取得JSON附件，opaque工件引用或分页预览不算完成。130增加唯一`export-artifact` purpose，复用同Weixin provider/原owner outbox/effect/lease/registry，不改变126现有文本purpose或另开HTTP服务。只有真实admitted主人明确“导出资料”命令授权该exact snapshot；Core批准文件名、字节digest/大小、当前owner/account/route及同effect单attempt。Plugin只在authorize后通过同一CorePort的受管短寿命读取取得该exact字节（上限兼容现64KiB帧，可用base64作为wire表示），只在内存中交固定附件transport；Core不网络，Plugin不使用任意文件路径，也不把复制的JSON落非受管明文缓存。
+### 唯一附件公开API与Core授权
 
-初步pinned只读证据为gateway/platforms/weixin.py的_get_upload_url(549)、AES128 ECB bytes加密helper(209)、_upload_ciphertext(581)及原sendmessage _api_post(399)；原高层_send_file会Path.read_bytes，生产不复用其高层自动重试/文件路径。附件只走固定media-file ticket→单次CDN密文上传→单次原owner文件消息，不因ticket/upload成功就当文件已发送。各物理步骤都属于原一个effect attempt；部分上传、超时、响应丢失或最后发送未确认都按unknown冻结，零自动重试/第二sender。
+主人必须实际能取得JSON附件，opaque工件引用或分页预览不算完成。唯一新增purpose为`export-artifact`，复用同Weixin provider/原owner outbox/effect/lease/registry。Core由真实admitted明确“导出资料”source形成精确snapshot及原`owner-outbox`引用；只有该显式命令授权当前owner/account/route的该exact artifact单次发送，不授权联系人、后续变更快照或任意外部存储。模型无权签发导出批准。
 
-授权wire可在130既有controlled-effect固定增加`export-artifact-prepare/start/read/complete`闭集：输入只为Core snapshot/effect/grant引用，read只返回已批准filename/size/digest/bytes_b64，complete沿完整原transport观察，不接受caller新路径/URL/正文。精确公开factory/API和允许provider/CDN源须以网络作者对固定pinned底层的剩余characterization完成后在本唯一候选收口；任何dynamic upload URL只能来自该provider ticket且通过固定HTTPS origin allowlist，禁止redirect/envproxy/任意URL。独立verifier须实际走纯bytes加密/低层upload/file-send的网络边界替身及同Core授权，不能只断言文件存在或只测文本路径。该附件交付是本票原导出权利的必要增量，不重开126的已冻结文本门。
+不新设export prepare/start/complete协议：沿126 `delivery-bind(owner-outbox)`→`delivery-prepare`→首次`delivery-authorize`→固定受管读片→再次`delivery-authorize`→发送→`delivery-complete`和原OwnerDeliveryTransportResult三字段wire。首次authorize为同一次原effect持久attempt并允许读取；第二次只是发送前的currentness复核，不新建或追加attempt，不开放126文本purpose重复authorize/重发。原authorization外层字段不变，recipient_role必须owner，purpose为export-artifact，send_intent仍为原OwnerDeliverySendIntent，payload精确为`{artifact_ref,filename,size_bytes,digest}`；artifact_ref是Core受管引用而非路径，digest为canonical文件bytes SHA256，payload_digest仍为该最小metadata payload的canonical digest。Core独立核验原outbox/send_intent digest、批准的文件metadata、选中对象版本/撤销边界、当前head/fence/owner/account/route及原lease；不能拿caller digest证明文件。普通业务CAS造成整体state变化不自动重造快照，选中对象若已更正/撤销则拒绝旧文件。
+
+唯一新增`controlled-effect / export-artifact-read`，payload精确`{intent_id,grant,index}`，返回精确`{artifact}`；artifact为null或`{artifact_ref,filename,size_bytes,digest,chunk_count,index,bytes_b64,next_index}`。对应Core公开`read_live_export_artifact(intent_id, grant, index) -> {artifact}`（进程内本片字段为bytes，由Service编码为bytes_b64）。size_bytes/digest指全部canonical文件，chunk_count/bytes片长/严格next-index/byte上限沿上节同一固定slice helper；这是export方向，不是模型result传输，错purpose/grant不能混片。不增加另一套ledger、generic文件读取或任意URL能力。
+
+Service从同原_effect_sessions取真正typed grant；Core确认该exact export已首次authorize并持久原attempt，逐片重查当前批准、head/fence、对象版本/撤销和route，才能解密原受管bytes。在此之前、错grant、wrong purpose或读片顺序不符均返回null并关闭该传输。每attempt从0到末片只读取一次，每次完整envelope仍先量化受原65536-byte上限；metadata超界在首次authorize前失败关闭。Service只在这个export session的短内存保留解密副本/next-index，不写明文缓存、每片receipt或新表；读片丢失/失序不得重读/重新生成文件/自动send，原attempt按unknown收口。
+
+`LiveWeixinDeliveryBridge(core_port, wire_adapter_factory, *, clock, export_wire_adapter_factory=None)`只增加这一可选factory，旧126文本factory及purpose不变。Bridge在首次export授权后按序读完，拼全并独立重验Core固定filename/size/digest/bytes；随后对同intent/grant再次调用原delivery-authorize。Core必须证明Service已完整交出该exact文件并重验当前head/fence/批准/route与未撤销对象，返回同原execution及exact metadata；当前性失效或无法证明时不构造网络adapter，不把先前授权继续当可用。仅完整读取且第二次authorize成功，Bridge才调用`export_wire_adapter_factory(authorization, plaintext_bytes)`构造单次adapter；不调用文本factory、不生成caption。缺factory、读回不确定或复核拒绝均不网络、不补发，原attempt保留真实未知/失败投影。返回仍为126 status/source/handoff/投递列表，不能吞附件complete结果或凭CDN成功推进cursor。
+
+公开类固定为同`partner_health_steward.weixin_transport.PinnedWeixinExportArtifactAdapter(binding, authorization, artifact_bytes, *, token, context_token_provider, session_factory=None)`；实现同步`send(exact_send_intent, /) -> OwnerDeliveryTransportResult wire`。constructor持明确bytes，send检查与Core授权完全一致、filename无路径/换行、rawsize/digest相同且<=8388608，单次latch后只在自己的asyncio.run loop创建/关闭HTTP session；Bridge沿原asyncio.to_thread调用。生产autowire在当前已批准同WeixinTransportBinding/token/context资源上构造这一个export factory；不能另选账户、provider、profile或reader路径。HTTP替身只替session_factory边界，不能代替Core授权、受管字节读取或最终outbox。
+
+字节只在Core原解密短内存及Plugin本次拼装/加密内存中存在，不落非受管明文缓存/普通Session/模型/日志；每个effect session只允许一个export buffer，不借分片延长原lease，全部buffer最长沿原300秒执行lease。complete、unknown、读取/验证失败、撤销、删除、holder退出或Core关闭时立即清除；原registry的加密导出副本随rights purge清理。两种模型transfer和export共用纯byte-slice/长度/SHA256校验helper，彼此按purpose/source/grant强隔离；helper只做内存传输，不能增添第二业务真相。
+
+### 固定pinned媒体wire与网络边界
+
+固定源码为Hermes Git `3c27eb6234bf91b8ceee9e9071591b31e9b148cb`的`gateway/platforms/weixin.py`：原常量API为`https://ilinkai.weixin.qq.com`（91），CDN为`https://novac2c.cdn.weixin.qq.com/c2c`（92）；_get_upload_url(549)、AES128 ECB bytes helper(209)、_upload_ciphertext(581)与_api_post(399)可以全内存使用，文件wire见2144–2240/2298–2308。原高层_send_file会Path.read_bytes且无条件采用upload_full_url，不复用该高层路径、caption额外发送或native自动重试。
+
+新附件adapter只允许binding.base_url精确等于上述API origin；HTTP wrapper只接受`https://ilinkai.weixin.qq.com/ilink/bot/getuploadurl`和`https://ilinkai.weixin.qq.com/ilink/bot/sendmessage`，不改变126文本wrapper已冻结行为。CDN只允许HTTPS无端口/userinfo/fragment的`https://novac2c.cdn.weixin.qq.com/c2c/upload`，query精确为不重复的encrypted_query_param/filekey，filekey必须等于该attempt本地产生的值。优先用有效upload_param经pinned _cdn_upload_url构造；若仅返回upload_full_url，只有它与同固定origin/path/query/filekey验证全部匹配才可用；任何HTTP/其他host/额外参数/编码别名/redirect均拒绝。全部session trust_env=False、allow_redirects=False，token只交固定API，CDN只接密文，不带账户API token。不能接受caller URL或pinned较宽的七host/HTTP允许集合。
+
+一次原effect attempt固定顺序且每步最多一次：①_get_upload_url(media_type=3,to_user_id=Core主人,filekey=本次随机16bytes的32hex,rawsize=len(bytes),rawfilemd5=lowercase MD5仅协议字段,filesize=_aes_padded_size(rawsize),aeskey_hex=本次随机16bytes密钥的32hex)；已知非零ret/errcode拒绝，缺必要ticket也不上传。②_aes128_ecb_encrypt对本次bytes按pinned PKCS7加密，上传密文一次；8388608 raw上限对应最大8388624密文字节。③_upload_ciphertext一次POST只在HTTP200且有效x-encrypted-param时有CDN接受证据。④最后一次_api_post EP_SEND_MESSAGE，精确msg.from_user_id空串、to_user_id为Core主人、稳定client_id绑定原intent/attempt、message_type=2、message_state=2、item_list仅一个type=4 file_item；file_item.media精确encrypt_query_param/CDN返回、aes_key=base64(32 ASCII hex)、encrypt_type=1，file_name为Core固定名，len为rawsize十进制字符串，附当前同账户主人context_token。缺context token不tokenless补发，不发caption。
+
+getupload API15秒、CDN120秒沿pinned超时；HTTP失败、部分上传/响应丢失或最终发送未确认均按原effect unknown冻结，零自动重试/第二sender。只有最终文件sendmessage明确0码可记provider accepted，明确非0码记rejected，其他记unknown；ticket或CDN成功绝不等于文件已发送。OwnerDeliveryTransportResult仍仅status/result_ref/evidence_ref，不新增delivered/read/主人已下载。主人实际导出说明固定包含“平台接受文件不代表你已经下载；导出到微信后的文件由你保管，管家删除资料不能撤回微信或CDN副本”。该pinned版本无CDN删除/撤回或下载确认API；原lifecycle只能确认本产品受管副本清理，已经交给Weixin/CDN/主人取得的副本不得声称已远程删除，其无法证明项沿原remains_unproven披露，不伪造purge证据。
 
 ## 主人可见限制与验收输入
 
 组合根将131同一model_use_disclosure实际带入初始化显示和主人回复；record-only、failed-closed、known terminal和completed都不能移除“不提供共同上下文保证”。显示值取Core实际budget/报告，不接受Plugin自造较好说明；不把actual model/usage或配置240000写成保证。
 
-候选有限outcome是：真实NL抽取且逐字来源/否定/时间边界；同源最多两stage的正确授权与跨进程单attempt；Core纯resolve和原七Skill唯一提交；unknown/候选丢失不重调不ACK；当前approved claims/templates与45topic边界；真实主人任务/控制/权利入口及模型非批准；published registry/socket/真实125 transport边界组合与131可见声明。由独立verifier按现实mutation收敛门，不按内部字段或SQL做笛卡尔积。唯一design/独立contract/tests同checkpoint fresh Spec/Standards通过前不实现、不闭票。
+候选有限outcome是：真实NL抽取且逐字来源/否定/时间边界；同源最多两stage的正确授权与跨进程单attempt；64KiB内有限分片完整request/result且Core纯resolve/原七Skill唯一提交；unknown/候选丢失不重调不ACK；当前approved claims/templates与45topic边界；真实due/localday review、主人控制/权利和可取得的受管附件且模型非批准；published registry/socket/真实125 transport边界组合与131可见声明。由独立verifier按现实mutation收敛门，不按内部字段或SQL做笛卡尔积。唯一design/独立contract/tests同checkpoint fresh Spec/Standards通过前不实现、不闭票。
