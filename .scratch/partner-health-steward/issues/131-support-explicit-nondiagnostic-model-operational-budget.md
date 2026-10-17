@@ -31,3 +31,11 @@ Ticket 125 已于 `58453bf` 正式闭票（Evidence44／45，785 全量门与独
 唯一设计：[131-nondiagnostic-operational-budget-design.md](../design/131-nondiagnostic-operational-budget-design.md)。独立 verification authority 为 implementation_audit，独占合同与测试；正式有限门／预期红灯尚待其发布，不把缺 Module 的预期红写成实现失败或通过。
 
 当前旧严格 CapabilityProfile／request／strategy 不支持诚实的仅字节预算；同一最终 wire builder、单次 transport、raw decoder、Core exact intent／grant／持久 attempt／report 可以复用。候选公开 ND budget 和 request codec 没有共同容量字段，使用固定 65536 bytes／2048 output、本次唯一 ND answer schema、公示与报告无保证声明，实际 diagnosis.prepare 源入口和诊断执行均拒绝该模式。产品范围和必要回归在唯一设计中，不改旧125冻结三件套或原测试。
+
+## Frozen implementation authority (2026-10-18)
+
+- Reviewed pre-code commit `e8da4159a469244f5098394bdc5672b596ebdda9`; tree `e93aed2b68eaec58e773d185efeab5c26143aa53`；fresh Spec PASS/Standards PASS，见 [Evidence46](../evidence/46-ticket131-precode-review-20261018.md)。
+- `.scratch/partner-health-steward/design/131-nondiagnostic-operational-budget-design.md` blob `30ce9bdf2b608b0036865e6016275ffc1ddf0ded`。
+- `.scratch/partner-health-steward/design/131-frozen-verification-contract.md` blob `2c7063b7c62cd3901ec0905ddcd46ecd2eac55d6`。
+- `tests/test_ticket131_nondiagnostic_budget.py` blob `8e77b3cac85bd8ea4c4f3fecb73b0af10161692e`。
+- 允许同一模型Module中的显式ND预算/固定schema/报告声明/真实诊断源门最小实现；产品作者不得改冻结三件套或自行闭票。4门及旧回归、全量/compile/diff/closure执行门之后才实施后审查。
