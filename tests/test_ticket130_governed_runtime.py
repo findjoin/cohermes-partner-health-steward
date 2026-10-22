@@ -627,6 +627,7 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
             self.assertFalse(core.owner_settings_state().proactive_support_paused)
             tasks = core.task_state().tasks
             self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].task_id, result["task_id"])
             approval = next(item for item in core.owner_settings_state().approvals if item.task_id == tasks[0].task_id)
             self.assertEqual(approval.max_attempts, 1)
             self.assertFalse(approval.revoked)
@@ -657,7 +658,10 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
             _initialize(fixture)
             result = self._run_child("task-cancel", fixture)
             self.assertEqual(result["model_calls"], 0)
-            self.assertEqual(fixture.service._core.task_state().tasks[0].primary_label, "cancelled")
+            tasks = fixture.service._core.task_state().tasks
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].task_id, result["task_id"])
+            self.assertEqual(tasks[0].primary_label, "cancelled")
             fixture.clock[0] += timedelta(minutes=3)
             wake = self._run_child("wake-cancelled", fixture)
             self.assertEqual(wake["task_sends"], 0)
@@ -1030,7 +1034,7 @@ async def _child(config):
                 token="synthetic-token", context_token_provider=lambda recipient: "synthetic-context"),
             clock=lambda: datetime.fromisoformat(config["now"]))
     native_times = {}
-    async def owner(text, identifier, *, allow_no_cursor=False, minute=5, cursor_override=None):
+    async def owner(text, identifier, *, allow_no_cursor=False, minute=5, cursor_override=None, current_cursor=None):
         before_sends = len(channel.sends)
         before_polls = len(channel.cursors)
         message = _native(config, identifier, text, minute=minute)
@@ -1041,8 +1045,9 @@ async def _child(config):
         channel.enqueue(cursor, message)
         if allow_no_cursor:
             return cursor, before_sends
-        await _wait(lambda: len(channel.cursors) >= before_polls + 2 and not channel.batches and cursor in channel.cursors)
-        assert _exchange(port, "managed-read", "health-entry-native-cursor")["native_cursor"] == cursor
+        expected_cursor = cursor if current_cursor is None else current_cursor
+        await _wait(lambda: len(channel.cursors) >= before_polls + 2 and not channel.batches and expected_cursor in channel.cursors)
+        assert _exchange(port, "managed-read", "health-entry-native-cursor")["native_cursor"] == expected_cursor
         return cursor, before_sends
     def ready():
         return _exchange(port, "managed-read", "health-entry-initialization")["initialization"]["phase"]
@@ -1150,6 +1155,13 @@ async def _child(config):
                 source = sources()[-1]
                 if gate.startswith("known-"):
                     await _wait(lambda: port.completed and any(_LIMIT in text for text in channel.texts()))
+                    notice = await _wait(lambda: next((value["payload"] for value in port.responses
+                        if value.get("status") == "accepted" and type(value.get("payload")) is dict
+                        and set(value["payload"]) == {"delivery", "source_causal_id", "handoff_complete"}
+                        and value["payload"]["source_causal_id"] == source
+                        and value["payload"]["handoff_complete"] is True), None))
+                    assert notice["delivery"]["source_causal_id"] == source
+                    assert notice["delivery"]["current_layer"] == "accepted" and notice["delivery"]["handoff_complete"] is True
                     assert len(models.calls) == 1 and "RAW_ERROR_MUST_NOT_ESCAPE" not in repr(channel.sends)
                 elif gate == "unknown":
                     await _wait(lambda: _exchange(port, "managed-read", "health-entry-nondiagnostic", {"source_causal_id": source})["state"] in {"unknown", "owner-decision-required"})
@@ -1252,12 +1264,24 @@ async def _child(config):
                 task_text = channel.texts()[-1]
                 assert "合成提醒喝水" in task_text and "一次" in task_text
                 assert any("取消" in text for text in channel.texts())
+                match = re.search(r"/health-task-cancel\s+(\S+)", task_text)
+                assert match, "task result must expose its actual cancellation command"
+                task_id = match.group(1)
+                task_source = sources()[-1]
+                original_refs = copy.deepcopy(latest_response()["delivery_refs"])
+                assert original_refs
                 if gate == "task-cancel":
-                    match = re.search(r"/health-task-cancel\s+(\S+)", task_text)
-                    assert match, "task result must expose its actual cancellation command"
                     await visible(match.group(0), "task-cancel", expected="取消")
                 before = len(channel.sends)
-                await owner(task_command, "task-once")
+                before_responses = len(port.responses)
+                current_cursor = _exchange(port, "managed-read", "health-entry-native-cursor")["native_cursor"]
+                await owner(task_command, "task-once", current_cursor=current_cursor)
+                replays = [value["payload"] for value in port.responses[before_responses:]
+                    if type(value.get("payload")) is dict and set(value["payload"]) == _STAGE_FIELDS]
+                assert len(replays) == 1 and replays[0]["response"]["causal_id"] == task_source
+                assert replays[0]["response"]["status"] in {"accepted", "replayed"}, replays
+                assert replays[0]["next_stage"] is None and replays[0]["delivery_refs"] == original_refs
+                assert _exchange(port, "managed-read", "health-entry-cursor-directive", {"source_causal_id": task_source})["directive"] is None
                 assert len(channel.sends) == before and not models.calls
                 foreign = _native(config, "foreign-owner-command", "/health-pause")
                 foreign["from_user_id"] = "not-the-owner"
@@ -1265,7 +1289,7 @@ async def _child(config):
                 channel.enqueue("cursor130:foreign-owner-command", foreign)
                 await _wait(lambda: not channel.batches and len(channel.cursors) >= polls + 2)
                 assert len(channel.sends) == before and not models.calls
-                result = {"model_calls": 0, "visible_results": True}
+                result = {"model_calls": 0, "visible_results": True, "task_id": task_id}
             elif gate in {"wake", "wake-cancelled"}:
                 before = len(channel.sends)
                 result_rpc = await adapter.wake_current()
