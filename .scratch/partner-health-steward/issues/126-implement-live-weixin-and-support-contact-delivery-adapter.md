@@ -1,7 +1,7 @@
 # 126 - 实现真实 Weixin 与支持联系人投递 Adapter
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md)
 Unblocks: [128 - 部署并完成主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -70,3 +70,9 @@ root独立持有`../design/126-frozen-verification-contract.md`与`../../../test
 ## Latest bounded verifier refreeze R6.1 (2026-10-18)
 
 [Evidence54末节](../evidence/54-ticket126-safety-independence-refreeze-20261018.md#r61保留一般unknown的局部pause样例修正)记录新owner unknown样例误沿用旧pause权限的实际假红；仅条件化pause，原两类paused correction、新类原safety.correct与不同来源负例均保留。当前唯一checkpoint `687961d8c0aca7b907e90b5fa8e7383a093e07f0` / tree `e9fd998710bdb9404139f1f6c901952ffc8c61fe` fresh双PASS，design `4a6ec81c94edab252936815cf0fc98925def3d0f`，contract `4cf76b06ba455ee6034d8a5cb961d431cefbd18b`，verifier `f971bb6a058945eeaab6daae5bebabda81d89c86`。取代R6对应项，允许仅原P2的Core窄修复；新全门/闭包及原finding双轴复核仍待完成，不能扩大owner unknown一般权限或闭票。
+
+## Answer
+
+root于2026-10-22核验归档并闭合本票。最终产品 `d86cb51223b7b9c31af7b30c9fd73036595aa6b4` / tree `f42edf12c12de85521cdef20a9ed060dc6951976`，冻结权威沿R6.1三件套未变；[Evidence55](../evidence/55-ticket126-final-execution-20261022.md)记录真实隔离正式126五门、131四门、124四门、794全量及root独立23门全绿，compile87、冻结15及runtime7464逐字不变；[Evidence56](../evidence/56-ticket126-final-review-and-closure-20261022.md)记录仅原安全独立P2的最终Spec/Standards均PASS，无阻塞finding。
+
+生产低层单次poll/send、真实native初始化来源绑定、Core exact outbox/grant发送、unknown精确cursor交接、同安全事实下两路独立和最小contact payload已经实现并验证。accepted不扩写送达／已读；重启unknown不重试。仅元数据闭票，不宣称真实部署、模型推理、微信外发或主人验收；130／128／127继续各自剩余范围，partner未触碰。
