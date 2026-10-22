@@ -1493,6 +1493,9 @@ class ProductionCoreService:
         try:
             if name == "nondiagnostic-request-chunk":
                 index = data["index"]
+                current = core.nondiagnostic_source_status(source)
+                if current["state"] != "ready":
+                    raise ValueError("request authority is no longer current")
                 if type(index) is not int or index != cached.request_next or cached.attempt_ref is not None:
                     raise ValueError("nondiagnostic request transfer closed")
                 descriptor = cached.request_descriptor
