@@ -174,6 +174,48 @@ class HealthPlugin:
         return encode_raw_response(response)
 
     def receive_weixin(self, message: RawWeixinMessage, *, peer_id: str) -> Response:
+        return self._receive_weixin(message, peer_id=peer_id)
+
+    def receive_governed_weixin(self, message: RawWeixinMessage, *, peer_id: str) -> dict:
+        response = self._receive_weixin(message, peer_id=peer_id, _governed=True)
+        source = response.causal_id
+        if response.reason_code == "governed-source-held" and response.status in {"accepted", "replayed"}:
+            return self._core.advance_governed_source(source)
+        disclosure = (None if source is None else
+                      self._core.nondiagnostic_source_status(source)["model_use_disclosure"])
+        return {"response": response.to_wire(), "next_stage": None,
+                "model_use_disclosure": disclosure, "delivery_refs": []}
+
+    def advance_governed_source(self, source_causal_id, *, peer_id):
+        self._trusted_governed_peer(peer_id)
+        return self._core.advance_governed_source(source_causal_id)
+
+    def nondiagnostic_source_status(self, source_causal_id, *, peer_id):
+        self._trusted_governed_peer(peer_id)
+        return self._core.nondiagnostic_source_status(source_causal_id)
+
+    def governed_owner_command(self, source_causal_id, *, peer_id):
+        self._trusted_governed_peer(peer_id)
+        return self._core.governed_owner_command(source_causal_id)
+
+    def governed_wake_current(self, *, peer_id):
+        self._trusted_governed_peer(peer_id)
+        return self._core.governed_wake_current()
+
+    @staticmethod
+    def _trusted_governed_peer(peer_id):
+        if type(peer_id) is not str or peer_id != "plugin":
+            raise ProtocolViolation("untrusted peer")
+
+    @staticmethod
+    def _governed_command_body(body):
+        text = body.strip()
+        return text.startswith("/health-") or any(text == alias or text.startswith(alias + " ") for alias in (
+            "帮助", "当前状态", "暂停主动联系", "恢复主动联系", "停止记录", "恢复记录",
+            "提醒我", "取消提醒", "查看资料", "导出资料", "纠正资料", "删除资料"))
+
+    def _receive_weixin(self, message: RawWeixinMessage, *, peer_id: str,
+                        _governed=False) -> Response:
         """Apply technical admission before a native adapter materializes text."""
 
         if type(peer_id) is not str or peer_id != "plugin":
@@ -366,12 +408,22 @@ class HealthPlugin:
                 if (
                     classification == "ordinary"
                     and envelope.requested_capability == "health-steward"
+                    and not (_governed and self._governed_command_body(envelope.body))
                 ):
                     return Response(
                         "accepted",
                         envelope.causal_id,
                         "ordinary-hermes-route",
                     )
+                if _governed:
+                    admitted = self.invoke(CommandEnvelope(
+                        peer="plugin", action="inbound.admit", source="health_weixin",
+                        causal_id=envelope.causal_id, generation=message.generation,
+                        scope=("inbound:admit",), payload=InboundAdmitPayload(envelope, policy)),
+                        peer_id=peer_id)
+                    if admitted.status not in {"accepted", "replayed"}:
+                        return admitted
+                    return Response(admitted.status, envelope.causal_id, "governed-source-held", admitted.meta)
                 try:
                     return self._run_daily_turn(
                         envelope,

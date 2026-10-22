@@ -19,7 +19,10 @@ import stat
 import struct
 import sys
 import threading
+import time
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -59,9 +62,61 @@ from .release_deployment import (
     _validate_ticket123_runtime_manifest,
 )
 from .storage import EncryptedStateStore, KeyUnavailable, StoreUnavailable
+from .bounded_transfer import (
+    MAX_METADATA_BYTES, canonical_bytes, decode_canonical, descriptor_for,
+    validate_descriptor, encode_chunk, decode_chunk, validate_bytes,
+)
+from .model_contract import StrictModelRequest, ModelTransportResult
 
 
 _MAX_FRAME_BYTES = 64 * 1024
+
+
+@dataclass
+class _TransientEffectSession:
+    """Ephemeral transfer ownership attached to the original typed grant."""
+
+    intent: EffectIntent
+    grant: EffectExecutionGrant
+    peer_pid: int
+    peer_start: str
+    created: float = field(default_factory=time.monotonic)
+    source: str | None = None
+    stage: str | None = None
+    request_bytes: bytes = b""
+    request_descriptor: dict | None = None
+    request_next: int = 0
+    attempt_ref: str | None = None
+    result_descriptor: dict | None = None
+    result_bytes: bytearray = field(default_factory=bytearray)
+    result_next: int = 0
+    completion: dict | None = None
+    export_id: str | None = None
+    export_metadata: dict | None = None
+    export_next: int = 0
+    export_read_complete: bool = False
+    export_revalidated: bool = False
+
+    def __iter__(self):
+        yield self.intent
+        yield self.grant
+
+    def clear(self):
+        self.request_bytes = b""
+        self.result_bytes.clear()
+        self.export_metadata = None
+
+
+def _process_start(pid):
+    if type(pid) is not int or pid < 1:
+        return None
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return None if fields[0] in {"Z", "X"} else fields[19]
+    except (OSError, IndexError):
+        return None
+
+
 _BINDING_FIELDS = frozenset(
     {
         "contract",
@@ -696,7 +751,8 @@ class ProductionCoreService:
         self._socket_identity: tuple[int, int] | None = None
         self._assets_current = False
         self._lifecycle_ready = False
-        self._effect_sessions: dict[str, tuple[EffectIntent, EffectExecutionGrant]] = {}
+        self._effect_sessions: dict[str, tuple[EffectIntent, EffectExecutionGrant] | _TransientEffectSession] = {}
+        self._request_peer_pid: int | None = None
 
     @staticmethod
     def _coerce_paths(value: object) -> HostPrivateFacilityPaths:
@@ -965,6 +1021,8 @@ class ProductionCoreService:
                 raise RuntimeError("production core service drain timed out")
         with self._lock:
             core, store = self._core, self._store
+            for session_id in tuple(self._effect_sessions):
+                self._drop_transient_session(session_id, abort=True)
             self._listener = None
             self._thread = None
             self._core = None
@@ -991,6 +1049,7 @@ class ProductionCoreService:
 
     def _serve(self) -> None:
         while not self._stop.is_set():
+            self._reap_transient_sessions()
             listener = self._listener
             if listener is None:
                 return
@@ -1006,9 +1065,12 @@ class ProductionCoreService:
                     _pid, peer_uid, _peer_gid = struct.unpack("3i", raw)
                     if peer_uid != self._binding["allowed_peer_uid"]:
                         continue
+                    self._request_peer_pid = _pid
                     self._handle_connection(connection)
                 except (OSError, ValueError, struct.error):
                     continue
+                finally:
+                    self._request_peer_pid = None
 
     @staticmethod
     def _receive(connection: socket.socket, size: int) -> bytes | None:
@@ -1044,6 +1106,23 @@ class ProductionCoreService:
         if response is None:
             return
         wire = _canonical(response)
+        if len(wire) > _MAX_FRAME_BYTES:
+            return
+        operation = request["payload"].get("operation")
+        if type(operation) is str and (operation.startswith("nondiagnostic-") or operation == "export-artifact-read"):
+            def metadata_only(value):
+                if type(value) is dict:
+                    return {k: "" if k == "bytes_b64" else metadata_only(v) for k, v in value.items()}
+                if type(value) is list:
+                    return [metadata_only(v) for v in value]
+                return value
+            if len(_canonical(metadata_only(response))) > MAX_METADATA_BYTES:
+                grant = request["payload"].get("payload", {}).get("grant")
+                if type(grant) is not dict:
+                    grant = response.get("payload", {}).get("grant")
+                if type(grant) is dict:
+                    self._drop_transient_session(grant.get("session_id"), abort=True)
+                return
         connection.sendall(struct.pack(">I", len(wire)) + wire)
 
     @staticmethod
@@ -1181,7 +1260,19 @@ class ProductionCoreService:
         if type(payload) is dict and payload.get("interface") == "health-entry-v1":
             if self._live_operations is None or not self._assets_current:
                 return None
-            return self._live_operations.dispatch("command", payload)
+            result = self._live_operations.dispatch("command", payload)
+            if payload.get("operation") in {"governed-advance", "governed-receive"}:
+                data = payload.get("payload", {})
+                source = data.get("source_causal_id")
+                if source is None and type(data.get("message")) is dict:
+                    source = data["message"].get("causal_id")
+                for session_id, cached in tuple(self._effect_sessions.items()):
+                    if (type(cached) is _TransientEffectSession and cached.source == source
+                            and cached.completion is not None):
+                        status = self._core.nondiagnostic_source_status(source)
+                        if status["state"] == "finalized" or status["next_stage"] not in {None, cached.stage}:
+                            self._drop_transient_session(session_id)
+            return result
         if type(payload) is not dict or set(payload) != {"interface", "command"} or payload.get("interface") != "command-v1":
             return None
         command = CommandEnvelope.from_wire(payload["command"])
@@ -1275,9 +1366,204 @@ class ProductionCoreService:
         candidates: list[EffectIntent] = []
         for effect_id in store.unresolved_effects():
             stored = store.effect(effect_id)
-            if stored is not None and stored.state == "intent" and type(stored.payload) is EffectIntent:
+            if (stored is not None and stored.state == "intent" and type(stored.payload) is EffectIntent
+                    and getattr(stored.payload, "model_stage", None) is None):
                 candidates.append(stored.payload)
         return candidates[0] if len(candidates) == 1 else None
+
+    def _new_transient_session(self, intent, grant, **values):
+        pid = self._request_peer_pid
+        identity = _process_start(pid)
+        if identity is None:
+            raise ValueError("effect peer lifecycle is unavailable")
+        return _TransientEffectSession(intent, grant, pid, identity, **values)
+
+    def _drop_transient_session(self, session_id, *, abort=False):
+        cached = self._effect_sessions.pop(session_id, None)
+        if type(cached) is not _TransientEffectSession:
+            return
+        core = self._core
+        try:
+            if abort and core is not None:
+                if cached.stage is not None:
+                    core.abort_nondiagnostic_stage(cached.source, cached.stage, cached.grant,
+                        cached.attempt_ref, reason_code=("result-transfer-aborted" if cached.attempt_ref
+                                                        else "request-transfer-aborted"))
+                elif cached.export_id is not None:
+                    core.complete_live_delivery(cached.export_id, cached.grant,
+                        OwnerDeliveryTransportResult("unknown", "effect-session-unconfirmed", "effect-session-unconfirmed"),
+                        observed_at_utc=datetime.now(timezone.utc).isoformat())
+        except (KeyUnavailable, StoreUnavailable, ProtocolViolation, ValueError, TypeError, OSError):
+            # A vanished/unprovable authority cannot be replaced by a cleanup
+            # assertion. Durable started effects retain their original unknown.
+            pass
+        finally:
+            cached.clear()
+
+    def _reap_transient_sessions(self):
+        for session_id, cached in tuple(self._effect_sessions.items()):
+            if type(cached) is _TransientEffectSession and (
+                    time.monotonic() - cached.created >= 300
+                    or _process_start(cached.peer_pid) != cached.peer_start):
+                self._drop_transient_session(session_id, abort=True)
+
+    def _transient_grant(self, value, *, source=None, stage=None):
+        if type(value) is not dict or type(value.get("session_id")) is not str:
+            return None, None
+        session_id = value["session_id"]
+        cached = self._effect_sessions.get(session_id)
+        if type(cached) is not _TransientEffectSession:
+            return session_id, None
+        if (value != self._grant_wire(session_id, cached.grant)
+                or cached.peer_pid != self._request_peer_pid
+                or _process_start(cached.peer_pid) != cached.peer_start
+                or time.monotonic() - cached.created >= 300
+                or source is not None and source != cached.source
+                or stage is not None and stage != cached.stage):
+            self._drop_transient_session(session_id, abort=True)
+            return session_id, None
+        return session_id, cached
+
+    @staticmethod
+    def _bounded_transfer_reply(payload):
+        metadata = dict(payload)
+        if "bytes_b64" in metadata:
+            metadata["bytes_b64"] = ""
+        if len(canonical_bytes(metadata)) > MAX_METADATA_BYTES or len(canonical_bytes(payload)) > _MAX_FRAME_BYTES - 256:
+            raise ValueError("bounded effect metadata exceeds frame limit")
+        return payload
+
+    def _live_nondiagnostic_effect(self, wire):
+        if (not self._assets_current or self._live_operations is None or self._core is None
+                or set(wire) != {"interface", "operation", "payload"}
+                or wire.get("interface") != "health-entry-v1" or type(wire.get("payload")) is not dict):
+            return None
+        fields = {
+            "nondiagnostic-prepare": {"source_causal_id", "stage"},
+            "nondiagnostic-request-chunk": {"source_causal_id", "stage", "grant", "index"},
+            "nondiagnostic-start": {"source_causal_id", "stage", "grant", "request_receipt"},
+            "nondiagnostic-result-chunk": {"source_causal_id", "stage", "grant", "attempt_ref", "result_transfer", "index", "bytes_b64"},
+            "nondiagnostic-complete": {"source_causal_id", "stage", "grant", "attempt_ref", "result_receipt"},
+            "nondiagnostic-abort": {"source_causal_id", "stage", "grant", "attempt_ref", "reason_code"},
+        }
+        name, data = wire["operation"], wire["payload"]
+        if name not in fields or set(data) != fields[name]:
+            return None
+        source, stage = data["source_causal_id"], data["stage"]
+        validate_opaque_text(source, "nondiagnostic source")
+        if stage not in {"intake", "answer"}:
+            return None
+        core = self._core
+        if name == "nondiagnostic-prepare":
+            prepared = core.prepare_nondiagnostic_stage(source, stage)
+            result = {"stage": stage, "state": prepared["state"],
+                      "request_transfer": None, "intent": None, "grant": None}
+            intent = prepared["effect_intent"]
+            if intent is None or prepared["request"] is None:
+                return result
+            # Duplicate prepare reads the same session; it cannot re-claim or
+            # create another transfer after a consumed request.
+            for sid, old in self._effect_sessions.items():
+                if type(old) is _TransientEffectSession and old.source == source and old.stage == stage:
+                    if old.peer_pid == self._request_peer_pid and old.request_next == 0 and old.attempt_ref is None:
+                        result.update(request_transfer=old.request_descriptor,
+                                      intent=self._intent_wire(old.intent), grant=self._grant_wire(sid, old.grant))
+                    return result
+            request = StrictModelRequest.from_wire(prepared["request"])
+            encoded = canonical_bytes(request.to_wire())
+            descriptor = descriptor_for(encoded)
+            grant = core.claim_effect_execution(intent)
+            if grant is None:
+                result["state"] = "failed-closed"
+                return result
+            session_id = "effect-session:" + uuid.uuid4().hex
+            cached = self._new_transient_session(intent, grant, source=source, stage=stage,
+                request_bytes=encoded, request_descriptor=descriptor)
+            self._effect_sessions[session_id] = cached
+            result.update(request_transfer=descriptor, intent=self._intent_wire(intent),
+                          grant=self._grant_wire(session_id, grant))
+            try:
+                return self._bounded_transfer_reply(result)
+            except (ValueError, TypeError):
+                self._drop_transient_session(session_id, abort=True)
+                raise
+        session_id, cached = self._transient_grant(data["grant"], source=source, stage=stage)
+        if cached is None:
+            return None
+        try:
+            if name == "nondiagnostic-request-chunk":
+                index = data["index"]
+                if type(index) is not int or index != cached.request_next or cached.attempt_ref is not None:
+                    raise ValueError("nondiagnostic request transfer closed")
+                descriptor = cached.request_descriptor
+                if descriptor is None:
+                    raise ValueError("nondiagnostic request unavailable")
+                encoded = encode_chunk(cached.request_bytes, index)
+                cached.request_next += 1
+                return self._bounded_transfer_reply({"request_transfer": descriptor, "index": index,
+                    "bytes_b64": encoded, "next_index": (None if cached.request_next == descriptor["chunk_count"] else cached.request_next)})
+            if name == "nondiagnostic-start":
+                descriptor = cached.request_descriptor
+                if (cached.attempt_ref is not None or descriptor is None
+                        or cached.request_next != descriptor["chunk_count"]
+                        or validate_descriptor(data["request_receipt"]) != descriptor):
+                    raise ValueError("request receipt is unconfirmed")
+                started = core.start_nondiagnostic_stage(source, stage, cached.grant)
+                if started["state"] == "attempted":
+                    if canonical_bytes(started["request"]) != cached.request_bytes:
+                        raise ValueError("started request changed")
+                    cached.attempt_ref = validate_opaque_text(started["attempt_ref"], "model attempt")
+                    request_digest = StrictModelRequest.from_wire(started["request"]).digest
+                else:
+                    request_digest = None
+                return {"stage": stage, "state": started["state"],
+                        "request_digest": request_digest, "attempt_ref": cached.attempt_ref}
+            if name == "nondiagnostic-abort":
+                if (data["attempt_ref"] != cached.attempt_ref or data["reason_code"] not in {
+                        "request-transfer-aborted", "result-transfer-aborted", "adapter-precall-unconfirmed"}):
+                    raise ValueError("invalid bounded abort")
+                result = core.abort_nondiagnostic_stage(source, stage, cached.grant,
+                    cached.attempt_ref, reason_code=data["reason_code"])
+                self._drop_transient_session(session_id)
+                return result
+            if cached.attempt_ref is None or data["attempt_ref"] != cached.attempt_ref:
+                raise ValueError("model attempt does not match")
+            if name == "nondiagnostic-result-chunk":
+                if cached.completion is not None:
+                    raise ValueError("model result transfer closed")
+                descriptor = validate_descriptor(data["result_transfer"])
+                index = data["index"]
+                if cached.result_descriptor is None:
+                    if index != 0:
+                        raise ValueError("result must start at zero")
+                    cached.result_descriptor = descriptor
+                if descriptor != cached.result_descriptor or type(index) is not int or index != cached.result_next:
+                    raise ValueError("model result transfer sequence mismatch")
+                chunk = decode_chunk(data["bytes_b64"], index=index, descriptor=descriptor)
+                cached.result_bytes.extend(chunk)
+                cached.result_next += 1
+                return {"stage": stage, "state": "attempted", "next_index":
+                        (None if cached.result_next == descriptor["chunk_count"] else cached.result_next)}
+            if name == "nondiagnostic-complete":
+                descriptor = validate_descriptor(data["result_receipt"])
+                if cached.completion is not None:
+                    if descriptor != cached.result_descriptor:
+                        raise ValueError("result receipt changed")
+                    return dict(cached.completion)
+                if descriptor != cached.result_descriptor or cached.result_next != descriptor["chunk_count"]:
+                    raise ValueError("model result is incomplete")
+                encoded = validate_bytes(bytes(cached.result_bytes), descriptor)
+                result = ModelTransportResult.from_wire(decode_canonical(encoded))
+                completed = core.complete_nondiagnostic_stage(source, stage, cached.grant,
+                    cached.attempt_ref, result)
+                cached.result_bytes.clear()
+                cached.request_bytes = b""
+                cached.completion = dict(completed)
+                return completed
+        except (ValueError, TypeError, ProtocolViolation, KeyUnavailable, StoreUnavailable):
+            self._drop_transient_session(session_id, abort=True)
+            return None
+        return None
 
     def _live_controlled_delivery(self, wire):
         if (not self._assets_current or self._live_operations is None or self._plugin is None
@@ -1287,7 +1573,8 @@ class ProductionCoreService:
         name, data = wire["operation"], wire["payload"]
         fields = {"delivery-prepare": {"intent_id", "attempted_at_utc"},
                   "delivery-authorize": {"intent_id", "grant", "attempted_at_utc"},
-                  "delivery-complete": {"intent_id", "grant", "result", "observed_at_utc"}}
+                  "delivery-complete": {"intent_id", "grant", "result", "observed_at_utc"},
+                  "export-artifact-read": {"intent_id", "grant", "index"}}
         if name not in fields or set(data) != fields[name]:
             return None
         plugin = self._plugin
@@ -1310,17 +1597,89 @@ class ProductionCoreService:
             return None
         intent, grant = cached
         if candidate != self._grant_wire(candidate["session_id"], grant):
+            if type(cached) is _TransientEffectSession:
+                self._drop_transient_session(candidate["session_id"], abort=True)
             return None
+        if type(cached) is _TransientEffectSession:
+            _, current = self._transient_grant(candidate)
+            if current is None or current.export_id != intent_id or current.stage is not None:
+                return None
+        if name == "export-artifact-read":
+            if type(cached) is not _TransientEffectSession or cached.export_metadata is None:
+                return {"artifact": None}
+            try:
+                index = data["index"]
+                if (type(index) is not int or index != cached.export_next
+                        or cached.export_read_complete):
+                    raise ValueError("export transfer is closed")
+                result = self._core.read_live_export_artifact(intent_id, grant, index)
+                artifact = result["artifact"]
+                if type(artifact) is not dict:
+                    raise ValueError("export currentness is unconfirmed")
+                metadata = {k: artifact[k] for k in ("artifact_ref", "filename", "size_bytes", "digest")}
+                descriptor = validate_descriptor({k: artifact[k] for k in ("size_bytes", "digest", "chunk_count")})
+                if metadata != cached.export_metadata or artifact["index"] != index:
+                    raise ValueError("export artifact changed")
+                raw = artifact["bytes"]
+                import base64
+                encoded = base64.b64encode(raw).decode("ascii")
+                decode_chunk(encoded, index=index, descriptor=descriptor)
+                expected_next = None if index + 1 == descriptor["chunk_count"] else index + 1
+                if artifact["next_index"] != expected_next:
+                    raise ValueError("export sequence changed")
+                wire = {k: artifact[k] for k in ("artifact_ref", "filename", "size_bytes", "digest", "chunk_count", "index", "next_index")}
+                wire["bytes_b64"] = encoded
+                self._bounded_transfer_reply(wire)
+                cached.export_next += 1
+                cached.export_read_complete = expected_next is None
+                return {"artifact": wire}
+            except (ValueError, TypeError, KeyError, StoreUnavailable, KeyUnavailable):
+                self._drop_transient_session(candidate["session_id"], abort=True)
+                return {"artifact": None}
         if name == "delivery-authorize":
+            if type(cached) is _TransientEffectSession and (not cached.export_read_complete or cached.export_revalidated):
+                self._drop_transient_session(candidate["session_id"], abort=True)
+                return {"delivery": plugin.live_delivery_status(intent_id, peer_id="plugin"), "authorization": None}
             authorization = plugin.authorize_live_delivery(intent_id, grant, attempted_at_utc=data["attempted_at_utc"], peer_id="plugin")
+            if type(authorization) is dict and authorization.get("purpose") == "export-artifact":
+                metadata = authorization.get("payload")
+                try:
+                    if type(metadata) is not dict or set(metadata) != {"artifact_ref", "filename", "size_bytes", "digest"}:
+                        raise ValueError("invalid export metadata")
+                    validate_descriptor({"size_bytes": metadata["size_bytes"], "digest": metadata["digest"],
+                        "chunk_count": (metadata["size_bytes"] + 32767) // 32768})
+                    self._bounded_transfer_reply(authorization)
+                    if type(cached) is _TransientEffectSession:
+                        if metadata != cached.export_metadata:
+                            raise ValueError("export authorization changed")
+                        cached.export_revalidated = True
+                    else:
+                        current = self._new_transient_session(intent, grant, export_id=intent_id,
+                            export_metadata=dict(metadata))
+                        self._effect_sessions[candidate["session_id"]] = current
+                except (ValueError, TypeError, KeyError):
+                    if type(cached) is not _TransientEffectSession:
+                        # Preserve the already durable attempted fact even if
+                        # this combination cannot hold its bounded payload.
+                        plugin.complete_live_delivery(intent_id, grant,
+                            OwnerDeliveryTransportResult("unknown", "export-transfer-unavailable", "export-transfer-unavailable"),
+                            observed_at_utc=data["attempted_at_utc"], peer_id="plugin")
+                        self._effect_sessions.pop(candidate["session_id"], None)
+                    else:
+                        self._drop_transient_session(candidate["session_id"], abort=True)
+                    authorization = None
             return {"delivery": plugin.live_delivery_status(intent_id, peer_id="plugin"), "authorization": authorization}
         observed = OwnerDeliveryTransportResult.from_wire(data["result"])
         result = plugin.complete_live_delivery(intent_id, grant, observed, observed_at_utc=data["observed_at_utc"], peer_id="plugin")
-        self._effect_sessions.pop(candidate["session_id"], None)
+        old = self._effect_sessions.pop(candidate["session_id"], None)
+        if type(old) is _TransientEffectSession:
+            old.clear()
         return result
 
     def _controlled_effect(self, payload: object) -> dict[str, object] | None:
         if type(payload) is dict and payload.get("interface") == "health-entry-v1":
+            if type(payload.get("operation")) is str and payload["operation"].startswith("nondiagnostic-"):
+                return self._live_nondiagnostic_effect(payload)
             return self._live_controlled_delivery(payload)
         if type(payload) is not dict or set(payload) != {"phase"} | ({"terminal"} if payload.get("phase") == "terminal" else set()):
             return None
@@ -1377,6 +1736,8 @@ class ProductionCoreService:
         cached = self._effect_sessions.get(session_id)
         if cached is None:
             return False
+        if type(cached) is _TransientEffectSession and cached.stage is not None:
+            return False  # Model terminals require full typed result resolution.
         intent, grant = cached
         expected = self._grant_wire(session_id, grant)
         if any(value.get(key) != expected[key] for key in expected):

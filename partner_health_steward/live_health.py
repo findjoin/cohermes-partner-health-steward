@@ -65,6 +65,9 @@ class LiveHealthCoreOperations:
 
     def _read(self, name, data):
         plugin = self._plugin
+        if name == "health-entry-nondiagnostic":
+            source = _mapping(data, {"source_causal_id"})["source_causal_id"]
+            return plugin.nondiagnostic_source_status(source, peer_id="plugin")
         if name == "health-entry-delivery":
             intent_id = _mapping(data, {"intent_id"})["intent_id"]
             return {"delivery": plugin.live_delivery_status(intent_id, peer_id="plugin")}
@@ -100,6 +103,17 @@ class LiveHealthCoreOperations:
 
     def _command(self, name, data):
         plugin = self._plugin
+        if name == "governed-receive":
+            wire = _mapping(_mapping(data, {"message"})["message"], _MESSAGE)
+            return plugin.receive_governed_weixin(RawWeixinMessage(**wire), peer_id="plugin")
+        if name in {"governed-advance", "governed-owner-command"}:
+            source = _mapping(data, {"source_causal_id"})["source_causal_id"]
+            if name == "governed-advance":
+                return plugin.advance_governed_source(source, peer_id="plugin")
+            return plugin.governed_owner_command(source, peer_id="plugin")
+        if name == "governed-wake":
+            _mapping(data, set())
+            return plugin.governed_wake_current(peer_id="plugin")
         if name == "delivery-bind":
             reference = _mapping(data, {"binding"})["binding"]
             return plugin.bind_live_delivery(reference, peer_id="plugin")
@@ -148,7 +162,14 @@ class LiveHealthRuntime:
     """Typed dependencies whose seven assets must belong to this release."""
 
     def __init__(self, admission_policy, health_init_runtime, coarse_router,
-                 daily_skill_runtime, *, asset_paths, core_options=None):
+                 daily_skill_runtime=None, *, asset_paths, core_options=None,
+                 governed_nondiagnostic_runtime=None):
+        governed = governed_nondiagnostic_runtime
+        if governed is not None:
+            from .governed_nondiagnostic import GovernedNonDiagnosticRuntime
+            if type(governed) is not GovernedNonDiagnosticRuntime or daily_skill_runtime is not None:
+                raise TypeError("invalid governed live runtime composition")
+            daily_skill_runtime = governed.daily_runtime
         if (type(admission_policy) is not AdmissionPolicy
                 or type(health_init_runtime) is not HealthInitRuntime
                 or type(coarse_router) is not CoarseMessageRouter
@@ -173,6 +194,7 @@ class LiveHealthRuntime:
         self._init = health_init_runtime
         self._router = coarse_router
         self._daily = daily_skill_runtime
+        self._governed = governed
         self._paths = paths
         self._options = dict(core_options)
 
@@ -206,7 +228,8 @@ class LiveHealthRuntime:
                 "health_init_verifier": self._init.verifier,
                 "health_init_asset": self._init.asset,
                 "daily_skill_verifier": self._daily.verifier,
-                "daily_skill_bundle": self._daily.bundle}
+                "daily_skill_bundle": self._daily.bundle,
+                **({} if self._governed is None else self._governed.core_dependencies())}
 
     def plugin(self, core):
         return HealthPlugin(core, admission_policy=self._policy,
