@@ -1414,7 +1414,8 @@ class ProductionCoreService:
         cached = self._effect_sessions.get(session_id)
         if type(cached) is not _TransientEffectSession:
             return session_id, None
-        if (value != self._grant_wire(session_id, cached.grant)
+        if (type(value.get("generation")) is not int
+                or value != self._grant_wire(session_id, cached.grant)
                 or cached.peer_pid != self._request_peer_pid
                 or _process_start(cached.peer_pid) != cached.peer_start
                 or time.monotonic() - cached.created >= 300
