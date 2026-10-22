@@ -113,6 +113,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         self._poll_lock = asyncio.Lock()
         self._rpc_lock = asyncio.Lock()
         self._connected_ingress = False
+        self._recovery_only = False
         self._last_reason = "health-entry-not-connected"
 
     async def _rpc(self, kind, payload):
@@ -148,6 +149,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         if self._running:
             return True
         try:
+            self._recovery_only = False
             for name in ("connect", "get_updates", "acknowledge_cursor", "disconnect"):
                 if not callable(getattr(self._ingress, name, None)):
                     raise _EntryUnavailable("health-entry-ingress-unavailable")
@@ -159,12 +161,28 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             # A healthy, uninitialized Core must receive the explicit init
             # request. Per-message preflight and Core consent still govern all
             # business writes, model work and controlled delivery.
-            if probe.get("state") != "healthy" or runtime.get("state") != "healthy":
+            healthy = probe.get("state") == "healthy" and runtime.get("state") == "healthy"
+            recovery = self._model_bridge is not None and all(
+                value.get("state") == "unknown"
+                and value.get("reason_code") == "effect-result-unknown"
+                and type(value.get("generation")) is int and value["generation"] > 0
+                and all(value.get(field) is False for field in (
+                    "health_writes_allowed", "model_effects_allowed", "outbound_effects_allowed"))
+                and value.get("content") is None
+                for value in (probe, runtime))
+            if not healthy and not recovery:
                 raise _EntryUnavailable("health-entry-core-unavailable")
             retained = await self._read("health-entry-native-cursor")
             if set(retained) != {"native_cursor"}:
                 raise _EntryUnavailable("health-entry-cursor-unconfirmed")
             self._cursor = _text(retained["native_cursor"], optional=True) or ""
+            if recovery:
+                # Existing unknown facts can hand off their one Core-bound
+                # limitation through short RPCs. No incoming body, wake work,
+                # or model attempt is admitted by this connection.
+                self._recovery_only = True
+                self._last_reason = "health-entry-recovery-only"
+                return True
             if await self._ingress.connect() is not True:
                 raise _EntryUnavailable("health-entry-ingress-unavailable")
             self._connected_ingress = True
@@ -184,6 +202,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
 
     async def disconnect(self):
         self._running = False
+        self._recovery_only = False
         task, self._poll_task = self._poll_task, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
@@ -214,7 +233,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
 
     async def poll_once(self):
         async with self._poll_lock:
-            if not self._running:
+            if not self._running or self._recovery_only:
                 return False
             batch = await self._ingress.get_updates(self._cursor)
             if not self._running:
@@ -516,7 +535,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                 "chat_id": chat_id}
 
     async def wake_current(self):
-        if not self._running:
+        if not self._running or self._recovery_only:
             return False
         try:
             if self._model_bridge is not None:
