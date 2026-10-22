@@ -45,3 +45,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.1 (2026-10-22)
 
 [Evidence58](../evidence/58-ticket130-unknown-time-refreeze-20261022.md)记录原时间enum样例的实际public roundtrip与fresh双轴PASS。唯一当前checkpoint `83448d732bdf9a9ec1e693f8ff5a6c043ca68a91` / tree `5a9b6c8e7ab4997320b7e44aa8d189353d73ae30`；设计 `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，合同 `7b07cea1e21d61d06c3dae65f7146210c945d189`、verifier `05557434802fb897b18eeb281989529d1817890e`取代R2对应项。仅原V02 unknown occurrence按旧known/uncertain合同期待uncertain，不扩产品enum或七门。其余Evidence57实施权限不变，最终执行和闭票仍待完成。
+
+## Narrow verifier refreeze R2.2 (2026-10-22)
+
+[Evidence59](../evidence/59-ticket130-wide-initialization-refreeze-20261022.md)记录真实隔离观察到wide positive漏初始化而正确被拒绝的局部假红，以及仅补既有public初始化的fresh双轴PASS。当前唯一checkpoint `87fb488291f13d935f89f6bed963546b1fe88670` / tree `e4cf0f73bf040dfb66e8ba60df4994e390b6b96c`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `518abde834452777d02885ba56d54e049c223db6`、verifier `774201899a2e70103e5bf400a712555056a192cf`取代R2.1对应项。七家族和产品初始化门禁不变。旧基线7个prereq失败及补初始化后的debug因果对照均不冒充当前正式门绿灯；完整最终source执行／闭票仍待完成。
