@@ -495,6 +495,7 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
     def test_v130_03_bounded_canonical_chunks_grant_isolation_currentness_and_no_core_network_lock(self):
         self._modules()
         with _service(wide=True) as fixture:
+            _initialize(fixture)
             result = self._run_child("chunks", fixture)
             self.assertGreater(result["request_size"], 65536)
             self.assertGreater(result["result_size"], 65536)
