@@ -49,3 +49,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.2 (2026-10-22)
 
 [Evidence59](../evidence/59-ticket130-wide-initialization-refreeze-20261022.md)记录真实隔离观察到wide positive漏初始化而正确被拒绝的局部假红，以及仅补既有public初始化的fresh双轴PASS。当前唯一checkpoint `87fb488291f13d935f89f6bed963546b1fe88670` / tree `e4cf0f73bf040dfb66e8ba60df4994e390b6b96c`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `518abde834452777d02885ba56d54e049c223db6`、verifier `774201899a2e70103e5bf400a712555056a192cf`取代R2.1对应项。七家族和产品初始化门禁不变。旧基线7个prereq失败及补初始化后的debug因果对照均不冒充当前正式门绿灯；完整最终source执行／闭票仍待完成。
+
+## Narrow verifier refreeze R2.3 (2026-10-22)
+
+[Evidence60](../evidence/60-ticket130-native-replay-refreeze-20261022.md)记录root与独立权威双复现的原native跨batchcursor alias兼容缺口，以及仅原V01有限补门的fresh双轴PASS。当前唯一checkpoint `7977d6c5563d8398b27f2377bfb9b71d05fa5bb3` / tree `99fa4c8914120e646c83d7e2f790cee912ecf79b`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `f8b82e354138961ae5d4cf227deaffa5653e0f33`、verifier `096792e578f98f0ef546c9c7d2e00376cf9a124e`取代R2.2对应项。只授权沿旧准入canonical source／原outbox恢复重投语义，不重建正文或形成新model/record/send；原七家族不变，完整执行与闭票仍待完成。
