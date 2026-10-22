@@ -53,3 +53,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.3 (2026-10-22)
 
 [Evidence60](../evidence/60-ticket130-native-replay-refreeze-20261022.md)记录root与独立权威双复现的原native跨batchcursor alias兼容缺口，以及仅原V01有限补门的fresh双轴PASS。当前唯一checkpoint `7977d6c5563d8398b27f2377bfb9b71d05fa5bb3` / tree `99fa4c8914120e646c83d7e2f790cee912ecf79b`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `f8b82e354138961ae5d4cf227deaffa5653e0f33`、verifier `096792e578f98f0ef546c9c7d2e00376cf9a124e`取代R2.2对应项。只授权沿旧准入canonical source／原outbox恢复重投语义，不重建正文或形成新model/record/send；原七家族不变，完整执行与闭票仍待完成。
+
+## Narrow verifier refreeze R2.4 (2026-10-22)
+
+[Evidence61](../evidence/61-ticket130-recovery-observation-refreeze-20261022.md)保留精确a71/R2.3正式七门6fail的真实结果，并记录原V04三处已独立实证的观察矛盾与fresh双轴PASS。当前唯一checkpoint `2d9da87194554bb31119d618ce8baaf2af3e5bc3` / tree `e14e7aae0a96185a6182794657be2f7b527f8300`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `1da035fa0994bb718184bd646292a24a57fa0aa7`、verifier `d4c943f5876720614cc5bd8088b22e0b661f0117`取代R2.3对应项。仅恢复家族的原Core正文拒绝／原Store零事实、已接受提示同refs零重发、fixture真实时间顺序观察修订；严格handoff及生产chrono未放宽，七家族不变。产品错误继续修复，完整最终执行与闭票仍待完成。
