@@ -41,3 +41,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Frozen implementation authority (2026-10-22)
 
 [Evidence57](../evidence/57-ticket130-precode-freeze-20261022.md)记录原V03/V06预审P2与已实证Gate07 fixture矛盾的独立R2修订，以及同一checkpoint的新鲜Spec／Standards PASS。当前唯一冻结checkpoint `813d7a77d3013bea2fe18708961efe2ae23de291` / tree `177bd5932689b989860d697adc6b64e374c722ab`；设计 `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`、合同 `c08f24c07fe7ba4dce0dd299db300834088b1f9a`、verifier `ba7aa63a04ce541f4463243eaba170e3850e527a`。root授权在此边界实施，产品作者不得改冻结门。7个prerequisite失败不代表内部路径已执行；真实外部动作／部署仍由128承接。前置126已按Evidence55/56闭合，794全量／root23是精确d86的历史结果，不冒充本票绿灯。完成仍须本票七门、受影响／全量／编译及18冻结完整性、实施后双轴与root闭票。
+
+## Narrow verifier refreeze R2.1 (2026-10-22)
+
+[Evidence58](../evidence/58-ticket130-unknown-time-refreeze-20261022.md)记录原时间enum样例的实际public roundtrip与fresh双轴PASS。唯一当前checkpoint `83448d732bdf9a9ec1e693f8ff5a6c043ca68a91` / tree `5a9b6c8e7ab4997320b7e44aa8d189353d73ae30`；设计 `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，合同 `7b07cea1e21d61d06c3dae65f7146210c945d189`、verifier `05557434802fb897b18eeb281989529d1817890e`取代R2对应项。仅原V02 unknown occurrence按旧known/uncertain合同期待uncertain，不扩产品enum或七门。其余Evidence57实施权限不变，最终执行和闭票仍待完成。
