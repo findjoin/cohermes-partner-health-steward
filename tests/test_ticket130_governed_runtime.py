@@ -14,9 +14,11 @@ import importlib.util
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -37,6 +39,7 @@ if __name__ == "__main__" and "--pinned-gate" in sys.argv:
     sys.modules["tests"] = tests
 
 from partner_health_steward.coordination import DailySkillBundle
+from partner_health_steward.authority import AuthorityValidationError
 from partner_health_steward.host_contract import _CorePortClient, _HostVerificationFailure
 from partner_health_steward.initialization import stable_digest, InitializationDisclosure, OwnerConsentEvidence
 from partner_health_steward.model_contract import ModelMessage, StrictHealthLLM, StrictModelRequest, ModelTransportResult
@@ -257,6 +260,34 @@ def _complete(fixture, source, stage, prepared, started, descriptor):
         "attempt_ref": started["attempt_ref"], "result_receipt": descriptor}))
 
 
+def _request_or_denial(port, kind, payload):
+    """A strict production client represents a refused frame as this exact EOF.
+
+    The older raw socket fixture returns None for the same wire observation.
+    Other failures remain test errors; no substitute successful reply is made.
+    """
+    try:
+        return port.request(kind, payload)
+    except _HostVerificationFailure as exc:
+        assert str(exc) == "core-frame-truncated", str(exc)
+        return None
+
+
+def _parent_barrier(config, event, **payload):
+    """Synthetic body-free fixture IPC, never a product receipt or authority."""
+    directory = Path(config["observer_directory"])
+    temporary = directory / "request.tmp"
+    temporary.write_bytes(_CANONICAL({"event": event, **payload}))
+    temporary.replace(directory / "request.json")
+    deadline = time.monotonic() + 12
+    while not (directory / "response.json").is_file():
+        assert time.monotonic() < deadline, "parent system-boundary observation timed out"
+        time.sleep(0.01)
+    observed = json.loads((directory / "response.json").read_bytes())
+    assert "error" not in observed, observed
+    return observed
+
+
 def _initialize(fixture):
     # Existing public consent/disclosure/commit/finalize; no direct active flag.
     request = replace(fixture.daily.initialization_request(), first_hop_route=fixture.budget.route.route_id)
@@ -322,17 +353,69 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                       "budget": fixture.budget.to_wire(), "route": fixture.budget.route.to_wire(),
                       "answer": fixture.candidate, "approved_reply": fixture.approved_reply,
                       "now": fixture.clock[0].isoformat()}
+            observer = home / "observer"
+            observer.mkdir()
+            config["observer_directory"] = str(observer)
             config_path = home / "offline-config.json"
             config_path.write_bytes(_CANONICAL(config)); config_path.chmod(0o600)
             env = {key: os.environ[key] for key in ("PATH", "LANG", "SYSTEMROOT") if key in os.environ}
             env.update(HERMES_HOME=str(home), HERMES_CONFIG=str(home / "config.yaml"), PYTHONDONTWRITEBYTECODE="1",
                        TICKET130_PINNED_SOURCE=str(pinned), TICKET130_PUBLISHED_PLUGIN=str(release_root / "plugin/health-weixin"),
                        TICKET126_HOST_RELEASE_DIGEST=host["release_digest"])
-            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--pinned-gate", str(config_path)],
-                                 cwd=home, env=env, capture_output=True, text=True, timeout=100)
+            stop, observer_errors = threading.Event(), []
+            def coordinate():
+                while not stop.wait(0.01):
+                    request_path = observer / "request.json"
+                    if not request_path.is_file():
+                        continue
+                    try:
+                        request = json.loads(request_path.read_bytes())
+                        if request == {"event": "head-unavailable-after-artifact-read"}:
+                            assert gate == "export" and data == {"mode": "unavailable-after-read"}
+                            # Replace only the already-declared external Dynamo
+                            # HTTP fixture after the final actual Core read.
+                            fixture.client.get_error = TimeoutError("offline current-head unavailable after export read")
+                            response = {"external_head_unavailable": True}
+                        else:
+                            assert gate == "delete" and set(request) == {"event", "operation_ref"}
+                            assert request["event"] == "observe-delete-terminal"
+                            deadline = time.monotonic() + 8
+                            while True:
+                                response = fixture.service._core.managed_lifecycle_read(request["operation_ref"])
+                                if response.get("phase") == "completed":
+                                    break
+                                assert time.monotonic() < deadline, response
+                                time.sleep(0.01)
+                    except BaseException as exc:
+                        observer_errors.append(exc)
+                        response = {"error": repr(exc)}
+                    temporary = observer / "response.tmp"
+                    temporary.write_bytes(_CANONICAL(response))
+                    temporary.replace(observer / "response.json")
+                    return
+            worker = threading.Thread(target=coordinate, daemon=True)
+            worker.start()
+            try:
+                run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--pinned-gate", str(config_path)],
+                                     cwd=home, env=env, capture_output=True, text=True, timeout=100)
+            finally:
+                stop.set()
+                worker.join(timeout=13)
+            self.assertFalse(worker.is_alive(), "fixture observer did not finish")
+            if observer_errors:
+                raise observer_errors[0]
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             self.assertIn("TICKET130-" + gate + "-PASS", run.stdout)
             return json.loads((home / "offline-result.json").read_text())
+
+    def _assert_start_denied(self, value):
+        if value is None:
+            return
+        self.assertEqual(value["status"], "accepted")
+        payload = value["payload"]
+        self.assertEqual(set(payload), {"stage", "state", "request_digest", "attempt_ref"})
+        self.assertIn(payload["state"], {"failed-closed", "not-started", "unavailable", "rejected"})
+        self.assertIsNone(payload["attempt_ref"])
 
     def test_v130_01_published_registry_socket_intake_evidence_answer_unique_commit_and_visible_limits(self):
         self._modules()
@@ -435,12 +518,25 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                 if mutation == "wrong-receipt":
                     request, receipt, _ = _request(fixture, "ticket130:slice", "intake", prepared)
                     receipt = dict(receipt, digest="sha256:" + "0" * 64)
-                    value = fixture.port.request("controlled-effect", _OPERATION("nondiagnostic-start", {
+                    value = _request_or_denial(fixture.port, "controlled-effect", _OPERATION("nondiagnostic-start", {
                         "source_causal_id": "ticket130:slice", "stage": "intake", "grant": prepared["grant"],
                         "request_receipt": receipt}))
+                    self._assert_start_denied(value)
                 else:
-                    value = fixture.port.request("controlled-effect", _OPERATION("nondiagnostic-request-chunk", payload))
-                self.assertTrue(value is None or value["payload"].get("state") != "attempted")
+                    value = _request_or_denial(fixture.port, "controlled-effect", _OPERATION("nondiagnostic-request-chunk", payload))
+                    # A successful slice has no state field. Require actual
+                    # wire refusal, so no health bytes can escape to the wrong
+                    # source/stage/index even when no attempt has started.
+                    self.assertIsNone(value, "invalid slice returned a payload or body bytes")
+                valid_slice = {"source_causal_id": "ticket130:slice", "stage": "intake",
+                               "grant": prepared["grant"], "index": 0}
+                self.assertIsNone(_request_or_denial(fixture.port, "controlled-effect", _OPERATION(
+                    "nondiagnostic-request-chunk", valid_slice)), "invalid transfer did not close its original grant")
+                # The original correct descriptor cannot revive a closed
+                # transfer, including after a fully read wrong-receipt case.
+                self._assert_start_denied(_request_or_denial(fixture.port, "controlled-effect", _OPERATION(
+                    "nondiagnostic-start", {"source_causal_id": "ticket130:slice", "stage": "intake",
+                        "grant": prepared["grant"], "request_receipt": prepared["request_transfer"]})))
                 self.assertIsNone(fixture.service._core.model_effect_report(prepared["intent"]["effect_id"]))
                 self.assertNotIn(_read(fixture, "ticket130:slice")["state"], {"attempted", "completed", "unknown"})
         with _service() as fixture:
@@ -448,10 +544,10 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
             prepared = _prepare(fixture, "ticket130:stale", "intake")
             _, receipt, _ = _request(fixture, "ticket130:stale", "intake", prepared)
             fixture.client.get_error = TimeoutError("offline current-head unavailable after prepare")
-            result = fixture.port.request("controlled-effect", _OPERATION("nondiagnostic-start", {
+            result = _request_or_denial(fixture.port, "controlled-effect", _OPERATION("nondiagnostic-start", {
                 "source_causal_id": "ticket130:stale", "stage": "intake", "grant": prepared["grant"],
                 "request_receipt": receipt}))
-            self.assertTrue(result is None or result["payload"].get("state") != "attempted")
+            self._assert_start_denied(result)
 
     def test_v130_04_started_unknown_completed_candidate_loss_and_terminal_recovery_never_recall(self):
         self._modules()
@@ -554,14 +650,63 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                     self.assertNotIn(private["sentinel"].encode(), path.read_bytes(), str(path))
         with _service() as fixture:
             _initialize(fixture)
+            self._run_child("seed", fixture)
+            core = fixture.service._core
+            before = core.managed_rights_read_current()
+            self.assertTrue(any(item.object_kind == "evidence_card" for item in before))
+            self.assertTrue(core.daily_state().evidence_cards)
+            self.assertFalse(fixture.head.read().head.terminal)
+            self.assertEqual(core.managed_lifecycle_read(None)["phase"], "idle")
+            replica_paths = tuple(Path(path) for path in fixture.binding["managed_replica_bindings"].values())
+            self.assertTrue(replica_paths and all(path.is_file() for path in replica_paths))
             outcome = self._run_child("delete", fixture)
-            self.assertTrue(outcome["independent_confirm"])
             self.assertEqual(outcome["model_calls"], 0)
-            self.assertTrue(outcome["visible_results"])
+            self.assertGreater(outcome["notice_send_count"], 0)
+            operation_ref = outcome["operation_ref"]
+            view = core.managed_lifecycle_read(operation_ref)
+            self.assertEqual(view["operation_ref"], operation_ref)
+            self.assertEqual(view["phase"], "completed")
+            self.assertEqual(view["status"], "completed")
+            self.assertEqual(view["mode"], "terminal")
+            self.assertFalse(view["source_active"] or view["target_active"])
+            authority = fixture.head.read().head.as_authority()
+            self.assertTrue(authority.terminal)
+            self.assertEqual(authority.transition_id, "lifecycle:terminal-delete:" + operation_ref)
+            self.assertEqual(view["authority_binding"], authority.to_storage())
+            request = {"operation_ref": operation_ref, "authority_binding": authority.to_storage(),
+                       "transition_id": authority.transition_id}
+            from partner_health_steward.host_authority import HostPrivateKeyProvider, HostAuthorityUnavailable
+            from partner_health_steward.production_core_service import FilesystemManagedReplicaAdapter
+            key = HostPrivateKeyProvider(fixture.binding["host_private_paths"], fixture.binding["installation_id"])
+            self.assertEqual(key.absence(request), {"status": "absent"})
+            with self.assertRaises(HostAuthorityUnavailable):
+                key.get_key()
+            replicas = FilesystemManagedReplicaAdapter(fixture.binding["managed_replica_root"],
+                fixture.binding["installation_id"], fixture.binding["managed_replica_bindings"],
+                fixture.binding["lifecycle_release"].get("unbound_real_providers", ()))
+            absent = replicas.absence(request)
+            self.assertEqual(absent["status"], "absent")
+            self.assertEqual(absent["remains_unproven"], view["remains_unproven"])
+            self.assertTrue(all(not path.exists() for path in replica_paths))
+            with self.assertRaises(AuthorityValidationError):
+                core.managed_rights_read_current()
+            # Generic storage-system absence oracle, as in the original117
+            # gate: enumerate all tables and count rows without product table
+            # names, columns, encrypted payloads or private store internals.
+            database = Path(fixture.binding["database_path"]).resolve()
+            with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+                tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+                self.assertTrue(tables)
+                for (table,) in tables:
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM " + quoted).fetchone()[0], 0, table)
+            self.assertFalse(core.health_writes_allowed())
+            self.assertFalse(core.model_effects_allowed())
+            self.assertFalse(core.outbound_effects_allowed())
 
     def test_v130_07_managed_json_file_real_pinned_media_second_authorization_and_no_false_delivery(self):
         self._modules()
-        for mode in ("accepted", "rejected", "send-loss", "bad-upload-url", "stale-after-read"):
+        for mode in ("accepted", "rejected", "send-loss", "bad-upload-url", "unavailable-after-read"):
             with self.subTest(mode=mode), _service() as fixture:
                 _initialize(fixture)
                 self._run_child("seed-large" if mode == "accepted" else "seed", fixture)
@@ -569,8 +714,9 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                 self.assertEqual(result["model_calls"], 0)
                 self.assertTrue(result["two_authorizations"])
                 self.assertTrue(result["artifact_from_core"])
-                if mode == "stale-after-read":
+                if mode == "unavailable-after-read":
                     self.assertEqual(result["media_posts"], 0)
+                    self.assertTrue(result["second_authorization_denied"])
                 elif mode == "bad-upload-url":
                     self.assertEqual(result["media_posts"], 1)
                     self.assertEqual(result["layer"], "unknown")
@@ -677,6 +823,7 @@ class _TracePort:
         self.artifact_metadata = None
         self.authorizations = []
         self.authorization_replies = []
+        self.denied = []
 
     def request(self, kind, payload, *, request_id=None):
         request_id = request_id or "ticket130-child-rpc"
@@ -688,7 +835,12 @@ class _TracePort:
         if operation == "governed-advance" and self.completed and self.mode == "candidate-loss":
             self.blocked_advances += 1
             raise ConnectionResetError("synthetic caller stops before using the completed candidate")
-        response = self.client.request(kind, payload, request_id=request_id)
+        try:
+            response = self.client.request(kind, payload, request_id=request_id)
+        except _HostVerificationFailure as exc:
+            assert str(exc) == "core-frame-truncated", str(exc)
+            self.denied.append((kind, copy.deepcopy(payload), str(exc)))
+            raise
         self.frames.append(len(_CANONICAL(response)))
         assert self.frames[-1] <= 65536
         self.responses.append(copy.deepcopy(response))
@@ -1084,35 +1236,42 @@ async def _child(config):
                 before = len(channel.sends)
                 await owner("/health-delete", "delete-request")
                 assert ready() == "enabled" and len(channel.sends) == before
-                await visible(match.group(0), "delete-independent-confirm", minute=7)
+                operation_ref = match.group(1)
+                await owner(match.group(0), "delete-independent-confirm", minute=7, allow_no_cursor=True)
+                # Original117 sends its minimal notice before terminal/key
+                # destruction. Do not require a new encrypted outbox, message
+                # or persistent native cursor after all local state is purged.
+                terminal = await asyncio.to_thread(_parent_barrier, config,
+                    "observe-delete-terminal", operation_ref=operation_ref)
+                assert terminal["operation_ref"] == operation_ref and terminal["phase"] == "completed"
+                await _wait(lambda: len(channel.sends) > before)
                 assert not models.calls
-                result = {"model_calls": 0, "visible_results": True, "independent_confirm": True}
+                result = {"model_calls": len(models.calls), "operation_ref": operation_ref,
+                          "notice_send_count": len(channel.sends) - before}
             elif gate == "export":
                 mode = config["data"]["mode"]
-                # Change the selected real object through its explicit owner
-                # source between last read and second authorization.
+                # A real held owner-delivery lease blocks correction CAS, so
+                # accepted RPC is not evidence that an object changed. Inject
+                # the declared external current-head read failure only after
+                # the complete actual artifact has crossed CorePort instead.
                 ordinary_request = port.request
-                changed = False
+                unavailable = False
                 def observed_request(kind, payload, *, request_id=None):
-                    nonlocal changed
+                    nonlocal unavailable
                     value = ordinary_request(kind, payload, request_id=request_id)
                     artifact = value["payload"].get("artifact")
-                    if mode == "stale-after-read" and not changed and artifact and artifact["next_index"] is None:
-                        changed = True
-                        exported = json.loads(port.read_artifact)
-                        ref = next(item["object_ref"] for item in exported["objects"] if item["object_kind"] == "evidence_card")
-                        message = _source_message(port, config, "export-revoke", "/health-correct " + ref + " 我昨晚睡得很好")
-                        response = core.request("command", _OPERATION("governed-receive", {"message": message}), request_id="ticket130-export-correction")
-                        assert response["status"] == "accepted"
+                    if mode == "unavailable-after-read" and not unavailable and artifact and artifact["next_index"] is None:
+                        observed = _parent_barrier(config, "head-unavailable-after-artifact-read")
+                        assert observed == {"external_head_unavailable": True}
+                        unavailable = True
                     return value
                 port.request = observed_request
                 before = len(channel.sends)
-                starting_polls = len(channel.cursors)
                 await owner("/health-export", "export-file", allow_no_cursor=True)
-                await _wait(lambda: len(port.authorizations) >= (1 if mode == "stale-after-read" else 2) and
-                            (changed if mode == "stale-after-read" else len(channel.media_posts) == (1 if mode == "bad-upload-url" else 3)))
+                await _wait(lambda: len(port.authorizations) >= (1 if mode == "unavailable-after-read" else 2) and
+                            (unavailable if mode == "unavailable-after-read" else len(channel.media_posts) == (1 if mode == "bad-upload-url" else 3)))
                 await _wait(lambda: any(type(value.get("payload", {}).get("delivery")) is dict and value["payload"]["delivery"]["handoff_complete"]
-                                       for value in port.responses) or mode == "stale-after-read")
+                                       for value in port.responses) or mode == "unavailable-after-read")
                 assert port.artifact_metadata and port.read_artifact
                 metadata = port.artifact_metadata; plaintext = bytes(port.read_artifact)
                 assert metadata["digest"] == _SHA(plaintext) and metadata["size_bytes"] == len(plaintext)
@@ -1120,14 +1279,20 @@ async def _child(config):
                 from partner_health_steward.rights import ManagedExport
                 exported = ManagedExport.from_wire(json.loads(plaintext))
                 assert _CANONICAL(exported.to_wire()) == plaintext
-                if mode == "stale-after-read":
+                second_denied = False
+                if mode == "unavailable-after-read":
                     intent_id = port.authorizations[0]["authorization"]["intent_id"]
-                    def same_authorizations():
-                        return [value for value in port.authorization_replies
-                                if type(value.get("delivery")) is dict and value["delivery"]["intent_id"] == intent_id]
-                    await _wait(lambda: len(same_authorizations()) >= 2)
-                    assert same_authorizations()[-1]["authorization"] is None
-                    await _wait(lambda: len(channel.cursors) >= starting_polls + 3)
+                    def denied_second_authorization():
+                        calls = [payload for _, payload in port.calls if payload.get("operation") == "delivery-authorize"
+                                 and payload["payload"]["intent_id"] == intent_id]
+                        refused_frame = any(payload.get("operation") == "delivery-authorize"
+                            and payload["payload"]["intent_id"] == intent_id and reason == "core-frame-truncated"
+                            for _, payload, reason in port.denied)
+                        refused_reply = any(value.get("authorization") is None and type(value.get("delivery")) is dict
+                            and value["delivery"]["intent_id"] == intent_id for value in port.authorization_replies)
+                        return len(calls) >= 2 and (refused_frame or refused_reply)
+                    await _wait(denied_second_authorization)
+                    second_denied = denied_second_authorization()
                     assert not channel.media_posts
                     layer = "unknown"
                 elif mode == "bad-upload-url":
@@ -1169,12 +1334,13 @@ async def _child(config):
                     await owner("/health-export", "export-file")
                     assert len(channel.media_posts) == previous
                 texts = "\n".join(channel.texts())
-                if mode != "stale-after-read":
+                if mode != "unavailable-after-read":
                     assert "平台接受文件不代表你已经下载" in texts and "不能撤回微信或CDN副本" in texts
                 result = {"model_calls": len(models.calls), "media_posts": len(channel.media_posts),
                           "two_authorizations": sum(payload.get("operation") == "delivery-authorize" and payload["payload"]["intent_id"] == port.authorizations[0]["authorization"]["intent_id"] for _, payload in port.calls) >= 2,
-                          "artifact_from_core": True, "artifact_size": len(plaintext), "decrypted_equals_canonical_export": mode not in {"stale-after-read", "bad-upload-url"},
-                          "layer": layer, "replay_posts": 0, "external_copy_limit_visible": mode == "stale-after-read" or "不能撤回微信或CDN副本" in texts}
+                          "artifact_from_core": True, "artifact_size": len(plaintext), "decrypted_equals_canonical_export": mode not in {"unavailable-after-read", "bad-upload-url"},
+                          "layer": layer, "replay_posts": 0, "second_authorization_denied": second_denied,
+                          "external_copy_limit_visible": mode == "unavailable-after-read" or "不能撤回微信或CDN副本" in texts}
             else:
                 raise AssertionError(gate)
         finally:
