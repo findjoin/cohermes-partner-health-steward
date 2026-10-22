@@ -556,6 +556,7 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
         for gate in ("known-incomplete", "known-failed", "unknown", "complete-loss", "candidate-loss", "peer-exit"):
             with self.subTest(gate=gate), _service() as fixture:
                 _initialize(fixture)
+                baseline_daily_digest = fixture.service._core.daily_state().digest
                 first = self._run_child(gate, fixture)
                 self.assertEqual(first["model_calls"], 1)
                 source = first["source"]
@@ -578,17 +579,39 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                     self.assertTrue(first["recovered"])
                 else:
                     from partner_health_steward.production_core_service import ProductionCoreService
+                    fixture.clock[0] = datetime.now(timezone.utc)
                     fixture.service.close()
                     restarted = ProductionCoreService(fixture.binding, current_head=fixture.head, live_runtime=fixture.runtime)
                     fixture.service = restarted; fixture.port = delivery_fixture._SocketPort(restarted.start())
-                    second = self._run_child("resume-only", fixture, data={"source": source})
+                    retained_notice = first.get("visible_delivery_refs", [])
+                    second = self._run_child("resume-only", fixture, data={
+                        "source": source, "visible_delivery_refs": retained_notice})
                     self.assertEqual(second["model_calls"], 0)
                     self.assertTrue(second["visible_limits"])
+                    if retained_notice:
+                        self.assertEqual(second["delivery_refs"], retained_notice)
+                        self.assertEqual(second["new_sends"], 0)
                     status = _read(fixture, source)
                     self.assertIn(status["state"], {"unknown", "owner-decision-required"})
                     self.assertIsNone(fixture.port.exchange("managed-read", _PROJECTION(
                         "health-entry-cursor-directive", {"source_causal_id": source}))["directive"])
-                    self.assertEqual(fixture.service._core.daily_state().evidence_cards, ())
+                    core = fixture.service._core
+                    if gate in {"unknown", "peer-exit"}:
+                        with self.assertRaisesRegex(AuthorityValidationError, r"\Adaily-state-unavailable\Z"):
+                            core.daily_state()
+                        self.assertFalse(core.health_writes_allowed())
+                        self.assertFalse(core.model_effects_allowed())
+                        self.assertFalse(core.outbound_effects_allowed())
+                        self.assertIsNone(core.daily_turn_status(source))
+                        # Core must keep its original UNKNOWN body-read gate
+                        # closed. The same synthetic Service's existing Store
+                        # public read is an absence oracle only, not a Plugin
+                        # capability or a replacement business authority.
+                        stored = fixture.service._store.daily_state()
+                        self.assertEqual(stored.digest, baseline_daily_digest)
+                        self.assertEqual(stored.evidence_cards, ())
+                    else:
+                        self.assertEqual(core.daily_state().evidence_cards, ())
                     if gate == "candidate-loss":
                         self.assertEqual(fixture.service._core.model_effect_report(effect_id).to_storage(), retained_report)
 
@@ -1128,15 +1151,27 @@ async def _child(config):
                 else:
                     await _wait(lambda: cursor in channel.cursors)
                     assert port.lost_reply and len(models.calls) == 1
+                visible_limits = any(_LIMIT in text for text in channel.texts())
+                visible_refs = []
+                if gate == "unknown" and visible_limits:
+                    observed_refs = [value["payload"]["delivery_refs"] for value in port.responses
+                        if type(value.get("payload")) is dict and set(value["payload"]) == _STAGE_FIELDS
+                        and value["payload"]["response"].get("causal_id") == source
+                        and value["payload"]["delivery_refs"]]
+                    assert observed_refs and all(refs == observed_refs[0] for refs in observed_refs)
+                    visible_refs = copy.deepcopy(observed_refs[0])
                 result = {"model_calls": len(models.calls), "source": source,
                           "effect_id": port.effect_ids[0], "recovered": gate == "complete-loss",
-                          "visible_limits": any(_LIMIT in text for text in channel.texts())}
+                          "visible_limits": visible_limits, "visible_delivery_refs": visible_refs}
             elif gate == "resume-only":
                 bridge = create_live_nondiagnostic_model_bridge(port,
                     route=config["route"], budget=config["budget"], credential_provider=lambda: _TOKEN)
                 outcome = await bridge.advance_source(config["data"]["source"])
                 assert set(outcome) == _STAGE_FIELDS
                 assert outcome["delivery_refs"], "unresolved original source needs its Core-bound minimal limitation"
+                retained_notice = config["data"].get("visible_delivery_refs", [])
+                if retained_notice:
+                    assert outcome["delivery_refs"] == retained_notice, "restart replaced the already-visible original notice"
                 from partner_health_steward.live_delivery import LiveWeixinDeliveryBridge
                 from partner_health_steward.weixin_transport import WeixinTransportBinding, PinnedWeixinOwnerDeliveryAdapter
                 binding = WeixinTransportBinding(config["policy"]["partner_id"], "https://ilinkai.weixin.qq.com")
@@ -1147,8 +1182,14 @@ async def _child(config):
                 for ref in outcome["delivery_refs"]:
                     observed = await delivery.send_committed(ref)
                     assert observed["handoff_complete"]
-                assert not models.calls and any(_LIMIT in text for text in channel.texts())
-                result = {"model_calls": 0, "visible_limits": True}
+                assert not models.calls
+                if retained_notice:
+                    assert not channel.sends and not channel.posts, "restart resent an already-visible original notice"
+                else:
+                    assert channel.sends and any(_LIMIT in text for text in channel.texts())
+                result = {"model_calls": len(models.calls),
+                          "visible_limits": bool(retained_notice) or any(_LIMIT in text for text in channel.texts()),
+                          "delivery_refs": copy.deepcopy(outcome["delivery_refs"]), "new_sends": len(channel.sends)}
             elif gate == "peer-exit":
                 # Direct declared CorePort sequence leaves an actual started
                 # attempt with no result callback, then this real process exits.
