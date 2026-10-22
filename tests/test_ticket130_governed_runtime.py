@@ -444,6 +444,7 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
                 self.assertEqual(report.model_use_disclosure, fixture.budget.model_use_disclosure)
             self.assertEqual(len(result["effects"]), 5)
             self.assertEqual(len(set(result["records"])), 3)
+            self.assertEqual(len(state.processed_source_causal_ids), 3)
             self.assertTrue(result["replay_unchanged"])
 
     def test_v130_02_intake_source_negation_time_question_and_real_stage_authority(self):
@@ -996,14 +997,14 @@ async def _child(config):
                 token="synthetic-token", context_token_provider=lambda recipient: "synthetic-context"),
             clock=lambda: datetime.fromisoformat(config["now"]))
     native_times = {}
-    async def owner(text, identifier, *, allow_no_cursor=False, minute=5):
+    async def owner(text, identifier, *, allow_no_cursor=False, minute=5, cursor_override=None):
         before_sends = len(channel.sends)
         before_polls = len(channel.cursors)
         message = _native(config, identifier, text, minute=minute)
         # Replays retain exact protocol time; independent sources are later.
         timestamp = native_times.setdefault(identifier, message["create_time_ms"] + len(native_times) * 1000)
         message["create_time_ms"] = timestamp
-        cursor = "cursor130:" + identifier
+        cursor = "cursor130:" + identifier if cursor_override is None else cursor_override
         channel.enqueue(cursor, message)
         if allow_no_cursor:
             return cursor, before_sends
@@ -1076,6 +1077,17 @@ async def _child(config):
                 before = (len(models.calls), len(channel.sends))
                 await owner(question, "question")
                 assert (len(models.calls), len(channel.sends)) == before
+                original_sources = set(sources())
+                # A later native batch re-delivers the same message ID, body,
+                # sender/account/conversation and protocol time; only its
+                # batch cursor (and resulting admission causal ID) changes.
+                await owner(question, "question", cursor_override="cursor130:question-new-batch")
+                assert sources()[-1] not in original_sources
+                assert (len(models.calls), len(channel.sends)) == before
+                replay_records = [value["payload"]["response"]["meta"]["turn_result"]["record_id"]
+                    for value in port.responses if type(value.get("payload")) is dict
+                    and value["payload"].get("response", {}).get("meta", {}).get("turn_result")]
+                assert set(replay_records) == set(records), "native alias minted another business record"
                 result = {"model_stages": [stage for stage, _ in models.calls],
                           "kinds": sorted({kind for kind, _ in port.calls}), "initialized_message": True,
                           "ordinary_calls": len(ordinary), "effects": list(dict.fromkeys(port.effect_ids)),

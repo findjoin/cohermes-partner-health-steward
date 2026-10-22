@@ -1,6 +1,6 @@
 # Ticket130 独立验证合同候选
 
-状态：pre-code candidate R2.2，尚未冻结。独立verification authority：verification_130（接续中断的implementation_audit同一权威文件）；唯一设计作者deployment_audit。设计以本checkpoint的`130-governed-live-nondiagnostic-runtime-design.md`为准（含6dab079的真实300秒短内存事实修正及650e8c5的主人独立delete确认语法澄清）。本合同不授予模型、网络、诊断、发布或主人canary权限；不新增业务ledger、第四种CorePort或长期恢复正文。
+状态：pre-code candidate R2.3，尚未冻结。独立verification authority：verification_130（接续中断的implementation_audit同一权威文件）；唯一设计作者deployment_audit。设计以本checkpoint的`130-governed-live-nondiagnostic-runtime-design.md`为准（含6dab079的真实300秒短内存事实修正及650e8c5的主人独立delete确认语法澄清）。本合同不授予模型、网络、诊断、发布或主人canary权限；不新增业务ledger、第四种CorePort或长期恢复正文。
 
 ## 已知差额与验证边界
 
@@ -12,7 +12,7 @@
 
 | 门 | 最高公开接口与必要结果 | 可杀死的现实错误等价类 |
 |---|---|---|
-|130-V01|同一真实发布/registry/socket完成首次披露、独立confirm、Core绑定成功说明及131限制；record一模型、mixed/question至多两固定stage，原evidence→portrait→answer→唯一daily提交→126受控发送及ACK。原生重投不增加模型、业务record或发送。|factory未接通、初始化只读enabled就自造成功、同步executor/普通Session旁路、将question记成主人事实、第三次模型或第二次提交、隐藏限制。|
+|130-V01|同一真实发布/registry/socket完成首次披露、独立confirm、Core绑定成功说明及131限制；record一模型、mixed/question至多两固定stage，原evidence→portrait→answer→唯一daily提交→126受控发送及ACK。保留同cursor重投，再将同native消息置于一个新batch cursor；真实Core读回新cursor已推进，模型、发送与业务record不增。|factory未接通、初始化只读enabled就自造成功、同步executor/普通Session旁路、将question记成主人事实、第三次模型或第二次提交、丢掉原native事件到canonical business source映射而新建错误通知/拒绝ACK、隐藏限制。|
 |130-V02|真实Core准入的原body经125完整terminal进入intake；完整否定/原文/范围、真实45topic及时间边界；question疾病原文不能变成fact；answer不能在同源intake/证据前取得grant。正常owner statement可用未知时间，不逼模型猜日期。|截断否定、改写quote、诊断问句逐字子串升级、越界时间、错stage/重复效果；只靠非法topic等无关原因形成假负例。|
 |130-V03|合法request/result均可大于64KiB而每一实际RPC frame仍≤65536；按bytes跨UTF-8边界分片、全canonical摘要重验；同source/stage/grant顺序及receipt/currentness严格绑定；错source/stage/index确实拒绝且零正文，原grant后续合法读取及start均不能复活；HTTP期间第二条真正Core probe返回合法envelope。|扩大旧帧、单片UTF-8解析、只传摘要/Plugin report、跨源/阶段/错序拼接、只检查不存在的state却已泄漏bytes、错receipt仍start、prepare后head失效仍尝试、Core锁或串行dispatcher等待模型网络。|
 |130-V04|真实known incomplete/failed保完整terminal并产生可见限制；started timeout、完整terminal回交已落但reply丢失、completed候选失用、实际peer退出/重建的有限恢复；已观察report/result保持同digest/actual/usage绑定。unknown或丢候选不调第二次、不补事实、不ACK原未决NL。|把已完成误写unknown/not-started、信Plugin缓存或digest恢复正文、丢reply再调模型、自动重试、把限制通知的handoff当原NL业务成功。|
@@ -24,6 +24,7 @@
 
 ## 关键fixture一致性与恢复事实
 
+- R2.3仅在既有V01原生重投家族补一个新batch cursor等价类，不增加家族或改变设计。独立实际public characterization复现当前d4e6599：原record经真实typed prepare/start/complete/advance已finalized；保持message_id、body、protocol time及全部native身份，仅换native_cursor/causal_id后，新HealthPlugin.receive_governed_weixin返回`unavailable/governed-runtime-unavailable`并新建1条通知，原source仍finalized而alias failed-closed。证据`/tmp/ticket130-root-native-alias-characterization.py/.log`，独立重跑日志`/tmp/ticket130-verifier-native-alias-characterization.log`。原DailySourceMeta.business_source_causal_id及旧_run_daily_turn已有canonical source兼容，因此属于既有“同原生事件重投零新增模型/业务/发送及ACK”验收漏检。测试仅给现owner helper加cursor override，沿原native_times保持同message ID/body/协议时间，保留同cursor重投后再发送一个新cursor；要求真实Core新cursor读回、模型/发送/record集合不增，并由父侧原DailyState证明仍只有3个processed business source。
 - R2.2仅补齐V03宽传输正向fixture的真实初始化前置条件：sealed产品d364783在Linux/Python3.11的实际observation先读到Core healthy，随后唯一governed-receive为`rejected/initialization-required`、next_stage=null，未到prepare/chunks/model；child的chunks分支不执行初始化，父侧该分支也漏掉了其它V03 mutation已有的`_initialize(fixture)`。证据`/tmp/ticket130-observe-wide-remote-v2.log`及`/tmp/dmit-connection-audit/formal-d364783-130-model-debug-selected.log`。本修订仅在wide positive前调用已有真实public披露/独立同意/commit/finalize helper，不放宽产品初始化门禁，不改设计、七家族或其它测试。
 - R2.1仅纠正V02未知时间样例的旧typed表示：唯一设计要求不能可靠重算时发生时间unknown，不要求新增certainty enum。当前原`AtomicEvidenceClaim`只接受`known/uncertain`；`EvidenceCard`及`DailyHealthState`沿同合同，未知发生时间须为`occurred_at="unknown"/time_certainty="uncertain"`。独立公开类型characterization已验证该claim/card/state可完整roundtrip；certainty="unknown"明确拒绝为`invalid evidence time certainty`，certainty="known"配未知时间明确拒绝为`known evidence occurrence is not orderable`。证据`/tmp/ticket130-unknown-time-characterization.py/.log`。这是原断言的局部假红，只改单样例预期，不改产品enum、唯一设计、七家族或旧冻结门。
 - 两阶段使用同一concrete131预算、route/owner decision/期限，intake和answer各有真实schema/authority；无stage的旧answer wire/digest保持。Core自己的完整结果resolve/report仍是权威。report原有结构不凭空扩展usage字段；usage/response/model完整typed结果由result_digest绑定并读回核对。
