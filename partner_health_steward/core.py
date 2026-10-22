@@ -14939,11 +14939,13 @@ class HealthCore:
                             or intent.route_generation!=settings.current_configuration_generation
                             or self._live_owner_binding_open(intent,settings) is None):
                         return result
+                    self._release_governed_source_memory(source_causal_id)
                     return {**result,'response':Response('replayed',source_causal_id,'daily-turn-result-redacted').to_wire(),
                             'delivery_refs':[{'kind':'owner-outbox','intent_id':intent.intent_id}]}
                 # Bind only the exact original finalized turn through126.
                 bound=self.bind_live_delivery({'kind':'committed-turn','source_causal_id':source_causal_id,'record_id':turn.record_id,'transition_id':turn.transition_id})
                 refs=[{'kind':'owner-outbox','intent_id':d['intent_id']} for d in bound['deliveries'] if d['recipient_role']=='owner']
+                self._release_governed_source_memory(source_causal_id)
                 return {**result,'response':Response('accepted',source_causal_id,'daily-turn-finalized',DailyTurnMeta(turn)).to_wire(),'delivery_refs':refs}
             except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
 
@@ -15562,3 +15564,13 @@ class HealthCore:
                 if self._lifecycle_notice_layer(operation) in {'accepted','unknown','delivered','read'}:
                     self._governed_execute_delete(operation)
         except (ValueError,TypeError,KeyUnavailable,StoreUnavailable,CurrentHeadError):return
+
+
+    def _release_governed_source_memory(self, source_causal_id):
+        for stage in ('intake','answer'):
+            key=(source_causal_id,stage)
+            self._governed_requests.pop(key,None)
+            self._governed_candidates.pop(key,None)
+            self._governed_started.pop(key,None)
+        self._recording_excluded_sources.pop(source_causal_id,None)
+        self._governed_source_holders.pop(source_causal_id,None)
