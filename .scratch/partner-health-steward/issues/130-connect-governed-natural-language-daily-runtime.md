@@ -61,3 +61,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.5 (2026-10-22)
 
 [Evidence62](../evidence/62-ticket130-original-review-authority-refreeze-20261022.md)记录独立public复现的原V05权威观察矛盾及fresh双轴PASS。当前唯一checkpoint `20f48dcd4149ceaa788f39114c3a879a347709f0` / tree `d291984067d2d49b71aaf8ad071e1c6a279d0485`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `462b33c7b7e5c76d13b71469a1f8b2b1c610287a`、verifier `38449b5b8bbaf44cf74d6de3acab9f7ce0894b72`取代R2.4对应项。仅V05读取原唯一DailyReviewLedger的current当地日真实完成与完整重放不变，防止为假红伪写Settings第二权威；其余家族、产品权限及设计不变。WIP补充结果不冒充正式门，完整最终执行与闭票仍待完成。
+
+## Narrow verifier refreeze R2.6 (2026-10-22)
+
+[Evidence63](../evidence/63-ticket130-handoff-and-replay-observation-refreeze-20261022.md)记录原known正向提前teardown及旧batch游标倒退的实证矛盾、真实重投产品错误和fresh双轴PASS。当前唯一checkpoint `fb97e5e656b4ebe29d7b1dfce25c24d6ce58ed46` / tree `b6e7fd0811be0fd017d848895ccda8086b50e0cf`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `5134e3a1f137bf24fe0acdcfc0aa50a43117214d`、verifier `19ba1c10dbf2de199c751c1f454569fced2091ed`取代R2.5对应项。V04正向必须等同source真实accepted/handoff后结束，原unknown严格门不变；V05不要求旧cursor倒退，同时加强实际重投接受、原refs与单任务/取消/零新副作用断言。既有HMAC归一的入口兼容缺口继续产品修复，不能把causal-id-conflict当成功。七家族、其余16冻结blob、设计及产品权限不变；正式完整执行、闭票及128真实部署仍待完成。
