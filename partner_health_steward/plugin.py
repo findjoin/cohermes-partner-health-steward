@@ -180,7 +180,21 @@ class HealthPlugin:
         response = self._receive_weixin(message, peer_id=peer_id, _governed=True)
         source = response.causal_id
         if response.reason_code == "governed-source-held" and response.status in {"accepted", "replayed"}:
-            return self._core.advance_governed_source(source)
+            primary = (response.meta.business_source_causal_id
+                       if type(response.meta) is DailySourceMeta else source)
+            result = self._core.advance_governed_source(primary)
+            if primary != source:
+                # Admission, rather than the caller's batch cursor, selected
+                # the canonical business event. Preserve this delivery's
+                # response correlation while reusing only its original result.
+                result = dict(result)
+                result["response"] = dict(result["response"], causal_id=source)
+                if result["next_stage"] is not None:
+                    result.update(next_stage=None, response=Response(
+                        "unavailable", source, "daily-source-native-replay-pending").to_wire())
+                elif result["response"]["status"] == "accepted":
+                    result["response"]["status"] = "replayed"
+            return result
         disclosure = (None if source is None else
                       self._core.nondiagnostic_source_status(source)["model_use_disclosure"])
         return {"response": response.to_wire(), "next_stage": None,
