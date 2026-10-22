@@ -432,8 +432,12 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         response = admitted.get("response")
         if not governed and set(admitted) != {"response"}:
             response = None
-        if (type(response) is not dict or response.get("status") not in {"accepted", "replayed"}
-                or response.get("causal_id") != headers["causal_id"]):
+        if type(response) is not dict or response.get("causal_id") != headers["causal_id"]:
+            return None, False
+        if response.get("status") not in {"accepted", "replayed"}:
+            if governed and admitted.get("delivery_refs"):
+                handed_off = await self._governed_handoff(headers["causal_id"], admitted)
+                return (headers["causal_id"], True) if handed_off else (None, False)
             return None, False
         if initialization is not None:
             for operation, payload in (

@@ -37,6 +37,12 @@ class LiveNonDiagnosticModelBridge:
         if (not callable(getattr(core_port, "request", None))
                 or type(adapter) is not ProductionModelAdapter):
             raise ValueError("invalid non-diagnostic bridge dependencies")
+        profile = object.__getattribute__(adapter, "_profile")
+        strategy = object.__getattribute__(adapter, "_strategy")
+        if (type(profile) is not NonDiagnosticOperationalBudget
+                or type(strategy) is not NonDiagnosticBudgetInputMeasurementStrategy
+                or object.__getattribute__(strategy, "_profile") != profile):
+            raise ValueError("non-diagnostic budget adapter required")
         self._port, self._adapter = core_port, adapter
         self._lock = asyncio.Lock()
 
@@ -66,7 +72,10 @@ class LiveNonDiagnosticModelBridge:
         _exact(intent, {"effect_id", "intent_digest", "effect_kind", "authority"})
         _exact(intent["authority"], {"source", "generation", "writer_fence"})
         _exact(grant, {"session_id", "lease_id", "effect_id", "intent_digest", "generation", "writer_fence"})
+        for field in ("session_id", "lease_id", "effect_id", "intent_digest", "writer_fence"):
+            _text(grant[field])
         if (intent["effect_kind"] != "model-work" or intent["authority"]["source"] != "core"
+                or type(grant["generation"]) is not int or grant["generation"] < 1
                 or any(grant[field] != intent[field] for field in ("effect_id", "intent_digest"))
                 or any(grant[field] != intent["authority"][field] for field in ("generation", "writer_fence"))):
             raise ValueError("non-diagnostic grant mismatch")
@@ -91,6 +100,8 @@ class LiveNonDiagnosticModelBridge:
             raise ValueError("non-diagnostic stage mismatch")
         if prepared["grant"] is None or prepared["intent"] is None or prepared["request_transfer"] is None:
             return
+        if prepared["state"] != "ready":
+            raise ValueError("non-diagnostic stage not ready")
         grant = self._grant(prepared)
         attempt, observed = None, None
         buffer = bytearray()
@@ -148,7 +159,7 @@ class LiveNonDiagnosticModelBridge:
                     "index": index, "bytes_b64": encode_chunk(result_bytes, index),
                 })
                 _exact(transferred, {"stage", "state", "next_index"})
-                if (transferred["stage"] != stage
+                if (transferred["stage"] != stage or transferred["state"] != "attempted"
                         or transferred["next_index"] != (index + 1 if index + 1 < result_descriptor["chunk_count"] else None)):
                     raise ValueError("non-diagnostic result transfer unconfirmed")
             complete_called = True
