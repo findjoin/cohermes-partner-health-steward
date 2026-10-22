@@ -14861,6 +14861,9 @@ class HealthCore:
                 if initialization is not None and initialization.phase=='enabled' and source_causal_id in initialization.draft.source_causal_ids:
                     refs=self._governed_notice(source_causal_id,'initialization-enabled','健康管家已初始化；诊断未启用')
                     return {**result,'response':Response('accepted',source_causal_id,'initialization-enabled').to_wire(),'delivery_refs':refs}
+                owner_receipt=next((r for r in self._store.health_command_receipts() if r.result.get('source_causal_id')==source_causal_id and r.result.get('_governed_action') is not None),None)
+                if owner_receipt is not None and owner_receipt.result.get('_governed_action') not in {'model-failed-closed','model-owner-decision'}:
+                    return {**result,**self.governed_owner_command(source_causal_id)}
                 binding=self._governed_source_open(source_causal_id)
                 if binding is not None and self._governed_is_owner_command(binding[0].body):
                     owner=self.governed_owner_command(source_causal_id)
