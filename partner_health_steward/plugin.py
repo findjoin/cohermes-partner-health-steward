@@ -299,6 +299,11 @@ class HealthPlugin:
                 return Response("unavailable", causal_id, report.reason_code)
         try:
             envelope = materialize_source(message)
+            if _governed:
+                # A native redelivery retains its first exact admission;
+                # current poll time/generation cannot rewrite that receipt.
+                envelope = self._core.live_entry_replay_source(envelope, policy)
+                message = RawWeixinMessage(**envelope.to_storage())
             if initialization.phase == "enabled":
                 safety_facts = self._core.ticket116_rule_facts_for_body(
                     envelope.body
