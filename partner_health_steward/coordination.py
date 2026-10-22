@@ -108,6 +108,25 @@ def _owner_reply_text(value: object, name: str) -> str:
     return value
 
 
+def _source_text(value: object, name: str) -> str:
+    """Bound admitted prose without treating it as an opaque authority ID."""
+    if type(value) is not str or not value:
+        raise AuthorityValidationError(f"invalid {name}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AuthorityValidationError(f"invalid {name}") from exc
+    if len(encoded) > 16384:
+        raise AuthorityValidationError(f"invalid {name}")
+    return value
+
+
+def _atomic_proves(value: object, *, stored: bool = False) -> tuple[str, ...]:
+    if type(value) is not (list if stored else tuple) or len(value) != 1:
+        raise AuthorityValidationError("invalid proves")
+    return (_source_text(value[0], "proves"),)
+
+
 def _texts(value: object, name: str, *, empty: bool = False) -> tuple[str, ...]:
     if type(value) is not tuple or (not value and not empty):
         raise AuthorityValidationError(f"invalid {name}")
@@ -619,7 +638,8 @@ class AtomicEvidenceClaim:
     summary_fields: EvidenceSummaryFields | None = None
 
     def __post_init__(self) -> None:
-        for value, name in ((self.content, "evidence content"), (self.source_kind, "source kind"),
+        _source_text(self.content, "evidence content")
+        for value, name in ((self.source_kind, "source kind"),
                             (self.occurred_at, "occurrence"), (self.applicable_period, "period"),
                             (self.purpose, "evidence purpose"), (self.uncertainty, "uncertainty")):
             validate_opaque_text(value, name)
@@ -726,7 +746,7 @@ class AtomicEvidenceClaim:
                     "task evidence fields do not match series profile"
                 )
         _texts(self.limitations, "limitations")
-        if _texts(self.proves, "proves") != (self.content,):
+        if _atomic_proves(self.proves) != (self.content,):
             raise AuthorityValidationError("one evidence card must carry one atomic claim")
         _texts(self.does_not_prove, "does not prove")
         for topic_ref in _texts(self.topic_refs, "topic references", empty=True):
@@ -756,7 +776,7 @@ class AtomicEvidenceClaim:
         return cls(f["content"], f["evidence_type"], f["source_kind"], f["occurred_at"],
                    f["applicable_period"], f["purpose"], f["uncertainty"],
                    _stored_texts(f["limitations"], "limitations"),
-                   _stored_texts(f["proves"], "proves"),
+                   _atomic_proves(f["proves"], stored=True),
                    _stored_texts(f["does_not_prove"], "does not prove"),
                    _stored_texts(f["topic_refs"], "topic references", empty=True),
                    _specific_fields_from_storage(f["specific_fields"]),
@@ -852,7 +872,7 @@ class StewardContext:
     def __post_init__(self) -> None:
         validate_opaque_text(self.source_causal_id, "source causal identifier")
         validate_opaque_text(self.requested_capability, "requested capability")
-        validate_opaque_text(self.owner_message, "owner message")
+        _source_text(self.owner_message, "owner message")
         if type(self.health_navigation) is not DailyHealthNavigation:
             raise AuthorityValidationError("invalid steward health navigation")
 
@@ -4136,7 +4156,10 @@ def _render_selected_daily_reply(atoms, resolution):
                       and a.source_result_digest == resolution.candidate_digest)
         others = tuple(a for a in atoms if a not in model)
         if model:
-            return "".join(a.text for a in model) + "".join(a.text for a in others)
+            from .model_contract import NonDiagnosticOperationalBudget, StrictHealthLLM
+            authority = StrictHealthLLM.authority_for_digest(resolution.model_authority_digest)
+            separator = "\n" if authority is not None and type(authority[1]) is NonDiagnosticOperationalBudget else ""
+            return separator.join(a.text for a in model) + "".join(a.text for a in others)
     return "".join(a.text for a in atoms)
 
 
@@ -6690,6 +6713,13 @@ class DailySkillRuntime:
         stage_cards = {
             card.evidence_id: card for card in evidence_stage.evidence_cards
         }
+        # Reserve room in one mobile reply for every limitation, portrait
+        # result and Skill disclosure; never shorten the managed statements.
+        compact_record_receipts = (
+            evidence_stage.purpose == "non-diagnostic-health"
+            and sum(len(f"已记录：{card.content}。".encode("utf-8"))
+                    for card in evidence_stage.evidence_cards) > 1024
+        )
         stage_changes = {
             change.change_id: change
             for change in evidence_stage.evidence_applicability_changes
@@ -6713,7 +6743,8 @@ class DailySkillRuntime:
                     reply_atoms.append(
                         OwnerReplyAtom.form(
                             kind="record-result",
-                            text=f"已记录：{card.content}。",
+                            text=("已记录一条完整主人原文；请缩小查看范围或导出完整资料。"
+                                  if compact_record_receipts else f"已记录：{card.content}。"),
                             source_skill="health-evidence",
                             source_result_digest=result.result_digest,
                             required_evidence_ids=(evidence_id,),

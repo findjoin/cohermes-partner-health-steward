@@ -916,21 +916,20 @@ class LifecycleCoordinator:
             except Exception:
                 pass
             return self._state_result(state, status="unknown")
-        state["phase"] = "completed"
-        state["source_active"] = False
-        state["target_active"] = False
-        state["reason_code"] = None
         try:
-            self._save(state)
+            # The confirmed data-key tombstone forbids new encrypted receipts.
+            # Finish the original local purge before projecting completion.
             self._store.purge_all_local_state()
         except Exception:
             state["phase"] = "cleanup-pending"
             state["reason_code"] = "local-purge-unavailable"
-            try:
-                self._save(state)
-            except Exception:
-                pass
+            self._states[state["operation_ref"]] = copy.deepcopy(state)
             return self._state_result(state, status="unknown")
+        state["phase"] = "completed"
+        state["source_active"] = False
+        state["target_active"] = False
+        state["reason_code"] = None
+        self._states[state["operation_ref"]] = copy.deepcopy(state)
         return self._state_result(state, status="completed", authority=authority)
 
     def _execute_prepare_migration(

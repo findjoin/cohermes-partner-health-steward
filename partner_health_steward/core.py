@@ -1714,7 +1714,10 @@ class HealthCore:
             # The object itself is untrusted, including its causal ID.  Do not
             # derive a receipt, pending journal, or response field from it.
             return Response("rejected", reason_code="invalid-command-envelope")
+        return self._apply_canonical_command(command)
 
+    def _apply_canonical_command(self, command: CommandEnvelope) -> Response:
+        """Apply the already re-parsed command through the original transaction."""
         try:
             with self._store.serialized():
                 with self._store.transaction():
@@ -3558,10 +3561,15 @@ class HealthCore:
                     or observed_at.utcoffset() is None
                 ):
                     raise ValueError("owner settings clock must be timezone-aware")
+                control_update = (
+                    request.settings_command.control_update
+                    if type(request.settings_command) is OwnerControlCommand
+                    else request.settings_command
+                )
                 if (
-                    type(request.settings_command) is ControlUpdate
-                    and request.settings_command.control_name == "recording"
-                    and request.settings_command.operation == "resume"
+                    type(control_update) is ControlUpdate
+                    and control_update.control_name == "recording"
+                    and control_update.operation == "resume"
                     and current_settings.recording_stopped_at_utc is not None
                 ):
                     stopped_at = datetime.fromisoformat(
@@ -11851,22 +11859,26 @@ class HealthCore:
                 authority = self._store.finalized_authority()
                 if authority is None or not self._store.verify_integrity(authority):
                     raise AuthorityValidationError("daily-stage-state-unavailable")
-                daily = self._store.daily_turn(source_causal_id)
-                if (
-                    daily is None
-                    or daily.phase != "evidence-finalized"
-                    or type(daily.draft) is not DailyTurnDraft
-                    or daily.evidence_state_digest is None
-                ):
-                    raise AuthorityValidationError("daily-stage-state-unavailable")
-                state = self._store.daily_state().apply_evidence_stage(daily.draft)
-                if state.digest != daily.evidence_state_digest:
-                    raise KeyUnavailable("evidence stage state mismatch")
-                return state
+                return self._daily_turn_post_stage_state_open(source_causal_id)
             except (KeyUnavailable, StoreUnavailable) as exc:
                 raise AuthorityValidationError(
                     "daily-stage-state-unavailable"
                 ) from exc
+
+    def _daily_turn_post_stage_state_open(self, source_causal_id: str) -> DailyHealthState:
+        """Form only the next Core-owned draft; its prepare rechecks authority."""
+        daily = self._store.daily_turn(source_causal_id)
+        if (
+            daily is None
+            or daily.phase != "evidence-finalized"
+            or type(daily.draft) is not DailyTurnDraft
+            or daily.evidence_state_digest is None
+        ):
+            raise AuthorityValidationError("daily-stage-state-unavailable")
+        state = self._store.daily_state().apply_evidence_stage(daily.draft)
+        if state.digest != daily.evidence_state_digest:
+            raise KeyUnavailable("evidence stage state mismatch")
+        return state
 
     def daily_turn_status(self, source_causal_id: str) -> DailyTurnStatus | None:
         """Project one exact durable turn so Plugin can resume without rerunning Skills."""
@@ -11880,44 +11892,48 @@ class HealthCore:
                 authority = self._store.finalized_authority()
                 if authority is None or not self._store.verify_integrity(authority):
                     return None
-                daily = self._store.daily_turn(source_causal_id)
-                if daily is None:
-                    return None
-                record = self._store.record(daily.record_id)
-                if record is None:
-                    raise KeyUnavailable("daily turn transition missing")
-                expected = {
-                    "prepared": "prepared",
-                    "unknown": "unknown",
-                    "committed": "committed",
-                    "evidence-finalized": "final",
-                    "finalized": "final",
-                }[daily.phase]
-                identity = daily.draft if daily.draft is not None else daily.terminal
-                if identity is None:
-                    raise KeyUnavailable("daily turn identity missing")
-                if (
-                    record.state != expected
-                    or record.revision_digest != identity.revision_digest
-                    or record.transition_id != identity.transition_id
-                ):
-                    raise KeyUnavailable("daily turn transition mismatch")
-                payload = record.payload
-                if isinstance(payload, PreparedTransition):
-                    prepared = payload
-                elif isinstance(payload, CommittedTransition):
-                    prepared = payload.prepared
-                else:
-                    raise KeyUnavailable("daily turn authority missing")
-                return DailyTurnStatus(
-                    daily.phase,
-                    daily.draft,
-                    None if daily.phase == "finalized" else daily.result,
-                    prepared.base,
-                    daily.terminal,
-                )
+                return self._daily_turn_status_open(source_causal_id)
             except (AuthorityValidationError, KeyUnavailable, StoreUnavailable):
                 return None
+
+    def _daily_turn_status_open(self, source_causal_id: str) -> DailyTurnStatus | None:
+        """Project exact typed facts under the caller's existing Core lock."""
+        daily = self._store.daily_turn(source_causal_id)
+        if daily is None:
+            return None
+        record = self._store.record(daily.record_id)
+        if record is None:
+            raise KeyUnavailable("daily turn transition missing")
+        expected = {
+            "prepared": "prepared",
+            "unknown": "unknown",
+            "committed": "committed",
+            "evidence-finalized": "final",
+            "finalized": "final",
+        }[daily.phase]
+        identity = daily.draft if daily.draft is not None else daily.terminal
+        if identity is None:
+            raise KeyUnavailable("daily turn identity missing")
+        if (
+            record.state != expected
+            or record.revision_digest != identity.revision_digest
+            or record.transition_id != identity.transition_id
+        ):
+            raise KeyUnavailable("daily turn transition mismatch")
+        payload = record.payload
+        if isinstance(payload, PreparedTransition):
+            prepared = payload
+        elif isinstance(payload, CommittedTransition):
+            prepared = payload.prepared
+        else:
+            raise KeyUnavailable("daily turn authority missing")
+        return DailyTurnStatus(
+            daily.phase,
+            daily.draft,
+            None if daily.phase == "finalized" else daily.result,
+            prepared.base,
+            daily.terminal,
+        )
 
     def model_effect_report(self, effect_id: str) -> ModelEffectReport | None:
         """Return only the content-free report for one terminal model effect."""
@@ -11986,21 +12002,23 @@ class HealthCore:
                     report.reason_code or "daily-turn-result-unavailable"
                 )
             try:
-                daily = self._store.daily_turn(source_causal_id)
-                if (
-                    daily is None
-                    or daily.phase != "finalized"
-                    or daily.draft is not None
-                    or daily.terminal is None
-                ):
-                    raise AuthorityValidationError(
-                        "daily-turn-result-unavailable"
-                    )
-                return daily.result
+                return self._daily_turn_result_open(source_causal_id)
             except (KeyUnavailable, StoreUnavailable) as exc:
                 raise AuthorityValidationError(
                     "daily-turn-result-unavailable"
                 ) from exc
+
+    def _daily_turn_result_open(self, source_causal_id: str) -> DailyTurnResult | None:
+        """Read the exact committed result before its original delivery binding."""
+        daily = self._store.daily_turn(source_causal_id)
+        if (
+            daily is None
+            or daily.phase != "finalized"
+            or daily.draft is not None
+            or daily.terminal is None
+        ):
+            raise AuthorityValidationError("daily-turn-result-unavailable")
+        return daily.result
 
     def initialization_status(self) -> InitializationProjection:
         """Return the durable product phase without treating probe liveness as enablement."""
@@ -12764,11 +12782,12 @@ class HealthCore:
 
     def authorize_live_delivery(self, intent_id, grant, *, attempted_at_utc):
         if self._governed is not None:
-            head=self._store.finalized_authority()
-            settings=self._current_owner_settings(head)
-            record=self._ticket115_outbox_state_open(settings).record(intent_id)
-            if record.intent.payload_ref.startswith('live-governed-export:'):
-                return self._governed_authorize_export(intent_id,grant,attempted_at_utc)
+            with self._lifecycle_lock:
+                head=self._store.finalized_authority()
+                settings=self._live_owner_binding(head,intent_id=intent_id)
+                record=self._ticket115_outbox_state_open(settings).record(intent_id)
+                if record.intent.payload_ref.startswith('live-governed-export:'):
+                    return self._governed_authorize_export(intent_id,grant,attempted_at_utc)
         contact = self._live_contact_fact(intent_id)
         if contact is not None:
             with self._lifecycle_lock:
@@ -14838,12 +14857,26 @@ class HealthCore:
 
     def _governed_commit_draft(self, source, draft, candidate=None):
         from .plugin import HealthPlugin
-        prepared=self.handle(CommandEnvelope(peer='plugin',action='turn.prepare',source='daily_skill_runtime',
-            causal_id=HealthPlugin._daily_turn_causal_id('evidence-prepare' if draft.turn_kind=='evidence-stage' else 'complete-prepare',source),
-            generation=self.daily_prepare_generation(),scope=('turn:prepare',),payload=DailyTurnPreparePayload(draft,candidate)))
+        with self._lifecycle_lock:
+            if self._closed:
+                return Response('unavailable',reason_code='current-writer-holder-missing')
+            if self._lifecycle_blocks_normal_operations():
+                return Response('rejected',reason_code='lifecycle-frozen')
+            if self._governed is None or type(draft) is not DailyTurnDraft or draft.source_causal_id != source:
+                return Response('rejected',reason_code='invalid-command-envelope')
+            command=CommandEnvelope(peer='plugin',action='turn.prepare',source='daily_skill_runtime',
+                causal_id=HealthPlugin._daily_turn_causal_id('evidence-prepare' if draft.turn_kind=='evidence-stage' else 'complete-prepare',source),
+                generation=self._read_head().generation,scope=('turn:prepare',),payload=DailyTurnPreparePayload(draft,candidate))
+            # This typed draft was formed inside Core, never received over RPC.
+            # Re-enter the complete codec without changing any public frame cap.
+            encoded=json.dumps(command.to_wire(),ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
+            if len(encoded)>8388608:
+                return Response('rejected',reason_code='invalid-command-envelope')
+            command=CommandEnvelope.from_wire(json.loads(encoded))
+            prepared=self._apply_canonical_command(command)
         if prepared.status not in {'accepted','replayed'}: return prepared
         while True:
-            status=self.daily_turn_status(source)
+            status=self._daily_turn_status_open(source)
             if status is None: return Response('unavailable',source,'daily-turn-state-unavailable')
             if status.phase in {'evidence-finalized','finalized'}: return Response('accepted',source,status.phase)
             if status.phase not in {'prepared','unknown','committed'}: return Response('unavailable',source,'daily-turn-state-unavailable')
@@ -14878,8 +14911,8 @@ class HealthCore:
                 if daily is None:
                     intake=self._governed_candidates.get((source_causal_id,'intake'))
                     if binding is None or intake is None: return result
-                    settings=self.owner_settings_state()
-                    draft=self._governed.evidence_stage(binding[0],self.daily_state(),intake,settings.timezone,recording_stopped=binding[2])
+                    settings=self._current_owner_settings(self._read_head())
+                    draft=self._governed.evidence_stage(binding[0],self._store.daily_state(),intake,settings.timezone,recording_stopped=binding[2])
                     committed=self._governed_commit_draft(source_causal_id,draft)
                     if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
                     daily=self._store.daily_turn(source_causal_id)
@@ -14894,7 +14927,7 @@ class HealthCore:
                         from .answer_resolution import ModelEffectRef
                         effect=self._governed_model_effect(source_causal_id,'answer')
                         report=effect.payload.model_report
-                        current=self.daily_turn_post_stage_state(source_causal_id)
+                        current=self._daily_turn_post_stage_state_open(source_causal_id)
                         pipeline=self._non_diagnostic_pipeline.with_current_owner_cards(current.current_evidence_cards,knowledge_valid_at=self._knowledge_clock().isoformat())
                         rendered=pipeline.render(candidate)
                         template=pipeline.approved_template(candidate.template_id)
@@ -14905,11 +14938,11 @@ class HealthCore:
                             rendered_reply_digest=stable_digest(rendered.to_commit_wire()))
                         atoms=rendered.reply_atoms
                     source=self._governed_source_open(source_causal_id)[0]
-                    complete=self._governed.daily_runtime.complete(source,self.daily_turn_post_stage_state(source_causal_id),daily.draft,
+                    complete=self._governed.daily_runtime.complete(source,self._daily_turn_post_stage_state_open(source_causal_id),daily.draft,
                         model_answer_resolution=resolution,model_reply_atoms=atoms)
                     committed=self._governed_commit_draft(source_causal_id,complete,candidate)
                     if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
-                turn=self.daily_turn_result(source_causal_id)
+                turn=self._daily_turn_result_open(source_causal_id)
                 if turn is None:
                     # Ticket112 intentionally released the final reply body.
                     # Only its original durable126 handoff can release a new
@@ -15187,8 +15220,19 @@ class HealthCore:
                 elif name=='/health-view':
                     objects=self.managed_rights_read_current()
                     if argument: objects=tuple(o for o in objects if argument in o.object_ref or argument in repr(o.to_wire()))
-                    value=json.dumps([o.to_wire() for o in objects],ensure_ascii=False,sort_keys=True,separators=(',',':'))
-                    text='当前资料：'+value if len(value.encode()) <= 3500 else '资料较多，请缩小查看范围或使用 /health-export 导出完整资料。'
+                    summaries=[]
+                    for item in objects:
+                        value=item.to_wire()['value']
+                        fields=(('content','source_kind','occurred_at','time_certainty','applicable_period','uncertainty','limitations','does_not_prove')
+                                if item.object_kind=='evidence_card' else
+                                ('topic_ref','current_understandings','current_understanding_applicable_periods','open_judgments','key_unknowns','trend','trend_period'))
+                        summaries.append({'object_ref':item.object_ref,'version':item.version,
+                            'source_refs':list(item.source_refs),'evidence_refs':list(item.evidence_refs),
+                            'value':{field:value[field] for field in fields if field in value}})
+                    text='当前资料摘要（完整字段请使用 /health-export）：'+json.dumps(summaries,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                    notice=text+'\n\n'+self._governed_disclosure()['context_disclosure']
+                    if len(notice)>2000 or len(notice.encode('utf-8'))>4096:
+                        text='资料较多，请缩小查看范围或使用 /health-export 导出完整资料。'
                 elif name=='/health-task-once':
                     return self._governed_task_once(source_causal_id,argument)
                 elif name=='/health-task-cancel':
@@ -15205,12 +15249,11 @@ class HealthCore:
             except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
 
     def _governed_command_now(self, source):
-        now=self._owner_settings_clock().astimezone(timezone.utc)
-        receipt=self._store.source_receipt(source)
-        if receipt is not None:
-            observed=datetime.fromisoformat(receipt.envelope.received_at).astimezone(timezone.utc)
-            now=max(now,observed)
-        return now
+        # Admission receipt time records arrival; Core owns business time.
+        now=self._owner_settings_clock()
+        if not isinstance(now,datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise AuthorityValidationError('owner-command-clock-unavailable')
+        return now.astimezone(timezone.utc)
 
     def _governed_task_once(self, source, argument):
         import re
@@ -15322,10 +15365,13 @@ class HealthCore:
                             result['delivery_refs'].append({'kind':'owner-outbox','intent_id':previous[0].intent.intent_id})
                         continue
                     claim_id='governed-task-claim:'+stable_digest({'task':task.task_id}).removeprefix('sha256:')
-                    claimed=self.claim_task(task.task_id,holder_id='governed-current-wake',lease_id=claim_id,acquired_at_utc=now.isoformat())
-                    self.advance_task_phase(task.task_id,phase='in-progress',advanced_at_utc=now.isoformat())
-                    self.release_task_claim(claim_id,holder_id='governed-current-wake',observed_at_utc=now.isoformat())
-                    self.advance_task_phase(task.task_id,phase='awaiting-result',advanced_at_utc=now.isoformat())
+                    def ready_for_delivery(current):
+                        claimed=TaskEngine.claim(current,task.task_id,holder_id='governed-current-wake',lease_id=claim_id,acquired_at_utc=now.isoformat())
+                        working=TaskEngine.advance_phase(claimed.state,task.task_id,phase='in-progress',advanced_at_utc=now.isoformat())
+                        released=TaskEngine.release_claim(working.state,claim_id,holder_id='governed-current-wake',observed_at_utc=now.isoformat())
+                        ready=TaskEngine.advance_phase(released.state,task.task_id,phase='awaiting-result',advanced_at_utc=now.isoformat())
+                        return replace(ready,state=replace(ready.state,version=current.version+1))
+                    self._mutate_ticket115_task(ready_for_delivery,health_command_action='task.phase.advance')
                     source=task.source_refs[0].removeprefix('source:')
                     due=task.deferred_until_utc or task.updated_at_utc
                     refs=self._governed_notice(source,'task-due','一次提醒：'+task.expected_result,
