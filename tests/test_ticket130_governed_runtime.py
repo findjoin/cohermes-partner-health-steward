@@ -490,7 +490,7 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
             card, = fixture.service._core.daily_state().evidence_cards
             self.assertEqual(card.content, text)
             self.assertEqual(card.occurred_at, "unknown")
-            self.assertEqual(card.time_certainty, "unknown")
+            self.assertEqual(card.time_certainty, "uncertain")
 
     def test_v130_03_bounded_canonical_chunks_grant_isolation_currentness_and_no_core_network_lock(self):
         self._modules()

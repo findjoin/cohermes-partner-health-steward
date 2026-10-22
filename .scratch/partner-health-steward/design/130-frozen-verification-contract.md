@@ -1,6 +1,6 @@
 # Ticket130 独立验证合同候选
 
-状态：pre-code candidate R2，尚未冻结。独立verification authority：verification_130（接续中断的implementation_audit同一权威文件）；唯一设计作者deployment_audit。设计以本checkpoint的`130-governed-live-nondiagnostic-runtime-design.md`为准（含6dab079的真实300秒短内存事实修正及650e8c5的主人独立delete确认语法澄清）。本合同不授予模型、网络、诊断、发布或主人canary权限；不新增业务ledger、第四种CorePort或长期恢复正文。
+状态：pre-code candidate R2.1，尚未冻结。独立verification authority：verification_130（接续中断的implementation_audit同一权威文件）；唯一设计作者deployment_audit。设计以本checkpoint的`130-governed-live-nondiagnostic-runtime-design.md`为准（含6dab079的真实300秒短内存事实修正及650e8c5的主人独立delete确认语法澄清）。本合同不授予模型、网络、诊断、发布或主人canary权限；不新增业务ledger、第四种CorePort或长期恢复正文。
 
 ## 已知差额与验证边界
 
@@ -24,6 +24,7 @@
 
 ## 关键fixture一致性与恢复事实
 
+- R2.1仅纠正V02未知时间样例的旧typed表示：唯一设计要求不能可靠重算时发生时间unknown，不要求新增certainty enum。当前原`AtomicEvidenceClaim`只接受`known/uncertain`；`EvidenceCard`及`DailyHealthState`沿同合同，未知发生时间须为`occurred_at="unknown"/time_certainty="uncertain"`。独立公开类型characterization已验证该claim/card/state可完整roundtrip；certainty="unknown"明确拒绝为`invalid evidence time certainty`，certainty="known"配未知时间明确拒绝为`known evidence occurrence is not orderable`。证据`/tmp/ticket130-unknown-time-characterization.py/.log`。这是原断言的局部假红，只改单样例预期，不改产品enum、唯一设计、七家族或旧冻结门。
 - 两阶段使用同一concrete131预算、route/owner decision/期限，intake和answer各有真实schema/authority；无stage的旧answer wire/digest保持。Core自己的完整结果resolve/report仍是权威。report原有结构不凭空扩展usage字段；usage/response/model完整typed结果由result_digest绑定并读回核对。
 - 全部输入、身份、账户token、模型credential、asset及approved atoms/template均为离线合成。预算明确覆盖Core业务clock和Plugin真实UTC；从不把配置240000、sample usage或65536 bytes说成共同上下文保证。模型说明来自实际Core budget/report，必须实际显示“不提供共同上下文保证”。
 - 主人业务clock受控用于due/wake；该家族仅以真实126 Bridge的已声明clock注入与真实pinned sender保持同一时间，既不伪造业务结果也不等待真实分钟流逝。完整初始化/模型/附件tracer仍测试生产autowire。NL相对时间依据原protocol timestamp与主人时区，而非接收时刻或模型日期。
