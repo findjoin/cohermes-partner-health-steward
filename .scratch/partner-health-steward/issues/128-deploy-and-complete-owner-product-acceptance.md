@@ -75,4 +75,4 @@ Blocked by: [130 - 受控自然语言与主人操作真实入口](130-connect-go
 
 ### Verified default service scope
 
-2026-10-18 root只读现场核查已确认：DMIT实际default `hermes-gateway.service`属于root用户级systemd，而非系统级；只查系统级得到LoadState=not-found不能据此宣称实际网关已停止。既有无秘密metadata脚本为`/tmp/dmit-connection-audit/dmit_deployment_metadata.sh`；精确只读查询上下文为`env XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus systemctl --user show hermes-gateway.service`。后继任何状态核查、启动/重启或回滚必须先识别并绑定真实service scope；当前120默认controller调用的系统级systemctl不能未经核验直接当作该目标的控制器。该记录仅补现场事实，不执行service操作、不读取配置或秘密，不新增部署方案。
+2026-10-18 root只读现场核查已确认：DMIT实际default `hermes-gateway.service`属于root用户级systemd，而非系统级；只查系统级得到LoadState=not-found不能据此宣称实际网关已停止。既有无秘密metadata脚本为`/tmp/dmit-connection-audit/dmit_deployment_metadata.sh`；精确只读查询上下文为`env XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus systemctl --user show hermes-gateway.service`。2026-10-22独立源码复核更正此前controller判断：现有120 `_DefaultServiceController`在`release_deployment.py:635—645`已经调用`systemctl --user`，并非系统级。后继须绑定实际root用户总线/XDG上下文并验证真实执行，不能从已选用户scope直接推断SSH启动可用或业务健康。该记录仅更正事实，不执行service操作、不读取配置或秘密，不新增部署方案。
