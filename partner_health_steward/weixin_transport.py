@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import hashlib
+import re
+import secrets
 import threading
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from .delivery import OwnerDeliverySendIntent, OwnerDeliveryTransportResult
 from .initialization import stable_digest
@@ -179,5 +183,163 @@ class PinnedWeixinOwnerDeliveryAdapter:
             return await _send_message(_BoundSession(session, self._binding),
                 base_url=self._binding.base_url, token=self._token, to=recipient,
                 text=text, context_token=context, client_id=client)
+        finally:
+            await session.close()
+
+
+_EXPORT_API = "https://ilinkai.weixin.qq.com"
+_EXPORT_CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
+_MAX_EXPORT_BYTES = 8388608
+
+
+def _export_upload_url(value, filekey):
+    from gateway.platforms.weixin import _cdn_upload_url
+    value = _text(value)
+    parsed = urlsplit(value)
+    if (parsed.scheme != "https" or parsed.netloc != "novac2c.cdn.weixin.qq.com"
+            or parsed.path != "/c2c/upload" or parsed.fragment
+            or parsed.username is not None or parsed.password is not None or parsed.port is not None):
+        raise ValueError("export CDN binding mismatch")
+    pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    if (len(pairs) != 2 or {key for key, _ in pairs} != {"encrypted_query_param", "filekey"}
+            or any(not item for _, item in pairs)):
+        raise ValueError("invalid export upload ticket")
+    fields = dict(pairs)
+    if fields["filekey"] != filekey or _cdn_upload_url(_EXPORT_CDN, fields["encrypted_query_param"], filekey) != value:
+        raise ValueError("export upload ticket changed")
+    return value
+
+
+class _ExportBoundSession:
+    def __init__(self, session, filekey):
+        self._session, self._filekey = session, filekey
+
+    def post(self, url, **kwargs):
+        from gateway.platforms.weixin import EP_GET_UPLOAD_URL, EP_SEND_MESSAGE
+        if url not in {_EXPORT_API + "/" + EP_GET_UPLOAD_URL, _EXPORT_API + "/" + EP_SEND_MESSAGE}:
+            _export_upload_url(url, self._filekey)
+            if any(key.lower() == "authorization" for key in kwargs.get("headers", {})):
+                raise ValueError("export CDN credentials denied")
+        kwargs["allow_redirects"] = False
+        return self._session.post(url, **kwargs)
+
+
+class PinnedWeixinExportArtifactAdapter:
+    """One in-memory pinned file attempt for one exact Core export grant."""
+
+    def __init__(self, binding, authorization, artifact_bytes, *, token, context_token_provider, session_factory=None):
+        if (type(binding) is not WeixinTransportBinding or binding.base_url != _EXPORT_API
+                or not callable(context_token_provider) or type(artifact_bytes) is not bytes):
+            raise ValueError("invalid export transport binding")
+        self._binding, self._token = binding, _text(token)
+        self._authorization, self._artifact = copy.deepcopy(authorization), artifact_bytes
+        self._context, self._factory = context_token_provider, session_factory
+        self._used, self._lock = False, threading.Lock()
+        self._validated()
+
+    def _validated(self):
+        auth = _exact(self._authorization, {
+            "purpose", "recipient_role", "account_id", "intent_id", "send_intent", "payload",
+            "payload_digest", "route_id", "route_generation", "execution",
+        })
+        if (auth["purpose"] != "export-artifact" or auth["recipient_role"] != "owner"
+                or auth["account_id"] != self._binding.account_id
+                or type(auth["route_generation"]) is not int or auth["route_generation"] < 1):
+            raise ValueError("export owner route mismatch")
+        execution = _exact(auth["execution"], {"lease_id", "effect_id", "intent_digest", "generation", "writer_fence"})
+        for field in ("lease_id", "effect_id", "intent_digest", "writer_fence"):
+            _text(execution[field])
+        if type(execution["generation"]) is not int or execution["generation"] < 1:
+            raise ValueError("invalid export execution generation")
+        payload = _exact(auth["payload"], {"artifact_ref", "filename", "size_bytes", "digest"})
+        _text(payload["artifact_ref"])
+        digest = payload["digest"]
+        if (type(digest) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                or payload["filename"] != "health-export-" + digest[7:] + ".json"
+                or type(payload["size_bytes"]) is not int or not 1 <= payload["size_bytes"] <= _MAX_EXPORT_BYTES
+                or type(self._artifact) is not bytes or len(self._artifact) != payload["size_bytes"]
+                or "sha256:" + hashlib.sha256(self._artifact).hexdigest() != digest
+                or stable_digest(payload) != auth["payload_digest"]):
+            raise ValueError("export artifact metadata mismatch")
+        intent = OwnerDeliverySendIntent.from_wire(auth["send_intent"])
+        if (intent.intent_id != auth["intent_id"] or intent.destination.partner_id != self._binding.account_id
+                or intent.destination.route_id != auth["route_id"] or intent.payload_digest != auth["payload_digest"]):
+            raise ValueError("export exact destination mismatch")
+        client = "health-export-" + stable_digest({
+            "account": self._binding.account_id, "intent_id": intent.intent_id,
+            "attempt_ref": intent.attempt_ref, "execution": execution,
+            "route_id": auth["route_id"], "route_generation": auth["route_generation"],
+            "idempotency_key": intent.idempotency_key,
+        }).removeprefix("sha256:")
+        return intent.destination.owner_sender_id, payload["filename"], client
+
+    def send(self, exact_send_intent, /):
+        if type(exact_send_intent) is not dict or exact_send_intent != self._authorization["send_intent"]:
+            raise ValueError("export exact send intent required")
+        recipient, filename, client = self._validated()
+        with self._lock:
+            if self._used:
+                raise ValueError("export attempt already consumed")
+            self._used = True
+        status = "unknown"
+        try:
+            context = _text(self._context(recipient))
+            raw = asyncio.run(self._send_once(recipient, filename, client, context))
+            if type(raw) is dict:
+                values = [raw[key] for key in ("ret", "errcode") if key in raw]
+                if any(type(value) is int and value != 0 for value in values):
+                    status = "rejected"
+                elif values and all(type(value) is int and value == 0 for value in values):
+                    status = "accepted"
+        except Exception:
+            pass
+        finally:
+            self._artifact = None
+        identity = stable_digest({"client_id": client, "status": status}).removeprefix("sha256:")
+        return OwnerDeliveryTransportResult(status, "weixin-export-result:" + identity,
+                                             "weixin-export-observation:" + identity).to_wire()
+
+    async def _send_once(self, recipient, filename, client, context):
+        from gateway.platforms.weixin import (
+            API_TIMEOUT_MS, EP_SEND_MESSAGE, MEDIA_FILE, ITEM_FILE,
+            _aes128_ecb_encrypt, _aes_padded_size, _api_post, _cdn_upload_url,
+            _get_upload_url, _upload_ciphertext,
+        )
+        plaintext = self._artifact
+        filekey, key = secrets.token_hex(16), secrets.token_bytes(16)
+        session = _session(self._factory)
+        bound = _ExportBoundSession(session, filekey)
+        try:
+            ticket = await _get_upload_url(bound, base_url=_EXPORT_API, token=self._token,
+                to_user_id=recipient, media_type=MEDIA_FILE, filekey=filekey,
+                rawsize=len(plaintext), rawfilemd5=hashlib.md5(plaintext).hexdigest(),
+                filesize=_aes_padded_size(len(plaintext)), aeskey_hex=key.hex())
+            if type(ticket) is not dict:
+                raise ValueError("export upload ticket unconfirmed")
+            codes = [ticket[name] for name in ("ret", "errcode") if name in ticket]
+            if any(type(code) is int and code != 0 for code in codes):
+                return ticket
+            if any(type(code) is not int for code in codes):
+                raise ValueError("export upload ticket unconfirmed")
+            if ticket.get("upload_param"):
+                upload_url = _cdn_upload_url(_EXPORT_CDN, _text(ticket["upload_param"]), filekey)
+            else:
+                upload_url = _text(ticket.get("upload_full_url"))
+            upload_url = _export_upload_url(upload_url, filekey)
+            ciphertext = _aes128_ecb_encrypt(plaintext, key)
+            if len(ciphertext) != _aes_padded_size(len(plaintext)) or len(ciphertext) > _MAX_EXPORT_BYTES + 16:
+                raise ValueError("export ciphertext size mismatch")
+            encrypted = _text(await _upload_ciphertext(bound, ciphertext=ciphertext, upload_url=upload_url))
+            return await _api_post(bound, base_url=_EXPORT_API, endpoint=EP_SEND_MESSAGE,
+                payload={"msg": {
+                    "from_user_id": "", "to_user_id": recipient, "client_id": client,
+                    "message_type": 2, "message_state": 2,
+                    "item_list": [{"type": ITEM_FILE, "file_item": {
+                        "media": {"encrypt_query_param": encrypted,
+                                  "aes_key": base64.b64encode(key.hex().encode("ascii")).decode("ascii"),
+                                  "encrypt_type": 1},
+                        "file_name": filename, "len": str(len(plaintext)),
+                    }}], "context_token": context,
+                }}, token=self._token, timeout_ms=API_TIMEOUT_MS)
         finally:
             await session.close()

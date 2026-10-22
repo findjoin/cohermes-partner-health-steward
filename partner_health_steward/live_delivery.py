@@ -17,10 +17,12 @@ def _exact(value, fields):
 
 
 class LiveWeixinDeliveryBridge:
-    def __init__(self, core_port, wire_adapter_factory, *, clock):
-        if not callable(getattr(core_port, "request", None)) or not callable(wire_adapter_factory) or not callable(clock):
+    def __init__(self, core_port, wire_adapter_factory, *, clock, export_wire_adapter_factory=None):
+        if (not callable(getattr(core_port, "request", None)) or not callable(wire_adapter_factory)
+                or not callable(clock) or export_wire_adapter_factory is not None and not callable(export_wire_adapter_factory)):
             raise ValueError("invalid live delivery dependencies")
         self._port, self._factory, self._clock = core_port, wire_adapter_factory, clock
+        self._export_factory = export_wire_adapter_factory
         self._lock = asyncio.Lock()
 
     async def _rpc(self, kind, name, payload):
@@ -81,6 +83,41 @@ class LiveWeixinDeliveryBridge:
         _exact(result, {"delivery"})
         return None if result["delivery"] is None else self._delivery(result["delivery"])
 
+    async def _read_export(self, intent_id, grant, authorization):
+        from .bounded_transfer import (
+            decode_canonical, decode_chunk, validate_bytes, validate_descriptor,
+        )
+        metadata = _exact(authorization["payload"], {"artifact_ref", "filename", "size_bytes", "digest"})
+        if (authorization.get("recipient_role") != "owner"
+                or metadata["filename"] != "health-export-" + str(metadata["digest"])[7:] + ".json"):
+            raise ValueError("invalid export owner metadata")
+        buffer = bytearray()
+        try:
+            descriptor, index = None, 0
+            while descriptor is None or index < descriptor["chunk_count"]:
+                value = await self._rpc("controlled-effect", "export-artifact-read", {
+                    "intent_id": intent_id, "grant": grant, "index": index,
+                })
+                _exact(value, {"artifact"})
+                artifact = _exact(value["artifact"], {
+                    "artifact_ref", "filename", "size_bytes", "digest", "chunk_count", "index", "bytes_b64", "next_index",
+                })
+                if {name: artifact[name] for name in metadata} != metadata:
+                    raise ValueError("export artifact metadata changed")
+                actual = validate_descriptor({name: artifact[name] for name in ("size_bytes", "digest", "chunk_count")})
+                if descriptor is None:
+                    descriptor = actual
+                if (actual != descriptor or type(artifact["index"]) is not int or artifact["index"] != index
+                        or artifact["next_index"] != (index + 1 if index + 1 < descriptor["chunk_count"] else None)):
+                    raise ValueError("export artifact chunk changed")
+                buffer.extend(decode_chunk(artifact["bytes_b64"], index=index, descriptor=descriptor))
+                index += 1
+            result = validate_bytes(bytes(buffer), descriptor)
+            decode_canonical(result)
+            return result
+        finally:
+            buffer.clear()
+
     async def _send(self, delivery):
         intent_id = delivery["intent_id"]
         if delivery["handoff_complete"]:
@@ -107,13 +144,28 @@ class LiveWeixinDeliveryBridge:
                 or auth.get("send_intent") != prepared["send_intent"]
                 or auth.get("execution") != {field: grant[field] for field in ("lease_id", "effect_id", "intent_digest", "generation", "writer_fence")}):
             raise ValueError("delivery authorization mismatch")
+        artifact_bytes = None
         try:
-            adapter = self._factory(copy.deepcopy(auth))
+            if auth.get("purpose") == "export-artifact":
+                if self._export_factory is None:
+                    raise ValueError("export transport unavailable")
+                artifact_bytes = await self._read_export(intent_id, grant, auth)
+                renewed = await self._rpc("controlled-effect", "delivery-authorize", {
+                    "intent_id": intent_id, "grant": grant, "attempted_at_utc": self._at(),
+                })
+                _exact(renewed, {"delivery", "authorization"})
+                if renewed["authorization"] != auth:
+                    raise ValueError("export send currentness unconfirmed")
+                adapter = self._export_factory(copy.deepcopy(auth), artifact_bytes)
+            else:
+                adapter = self._factory(copy.deepcopy(auth))
             result = await asyncio.to_thread(adapter.send, copy.deepcopy(auth["send_intent"]))
             result = OwnerDeliveryTransportResult.from_wire(result).to_wire()
         except Exception:
             digest = stable_digest({"intent_id": intent_id, "execution": auth["execution"]}).removeprefix("sha256:")
             result = {"status": "unknown", "result_ref": "delivery-unknown:" + digest, "evidence_ref": "delivery-observation:" + digest}
+        finally:
+            artifact_bytes = None
         try:
             completed = await self._rpc("controlled-effect", "delivery-complete", {
                 "intent_id": intent_id, "grant": grant, "result": result, "observed_at_utc": self._at()})

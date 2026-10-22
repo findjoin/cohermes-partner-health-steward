@@ -64,10 +64,18 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             raise _EntryUnavailable("health-entry-core-required")
         self._ingress = ingress_transport if ingress_transport is not None else extra.get("ingress_transport")
         self._delivery = delivery_transport if delivery_transport is not None else extra.get("delivery_transport")
+        self._model_bridge = None
+        if "nondiagnostic_model_binding" in extra:
+            from .live_nondiagnostic import create_live_nondiagnostic_model_bridge
+            model = extra["nondiagnostic_model_binding"]
+            if type(model) is not dict or set(model) != {"route", "budget", "credential_provider"}:
+                raise _EntryUnavailable("health-entry-model-binding-required")
+            self._model_bridge = create_live_nondiagnostic_model_bridge(self._core_port, **model)
         self._context_tokens = None
         if "weixin_transport_binding" in extra and (self._ingress is None or self._delivery is None):
             from .weixin_transport import (
                 WeixinTransportBinding, PinnedWeixinIngressTransport, PinnedWeixinOwnerDeliveryAdapter,
+                PinnedWeixinExportArtifactAdapter,
             )
             from .live_delivery import LiveWeixinDeliveryBridge
             from gateway.platforms.weixin import ContextTokenStore, get_hermes_home
@@ -88,8 +96,13 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                     return PinnedWeixinOwnerDeliveryAdapter(
                         binding, authorization, token=token,
                         context_token_provider=lambda recipient: tokens.get(binding.account_id, recipient))
+                def export_factory(authorization, artifact_bytes):
+                    return PinnedWeixinExportArtifactAdapter(
+                        binding, authorization, artifact_bytes, token=token,
+                        context_token_provider=lambda recipient: tokens.get(binding.account_id, recipient))
                 self._delivery = LiveWeixinDeliveryBridge(
-                    self._core_port, factory, clock=lambda: datetime.now(timezone.utc))
+                    self._core_port, factory, clock=lambda: datetime.now(timezone.utc),
+                    export_wire_adapter_factory=export_factory)
         self._template = None
         if "initialization_template" in extra:
             self._template = OwnerInitialization.from_storage(extra["initialization_template"])
@@ -318,6 +331,24 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         # production handoff; the production bridge above cannot use it.
         return type(result) is dict and result.get("status") in {"accepted", "unknown"}
 
+    async def _governed_handoff(self, source, outcome):
+        if (type(outcome) is not dict or set(outcome) != {
+                "response", "next_stage", "model_use_disclosure", "delivery_refs"}
+                or outcome["next_stage"] not in {None, "intake", "answer"}
+                or type(outcome["delivery_refs"]) is not list):
+            raise _EntryUnavailable("health-entry-governed-result-unconfirmed")
+        if outcome["next_stage"] is not None:
+            outcome = await self._model_bridge.advance_source(source)
+        if type(outcome.get("response")) is not dict or type(outcome.get("delivery_refs")) is not list:
+            raise _EntryUnavailable("health-entry-governed-result-unconfirmed")
+        refs = outcome["delivery_refs"]
+        handed_off = bool(refs)
+        for reference in refs:
+            handed_off = await self._bridge(reference) and handed_off
+        # The caller still obtains the original Core cursor directive. A
+        # minimal unknown notice cannot authorize ACK of its unresolved source.
+        return handed_off
+
     async def _process(self, native, cursor, index):
         try:
             headers = self._headers(native, cursor, index)
@@ -396,8 +427,11 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             capability = "health-init"
         message = {**headers, "generation": preflight["current_generation"],
                    "requested_capability": capability, "body": body}
-        admitted = await self._command("receive-weixin", {"message": message})
-        response = admitted.get("response") if set(admitted) == {"response"} else None
+        governed = self._model_bridge is not None and initialization is None
+        admitted = await self._command("governed-receive" if governed else "receive-weixin", {"message": message})
+        response = admitted.get("response")
+        if not governed and set(admitted) != {"response"}:
+            response = None
         if (type(response) is not dict or response.get("status") not in {"accepted", "replayed"}
                 or response.get("causal_id") != headers["causal_id"]):
             return None, False
@@ -416,6 +450,10 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             projection = InitializationProjection.from_storage(state["initialization"])
             if projection.phase != "enabled" or not projection.enabled:
                 return None, False
+            if self._model_bridge is not None:
+                outcome = await self._command("governed-advance", {"source_causal_id": headers["causal_id"]})
+                handed_off = await self._governed_handoff(headers["causal_id"], outcome)
+                return (headers["causal_id"], True) if handed_off else (None, False)
         elif response.get("reason_code") == "ordinary-hermes-route":
             await self._ordinary(headers, body)
             return None, True
@@ -427,6 +465,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                 result_ref = _text(meta.get("result_ref"))
                 handed_off = await self._bridge({"kind": "committed-safety",
                     "source_causal_id": headers["causal_id"], "result_ref": result_ref})
+                return (headers["causal_id"], True) if handed_off else (None, False)
+            if governed:
+                handed_off = await self._governed_handoff(headers["causal_id"], admitted)
                 return (headers["causal_id"], True) if handed_off else (None, False)
             turn = meta.get("turn_result") if type(meta) is dict else None
             if type(turn) is not dict:
@@ -474,6 +515,14 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         if not self._running:
             return False
         try:
+            if self._model_bridge is not None:
+                result = await self._command("governed-wake")
+                if type(result) is not dict or set(result) != {"delivery_refs", "task_status"} or type(result["delivery_refs"]) is not list:
+                    raise _EntryUnavailable("health-entry-wake-unconfirmed")
+                for reference in result["delivery_refs"]:
+                    if not await self._bridge(reference):
+                        raise _EntryUnavailable("health-entry-wake-handoff-unconfirmed")
+                return result
             result = await self._command("wake-current")
             response = result.get("response") if set(result) == {"response"} else None
             return type(response) is dict and response.get("status") in {"accepted", "replayed"}
