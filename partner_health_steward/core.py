@@ -14910,7 +14910,37 @@ class HealthCore:
                     committed=self._governed_commit_draft(source_causal_id,complete,candidate)
                     if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
                 turn=self.daily_turn_result(source_causal_id)
-                if turn is None: return {**result,'response':Response('replayed',source_causal_id,'daily-turn-result-redacted').to_wire()}
+                if turn is None:
+                    # Ticket112 intentionally released the final reply body.
+                    # Only its original durable126 handoff can release a new
+                    # native cursor; no body, intent, or business work is rebuilt.
+                    report=self.probe()
+                    if report.state is not ProbeState.HEALTHY and not (report.state is ProbeState.UNKNOWN and report.reason_code=='effect-result-unknown'):
+                        return result
+                    head=self._read_head()
+                    authority=self._store.finalized_authority()
+                    if (daily.phase!='finalized' or daily.terminal is None or authority is None
+                            or authority.mismatch_reason(head) is not None
+                            or self._current_writer_proof(head) is None
+                            or not self._store.verify_integrity(authority)):
+                        return result
+                    settings=self._current_owner_settings(head)
+                    destination=self._owner_weixin_destination_open(settings)
+                    records=self._live_source_deliveries(source_causal_id,settings)
+                    owners=[r for r in records if self._live_owner_intent(r.intent)]
+                    if (len(owners)!=1 or not self._live_handoff(source_causal_id,settings)
+                            or not settings.consent_enabled or settings.consent_path_status!='active'):
+                        return result
+                    intent=owners[0].intent
+                    if (intent.payload_ref!='live-daily-reply:'+daily.terminal.record_id
+                            or intent.business_fact_ref!=daily.terminal.record_id
+                            or intent.business_revision_digest!=daily.terminal.result_digest
+                            or intent.route_id!=destination.route_id or intent.recipient_ref!=destination.owner_sender_id
+                            or intent.route_generation!=settings.current_configuration_generation
+                            or self._live_owner_binding_open(intent,settings) is None):
+                        return result
+                    return {**result,'response':Response('replayed',source_causal_id,'daily-turn-result-redacted').to_wire(),
+                            'delivery_refs':[{'kind':'owner-outbox','intent_id':intent.intent_id}]}
                 # Bind only the exact original finalized turn through126.
                 bound=self.bind_live_delivery({'kind':'committed-turn','source_causal_id':source_causal_id,'record_id':turn.record_id,'transition_id':turn.transition_id})
                 refs=[{'kind':'owner-outbox','intent_id':d['intent_id']} for d in bound['deliveries'] if d['recipient_role']=='owner']
