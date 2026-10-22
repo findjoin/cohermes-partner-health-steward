@@ -9793,7 +9793,8 @@ class HealthCore:
             receipt=self._store.health_command_receipt(intent.business_fact_ref)
             if receipt is not None and receipt.result.get('_governed_action')=='task-due':
                 if (self._governed_task_notice_current(intent,settings) is None
-                        or not self._owner_delivery_global_controls_allow_open(settings,observed_at_utc=observed_at_utc)):
+                        or settings.proactive_support_paused
+                        or not self._owner_delivery_global_controls_allow_open(settings,observed_at_utc=observed_at_utc,mandatory=True)):
                     return None
             attempted = outbox_record.optional_fact("attempted")
             if expected_attempt_ref is None:
