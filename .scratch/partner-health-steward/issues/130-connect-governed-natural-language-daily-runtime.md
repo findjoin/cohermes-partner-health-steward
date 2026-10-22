@@ -65,3 +65,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.6 (2026-10-22)
 
 [Evidence63](../evidence/63-ticket130-handoff-and-replay-observation-refreeze-20261022.md)记录原known正向提前teardown及旧batch游标倒退的实证矛盾、真实重投产品错误和fresh双轴PASS。当前唯一checkpoint `fb97e5e656b4ebe29d7b1dfce25c24d6ce58ed46` / tree `b6e7fd0811be0fd017d848895ccda8086b50e0cf`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `5134e3a1f137bf24fe0acdcfc0aa50a43117214d`、verifier `19ba1c10dbf2de199c751c1f454569fced2091ed`取代R2.5对应项。V04正向必须等同source真实accepted/handoff后结束，原unknown严格门不变；V05不要求旧cursor倒退，同时加强实际重投接受、原refs与单任务/取消/零新副作用断言。既有HMAC归一的入口兼容缺口继续产品修复，不能把causal-id-conflict当成功。七家族、其余16冻结blob、设计及产品权限不变；正式完整执行、闭票及128真实部署仍待完成。
+
+## Same-freeze full-suite resource failure (2026-10-22)
+
+[Evidence64](../evidence/64-ticket130-full-suite-resource-lifetime-failure-20261022.md)记录精确364943e正式组件20/20绿色但同快照全量801项出现7个真实FD耗尽error。独立sealed对照及产品作者public纯合成复现均证明原Service正常关闭与启动失败每轮遗留10个私有资源FD，另有临时provider遗留；不是仅fixture错误。root退回原authority/service自有资源生命周期内窄修，禁止提高limit、改冻结或拆全量绕过，R2.6十八冻结身份不变。当前票仍claimed，未开始实施后双轴或宣称全量／部署完成。
