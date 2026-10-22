@@ -37,3 +37,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 候选在同一引用内收口：原64KiB CorePort不变，以同effect session短内存、8MiB总量/32768-byte片传完整request/result；真实owner rights包含受管JSON附件的单次固定Weixin媒体链，8MiB本地文件上限（同export effect session有限分片）与不可远程证明的CDN删除限制明确披露。真实due/localday review wake、停止记录正文短寿命和内部纯executor仍为必需验收输入。该补充不构成实现、冻结或闭票。
 
 初始化独立确认、控制/权利及失败未知提示的实际主人结果也由同候选收口：原native source/业务transition→Core固定结果→原owner-outbox→126受控发送，不以enabled projection/ACK或RPC返回代替实际交接；131限制说明实际随成功结果显示。
+
+## Frozen implementation authority (2026-10-22)
+
+[Evidence57](../evidence/57-ticket130-precode-freeze-20261022.md)记录原V03/V06预审P2与已实证Gate07 fixture矛盾的独立R2修订，以及同一checkpoint的新鲜Spec／Standards PASS。当前唯一冻结checkpoint `813d7a77d3013bea2fe18708961efe2ae23de291` / tree `177bd5932689b989860d697adc6b64e374c722ab`；设计 `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`、合同 `c08f24c07fe7ba4dce0dd299db300834088b1f9a`、verifier `ba7aa63a04ce541f4463243eaba170e3850e527a`。root授权在此边界实施，产品作者不得改冻结门。7个prerequisite失败不代表内部路径已执行；真实外部动作／部署仍由128承接。前置126已按Evidence55/56闭合，794全量／root23是精确d86的历史结果，不冒充本票绿灯。完成仍须本票七门、受影响／全量／编译及18冻结完整性、实施后双轴与root闭票。
