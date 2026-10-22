@@ -99,6 +99,7 @@ LIFECYCLE_STORAGE_TABLES = frozenset(
         "daily_reviews_v1",
         "owner_outbox_v1",
         "owner_delivery_observations_v1",
+        "managed_exports_v1",
     }
 )
 

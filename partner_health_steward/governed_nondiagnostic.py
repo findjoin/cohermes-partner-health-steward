@@ -97,7 +97,7 @@ class NonDiagnosticIntakeCandidate:
             quote = item['quote']
             if (item['start'],item['end']) not in clauses:
                 raise AuthorityValidationError("intake fact omitted a clause qualifier")
-            if re.search(r'[?？]|是不是|是否|会不会|有没有|怎么|怎样|如何|假如|如果|假设|请.*(?:诊断|判断)|帮我.*(?:诊断|判断)', quote):
+            if re.search(r'[?？]|是不是|是否|会不会|有没有|怎么|怎样|如何|为什么|为啥|能否|[吗呢][。！!]?\Z|假如|如果|假设|请.*(?:诊断|判断|告诉)|帮我.*(?:诊断|判断)', quote):
                 raise AuthorityValidationError("intake question is not an owner fact")
         return self
 
@@ -156,16 +156,24 @@ class GovernedNonDiagnosticRuntime:
         try: return self._daily_runtime.execute_evidence_stage(source,state)
         finally: self._formation.reset(token)
 
+    def correction_stage(self, source, state, pending):
+        from .rights import PendingCorrectionDraft
+        if type(pending) is not PendingCorrectionDraft or pending.revision.source_refs != ('source:'+source.causal_id,):
+            raise AuthorityValidationError('invalid governed correction authority')
+        token=self._formation.set((source,pending,None,False))
+        try: return self._daily_runtime.execute_evidence_stage(source,state)
+        finally: self._formation.reset(token)
+
     def _claim(self, source, fact, zone):
         quote = fact['quote']; occurred = 'unknown'; certainty = 'uncertain'
         if fact['time_start'] is not None:
             text = source.body[fact['time_start']:fact['time_end']]
             try:
-                stamp = datetime.fromisoformat(source.protocol_timestamp).astimezone(ZoneInfo(zone))
                 if re.fullmatch(r'\d{4}-\d{2}-\d{2}', text):
                     occurred = datetime.fromisoformat(text).date().isoformat()
-                elif text in {'今天','今早','今晚'}: occurred = stamp.date().isoformat()
-                elif text in {'昨天','昨晚'}: occurred = (stamp.date()-timedelta(days=1)).isoformat()
+                elif text in {'今天','今早','今晚','昨天','昨晚'}:
+                    stamp=datetime.fromisoformat(source.protocol_timestamp).astimezone(ZoneInfo(zone))
+                    occurred=(stamp.date()-timedelta(days=text in {'昨天','昨晚'})).isoformat()
                 if occurred != 'unknown': certainty = 'known'
             except (ValueError, TypeError, KeyError): pass
         topics = () if fact['topic_ref'] is None else (fact['topic_ref'],)
@@ -180,27 +188,40 @@ class GovernedNonDiagnosticRuntime:
             if formation is None or formation[0].causal_id != context.source_causal_id:
                 raise AuthorityValidationError("verified intake formation required")
             source,candidate,zone,stopped = formation
+            from .rights import PendingCorrectionDraft
+            if type(candidate) is PendingCorrectionDraft:
+                topics=tuple(ref.removeprefix('portrait-topic:') for ref in candidate.revision.affected_object_refs)
+                skills=('health-evidence','health-portrait') if topics else ('health-evidence',)
+                return StewardPlan('owner-correction',skills,(),portrait_topic_refs=topics,
+                    evidence_maintenance_requests=(candidate.maintenance_request,))
             if stopped:
                 return StewardPlan(RECORDING_EXCLUDED_TEMPORARY_PURPOSE, ('health-owner-inquiry',),(), inquiry_gap='owner-requested temporary clarification')
             claims = tuple(self._claim(source,dict(f),zone) for f in candidate.facts)
             skills = []
             if claims: skills.append('health-evidence')
             if any(c.topic_refs for c in claims): skills.append('health-portrait')
-            if not claims: skills.append('health-owner-inquiry')
+            if not claims and candidate.operation == 'clarify': skills.append('health-owner-inquiry')
             return StewardPlan('non-diagnostic-health',tuple(skills),claims,
-                inquiry_gap='请明确你希望记录的完整陈述或具体问题' if not claims else None)
+                inquiry_gap='请明确你希望记录的完整陈述或具体问题' if not claims and candidate.operation == 'clarify' else None)
         if name == 'health-steward' and type(context) is StewardResolutionContext:
             return StewardResolution(context.candidate_evidence_ids,context.candidate_portrait_topic_refs,
                 tuple(a.atom_id for a in context.reply_atoms),context.candidate_evidence_change_ids)
-        if name == 'health-evidence': return EvidenceDecision.admit(context.atomic_claim)
+        if name == 'health-evidence':
+            if context.maintenance_request is not None:
+                request=context.maintenance_request
+                return EvidenceDecision.correct(request.replacement_claim,request.target_evidence_ids,reason=request.reason)
+            return EvidenceDecision.admit(context.atomic_claim)
         if name == 'health-portrait':
             topic = context.affected_topic_refs[0]
             cards = tuple(c for c in context.committed_related_cards if topic in c.topic_refs)
             if not cards or len(cards) > 3 or any(len('主人原文：'+c.content)>60 for c in cards):
+                if context.purpose=='owner-correction':
+                    return PortraitDecision('withdraw',topic,reason='owner correction requires portrait rejudgment')
                 return PortraitDecision.gap('主人原文无法在当前完整展示边界内表达')
             items=tuple('主人原文：'+c.content for c in cards)
             links=tuple(PortraitProofLink(c.evidence_id,'supports',topic,'current-understanding',text,applicable_period=c.applicable_period) for c,text in zip(cards,items))
-            return PortraitDecision('update',topic,items,proof_links=links)
+            return PortraitDecision('degrade' if context.purpose=='owner-correction' else 'update',topic,items,proof_links=links,
+                reason='owner correction requires portrait rejudgment' if context.purpose=='owner-correction' else None)
         if name == 'health-owner-inquiry': return OwnerInquiryDecision.gap('required-context-unavailable')
         if name == 'health-settings': return SettingsDecision.no_change()
         if name == 'health-literature': return LiteratureDecision.no_qualified_material('无当前批准知识')

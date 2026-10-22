@@ -758,7 +758,7 @@ class AtomicEvidenceClaim:
                    _stored_texts(f["limitations"], "limitations"),
                    _stored_texts(f["proves"], "proves"),
                    _stored_texts(f["does_not_prove"], "does not prove"),
-                   _stored_texts(f["topic_refs"], "topic references"),
+                   _stored_texts(f["topic_refs"], "topic references", empty=True),
                    _specific_fields_from_storage(f["specific_fields"]),
                    EvidenceSeriesKey.from_storage(f["series_key"]),
                    f["time_certainty"],
@@ -4128,6 +4128,18 @@ class DailyTurnResult:
         )  # type: ignore[arg-type]
 
 
+def _render_selected_daily_reply(atoms, resolution):
+    # Keep the approved answer template contiguous in a mixed record/question
+    # turn. Every selected, responsibility-validated business atom is retained.
+    if resolution is not None and resolution.status == "rendered":
+        model = tuple(a for a in atoms if a.source_skill == "health-steward"
+                      and a.source_result_digest == resolution.candidate_digest)
+        others = tuple(a for a in atoms if a not in model)
+        if model:
+            return "".join(a.text for a in model) + "".join(a.text for a in others)
+    return "".join(a.text for a in atoms)
+
+
 @dataclass(frozen=True)
 class DailyTurnDraft:
     source_causal_id: str
@@ -4839,7 +4851,7 @@ class DailyTurnDraft:
             return False
         if (
             (
-                "".join(atom.text for atom in selected_atoms)
+                _render_selected_daily_reply(selected_atoms, self.model_answer_resolution)
                 + _render_daily_skill_disclosure(self.skill_disclosures)
             )
             != self.owner_reply
@@ -7176,7 +7188,7 @@ class DailySkillRuntime:
             tuple(proofs),
             disclosures,
             (
-                "".join(atom.text for atom in selected_atoms)
+                _render_selected_daily_reply(selected_atoms, model_answer_resolution)
                 + _render_daily_skill_disclosure(disclosures)
             ),
             "complete-turn",

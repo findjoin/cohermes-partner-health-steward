@@ -1135,6 +1135,7 @@ class HealthCore:
         self._governed_candidates = {}
         self._governed_started = {}
         self._governed_source_holders = {}
+        self._governed_export_reads = {}
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
@@ -1220,6 +1221,7 @@ class HealthCore:
             self._governed_candidates.clear()
             self._governed_started.clear()
             self._governed_source_holders.clear()
+            self._governed_export_reads.clear()
             self._pending_correction_authorizations.clear()
             failed_writer: list[tuple[str, str]] = []
             for namespace, session in tuple(self._writer_holder_sessions.items()):
@@ -9788,6 +9790,11 @@ class HealthCore:
             if (intent.route_id != destination.route_id or intent.recipient_ref != destination.owner_sender_id
                     or intent.route_generation != settings.current_configuration_generation or outbox_record.unknown_frozen):
                 return None
+            receipt=self._store.health_command_receipt(intent.business_fact_ref)
+            if receipt is not None and receipt.result.get('_governed_action')=='task-due':
+                if (self._governed_task_notice_current(intent,settings) is None
+                        or not self._owner_delivery_global_controls_allow_open(settings,observed_at_utc=observed_at_utc)):
+                    return None
             attempted = outbox_record.optional_fact("attempted")
             if expected_attempt_ref is None:
                 if attempted is not None:
@@ -12435,6 +12442,12 @@ class HealthCore:
             if self._governed is not None:
                 text += "\n\n" + self._governed_disclosure()["context_disclosure"]
             return {"text": text}
+        if intent.payload_ref.startswith("live-governed-export:"):
+            receipt=self._store.health_command_receipt(intent.business_fact_ref)
+            if (receipt is None or receipt.command_digest!=intent.business_revision_digest
+                    or receipt.result.get('_governed_action')!='export-formed' or receipt.result.get('source_causal_id')!=intent.source_ref):
+                raise AuthorityValidationError('export-result-binding-mismatch')
+            return receipt.result['details']
         if intent.payload_ref.startswith("live-governed-reply:"):
             receipt=self._store.health_command_receipt(intent.business_fact_ref)
             if (receipt is None or receipt.command_digest != intent.business_revision_digest
@@ -12476,6 +12489,8 @@ class HealthCore:
         if intent.payload_ref.startswith("owner-decision-status-payload:"):
             return {"text": "健康管理状态已更新，请主人查看并确认当前状态。"}
         if intent.payload_ref.startswith("lifecycle-notice:"):
+            if self._governed is not None:
+                return {"text": "即将永久删除本安装受管健康资料与受管导出副本；管家无法撤回微信或CDN上的外部副本。\n\n" + self._governed_disclosure()["context_disclosure"]}
             return {"text": "健康管理数据操作状态已更新，请主人查看当前处理结果。"}
         review = self._store.daily_review(intent.business_fact_ref)
         if review is not None and review.result_digest == intent.business_revision_digest:
@@ -12747,6 +12762,12 @@ class HealthCore:
             return {"delivery": self.live_delivery_status(intent_id), "send_intent": send.to_wire(), "effect_intent": response.meta.intent}
 
     def authorize_live_delivery(self, intent_id, grant, *, attempted_at_utc):
+        if self._governed is not None:
+            head=self._store.finalized_authority()
+            settings=self._current_owner_settings(head)
+            record=self._ticket115_outbox_state_open(settings).record(intent_id)
+            if record.intent.payload_ref.startswith('live-governed-export:'):
+                return self._governed_authorize_export(intent_id,grant,attempted_at_utc)
         contact = self._live_contact_fact(intent_id)
         if contact is not None:
             with self._lifecycle_lock:
@@ -12823,8 +12844,13 @@ class HealthCore:
                 self.complete_owner_delivery_attempt(completion, grant)
             delivery = self.live_delivery_status(intent_id)
             with self._ticket115_write_authority(live_intent_id=None if contact else intent_id) as (_, settings):
-                return {"delivery": delivery, "source_causal_id": record.intent.source_ref,
+                projection={"delivery": delivery, "source_causal_id": record.intent.source_ref,
                         "handoff_complete": self._live_handoff(record.intent.source_ref, settings)}
+            if self._governed is not None:
+                self._governed_export_reads.pop((grant.lease.effect_id,grant.lease.lease_id),None)
+                if result.status=='accepted': self._governed_finish_task_delivery(intent_id)
+                self._governed_finish_delete_if_ready()
+            return projection
 
     def _recover_live_contact(self, intent_id):
         """A lost contact handoff has one conservative terminal, never a resend."""
@@ -14089,12 +14115,12 @@ class HealthCore:
                     route_id=destination.route_id,
                     route_generation=settings.current_configuration_generation,
                     payload_ref=payload_ref,
-                    payload_digest=stable_digest(
+                    payload_digest=(stable_digest({"text": "即将永久删除本安装受管健康资料与受管导出副本；管家无法撤回微信或CDN上的外部副本。\n\n" + self._governed_disclosure()["context_disclosure"]}) if self._governed is not None else stable_digest(
                         {
                             "contract": "ticket117-lifecycle-notice-payload-v1",
                             "operation_ref": operation_ref,
                         }
-                    ),
+                    )),
                     formed_at_utc=formed_at_utc,
                 )
                 submitted = OwnerDeliveryEngine.submit(
@@ -14673,9 +14699,9 @@ class HealthCore:
             except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError):
                 return result
 
-    def _governed_attempt(self, source, stage, grant, attempt_ref=None):
+    def _governed_attempt(self, source, stage, grant, attempt_ref=None, *, allow_expired=False):
         cached=self._governed_requests.get((source,stage))
-        if cached is None or time.monotonic() >= cached[1]: return None
+        if cached is None or (not allow_expired and time.monotonic() >= cached[1]): return None
         request=cached[0]
         execution=self._validated_model_execution(grant,request.digest)
         if (execution is None or execution.intent.model_stage != stage
@@ -14719,7 +14745,7 @@ class HealthCore:
         if self._governed is None or stage not in {'intake','answer'}: return response
         with self._lifecycle_lock:
             try:
-                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref)
+                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref,allow_expired=True)
                 if matched is None: return response
                 request,execution,attempt=matched
                 if not execution.model_attempt_started: return response
@@ -14731,6 +14757,8 @@ class HealthCore:
                 stored=self._governed_model_effect(source_causal_id,stage)
                 if stored is None or type(stored.payload) is not TerminalEffect or stored.payload.model_report != outcome.model_report:
                     return {'stage':stage,'state':'unknown','reason_code':'model-terminal-unconfirmed'}
+                if outcome.candidate is not None and time.monotonic() >= self._governed_requests[(source_causal_id,stage)][1]:
+                    return {'stage':stage,'state':'owner-decision-required','reason_code':'model-candidate-window-expired'}
                 if outcome.candidate is not None:
                     if stage == 'intake':
                         from .governed_nondiagnostic import NonDiagnosticIntakeCandidate
@@ -14757,7 +14785,7 @@ class HealthCore:
                 self._governed_source_holders.pop(source_causal_id,None)
                 return {'stage':stage,'state':'unknown' if effect.state=='unknown' else 'completed' if effect.state=='accepted' else 'failed-closed','reason_code':reason_code}
             try:
-                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref)
+                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref,allow_expired=True)
                 if matched is None: return {'stage':stage,'state':'failed-closed','reason_code':reason_code}
                 request,execution,attempt=matched
                 report=None if not execution.model_attempt_started else self._governed.llm(stage).transport_unknown_outcome(request).model_report
@@ -14891,7 +14919,7 @@ class HealthCore:
         return body.strip().startswith('/health-') or body.strip().split(' ',1)[0] in {
             '帮助','当前状态','暂停主动联系','恢复主动联系','停止记录','恢复记录','提醒我','取消提醒','查看资料','导出资料','纠正资料','删除资料'}
 
-    def _governed_notice(self, source, kind, text, *, details=None, mark_committed=True):
+    def _governed_notice(self, source, kind, text, *, details=None, mark_committed=True, effect_request_id=None):
         """Commit one original command receipt and owner outbox together."""
         identity=stable_digest({'source':source,'kind':kind}).removeprefix('sha256:')
         fact='governed-result:'+identity
@@ -14909,7 +14937,7 @@ class HealthCore:
                 destination=self._owner_weixin_destination_open(settings)
                 observed=self._owner_delivery_clock_utc_open()
                 intent=OwnerDeliveryEngine.form_intent(effect_kind='owner-delivery',owner_id=settings.owner_id,installation_id=settings.installation_id,
-                    effect_request_id='governed-owner-delivery:'+identity,business_fact_ref=fact,business_revision_digest=receipt.command_digest,
+                    effect_request_id=effect_request_id or 'governed-owner-delivery:'+identity,business_fact_ref=fact,business_revision_digest=receipt.command_digest,
                     source_ref=source,recipient_ref=destination.owner_sender_id,route_id=destination.route_id,
                     route_generation=settings.current_configuration_generation,payload_ref='live-governed-reply:'+fact,
                     payload_digest=stable_digest(payload),formed_at_utc=observed)
@@ -15080,7 +15108,7 @@ class HealthCore:
         from .owner_authority import OwnerMutationRequest
         context=self._governed_owner_context(source)
         settings=self.owner_settings_state()
-        now=self._owner_settings_clock().astimezone(timezone.utc).isoformat()
+        now=self._governed_command_now(source).isoformat()
         typed=OwnerControlCommand(OwnerCommandContext(context.command_id,context.causal_id,'current_owner',context.owner_id,
             context.installation_id,'health_settings.write',context.context_ref,context.current_head_generation,context.writer_fence),
             ControlUpdate(control,operation,target,context.current_head_generation,now),approval)
@@ -15139,3 +15167,363 @@ class HealthCore:
                 refs=self._governed_notice(source_causal_id,name,text)
                 return {'response':Response('accepted',source_causal_id,'owner-command-finalized').to_wire(),'delivery_refs':refs}
             except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
+
+    def _governed_command_now(self, source):
+        now=self._owner_settings_clock().astimezone(timezone.utc)
+        receipt=self._store.source_receipt(source)
+        if receipt is not None:
+            observed=datetime.fromisoformat(receipt.envelope.received_at).astimezone(timezone.utc)
+            now=max(now,observed)
+        return now
+
+    def _governed_task_once(self, source, argument):
+        import re
+        from .tasks import TaskCandidate,TaskApprovalBinding,TaskExternalBoundary,TaskOwnerMutation
+        from .settings import ExecutionScopeApproval
+        settings=self.owner_settings_state(); now=self._governed_command_now(source)
+        match=re.fullmatch(r'(\d{4}-\d{2}-\d{2}|今天|明天)\s+(\d{2}:\d{2})\s+(.+)',argument,re.S)
+        if match is None:
+            refs=self._governed_notice(source,'task-clarify','请提供明确的当地日期、时间和提醒内容，例如：/health-task-once 明天 18:00 喝水。')
+            return {'response':Response('accepted',source,'task-time-clarification').to_wire(),'delivery_refs':refs}
+        zone=ZoneInfo(settings.timezone)
+        date,time_text,text=match.groups()
+        if date in {'今天','明天'}: date=(now.astimezone(zone).date()+timedelta(days=date=='明天')).isoformat()
+        naive=datetime.fromisoformat(date+'T'+time_text)
+        local=naive.replace(tzinfo=zone,fold=0)
+        if local.utcoffset()!=naive.replace(tzinfo=zone,fold=1).utcoffset() or local.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)!=naive:
+            refs=self._governed_notice(source,'task-clarify','该当地时间存在时区歧义或并不存在，请提供另一明确时间。')
+            return {'response':Response('accepted',source,'task-time-clarification').to_wire(),'delivery_refs':refs}
+        due=local.astimezone(timezone.utc)
+        if due <= now:
+            refs=self._governed_notice(source,'task-clarify','提醒时间已过去，请提供未来的明确当地日期和时间。')
+            return {'response':Response('accepted',source,'task-time-clarification').to_wire(),'delivery_refs':refs}
+        destination=self._owner_weixin_destination_open(settings)
+        identity=stable_digest({'source':source,'due':due.isoformat(),'text':text}).removeprefix('sha256:')
+        approval_id='governed-task-approval:'+identity
+        request_id='governed-task-delivery:'+identity
+        candidate=TaskCandidate('governed-task-candidate:'+identity,'owner-goal','source:'+source,
+            stable_digest(self._store.source_receipt(source).envelope.to_storage()),'主人单次提醒',text,'partner-health-plugin',
+            ('owner-reminder',),('source:'+source,),TaskExternalBoundary((destination.owner_sender_id,),('owner-delivery',)),
+            'planned',TaskApprovalBinding.bound(approval_id,1),('当前微信接口已接受该次提醒，不代表主人已读',))
+        task_id='task:'+candidate.semantic_digest.removeprefix('sha256:')[:32]+':1'
+        approval=ExecutionScopeApproval(approval_id,1,settings.owner_id,settings.installation_id,task_id,request_id,
+            candidate.assignee,candidate.purpose,candidate.allowed_data_categories,candidate.allowed_data_refs,
+            settings.current_first_hop_recipient,'owner-delivery',1,0,(due+timedelta(days=1)).isoformat(),
+            settings.current_route_id,settings.current_configuration_generation,settings.current_disclosure_version,False,None)
+        self._governed_settings_command(source,'execution_scope_approval','grant',target=approval_id,approval=approval)
+        transition=self.admit_task_candidate(candidate,committed_at_utc=now.isoformat())
+        if transition.task_id!=task_id: raise AuthorityValidationError('task-identity-unconfirmed')
+        self._mutate_ticket115_task(lambda state:TaskEngine.apply_owner_mutation(state,
+            TaskOwnerMutation.defer(task_id,deferred_until_utc=due.isoformat()),control_ref='source:'+source,effective_at_utc=now.isoformat()),
+            health_command_action='task.owner.defer')
+        refs=self._governed_notice(source,'task-created','已创建一次提醒：'+text+'；当地时间 '+local.strftime('%Y-%m-%d %H:%M')+
+            '。仅向当前主人微信发送一次，接口接受不代表已读。取消请发送：/health-task-cancel '+task_id,
+            details={'task_id':task_id,'due_at_utc':due.isoformat(),'approval_id':approval_id})
+        return {'response':Response('accepted',source,'task-created').to_wire(),'delivery_refs':refs}
+
+    def _governed_task_cancel(self, source, task_id):
+        self._governed_settings_command(source,'task','cancel',target=task_id)
+        self.cancel_task(task_id,cancelled_at_utc=self._governed_command_now(source).isoformat())
+        refs=self._governed_notice(source,'task-cancelled','已取消提醒：'+task_id)
+        return {'response':Response('accepted',source,'task-cancelled').to_wire(),'delivery_refs':refs}
+
+    def _governed_task_notice_current(self, intent, settings, *, require_accepted=False):
+        receipt=self._store.health_command_receipt(intent.business_fact_ref)
+        if receipt is None or receipt.result.get('_governed_action')!='task-due': return None
+        details=receipt.result.get('details')
+        if type(details) is not dict or set(details)!={'task_id','approval_id','due_at_utc'}: return None
+        task=self._ticket115_task_state_open(settings).task(details['task_id'])
+        approval=next((a for a in settings.approvals if a.approval_id==details['approval_id']),None)
+        now=self._owner_settings_clock().astimezone(timezone.utc)
+        if (task.purpose!='主人单次提醒' or task.source_kinds!=('owner-goal',) or approval is None or approval.revoked
+                or approval.max_attempts!=1 or task.approval.approval_id!=approval.approval_id
+                or task.approval.approval_version!=approval.approval_version or approval.task_id!=task.task_id
+                or approval.effect_request_id!=intent.effect_request_id or approval.route_id!=settings.current_route_id
+                or approval.configuration_generation!=settings.current_configuration_generation
+                or approval.first_hop_recipient!=settings.current_first_hop_recipient
+                or now>=datetime.fromisoformat(approval.expires_at_utc) or now<datetime.fromisoformat(details['due_at_utc'])
+                or task.primary_label not in ({'active','solved'} if require_accepted else {'active'})
+                or task.task_id in settings.cancelled_task_refs): return None
+        return task
+
+    def _governed_finish_task_delivery(self, intent_id):
+        from .tasks import TaskAcceptance,TaskAcceptanceCriterionProof
+        with self._ticket115_write_authority(live_intent_id=intent_id) as (_,settings):
+            record=self._ticket115_outbox_state_open(settings).record(intent_id)
+            intent=record.intent
+            task=self._governed_task_notice_current(intent,settings,require_accepted=True)
+            if task is None or task.primary_label!='active' or record.current_layer!='accepted': return
+            effect=self._store.effect(self._effect_id(intent.effect_request_id))
+            if effect is None or effect.state!='accepted' or type(effect.payload) is not TerminalEffect: return
+            proof=TaskAcceptanceCriterionProof(task.acceptance_criteria[0],(intent.intent_id,),(intent.semantic_digest,))
+            accepted=TaskAcceptance.prove(task,(proof,),accepted_at_utc=self._owner_settings_clock().astimezone(timezone.utc).isoformat())
+        self._mutate_ticket115_task(lambda state:TaskEngine.solve(state,accepted,current_evidence_revisions={intent.intent_id:intent.semantic_digest}),
+            health_command_action='task.solve')
+
+    def governed_wake_current(self):
+        result={'delivery_refs':[],'task_status':'unavailable'}
+        if self._governed is None: return result
+        with self._lifecycle_lock:
+            try:
+                lifecycle={} if self._lifecycle is None else self.managed_lifecycle_read(None)
+                if lifecycle.get('phase')=='notice-pending':
+                    operation=lifecycle['operation_ref']
+                    self._governed_execute_delete(operation)
+                    return result
+                settings=self.owner_settings_state(); now=self._owner_settings_clock().astimezone(timezone.utc)
+                state=self.task_state()
+                for task in state.tasks:
+                    if task.primary_label!='active' or task.purpose!='主人单次提醒': continue
+                    if TaskEngine.is_deferred(task,now.isoformat()) or settings.proactive_support_paused: continue
+                    approval=next((a for a in settings.approvals if a.approval_id==task.approval.approval_id),None)
+                    if approval is None or approval.revoked or now>=datetime.fromisoformat(approval.expires_at_utc): continue
+                    outbox=self.owner_delivery_outbox_state()
+                    previous=[r for r in outbox.records if r.intent.effect_request_id==approval.effect_request_id]
+                    if previous:
+                        if previous[0].current_layer=='accepted': self._governed_finish_task_delivery(previous[0].intent.intent_id)
+                        if not self._live_projection(previous[0])['handoff_complete']:
+                            result['delivery_refs'].append({'kind':'owner-outbox','intent_id':previous[0].intent.intent_id})
+                        continue
+                    claim_id='governed-task-claim:'+stable_digest({'task':task.task_id}).removeprefix('sha256:')
+                    claimed=self.claim_task(task.task_id,holder_id='governed-current-wake',lease_id=claim_id,acquired_at_utc=now.isoformat())
+                    self.advance_task_phase(task.task_id,phase='in-progress',advanced_at_utc=now.isoformat())
+                    self.release_task_claim(claim_id,holder_id='governed-current-wake',observed_at_utc=now.isoformat())
+                    self.advance_task_phase(task.task_id,phase='awaiting-result',advanced_at_utc=now.isoformat())
+                    source=task.source_refs[0].removeprefix('source:')
+                    due=task.deferred_until_utc or task.updated_at_utc
+                    refs=self._governed_notice(source,'task-due','一次提醒：'+task.expected_result,
+                        details={'task_id':task.task_id,'approval_id':approval.approval_id,'due_at_utc':due},effect_request_id=approval.effect_request_id)
+                    result['delivery_refs'].extend(refs)
+                decision=self.prepare_daily_review()
+                # Due dispatches already carry their exact approval request ID,
+                # so the original review sees no remaining duplicate action.
+                if not decision.notification_required: self.commit_daily_review(decision)
+                result['task_status']='current'
+                return result
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
+
+    def _governed_correct(self, source, argument):
+        from .rights import ManagedObjectReference
+        from .owner_authority import OwnerMutationRequest
+        from .governed_nondiagnostic import NonDiagnosticIntakeCandidate
+        target_id,separator,replacement=argument.partition(' ')
+        if not separator or not replacement.strip():
+            refs=self._governed_notice(source,'correction-clarify','请提供对象引用和明确更正原文，例如：/health-correct 对象引用 我昨晚睡得很好。')
+            return {'response':Response('accepted',source,'correction-clarification').to_wire(),'delivery_refs':refs}
+        source_envelope=self._governed_source_open(source)[0]
+        objects=self.managed_rights_read_current()
+        target=next((o for o in objects if o.object_ref==target_id and o.object_kind=='evidence_card'),None)
+        if target is None: raise AuthorityValidationError('correction-current-evidence-required')
+        from .coordination import EvidenceCard
+        old=EvidenceCard.from_storage(dict(target.to_wire()['value']))
+        start=source_envelope.body.rfind(replacement)
+        import re
+        time_match=re.search(r'\d{4}-\d{2}-\d{2}|今天|昨天|昨晚|今早|今晚',replacement)
+        fact={'start':start,'end':start+len(replacement),'quote':replacement,'topic_ref':old.topic_refs[0] if old.topic_refs else None,
+              'time_start':None if time_match is None else start+time_match.start(),'time_end':None if time_match is None else start+time_match.end()}
+        claim=self._governed._claim(source_envelope,fact,self.owner_settings_state().timezone)
+        claim=replace(claim,series_key=old.series_key,purpose="owner-correction")
+        now=self._governed_command_now(source).isoformat()
+        pending=self.managed_correction_draft(target_ref=ManagedObjectReference(target.object_ref,target.installation_id,target.version),
+            correction_id='governed-correction:'+stable_digest({'source':source,'object':target.object_ref}).removeprefix('sha256:'),
+            reason='主人明确更正原文',corrected_at_utc=now,replacement_claim=claim,correction_source_refs=('source:'+source,),
+            affected_object_refs=tuple('portrait-topic:'+t for t in old.topic_refs),disposition_requests=('withdraw_current','rejudge'))
+        stage=self._governed.correction_stage(source_envelope,self.daily_state(),pending)
+        prepared=self._governed_commit_draft(source,stage)
+        if prepared.status not in {'accepted','replayed'}: raise AuthorityValidationError(prepared.reason_code or 'correction-evidence-unconfirmed')
+        daily=self._store.daily_turn(source)
+        complete=self._governed.daily_runtime.complete(source_envelope,self.daily_turn_post_stage_state(source),daily.draft)
+        context=self._governed_owner_context(source,permissions=('health_data.correct',))
+        request=OwnerMutationRequest.form(context=context,expected_settings_version=self.owner_settings_state().version,
+            requested_at_utc=now,pending_correction=pending,daily_turn_draft=complete)
+        committed=self._governed_apply_owner(request)
+        if committed.status not in {'accepted','replayed'}: raise AuthorityValidationError(committed.reason_code or 'correction-unconfirmed')
+        refs=self._governed_notice(source,'correction-completed','已按主人原文纠正资料；旧记录退出当前适用，相关画像已重新判断。')
+        return {'response':Response('accepted',source,'correction-completed').to_wire(),'delivery_refs':refs}
+
+    def _governed_export(self, source, argument):
+        from .rights import ManagedObjectReference
+        objects=self.managed_rights_read_current()
+        if argument:
+            selected=set(argument.split())
+            objects=tuple(o for o in objects if o.object_ref in selected)
+            if {o.object_ref for o in objects} != selected: raise AuthorityValidationError('export-current-object-required')
+        if not objects:
+            refs=self._governed_notice(source,'export-empty','当前没有可导出的资料。')
+            return {'response':Response('accepted',source,'export-empty').to_wire(),'delivery_refs':refs}
+        identity=stable_digest({'source':source,'objects':[(o.object_ref,o.version) for o in objects]}).removeprefix('sha256:')
+        exported=self.managed_rights_export(requested_refs=tuple(ManagedObjectReference(o.object_ref,o.installation_id,o.version) for o in objects),
+            snapshot_id='governed-export:'+identity,created_at_utc=self._governed_command_now(source).isoformat())
+        encoded=json.dumps(exported.to_wire(),ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+        if len(encoded)>8388608:
+            refs=self._governed_notice(source,'export-too-large','未导出，请选择更小资料范围。')
+            return {'response':Response('accepted',source,'export-too-large').to_wire(),'delivery_refs':refs}
+        digest='sha256:'+hashlib.sha256(encoded).hexdigest()
+        artifact='managed-export:'+identity
+        metadata={'artifact_ref':artifact,'filename':'health-export-'+digest[7:]+'.json','size_bytes':len(encoded),'digest':digest}
+        text='资料已形成JSON导出文件。平台接受文件不代表你已经下载；导出到微信后的文件由你保管，管家删除资料不能撤回微信或CDN副本。\n\n'+self._governed_disclosure()['context_disclosure']
+        fact='governed-result:export:'+identity
+        value={'contract':'managed-export-artifact-v1','copy_kind':'server-export','artifact_ref':artifact,
+            'source_causal_id':source,'owner_id':exported.snapshot.owner_id,'installation_id':exported.snapshot.installation_id,
+            'metadata':metadata,'selected_refs':[{'object_ref':o.object_ref,'version':o.version} for o in objects],
+            'export':exported.to_wire()}
+        self._store.remember_managed_export(artifact,value)
+        with self._ticket115_write_authority() as (head,settings):
+            if self._store.health_command_receipt(fact) is not None:
+                outbox=self._ticket115_outbox_state_open(settings)
+                refs=[{'kind':'owner-outbox','intent_id':r.intent.intent_id} for r in outbox.records if r.intent.business_fact_ref==fact]
+                return {'response':Response('replayed',source,'export-formed').to_wire(),'delivery_refs':refs}
+            receipt=HealthCommandReceipt(causal_id=fact,command_digest=stable_digest({'source':source,'artifact':metadata,'selected':value['selected_refs']}),
+                result={'_governed_action':'export-formed','source_causal_id':source,'text':text,'details':metadata})
+            destination=self._owner_weixin_destination_open(settings); observed=self._owner_delivery_clock_utc_open()
+            outbox=self._ticket115_outbox_state_open(settings); refs=[]
+            base_outbox_version=outbox.version
+            for purpose,payload,prefix in (('explanation',{'text':text},'live-governed-reply:'),('artifact',metadata,'live-governed-export:')):
+                intent=OwnerDeliveryEngine.form_intent(effect_kind='owner-delivery',owner_id=settings.owner_id,installation_id=settings.installation_id,
+                    effect_request_id='governed-export-'+purpose+':'+identity,business_fact_ref=fact,business_revision_digest=receipt.command_digest,
+                    source_ref=source,recipient_ref=destination.owner_sender_id,route_id=destination.route_id,
+                    route_generation=settings.current_configuration_generation,payload_ref=prefix+fact,payload_digest=stable_digest(payload),formed_at_utc=observed)
+                submitted=OwnerDeliveryEngine.submit(outbox,intent,submitted_at_utc=observed);outbox=submitted.state
+                refs.append({'kind':'owner-outbox','intent_id':intent.intent_id})
+            outbox=replace(outbox,version=base_outbox_version+1)
+            mutation=self._prepare_ticket115_facts_open(head,settings,delivery_state=outbox,health_command_receipt=receipt)
+        self._complete_ticket115_mutation(mutation)
+        self._store.mark_source_business_committed(source)
+        return {'response':Response('accepted',source,'export-formed').to_wire(),'delivery_refs':refs}
+
+    def _governed_export_current(self, intent, settings):
+        from .rights import ManagedExport
+        receipt=self._store.health_command_receipt(intent.business_fact_ref)
+        if (receipt is None or receipt.result.get('_governed_action')!='export-formed'
+                or receipt.command_digest!=intent.business_revision_digest or receipt.result.get('source_causal_id')!=intent.source_ref): return None
+        metadata=receipt.result.get('details')
+        if type(metadata) is not dict or set(metadata)!={'artifact_ref','filename','size_bytes','digest'}:return None
+        value=self._store.managed_export(metadata['artifact_ref'])
+        if value is None or value.get('metadata')!=metadata or value.get('source_causal_id')!=intent.source_ref or value.get('owner_id')!=settings.owner_id or value.get('installation_id')!=settings.installation_id:return None
+        projection=self._managed_rights_projection_from_state(self._store.daily_state(),owner_id=settings.owner_id,installation_id=settings.installation_id)
+        current={o.object_ref:o for o in projection.objects if o.current and o.object_ref in projection.permitted_object_refs and o.object_ref not in projection.revoked_object_refs}
+        if any(item['object_ref'] not in current or current[item['object_ref']].version!=item['version'] for item in value['selected_refs']):return None
+        exported=ManagedExport.from_wire(value['export'])
+        # A selected object's canonical bytes and current revision must both match.
+        if any(current[o.object_ref].to_wire()!=o.to_wire() for o in exported.objects):return None
+        encoded=json.dumps(exported.to_wire(),ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+        if (not 0<len(encoded)<=8388608 or metadata['size_bytes']!=len(encoded)
+                or metadata['digest']!='sha256:'+hashlib.sha256(encoded).hexdigest()
+                or metadata['filename']!='health-export-'+metadata['digest'][7:]+'.json'):return None
+        return metadata,encoded
+
+    def _governed_authorize_export(self, intent_id, grant, attempted_at_utc):
+        with self._lifecycle_lock:
+            with self._ticket115_write_authority(live_intent_id=intent_id) as (_,settings):
+                record=self._ticket115_outbox_state_open(settings).record(intent_id)
+                if not record.intent.payload_ref.startswith('live-governed-export:'):return None
+                current=self._governed_export_current(record.intent,settings)
+                execution=self._validated_effect_execution(grant,record.intent.semantic_digest,effect_kind='owner-delivery')
+                if current is None or execution is None or execution.intent.business_source_causal_id!=intent_id:return None
+                phase=self._owner_delivery_attempt_phase(intent_id)
+                key=(grant.lease.effect_id,grant.lease.lease_id)
+                if phase==_OWNER_DELIVERY_ATTEMPT_AUTHORIZED:
+                    read=self._governed_export_reads.get(key)
+                    count=(current[0]['size_bytes']+32767)//32768
+                    if (read is None or read['intent_id']!=intent_id or read['next_index']!=count
+                            or read['second_authorized'] or time.monotonic()>=read['expires']):return None
+                    read['second_authorized']=True
+                    attempted=record.fact('attempted')
+                    send=self._owner_delivery_send_intent_open(record.intent,settings,attempted.attempt_ref)
+                elif phase==_OWNER_DELIVERY_ATTEMPT_PREPARED:
+                    send=None
+                else:return None
+            if send is None:
+                send=self.authorize_owner_delivery_attempt(intent_id,grant,attempted_at_utc=attempted_at_utc)
+                self._governed_export_reads[key]={'intent_id':intent_id,'next_index':0,'expires':time.monotonic()+300,'second_authorized':False}
+            metadata=current[0]; lease=grant.lease
+            return {'purpose':'export-artifact','recipient_role':'owner','account_id':self._admission_policy.partner_id,
+                'intent_id':intent_id,'send_intent':send.to_wire(),'payload':metadata,'payload_digest':stable_digest(metadata),
+                'route_id':record.intent.route_id,'route_generation':record.intent.route_generation,
+                'execution':{'lease_id':lease.lease_id,'effect_id':lease.effect_id,'intent_digest':lease.intent_digest,
+                    'generation':lease.authority.generation,'writer_fence':lease.authority.writer_fence}}
+
+    def read_live_export_artifact(self, intent_id, grant, index):
+        result={'artifact':None}
+        if type(grant) is not EffectExecutionGrant or type(index) is not int or index<0:return result
+        key=(grant.lease.effect_id,grant.lease.lease_id)
+        with self._lifecycle_lock:
+            read=self._governed_export_reads.get(key)
+            try:
+                if (read is None or read['intent_id']!=intent_id or index!=read['next_index']
+                        or read['second_authorized'] or time.monotonic()>=read['expires']
+                        or self._owner_delivery_attempt_phase(intent_id)!=_OWNER_DELIVERY_ATTEMPT_AUTHORIZED):
+                    raise AuthorityValidationError('export-read-sequence-invalid')
+                with self._ticket115_write_authority(live_intent_id=intent_id) as (_,settings):
+                    record=self._ticket115_outbox_state_open(settings).record(intent_id)
+                    execution=self._validated_effect_execution(grant,record.intent.semantic_digest,effect_kind='owner-delivery')
+                    current=self._governed_export_current(record.intent,settings)
+                    if execution is None or current is None:raise AuthorityValidationError('export-currentness-unavailable')
+                    metadata,encoded=current
+                    count=(len(encoded)+32767)//32768
+                    if index>=count:raise AuthorityValidationError('export-read-sequence-invalid')
+                    raw=encoded[index*32768:(index+1)*32768]
+                    read['next_index']+=1
+                    return {'artifact':{**metadata,'chunk_count':count,'index':index,'bytes':raw,'next_index':None if index+1==count else index+1}}
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError):
+                self._governed_export_reads.pop(key,None)
+                return result
+
+    def _governed_delete(self, source, command, argument):
+        if command=='/health-delete':
+            head=self._store.finalized_authority();settings=self._current_owner_settings(head)
+            receipt=self._store.source_receipt(source)
+            operation='governed-delete:'+stable_digest({'source':source,'native':receipt.native_event_digest,
+                'owner':settings.owner_id,'installation':settings.installation_id,'writer_fence':head.writer_fence}).removeprefix('sha256:')
+            details={'operation_ref':operation,'request_source':source,'native_event_digest':receipt.native_event_digest,
+                'owner_id':settings.owner_id,'installation_id':settings.installation_id,'site':head.site,'writer_fence':head.writer_fence,
+                'route_id':settings.current_route_id,'route_generation':settings.current_configuration_generation}
+            refs=self._governed_notice(source,'delete-request','永久删除会清理本安装受管健康资料与受管导出副本，不能撤回微信或CDN上的外部副本。'
+                '本次尚未删除。确认此范围后，请独立发送：\n/health-delete-confirm '+operation,details=details)
+            return {'response':Response('accepted',source,'delete-independent-confirm-required').to_wire(),'delivery_refs':refs}
+        if not argument or len(argument.split())!=1: raise AuthorityValidationError('delete-confirm-reference-required')
+        operation=argument.strip()
+        current=self._store.source_receipt(source)
+        head=self._store.finalized_authority();settings=self._current_owner_settings(head)
+        matches=[r for r in self._store.health_command_receipts() if r.result.get('_governed_action')=='delete-request'
+            and type(r.result.get('details')) is dict and r.result['details'].get('operation_ref')==operation]
+        if len(matches)!=1: raise AuthorityValidationError('delete-confirm-reference-mismatch')
+        request=matches[0];details=request.result['details'];original=self._store.source_receipt(details['request_source'])
+        if (current is None or original is None or source==details['request_source']
+                or current.envelope.message_id is None or current.envelope.message_id==original.envelope.message_id
+                or current.native_event_digest==original.native_event_digest
+                or details['owner_id']!=settings.owner_id or details['installation_id']!=settings.installation_id
+                or details['site']!=head.site or details['writer_fence']!=head.writer_fence
+                or details['route_id']!=settings.current_route_id or details['route_generation']!=settings.current_configuration_generation
+                or current.envelope.protocol_timestamp is None or original.envelope.protocol_timestamp is None
+                or datetime.fromisoformat(current.envelope.protocol_timestamp)<=datetime.fromisoformat(original.envelope.protocol_timestamp)):
+            raise AuthorityValidationError('delete-independent-owner-confirm-required')
+        outbox=self._ticket115_outbox_state_open(settings)
+        explanations=[r for r in outbox.records if r.intent.business_fact_ref==request.causal_id and r.intent.source_ref==details['request_source']]
+        if len(explanations)!=1 or not self._live_projection(explanations[0])['handoff_complete']:
+            raise AuthorityValidationError('delete-explanation-handoff-required')
+        observed=self._governed_execute_delete(operation)
+        refs=[]
+        for record in self._ticket115_outbox_state_open(settings).records:
+            if record.intent.payload_ref=='lifecycle-notice:'+operation:
+                refs.append({'kind':'owner-outbox','intent_id':record.intent.intent_id})
+        return {'response':Response('accepted' if observed.get('status')=='notice-pending' else 'unavailable',source,'delete-'+str(observed.get('status'))).to_wire(),
+                'delivery_refs':refs}
+
+    def _governed_execute_delete(self, operation):
+        from .lifecycle import LIFECYCLE_DELETE_SEMANTICS
+        head=self._store.finalized_authority()
+        command=TrustedHealthCommand(action='lifecycle.execute',source='owner_rights_runtime',causal_id='governed-delete-command:'+operation,
+            generation=head.generation,scope=('lifecycle:delete',),
+            payload={'kind':'delete-all','operation_ref':operation,'owner_command_ref':'owner-command:'+operation,'semantics':LIFECYCLE_DELETE_SEMANTICS})
+        return self.execute_trusted_health_command(command)
+
+    def _governed_finish_delete_if_ready(self):
+        if self._governed is None or self._lifecycle is None:return
+        try:
+            view=self.managed_lifecycle_read(None)
+            if view.get('phase')=='notice-pending' and type(view.get('operation_ref')) is str:
+                operation=view['operation_ref']
+                if self._lifecycle_notice_layer(operation) in {'accepted','unknown','delivered','read'}:
+                    self._governed_execute_delete(operation)
+        except (ValueError,TypeError,KeyUnavailable,StoreUnavailable,CurrentHeadError):return

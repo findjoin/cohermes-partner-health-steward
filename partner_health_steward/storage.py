@@ -1846,6 +1846,7 @@ class EncryptedStateStore:
             ON owner_delivery_observations_v1(intent_id, observation_id)
             """
         )
+        self._execute("CREATE TABLE IF NOT EXISTS managed_exports_v1 (artifact_ref TEXT PRIMARY KEY, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL)")
         self._commit("health state initialization unavailable")
         self._initialize_or_verify_key_check()
         self._initialize_integrity_manifest()
@@ -2313,6 +2314,9 @@ class EncryptedStateStore:
                 "ORDER BY causal_id"
             ).fetchall()
 
+        exports=self._execute("SELECT artifact_ref,nonce,ciphertext FROM managed_exports_v1 ORDER BY artifact_ref").fetchall()
+        if exports:
+            tables["managed_exports"] = exports
         def wire_value(value: object) -> object:
             if isinstance(value, bytes):
                 return {"bytes": value.hex()}
@@ -6905,3 +6909,27 @@ class EncryptedStateStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def remember_managed_export(self, artifact_ref: str, value: dict[str, object]) -> None:
+        """Store only an authenticated encrypted, non-authoritative rights copy."""
+        validate_opaque_text(artifact_ref,'managed export artifact')
+        if type(value) is not dict or value.get('artifact_ref') != artifact_ref or value.get('copy_kind') != 'server-export':
+            raise AuthorityValidationError('invalid managed export copy')
+        nonce,ciphertext=self._seal('managed-export:'+artifact_ref,value)
+        with self.transaction() as connection:
+            self._assert_integrity_manifest_before_mutation()
+            prior=connection.execute('SELECT nonce,ciphertext FROM managed_exports_v1 WHERE artifact_ref=?',(artifact_ref,)).fetchone()
+            if prior is not None:
+                if self._open('managed-export:'+artifact_ref,*prior)!=value: raise KeyUnavailable('managed export is immutable')
+                return
+            connection.execute('INSERT INTO managed_exports_v1(artifact_ref,nonce,ciphertext) VALUES(?,?,?)',(artifact_ref,nonce,ciphertext))
+            self._refresh_integrity_manifest(connection)
+
+    def managed_export(self, artifact_ref: str) -> dict[str, object] | None:
+        validate_opaque_text(artifact_ref,'managed export artifact')
+        row=self._execute('SELECT nonce,ciphertext FROM managed_exports_v1 WHERE artifact_ref=?',(artifact_ref,)).fetchone()
+        if row is None:return None
+        value=self._open('managed-export:'+artifact_ref,*row)
+        if type(value) is not dict or value.get('artifact_ref')!=artifact_ref or value.get('copy_kind')!='server-export':
+            raise KeyUnavailable('managed export copy identity mismatch')
+        return value
