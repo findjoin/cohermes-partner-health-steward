@@ -399,16 +399,15 @@ class StrictModelRequest:
             NonDiagnosticOperationalBudget.__post_init__(budget)
             from .model_adapter import (
                 NONDIAGNOSTIC_OPERATION_SCHEMA_NAME, NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST,
-                nondiagnostic_operation_schema, _responses_body, _canonical,
+                nondiagnostic_schema, _responses_body, _canonical,
             )
             if (self.route != budget.route or self.final_input_upper_bound_tokens is not None
                     or self.output_reservation_tokens != ND_OUTPUT_RESERVATION
-                    or self.strict_schema_name != NONDIAGNOSTIC_OPERATION_SCHEMA_NAME
-                    or self.strict_schema_digest != NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST):
+                    or self.strict_schema_digest != stable_digest(nondiagnostic_schema(self.strict_schema_name))):
                 raise ModelContractViolation("invalid ND request binding")
             measured = len(_canonical(_responses_body(
                 self.route, self.messages, self.output_reservation_tokens,
-                self.strict_schema_name, nondiagnostic_operation_schema())))
+                self.strict_schema_name, nondiagnostic_schema(self.strict_schema_name, self.strict_schema_digest))))
             _integer(self.final_wire_bytes, "final wire bytes", positive=True)
             if self.final_wire_bytes != measured or measured > ND_WIRE_BYTE_LIMIT:
                 raise ModelContractViolation("invalid ND final wire budget")
@@ -706,13 +705,13 @@ class StrictHealthLLM:
         if type(capability_profile) is NonDiagnosticOperationalBudget:
             from .model_adapter import (
                 NonDiagnosticBudgetInputMeasurementStrategy, NONDIAGNOSTIC_OPERATION_SCHEMA_NAME,
-                NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST,
+                NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST, nondiagnostic_schema,
             )
             if type(route) is not FirstHopRoute:
                 raise ModelContractViolation("invalid current ND model route")
             budget = NonDiagnosticOperationalBudget.from_wire(NonDiagnosticOperationalBudget.to_wire(capability_profile))
-            if (route != budget.route or strict_schema_name != NONDIAGNOSTIC_OPERATION_SCHEMA_NAME
-                    or strict_schema_digest != NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST):
+            if (route != budget.route
+                    or strict_schema_digest != stable_digest(nondiagnostic_schema(strict_schema_name))):
                 raise ModelContractViolation("invalid current ND model authority")
             self._route = FirstHopRoute.from_wire(FirstHopRoute.to_wire(route))
             self._capability_profile = budget
@@ -1168,10 +1167,12 @@ class StrictHealthLLM:
             if (type(request.capability_profile) is NonDiagnosticOperationalBudget
                     or request.strict_schema_name == SYNTHETIC_STRICT_SCHEMA_NAME):
                 try:
-                    validated_candidate = NonDiagnosticCandidate.from_wire(
-                        candidate
-                    ).to_wire()
-                except NonDiagnosticContractViolation:
+                    if request.strict_schema_name == "nondiagnostic-intake-v1":
+                        from .governed_nondiagnostic import NonDiagnosticIntakeCandidate
+                        validated_candidate = NonDiagnosticIntakeCandidate.from_wire(candidate).to_wire()
+                    else:
+                        validated_candidate = NonDiagnosticCandidate.from_wire(candidate).to_wire()
+                except (NonDiagnosticContractViolation, ValueError, TypeError):
                     report = report_result(
                         result,
                         "strict-schema-error",

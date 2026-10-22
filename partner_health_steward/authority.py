@@ -328,6 +328,7 @@ class EffectIntent:
     intent_digest: str
     authority: AuthoritySnapshot
     business_source_causal_id: str | None = None
+    model_stage: str | None = None
 
     def __post_init__(self) -> None:
         validate_opaque_text(self.effect_id, "effect_id")
@@ -335,11 +336,17 @@ class EffectIntent:
         validate_opaque_text(self.intent_digest, "intent_digest")
         if type(self.authority) is not AuthoritySnapshot:
             raise AuthorityValidationError("invalid effect authority")
+        self._validate_stage()
         if self.business_source_causal_id is not None:
             validate_opaque_text(
                 self.business_source_causal_id,
                 "effect business source causal identifier",
             )
+
+    def _validate_stage(self) -> None:
+        if self.model_stage is not None and (self.model_stage not in {"intake", "answer"}
+                or self.effect_kind != "model-work" or self.business_source_causal_id is None):
+            raise AuthorityValidationError("invalid effect model stage")
 
     def to_storage(self) -> dict[str, object]:
         stored: dict[str, object] = {
@@ -350,6 +357,8 @@ class EffectIntent:
         }
         if self.business_source_causal_id is not None:
             stored["business_source_causal_id"] = self.business_source_causal_id
+        if self.model_stage is not None:
+            stored["model_stage"] = self.model_stage
         return stored
 
     def to_wire_metadata(self) -> dict[str, object]:
@@ -365,6 +374,7 @@ class EffectIntent:
         if not isinstance(value, Mapping) or frozenset(value) not in (
             legacy_fields,
             legacy_fields | {"business_source_causal_id"},
+            legacy_fields | {"business_source_causal_id", "model_stage"},
         ):
             raise AuthorityValidationError("invalid effect intent")
         stored = value
@@ -381,6 +391,7 @@ class EffectIntent:
                     "effect business source causal identifier",
                 )
             ),
+            model_stage=stored.get("model_stage"),
         )
 
     @classmethod

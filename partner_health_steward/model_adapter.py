@@ -61,6 +61,42 @@ def nondiagnostic_operation_schema() -> dict:
 NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST = stable_digest(nondiagnostic_operation_schema())
 
 
+NONDIAGNOSTIC_INTAKE_SCHEMA_NAME = "nondiagnostic-intake-v1"
+
+
+def nondiagnostic_intake_schema() -> dict:
+    offset = {"type": "integer", "minimum": 0}
+    nullable_offset = {"type": ["integer", "null"], "minimum": 0}
+    quote = {"type": "object", "properties": {
+        "start": offset, "end": offset, "quote": {"type": "string", "minLength": 1}},
+        "required": ["start", "end", "quote"], "additionalProperties": False}
+    from .portrait_schema import PORTRAIT_TOPIC_REFS
+    fact = {"type": "object", "properties": {
+        **quote["properties"], "topic_ref": {"type": ["string", "null"], "enum": [None, *sorted(PORTRAIT_TOPIC_REFS)]},
+        "time_start": nullable_offset, "time_end": nullable_offset},
+        "required": ["start", "end", "quote", "topic_ref", "time_start", "time_end"], "additionalProperties": False}
+    return {"type": "object", "properties": {
+        "operation": {"type": "string", "enum": ["record", "question", "mixed", "clarify"]},
+        "facts": {"type": "array", "maxItems": 8, "items": fact},
+        "question": {"anyOf": [quote, {"type": "null"}]}},
+        "required": ["operation", "facts", "question"], "additionalProperties": False}
+
+
+NONDIAGNOSTIC_INTAKE_SCHEMA_DIGEST = stable_digest(nondiagnostic_intake_schema())
+
+
+def nondiagnostic_schema(name, digest=None):
+    if name == NONDIAGNOSTIC_OPERATION_SCHEMA_NAME:
+        schema = nondiagnostic_operation_schema()
+    elif name == NONDIAGNOSTIC_INTAKE_SCHEMA_NAME:
+        schema = nondiagnostic_intake_schema()
+    else:
+        raise ModelContractViolation("invalid ND stage schema")
+    if digest is not None and digest != stable_digest(schema):
+        raise ModelContractViolation("ND stage schema drift")
+    return schema
+
+
 def _canonical(value: object) -> bytes:
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -235,20 +271,24 @@ class NonDiagnosticBudgetInputMeasurementStrategy:
         if type(request.capability_profile) is not NonDiagnosticOperationalBudget or request.capability_profile != budget:
             raise ModelContractViolation("ND budget authority drift")
         return _responses_body(request.route, request.messages, request.output_reservation_tokens,
-                               request.strict_schema_name, nondiagnostic_operation_schema())
+                               request.strict_schema_name, nondiagnostic_schema(request.strict_schema_name, request.strict_schema_digest))
 
-    def prepare_request(self, messages):
+    def prepare_request(self, messages, *, stage="answer"):
+        if stage not in {"intake", "answer"}:
+            raise ModelContractViolation("invalid ND stage")
+        schema_name = NONDIAGNOSTIC_INTAKE_SCHEMA_NAME if stage == "intake" else NONDIAGNOSTIC_OPERATION_SCHEMA_NAME
+        schema = nondiagnostic_schema(schema_name)
         strategy = NonDiagnosticBudgetInputMeasurementStrategy.canonical_copy(self)
         budget = object.__getattribute__(strategy, "_profile")
         if type(messages) is not tuple or not messages:
             raise ModelContractViolation("invalid ND messages")
         body = _responses_body(budget.route, messages, budget.output_reservation_tokens,
-                               NONDIAGNOSTIC_OPERATION_SCHEMA_NAME, nondiagnostic_operation_schema())
+                               schema_name, schema)
         request = StrictModelRequest(
             budget.route, budget, messages,
             stable_digest({"messages": [ModelMessage.to_wire(item) for item in messages]}),
-            None, budget.output_reservation_tokens, NONDIAGNOSTIC_OPERATION_SCHEMA_NAME,
-            NONDIAGNOSTIC_OPERATION_SCHEMA_DIGEST, len(_canonical(body)),
+            None, budget.output_reservation_tokens, schema_name,
+            stable_digest(schema), len(_canonical(body)),
         )
         NonDiagnosticBudgetInputMeasurementStrategy.measure(strategy, request)
         return request
@@ -581,7 +621,8 @@ class ProductionModelAdapter:
             if len(texts) != 1:
                 raise ModelContractViolation("ambiguous model structured output")
             candidate = _loads(texts[0])
-            if type(candidate) is not dict or not _matches(candidate, _thaw_json(self._strategy._schema)):
+            if type(candidate) is not dict or not _matches(candidate, nondiagnostic_schema(request.strict_schema_name, request.strict_schema_digest)
+                    if type(self._profile) is NonDiagnosticOperationalBudget else _thaw_json(self._strategy._schema)):
                 raise ModelContractViolation("invalid model structured output")
         elif status == "incomplete":
             details = raw.get("incomplete_details")

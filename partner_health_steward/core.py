@@ -1025,6 +1025,7 @@ class HealthCore:
         safety_diagnostic_assets: Mapping[str, object] | None = None,
         acceptance_evidence_provider: object | None = None,
         lifecycle_config: Mapping[str, object] | None = None,
+        governed_nondiagnostic_runtime: object = None,
     ) -> None:
         self._store = store
         self._current_head = current_head
@@ -1126,6 +1127,14 @@ class HealthCore:
                 approved_templates=approved_templates,
             )
         )
+        from .governed_nondiagnostic import GovernedNonDiagnosticRuntime
+        if governed_nondiagnostic_runtime is not None and type(governed_nondiagnostic_runtime) is not GovernedNonDiagnosticRuntime:
+            raise AuthorityValidationError("invalid governed runtime")
+        self._governed = governed_nondiagnostic_runtime
+        self._governed_requests = {}
+        self._governed_candidates = {}
+        self._governed_started = {}
+        self._governed_source_holders = {}
         self._writer_holder_claim = WriterHolderClaim(
             "writer-holder:" + secrets.token_urlsafe(24)
         )
@@ -1207,6 +1216,10 @@ class HealthCore:
             # WriterFenceProof remains usable after orderly handoff.
             self._closed = True
             self._recording_excluded_sources.clear()
+            self._governed_requests.clear()
+            self._governed_candidates.clear()
+            self._governed_started.clear()
+            self._governed_source_holders.clear()
             self._pending_correction_authorizations.clear()
             failed_writer: list[tuple[str, str]] = []
             for namespace, session in tuple(self._writer_holder_sessions.items()):
@@ -2937,7 +2950,10 @@ class HealthCore:
             ):
                 key = (execution.lease.effect_id, execution.lease.lease_id)
                 observed = self._observed_model_reports.get(key)
-                if observed is None or payload.model_report != observed:
+                if (observed is None or payload.model_report != observed) and not (
+                        execution.intent.model_stage is not None and not execution.model_attempt_started
+                        and payload.model_report is None and payload.status == "rejected"
+                        and payload.result_digest == stable_digest({"stage": execution.intent.model_stage, "request": execution.intent.intent_digest, "aborted-before-start": True})):
                     return Response(
                         "rejected",
                         command.causal_id,
@@ -5384,8 +5400,8 @@ class HealthCore:
             daily = self._store.daily_turn(source_causal_id)
             if (
                 source_binding is None
-                or daily is None
-                or daily.phase != "evidence-finalized"
+                or (payload.model_stage != "intake" and (daily is None or daily.phase != "evidence-finalized"))
+                or (payload.model_stage == "intake" and (self._governed is None or daily is not None))
             ):
                 return _Handled(
                     Response(
@@ -5395,7 +5411,7 @@ class HealthCore:
                     ),
                     True,
                 )
-            existing = self._store.model_effect_for_source(source_causal_id)
+            existing = self._store.model_effect_for_source(source_causal_id, payload.model_stage)
             if existing is not None:
                 reason = "model-effect-already-bound"
                 if (
@@ -5416,6 +5432,7 @@ class HealthCore:
             intent_digest=payload.request_digest,
             authority=head,
             business_source_causal_id=source_causal_id,
+            model_stage=payload.model_stage,
         )
         self._store.write_effect(intent.effect_id, "intent", intent)
         return _Handled(
@@ -5519,6 +5536,7 @@ class HealthCore:
                     site=authority.site,
                 ),
                 business_source_causal_id=value.business_source_causal_id,
+                model_stage=value.model_stage,
             )
         except Exception:
             return None
@@ -5534,6 +5552,7 @@ class HealthCore:
             and left.intent_digest == right.intent_digest
             and left.business_source_causal_id
             == right.business_source_causal_id
+            and left.model_stage == right.model_stage
         )
 
     def _ticket116_effect_intent_was_issued(
@@ -9560,6 +9579,7 @@ class HealthCore:
             (
                 _OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX,
                 _OWNER_DECISION_STATUS_TRANSITION_PREFIX,
+                "owner-decision:governed-model:",
             )
         )
 
@@ -9569,6 +9589,8 @@ class HealthCore:
         outbox: DeliveryOutboxState,
     ) -> str | None:
         request_id = intent.effect_request_id
+        if request_id.startswith("owner-decision:governed-model:"):
+            return "governed-model" if self._governed_model_decision_binding(intent, outbox) is not None else None
         if request_id.startswith(_OWNER_DECISION_DELIVERY_UNKNOWN_PREFIX):
             if intent.authorization_kind not in {"legacy", "delivery-unknown"}:
                 return None
@@ -9667,6 +9689,14 @@ class HealthCore:
             return False
         own_effect_id = self._effect_id(intent.effect_request_id)
         allowed = {own_effect_id}
+        if decision_kind == "governed-model":
+            binding = self._governed_model_decision_binding(intent, outbox)
+            if binding is None:
+                return False
+            model = self._store.effect(binding["effect_id"])
+            if model is not None and model.state == "unknown":
+                allowed.add(model.payload.intent.effect_id)
+            return own_effect_id in unresolved_effects and set(unresolved_effects).issubset(allowed)
         if decision_kind == "delivery-unknown":
             sources = (outbox.record(intent.source_ref),)
         else:
@@ -12339,7 +12369,7 @@ class HealthCore:
 
     @staticmethod
     def _live_owner_intent(intent: OutboxIntent) -> bool:
-        return intent.payload_ref.startswith(("live-daily-reply:", "live-safety-reply:", "live-initialization-disclosure:"))
+        return intent.payload_ref.startswith(("live-daily-reply:", "live-safety-reply:", "live-initialization-disclosure:", "live-governed-reply:", "live-governed-export:"))
 
     def _live_challenge_for_intent(self, intent: OutboxIntent):
         if not intent.payload_ref.startswith("live-initialization-disclosure:"):
@@ -12401,7 +12431,17 @@ class HealthCore:
                 return None
             if stable_digest(turn.result.to_storage()) != intent.business_revision_digest:
                 raise AuthorityValidationError("live-daily-result-mismatch")
-            return {"text": turn.result.owner_reply}
+            text=turn.result.owner_reply
+            if self._governed is not None:
+                text += "\n\n" + self._governed_disclosure()["context_disclosure"]
+            return {"text": text}
+        if intent.payload_ref.startswith("live-governed-reply:"):
+            receipt=self._store.health_command_receipt(intent.business_fact_ref)
+            if (receipt is None or receipt.command_digest != intent.business_revision_digest
+                    or receipt.result.get('source_causal_id') != intent.source_ref
+                    or type(receipt.result.get('text')) is not str):
+                raise AuthorityValidationError('governed-result-binding-mismatch')
+            return {'text':receipt.result['text']}
         if intent.payload_ref.startswith("live-safety-reply:"):
             receipt = self._store.health_command_receipt(intent.business_fact_ref)
             if (receipt is None or receipt.result.get("_ticket116_action") != "safety.evaluate"
@@ -12427,6 +12467,12 @@ class HealthCore:
             return {"text": text}
         if intent.payload_ref.startswith("owner-decision-payload:"):
             return {"text": "上次投递结果无法确认，已停止自动重试，请主人决定后续处理。"}
+        if intent.payload_ref.startswith("owner-decision-model-payload:"):
+            settings = self._current_owner_settings(self._store.finalized_authority())
+            outbox = self._ticket115_outbox_state_open(settings)
+            if self._governed_model_decision_binding(intent, outbox) is None:
+                raise AuthorityValidationError("governed-model-decision-unavailable")
+            return {"text": self._store.health_command_receipt(intent.business_fact_ref).result["text"]}
         if intent.payload_ref.startswith("owner-decision-status-payload:"):
             return {"text": "健康管理状态已更新，请主人查看并确认当前状态。"}
         if intent.payload_ref.startswith("lifecycle-notice:"):
@@ -12615,7 +12661,8 @@ class HealthCore:
                                 or turn.terminal.transition_id != reference["transition_id"]):
                             raise AuthorityValidationError("live-daily-result-mismatch")
                         fact_ref, revision, prefix = turn.terminal.record_id, turn.terminal.result_digest, "live-daily-reply:"
-                        payload = None if turn.result is None else {"text": turn.result.owner_reply}
+                        payload = None if turn.result is None else {"text": turn.result.owner_reply + (
+                            "\n\n" + self._governed_disclosure()["context_disclosure"] if self._governed is not None else "")}
                     elif kind == "committed-safety":
                         managed = self._store.health_command_receipt(reference["result_ref"])
                         if (managed is None or managed.result.get("_ticket116_action") != "safety.evaluate"
@@ -14562,3 +14609,533 @@ class HealthCore:
             and authority.writer_fence == prepared.base.writer_fence
             and not authority.terminal
         )
+
+    def _governed_model_effect(self, source, stage):
+        return self._store.model_effect_for_source(source, stage)
+
+    def _governed_disclosure(self):
+        return None if self._governed is None else self._governed.model_use_disclosure
+
+    def _governed_source_open(self, source):
+        binding = self._daily_source_binding(source)
+        if binding is None:
+            return None
+        if binding[2]:
+            expiry = self._governed_source_holders.setdefault(source, time.monotonic()+300)
+            if time.monotonic() >= expiry:
+                self._recording_excluded_sources.pop(source,None)
+                self._governed_source_holders.pop(source,None)
+                return None
+        return binding
+
+    def prepare_nondiagnostic_stage(self, source_causal_id, stage):
+        result = {'stage':stage,'state':'failed-closed','request':None,'effect_intent':None}
+        if self._governed is None or stage not in {'intake','answer'}:
+            return result
+        with self._lifecycle_lock:
+            try:
+                if self.probe().state is not ProbeState.HEALTHY:
+                    return result
+                binding = self._governed_source_open(source_causal_id)
+                if binding is None:
+                    return result
+                source,receipt,excluded = binding
+                daily = self._store.daily_turn(source_causal_id)
+                if stage == 'intake' and daily is not None:
+                    return result
+                if stage == 'answer':
+                    intake = self._governed_candidates.get((source_causal_id,'intake'))
+                    if (daily is None or daily.phase != 'evidence-finalized' or intake is None
+                            or intake.operation not in {'question','mixed'}):
+                        return result
+                existing = self._governed_model_effect(source_causal_id,stage)
+                if existing is not None:
+                    return result
+                pipeline=self._non_diagnostic_pipeline
+                claims=() if pipeline is None else pipeline._approved_claim_values
+                templates=() if pipeline is None else pipeline._approved_template_values
+                request=self._governed.request(source,stage,owner_cards=self._store.daily_state().current_evidence_cards,
+                    claims=claims,templates=templates)
+                llm=self._governed.llm(stage)
+                if llm.preflight(request) is not None:
+                    return result
+                head=self._store.finalized_authority()
+                command=CommandEnvelope(peer='plugin',action='effect.request',source='governed_nondiagnostic',
+                    causal_id='governed-model:'+stable_digest({'source':source_causal_id,'stage':stage}).removeprefix('sha256:'),
+                    generation=head.generation,scope=('effect:request',),
+                    payload=EffectRequestPayload('model-work',request.digest,source_causal_id,stage))
+                issued=self.handle(command)
+                if issued.status not in {'accepted','replayed'} or type(issued.meta) is not EffectIntentMeta:
+                    return result
+                self._governed_requests[(source_causal_id,stage)]=(request,time.monotonic()+300)
+                result.update(state='ready',request=request.to_wire(),effect_intent=issued.meta.intent)
+                return result
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError):
+                return result
+
+    def _governed_attempt(self, source, stage, grant, attempt_ref=None):
+        cached=self._governed_requests.get((source,stage))
+        if cached is None or time.monotonic() >= cached[1]: return None
+        request=cached[0]
+        execution=self._validated_model_execution(grant,request.digest)
+        if (execution is None or execution.intent.model_stage != stage
+                or execution.intent.business_source_causal_id != source): return None
+        expected='model-attempt:'+stable_digest({'effect':execution.intent.effect_id,'lease':execution.lease.lease_id,
+                                                'request':request.digest,'stage':stage}).removeprefix('sha256:')
+        if attempt_ref is not None and attempt_ref != expected: return None
+        return request,execution,expected
+
+    def start_nondiagnostic_stage(self, source_causal_id, stage, grant):
+        result={'stage':stage,'state':'failed-closed','request':None,'attempt_ref':None}
+        if self._governed is None or stage not in {'intake','answer'}: return result
+        with self._lifecycle_lock:
+            try:
+                matched=self._governed_attempt(source_causal_id,stage,grant)
+                if matched is None: return result
+                request,execution,attempt=matched
+                if execution.model_attempt_started or self._governed_source_open(source_causal_id) is None: return result
+                if self._read_head().mismatch_reason(execution.intent.authority) is not None: return result
+                if self._current_writer_proof(execution.intent.authority) is None or self._governed.llm(stage).preflight(request) is not None: return result
+                self._store.write_effect(execution.intent.effect_id,'executing',replace(execution,model_attempt_started=True))
+                self._model_effect_executions_started.add((execution.intent.effect_id,execution.lease.lease_id))
+                self._governed_started[(source_causal_id,stage)]=attempt
+                return {'stage':stage,'state':'attempted','request':request.to_wire(),'attempt_ref':attempt}
+            except (ValueError,TypeError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
+
+    def _governed_terminalize(self, source, stage, grant, execution, report):
+        key=(execution.intent.effect_id,execution.lease.lease_id)
+        if report is not None: self._observed_model_reports[key]=report
+        digest=(report.digest if report is not None else stable_digest({'stage':stage,'request':execution.intent.intent_digest,'aborted-before-start':True}))
+        status=report.outer_effect_status if report is not None else 'rejected'
+        command=CommandEnvelope(peer='plugin',action='effect.result',source='governed_nondiagnostic',
+            causal_id='governed-model-result:'+stable_digest({'effect':execution.intent.effect_id,'lease':execution.lease.lease_id,'result':digest}).removeprefix('sha256:'),
+            generation=execution.lease.authority.generation,scope=('effect:result',),
+            payload=EffectResultPayload(execution.intent.effect_id,execution.intent.intent_digest,execution.lease.lease_id,
+                                       grant.completion_capability,status,True,digest,report))
+        return self.handle(command)
+
+    def complete_nondiagnostic_stage(self, source_causal_id, stage, grant, attempt_ref, result):
+        response={'stage':stage,'state':'failed-closed','reason_code':'model-effect-authorization-required'}
+        if self._governed is None or stage not in {'intake','answer'}: return response
+        with self._lifecycle_lock:
+            try:
+                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref)
+                if matched is None: return response
+                request,execution,attempt=matched
+                if not execution.model_attempt_started: return response
+                from .model_contract import ModelTransportResult
+                observed=ModelTransportResult.canonical_copy(result)
+                outcome=self._governed.llm(stage).resolve_transport_result(request,observed)
+                if type(outcome.model_report) is not ModelEffectReport: return response
+                terminal=self._governed_terminalize(source_causal_id,stage,grant,execution,outcome.model_report)
+                stored=self._governed_model_effect(source_causal_id,stage)
+                if stored is None or type(stored.payload) is not TerminalEffect or stored.payload.model_report != outcome.model_report:
+                    return {'stage':stage,'state':'unknown','reason_code':'model-terminal-unconfirmed'}
+                if outcome.candidate is not None:
+                    if stage == 'intake':
+                        from .governed_nondiagnostic import NonDiagnosticIntakeCandidate
+                        candidate=NonDiagnosticIntakeCandidate.from_wire(outcome.candidate)
+                        binding=self._governed_source_open(source_causal_id)
+                        if binding is None: return response
+                        candidate.validate_source(binding[0].body)
+                    else: candidate=NonDiagnosticCandidate.from_wire(outcome.candidate)
+                    self._governed_candidates[(source_causal_id,stage)]=candidate
+                return {'stage':stage,'state':'unknown' if stored.state=='unknown' else 'completed' if outcome.candidate is not None else 'failed-closed',
+                        'reason_code':outcome.reason_code}
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError):
+                return response
+
+    def abort_nondiagnostic_stage(self, source_causal_id, stage, grant, attempt_ref, *, reason_code):
+        if reason_code not in {'request-transfer-aborted','result-transfer-aborted','adapter-precall-unconfirmed'}:
+            raise ProtocolViolation('invalid governed abort reason')
+        with self._lifecycle_lock:
+            effect=self._governed_model_effect(source_causal_id,stage)
+            if effect is not None and type(effect.payload) is TerminalEffect:
+                self._governed_requests.pop((source_causal_id,stage),None)
+                self._governed_candidates.pop((source_causal_id,stage),None)
+                self._recording_excluded_sources.pop(source_causal_id,None)
+                self._governed_source_holders.pop(source_causal_id,None)
+                return {'stage':stage,'state':'unknown' if effect.state=='unknown' else 'completed' if effect.state=='accepted' else 'failed-closed','reason_code':reason_code}
+            try:
+                matched=self._governed_attempt(source_causal_id,stage,grant,attempt_ref)
+                if matched is None: return {'stage':stage,'state':'failed-closed','reason_code':reason_code}
+                request,execution,attempt=matched
+                report=None if not execution.model_attempt_started else self._governed.llm(stage).transport_unknown_outcome(request).model_report
+                self._governed_terminalize(source_causal_id,stage,grant,execution,report)
+                state='unknown' if execution.model_attempt_started else 'failed-closed'
+            finally:
+                self._governed_requests.pop((source_causal_id,stage),None)
+                self._governed_candidates.pop((source_causal_id,stage),None)
+                self._recording_excluded_sources.pop(source_causal_id,None)
+                self._governed_source_holders.pop(source_causal_id,None)
+            return {'stage':stage,'state':state,'reason_code':reason_code}
+
+    def nondiagnostic_source_status(self, source_causal_id):
+        result={'source_causal_id':source_causal_id,'next_stage':None,'state':'failed-closed','reason_code':'governed-runtime-unavailable',
+                'model_use_disclosure':self._governed_disclosure()}
+        if self._governed is None: return result
+        with self._lifecycle_lock:
+            try:
+                daily=self._store.daily_turn(source_causal_id)
+                if daily is not None and daily.phase=='finalized': return {**result,'state':'finalized','reason_code':None}
+                for stage in ('answer','intake'):
+                    effect=self._governed_model_effect(source_causal_id,stage)
+                    if effect is None: continue
+                    if effect.state in {'claiming','executing'}:
+                        started=type(effect.payload) is ExecutingEffect and effect.payload.model_attempt_started
+                        if not started:
+                            cached=self._governed_requests.get((source_causal_id,stage))
+                            head=self._read_head()
+                            if (cached is None or time.monotonic() >= cached[1]
+                                    or effect.payload.intent.authority.mismatch_reason(head) is not None
+                                    or self._current_writer_proof(head) is None
+                                    or self._governed_source_open(source_causal_id) is None
+                                    or self._governed.llm(stage).preflight(cached[0]) is not None):
+                                return result
+                        return {**result,'state':'attempted' if started else 'ready','reason_code':None}
+                    if effect.state=='unknown': return {**result,'state':'unknown','reason_code':'model-effect-unknown'}
+                    report=effect.payload.model_report if type(effect.payload) is TerminalEffect else None
+                    if effect.state=='accepted' and report is not None and report.candidate_digest is not None:
+                        candidate=self._governed_candidates.get((source_causal_id,stage))
+                        if candidate is None: return {**result,'state':'owner-decision-required','reason_code':'model-candidate-unavailable'}
+                        if stage=='intake' and daily is not None and daily.phase=='evidence-finalized' and candidate.operation in {'question','mixed'}:
+                            return {**result,'state':'ready','next_stage':'answer','reason_code':None}
+                        return {**result,'state':'completed','reason_code':None}
+                    return {**result,'state':'failed-closed','reason_code':None if report is None else report.reason_code}
+                if self._governed_source_open(source_causal_id) is not None:
+                    return {**result,'state':'ready','next_stage':'intake','reason_code':None}
+            except (ValueError,TypeError,KeyUnavailable,StoreUnavailable): pass
+        return result
+
+    def _governed_commit_draft(self, source, draft, candidate=None):
+        from .plugin import HealthPlugin
+        prepared=self.handle(CommandEnvelope(peer='plugin',action='turn.prepare',source='daily_skill_runtime',
+            causal_id=HealthPlugin._daily_turn_causal_id('evidence-prepare' if draft.turn_kind=='evidence-stage' else 'complete-prepare',source),
+            generation=self.daily_prepare_generation(),scope=('turn:prepare',),payload=DailyTurnPreparePayload(draft,candidate)))
+        if prepared.status not in {'accepted','replayed'}: return prepared
+        while True:
+            status=self.daily_turn_status(source)
+            if status is None: return Response('unavailable',source,'daily-turn-state-unavailable')
+            if status.phase in {'evidence-finalized','finalized'}: return Response('accepted',source,status.phase)
+            if status.phase not in {'prepared','unknown','committed'}: return Response('unavailable',source,'daily-turn-state-unavailable')
+            transition=self.handle(HealthPlugin._daily_transition_command(status,'state.finalize' if status.phase=='committed' else 'state.commit'))
+            if transition.status not in {'accepted','replayed'}: return transition
+
+    def advance_governed_source(self, source_causal_id):
+        from .contract import DailyTurnMeta
+        result={'response':Response('unavailable',source_causal_id,'governed-runtime-unavailable').to_wire(),'next_stage':None,
+                'model_use_disclosure':self._governed_disclosure(),'delivery_refs':[]}
+        if self._governed is None: return result
+        with self._lifecycle_lock:
+            try:
+                initialization=self._store.initialization()
+                if initialization is not None and initialization.phase=='enabled' and source_causal_id in initialization.draft.source_causal_ids:
+                    refs=self._governed_notice(source_causal_id,'initialization-enabled','健康管家已初始化；诊断未启用')
+                    return {**result,'response':Response('accepted',source_causal_id,'initialization-enabled').to_wire(),'delivery_refs':refs}
+                binding=self._governed_source_open(source_causal_id)
+                if binding is not None and self._governed_is_owner_command(binding[0].body):
+                    owner=self.governed_owner_command(source_causal_id)
+                    return {**result,**owner}
+                status=self.nondiagnostic_source_status(source_causal_id)
+                if status['next_stage']=='intake':
+                    return {**result,'response':Response('accepted',source_causal_id,'governed-source-held').to_wire(),'next_stage':'intake'}
+                if status['state'] in {'failed-closed','unknown','owner-decision-required'}:
+                    refs=self._governed_failure_notice(source_causal_id,status)
+                    return {**result,'response':Response('unavailable',source_causal_id,status['reason_code'] or status['state']).to_wire(),'delivery_refs':refs}
+                daily=self._store.daily_turn(source_causal_id)
+                if daily is None:
+                    intake=self._governed_candidates.get((source_causal_id,'intake'))
+                    if binding is None or intake is None: return result
+                    settings=self.owner_settings_state()
+                    draft=self._governed.evidence_stage(binding[0],self.daily_state(),intake,settings.timezone,recording_stopped=binding[2])
+                    committed=self._governed_commit_draft(source_causal_id,draft)
+                    if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
+                    daily=self._store.daily_turn(source_causal_id)
+                if daily.phase=='evidence-finalized':
+                    intake=self._governed_candidates.get((source_causal_id,'intake'))
+                    if intake is None: return result
+                    if intake.operation in {'question','mixed'} and (source_causal_id,'answer') not in self._governed_candidates:
+                        return {**result,'response':Response('accepted',source_causal_id,'evidence-finalized').to_wire(),'next_stage':'answer'}
+                    candidate=self._governed_candidates.get((source_causal_id,'answer'))
+                    resolution=None; atoms=()
+                    if candidate is not None:
+                        from .answer_resolution import ModelEffectRef
+                        effect=self._governed_model_effect(source_causal_id,'answer')
+                        report=effect.payload.model_report
+                        current=self.daily_turn_post_stage_state(source_causal_id)
+                        pipeline=self._non_diagnostic_pipeline.with_current_owner_cards(current.current_evidence_cards,knowledge_valid_at=self._knowledge_clock().isoformat())
+                        rendered=pipeline.render(candidate)
+                        template=pipeline.approved_template(candidate.template_id)
+                        resolution=ModelAnswerResolution.rendered(strict_request_digest=effect.payload.intent.intent_digest,
+                            model_authority_digest=self._governed.answer_llm.model_authority_digest,
+                            template_id=template.template_id,template_version=template.version,template_digest=stable_digest(template.to_wire()),
+                            effect_ref=ModelEffectRef(effect.payload.intent.effect_id,report.digest),candidate_digest=stable_digest(candidate.to_wire()),
+                            rendered_reply_digest=stable_digest(rendered.to_commit_wire()))
+                        atoms=rendered.reply_atoms
+                    source=self._governed_source_open(source_causal_id)[0]
+                    complete=self._governed.daily_runtime.complete(source,self.daily_turn_post_stage_state(source_causal_id),daily.draft,
+                        model_answer_resolution=resolution,model_reply_atoms=atoms)
+                    committed=self._governed_commit_draft(source_causal_id,complete,candidate)
+                    if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
+                turn=self.daily_turn_result(source_causal_id)
+                if turn is None: return {**result,'response':Response('replayed',source_causal_id,'daily-turn-result-redacted').to_wire()}
+                # Bind only the exact original finalized turn through126.
+                bound=self.bind_live_delivery({'kind':'committed-turn','source_causal_id':source_causal_id,'record_id':turn.record_id,'transition_id':turn.transition_id})
+                refs=[{'kind':'owner-outbox','intent_id':d['intent_id']} for d in bound['deliveries'] if d['recipient_role']=='owner']
+                return {**result,'response':Response('accepted',source_causal_id,'daily-turn-finalized',DailyTurnMeta(turn)).to_wire(),'delivery_refs':refs}
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result
+
+    @staticmethod
+    def _governed_is_owner_command(body):
+        if type(body) is not str: return False
+        return body.strip().startswith('/health-') or body.strip().split(' ',1)[0] in {
+            '帮助','当前状态','暂停主动联系','恢复主动联系','停止记录','恢复记录','提醒我','取消提醒','查看资料','导出资料','纠正资料','删除资料'}
+
+    def _governed_notice(self, source, kind, text, *, details=None, mark_committed=True):
+        """Commit one original command receipt and owner outbox together."""
+        identity=stable_digest({'source':source,'kind':kind}).removeprefix('sha256:')
+        fact='governed-result:'+identity
+        with self._ticket115_write_authority() as (head,settings):
+            original=self._store.source_receipt(source)
+            if original is None or not self._admission_policy.accepts(original.envelope,allowed_capabilities=('health-init',*DAILY_HEALTH_SKILL_NAMES)):
+                raise AuthorityValidationError('governed-result-source-unavailable')
+            prior=self._store.health_command_receipt(fact)
+            outbox=self._ticket115_outbox_state_open(settings)
+            if prior is None:
+                notice=text+'\n\n'+self._governed_disclosure()['context_disclosure']
+                payload={'text':notice}
+                receipt=HealthCommandReceipt(causal_id=fact,command_digest=stable_digest({'source':source,'kind':kind,'text':notice,'details':details}),
+                    result={'_governed_action':kind,'source_causal_id':source,'text':notice,'details':details})
+                destination=self._owner_weixin_destination_open(settings)
+                observed=self._owner_delivery_clock_utc_open()
+                intent=OwnerDeliveryEngine.form_intent(effect_kind='owner-delivery',owner_id=settings.owner_id,installation_id=settings.installation_id,
+                    effect_request_id='governed-owner-delivery:'+identity,business_fact_ref=fact,business_revision_digest=receipt.command_digest,
+                    source_ref=source,recipient_ref=destination.owner_sender_id,route_id=destination.route_id,
+                    route_generation=settings.current_configuration_generation,payload_ref='live-governed-reply:'+fact,
+                    payload_digest=stable_digest(payload),formed_at_utc=observed)
+                submitted=OwnerDeliveryEngine.submit(outbox,intent,submitted_at_utc=observed)
+                mutation=self._prepare_ticket115_facts_open(head,settings,delivery_state=submitted.state,health_command_receipt=receipt)
+            else:
+                mutation=None
+                matches=[r.intent for r in outbox.records if r.intent.business_fact_ref==fact and r.intent.source_ref==source]
+                if len(matches)!=1: raise AuthorityValidationError('governed-result-outbox-mismatch')
+                intent=matches[0]
+        self._complete_ticket115_mutation(mutation)
+        if mark_committed:
+            self._store.mark_source_business_committed(source)
+        return [{'kind':'owner-outbox','intent_id':intent.intent_id}]
+
+    def _governed_failure_notice(self, source, status):
+        if status['state'] in {'unknown','owner-decision-required'}:
+            try:
+                with self._ticket115_write_authority() as (head, settings):
+                    fact = self._governed_model_decision_fact(source)
+                    if fact is None or fact['state'] != status['state']:
+                        return []
+                    identity = stable_digest({'source': source, 'kind': 'model-owner-decision'}).removeprefix('sha256:')
+                    fact_ref = 'governed-model-decision:' + identity
+                    text = ('本次模型处理结果无法确认，已停止继续处理，请主人决定后续操作。'
+                            if fact['state'] == 'unknown' else
+                            '已观察到模型完成，但候选正文无法恢复，已停止继续处理，请主人决定后续操作。')
+                    text += '\n\n' + self._governed_disclosure()['context_disclosure']
+                    details = {'effect_id': fact['effect_id'], 'stage': fact['stage'],
+                               'model_report_digest': fact['model_report_digest'], 'state': fact['state']}
+                    command_digest = stable_digest({'source': source, 'kind': 'model-owner-decision',
+                                                    'text': text, 'details': details})
+                    receipt = HealthCommandReceipt(causal_id=fact_ref, command_digest=command_digest,
+                        result={'_governed_action': 'model-owner-decision', 'source_causal_id': source,
+                                'text': text, 'details': details})
+                    outbox = self._ticket115_outbox_state_open(settings)
+                    prior = self._store.health_command_receipt(fact_ref)
+                    destination = self._owner_weixin_destination_open(settings)
+                    observed = self._owner_delivery_clock_utc_open()
+                    if prior is None:
+                        intent = OwnerDeliveryEngine.form_intent(effect_kind='owner-delivery',
+                            owner_id=settings.owner_id, installation_id=settings.installation_id,
+                            effect_request_id='owner-decision:governed-model:' + identity,
+                            business_fact_ref=fact_ref, business_revision_digest=receipt.command_digest,
+                            source_ref=source, recipient_ref=destination.owner_sender_id,
+                            route_id=destination.route_id, route_generation=settings.current_configuration_generation,
+                            payload_ref='owner-decision-model-payload:' + fact_ref,
+                            payload_digest=stable_digest({'text': text}), formed_at_utc=observed)
+                        submitted = OwnerDeliveryEngine.submit(outbox, intent, submitted_at_utc=observed)
+                        mutation = self._prepare_ticket115_facts_open(head, settings,
+                            delivery_state=submitted.state, health_command_receipt=receipt)
+                    else:
+                        if prior != receipt:
+                            return []
+                        matches = [record.intent for record in outbox.records
+                                   if record.intent.business_fact_ref == fact_ref and record.intent.source_ref == source]
+                        if len(matches) != 1 or self._governed_model_decision_binding(matches[0], outbox) is None:
+                            return []
+                        intent, mutation = matches[0], None
+                self._complete_ticket115_mutation(mutation)
+                return [{'kind': 'owner-outbox', 'intent_id': intent.intent_id}]
+            except (ValueError, TypeError, KeyUnavailable, StoreUnavailable, CurrentHeadError):
+                return []
+        try: return self._governed_notice(source,'model-failed-closed','这次健康处理无法安全完成，没有记录新的健康回答。')
+        except (ValueError,TypeError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return []
+
+    def _governed_model_decision_fact(self, source):
+        """Read only a durable exact model terminal and its original source."""
+        if self._governed is None or type(source) is not str:
+            return None
+        head = self._store.finalized_authority()
+        receipt = self._store.source_receipt(source)
+        if (head is None or receipt is None or type(self._admission_policy) is not AdmissionPolicy
+                or not self._admission_policy.accepts(receipt.envelope,
+                    allowed_capabilities=DAILY_HEALTH_SKILL_NAMES)):
+            return None
+        for stage in ('answer', 'intake'):
+            stored = self._governed_model_effect(source, stage)
+            if stored is None:
+                continue
+            terminal = stored.payload
+            if type(terminal) is not TerminalEffect or type(terminal.execution) is not ExecutingEffect:
+                return None
+            intent, report = terminal.intent, terminal.model_report
+            authority = terminal.lease.authority
+            if (intent.effect_kind != 'model-work' or intent.model_stage != stage
+                    or intent.business_source_causal_id != source
+                    or not terminal.execution.model_attempt_started or type(report) is not ModelEffectReport
+                    or terminal.result_digest != report.digest
+                    or authority.installation_id != head.installation_id or authority.site != head.site
+                    or authority.writer_fence != head.writer_fence):
+                return None
+            if stored.state == 'unknown' and terminal.status == 'unknown' and report.model_status == 'unknown':
+                state = 'unknown'
+            elif (stored.state == 'accepted' and terminal.status == 'accepted'
+                    and report.model_status == 'completed' and report.terminal_proven
+                    and report.candidate_digest is not None
+                    and (source, stage) not in self._governed_candidates):
+                state = 'owner-decision-required'
+            else:
+                return None
+            return {'source': source, 'effect_id': intent.effect_id, 'stage': stage,
+                    'model_report_digest': report.digest, 'state': state}
+        return None
+
+    def _governed_model_decision_binding(self, intent, outbox):
+        """Recognize one body-free mandatory notice, never general writes."""
+        if (type(intent) is not OutboxIntent or intent.authorization_kind != 'legacy'
+                or not intent.effect_request_id.startswith('owner-decision:governed-model:')):
+            return None
+        fact = self._governed_model_decision_fact(intent.source_ref)
+        if fact is None:
+            return None
+        identity = stable_digest({'source': intent.source_ref, 'kind': 'model-owner-decision'}).removeprefix('sha256:')
+        fact_ref = 'governed-model-decision:' + identity
+        receipt = self._store.health_command_receipt(fact_ref)
+        if receipt is None:
+            return None
+        text = ('本次模型处理结果无法确认，已停止继续处理，请主人决定后续操作。'
+                if fact['state'] == 'unknown' else
+                '已观察到模型完成，但候选正文无法恢复，已停止继续处理，请主人决定后续操作。')
+        text += '\n\n' + self._governed_disclosure()['context_disclosure']
+        details = {name: fact[name] for name in ('effect_id', 'stage', 'model_report_digest', 'state')}
+        expected = {'_governed_action': 'model-owner-decision', 'source_causal_id': intent.source_ref,
+                    'text': text, 'details': details}
+        command_digest = stable_digest({'source': intent.source_ref, 'kind': 'model-owner-decision',
+                                       'text': text, 'details': details})
+        try:
+            settings = self._current_owner_settings(self._store.finalized_authority())
+            destination = self._owner_weixin_destination_open(settings)
+            if (outbox.record(intent.intent_id).intent != intent or receipt.result != expected
+                    or receipt.command_digest != command_digest or intent.business_fact_ref != fact_ref
+                    or intent.business_revision_digest != command_digest
+                    or intent.effect_request_id != 'owner-decision:governed-model:' + identity
+                    or intent.payload_ref != 'owner-decision-model-payload:' + fact_ref
+                    or intent.payload_digest != stable_digest({'text': text})
+                    or intent.owner_id != settings.owner_id or intent.installation_id != settings.installation_id
+                    or intent.recipient_ref != destination.owner_sender_id or intent.route_id != destination.route_id
+                    or intent.route_generation != settings.current_configuration_generation):
+                return None
+        except (AuthorityValidationError, DeliveryContractViolation, KeyUnavailable, TypeError, ValueError):
+            return None
+        return details
+
+    def _governed_owner_context(self, source, *, permissions=('health_settings.write',)):
+        from .owner_authority import OwnerMutationContext
+        head=self._store.finalized_authority()
+        settings=self._current_owner_settings(head)
+        identity=stable_digest({'source':source,'permissions':list(permissions)}).removeprefix('sha256:')
+        return OwnerMutationContext('governed-owner-command:'+identity,'governed-owner-prepare:'+identity,'current_owner',
+            settings.owner_id,settings.installation_id,tuple(sorted(permissions)),'source:'+source,head.generation,head.writer_fence)
+
+    def _governed_apply_owner(self, request):
+        from .plugin import HealthPlugin
+        response=self.handle(CommandEnvelope(peer='plugin',action='owner.prepare',source='owner_authority',
+            causal_id=request.context.causal_id,generation=request.context.current_head_generation,scope=('owner:prepare',),payload=OwnerPreparePayload(request)))
+        if response.status not in {'accepted','replayed'}: return response
+        while True:
+            status=self.owner_mutation_status(request.context.command_id)
+            if status is None: return Response('unavailable',request.context.causal_id,'owner-mutation-state-unavailable')
+            if status.phase=='finalized': return Response('accepted',request.context.causal_id,'owner-mutation-finalized')
+            if status.phase not in {'prepared','unknown','committed'}: return Response('unavailable',request.context.causal_id,'owner-mutation-state-unavailable')
+            response=self.handle(HealthPlugin._owner_mutation_transition_command(status,'state.finalize' if status.phase=='committed' else 'state.commit'))
+            if response.status not in {'accepted','replayed'}: return response
+
+    def _governed_settings_command(self, source, control, operation, *, target=None, approval=None):
+        from .settings import OwnerCommandContext, OwnerControlCommand, ControlUpdate
+        from .owner_authority import OwnerMutationRequest
+        context=self._governed_owner_context(source)
+        settings=self.owner_settings_state()
+        now=self._owner_settings_clock().astimezone(timezone.utc).isoformat()
+        typed=OwnerControlCommand(OwnerCommandContext(context.command_id,context.causal_id,'current_owner',context.owner_id,
+            context.installation_id,'health_settings.write',context.context_ref,context.current_head_generation,context.writer_fence),
+            ControlUpdate(control,operation,target,context.current_head_generation,now),approval)
+        request=OwnerMutationRequest.form(context=context,expected_settings_version=settings.version,requested_at_utc=now,settings_command=typed)
+        result=self._governed_apply_owner(request)
+        if result.status not in {'accepted','replayed'}: raise AuthorityValidationError(result.reason_code or 'owner-control-unconfirmed')
+        return self.owner_settings_state()
+
+    def governed_owner_command(self, source_causal_id):
+        result={'response':Response('unavailable',source_causal_id,'owner-command-unavailable').to_wire(),'delivery_refs':[]}
+        if self._governed is None: return result
+        with self._lifecycle_lock:
+            try:
+                # Exact native replays find their original result without rerunning mutations.
+                for receipt in self._store.health_command_receipts():
+                    if receipt.result.get('source_causal_id')==source_causal_id and receipt.result.get('_governed_action') is not None:
+                        head=self._store.finalized_authority(); settings=self._current_owner_settings(head)
+                        outbox=self._ticket115_outbox_state_open(settings)
+                        refs=[{'kind':'owner-outbox','intent_id':r.intent.intent_id} for r in outbox.records if r.intent.business_fact_ref==receipt.causal_id]
+                        return {'response':Response('replayed',source_causal_id,'owner-command-finalized').to_wire(),'delivery_refs':refs}
+                binding=self._governed_source_open(source_causal_id)
+                if binding is None: return result
+                source=binding[0]; body=source.body.strip()
+                aliases={'帮助':'/health-help','当前状态':'/health-status','暂停主动联系':'/health-pause','恢复主动联系':'/health-resume',
+                    '停止记录':'/health-recording-stop','恢复记录':'/health-recording-resume','提醒我':'/health-task-once','取消提醒':'/health-task-cancel',
+                    '查看资料':'/health-view','导出资料':'/health-export','纠正资料':'/health-correct','删除资料':'/health-delete'}
+                name,_,argument=body.partition(' '); name=aliases.get(name,name)
+                settings=self.owner_settings_state()
+                controls={'/health-pause':('proactive_support','pause','已暂停主动联系'),'/health-resume':('proactive_support','resume','已恢复主动联系'),
+                    '/health-recording-stop':('recording','stop','已停止记录'),'/health-recording-resume':('recording','resume','已恢复记录')}
+                if name in controls:
+                    control,operation,text=controls[name]
+                    current=self._governed_settings_command(source_causal_id,control,operation)
+                    expected=(current.recording_stopped if control=='recording' else current.proactive_support_paused)
+                    if expected != (operation in {'stop','pause'}): raise AuthorityValidationError('owner-control-readback-unconfirmed')
+                elif name=='/health-status':
+                    text='当前状态：'+('已停止记录' if settings.recording_stopped else '记录已开启')+'；'+('主动联系已暂停' if settings.proactive_support_paused else '主动联系可用')+'；诊断未启用。'
+                elif name=='/health-help':
+                    text='可用命令：/health-status、/health-pause、/health-resume、/health-recording-stop、/health-recording-resume、/health-task-once 今天 18:00 提醒内容、/health-task-cancel 任务编号、/health-view、/health-export、/health-correct 对象引用 更正原文、/health-delete。'
+                elif name=='/health-view':
+                    objects=self.managed_rights_read_current()
+                    if argument: objects=tuple(o for o in objects if argument in o.object_ref or argument in repr(o.to_wire()))
+                    value=json.dumps([o.to_wire() for o in objects],ensure_ascii=False,sort_keys=True,separators=(',',':'))
+                    text='当前资料：'+value if len(value.encode()) <= 3500 else '资料较多，请缩小查看范围或使用 /health-export 导出完整资料。'
+                elif name=='/health-task-once':
+                    return self._governed_task_once(source_causal_id,argument)
+                elif name=='/health-task-cancel':
+                    return self._governed_task_cancel(source_causal_id,argument)
+                elif name=='/health-correct':
+                    return self._governed_correct(source_causal_id,argument)
+                elif name=='/health-export':
+                    return self._governed_export(source_causal_id,argument)
+                elif name in {'/health-delete','/health-delete-confirm'}:
+                    return self._governed_delete(source_causal_id,name,argument)
+                else: text='该命令无法识别，请发送 帮助 查看可用命令。'
+                refs=self._governed_notice(source_causal_id,name,text)
+                return {'response':Response('accepted',source_causal_id,'owner-command-finalized').to_wire(),'delivery_refs':refs}
+            except (ValueError,TypeError,KeyError,KeyUnavailable,StoreUnavailable,CurrentHeadError): return result

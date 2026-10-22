@@ -729,7 +729,7 @@ class AtomicEvidenceClaim:
         if _texts(self.proves, "proves") != (self.content,):
             raise AuthorityValidationError("one evidence card must carry one atomic claim")
         _texts(self.does_not_prove, "does not prove")
-        for topic_ref in _texts(self.topic_refs, "topic references"):
+        for topic_ref in _texts(self.topic_refs, "topic references", empty=True):
             _topic(topic_ref)
 
     def to_storage(self) -> dict[str, object]:

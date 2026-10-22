@@ -5931,7 +5931,7 @@ class EncryptedStateStore:
         row = self._execute("SELECT state FROM effects WHERE effect_id = ?", (effect_id,)).fetchone()
         return None if row is None else row[0]
 
-    def model_effect_for_source(self, source_causal_id: str) -> StoredEffect | None:
+    def model_effect_for_source(self, source_causal_id: str, model_stage: str | None = None) -> StoredEffect | None:
         """Return the unique model effect durably bound to one business source."""
 
         validate_opaque_text(source_causal_id, "effect business source causal identifier")
@@ -5955,6 +5955,7 @@ class EncryptedStateStore:
                 type(intent) is EffectIntent
                 and intent.effect_kind == "model-work"
                 and intent.business_source_causal_id == source_causal_id
+                and intent.model_stage == model_stage
             ):
                 matches.append(StoredEffect(state=state, payload=payload))
         if len(matches) > 1:
