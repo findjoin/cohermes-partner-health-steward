@@ -632,16 +632,26 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
             self.assertFalse(approval.revoked)
             self.assertEqual(tasks[0].approval.approval_id, approval.approval_id)
             self.assertEqual(len(tasks[0].external_boundary.recipient_refs), 1)
+            from partner_health_steward.review import local_day_key
+            review_settings = core.owner_settings_state()
+            baseline_keys = {record.key.value for record in core.daily_review_ledger().completed}
             fixture.clock[0] += timedelta(minutes=3)
+            current_key = local_day_key(review_settings.owner_id, review_settings.installation_id,
+                                        review_settings.timezone, fixture.clock[0])
+            self.assertNotIn(current_key.value, baseline_keys)
             first = self._run_child("wake", fixture)
             self.assertTrue(first["visible_results"])
-            completed = core.owner_settings_state().completed_review_keys
-            self.assertTrue(completed)
+            completed = core.daily_review_ledger()
+            self.assertIsNotNone(completed.record_for(current_key))
+            self.assertIsNone(completed.pending)
+            self.assertEqual({record.key.value for record in completed.completed}, baseline_keys | {current_key.value})
+            self.assertEqual(core.owner_settings_state().completed_review_keys, review_settings.completed_review_keys)
             self.assertEqual(core.task_state().tasks[0].primary_label, "solved")
             self.assertEqual(core.task_state().tasks[0].phase, "accepted")
             second = self._run_child("wake", fixture)
             self.assertEqual(second["new_sends"], 0)
-            self.assertEqual(core.owner_settings_state().completed_review_keys, completed)
+            self.assertEqual(core.daily_review_ledger().to_storage(), completed.to_storage())
+            self.assertEqual(core.owner_settings_state().completed_review_keys, review_settings.completed_review_keys)
             self.assertEqual(len(core.task_state().tasks), 1)
         with _service() as fixture:
             _initialize(fixture)
