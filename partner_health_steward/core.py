@@ -15227,7 +15227,8 @@ class HealthCore:
 
     def _governed_task_cancel(self, source, task_id):
         self._governed_settings_command(source,'task','cancel',target=task_id)
-        self.cancel_task(task_id,cancelled_at_utc=self._governed_command_now(source).isoformat())
+        if self.task_state().task(task_id).primary_label!='cancelled':
+            raise AuthorityValidationError('owner-task-cancellation-unconfirmed')
         refs=self._governed_notice(source,'task-cancelled','已取消提醒：'+task_id)
         return {'response':Response('accepted',source,'task-cancelled').to_wire(),'delivery_refs':refs}
 
