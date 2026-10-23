@@ -201,6 +201,22 @@ def _systemd_environment():
     return environment
 
 
+def _validate_fixed_plan(plan):
+    # The private JSON selects this fixed program; it is not an authority for
+    # arbitrary filesystem resources, identities, sockets or service commands.
+    from .default_runtime import build_default_plan
+    expected=build_default_plan(Path(plan['release_root']),plan['facts'],
+        {'installation_id':plan['core_binding']['installation_id'],'site':plan['core_binding']['site']})
+    for name in ('core_binding','head_binding','live_binding','roles','program_resources','program_plan'):
+        if plan.get(name)!=expected[name]:raise ValueError('fixed default program binding drift')
+    gateway=copy.deepcopy(expected['gateway_config'])
+    gateway['technical_acceptance']={'root':str(_ARTIFACTS),'identity':{
+        'release_digest':plan['release_digest'],'distribution_digest':plan['distribution_digest'],
+        'run_id':plan['run_context']['run_id'],'run_scope':plan['run_context']['run_scope'],'target':'default'}}
+    if plan.get('gateway_config')!=gateway or plan.get('execution_artifacts_root')!=str(_ARTIFACTS):
+        raise ValueError('fixed default gateway binding drift')
+
+
 def _service(action, unit):
     if unit not in {'hermes-gateway.service','cohermes-default-core.service','cohermes-default-ordinary.service'}:
         raise ValueError('non-default service forbidden')
@@ -241,7 +257,7 @@ def _program_paths(plan):
     for value in plan['program_resources']:
         path=Path(value)
         if (not path.is_absolute() or path == _HOME or path == Path('/root')
-                or path.is_relative_to(protected) or protected.is_relative_to(path)
+                or (path.is_relative_to(protected) and path not in {protected/'core.json',protected/'live.json'}) or protected.is_relative_to(path)
                 or path.is_relative_to(_ARTIFACTS) or path.is_relative_to(_PERMITS)):
             raise ValueError('unsafe program rollback resource')
         if any(path == p or path.is_relative_to(p) or p.is_relative_to(path) for p in result):
@@ -414,6 +430,7 @@ class DefaultAcceptanceGateExecutor:
         _safe_directory(_HOME)
         plan=_read_private(_BINDING)
         _default_only(plan)
+        _validate_fixed_plan(plan)
         context=plan['run_context']
         if (request['gate_id'] not in _gates(context)
                 or any(request[k]!=context[k] for k in ('run_id','run_scope','distribution_digest','target_ref'))
@@ -496,8 +513,14 @@ class DefaultAcceptanceGateExecutor:
             plan.clear();plan.update(installed)
             _write_private(_BINDING,plan)
             if not _reload():raise ValueError('daemon reload failed')
-            for role in plan['roles']:
-                if not _service('restart',role['unit']):raise ValueError('service restart failed')
+            from .default_role_probe import run_default_role_probe
+            role_facts=run_default_role_probe(plan)
+            _write_private(_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.role-probes.json'),
+                {'contract':'ticket128-role-observation-v1','execution_key':request['execution_key'],
+                 'release_digest':request['release_digest'],'distribution_digest':request['distribution_digest'],
+                 'facts':role_facts},exclusive=True)
+            if type(role_facts) is not dict or role_facts.get('passed') is not True:
+                raise ValueError('actual role observations are incomplete')
             deadline=time.monotonic()+20
             while time.monotonic()<deadline:
                 try:
@@ -509,7 +532,7 @@ class DefaultAcceptanceGateExecutor:
             if not _live_role_identity(plan):raise ValueError('actual role identity unconfirmed')
             installation={'contract':'ticket128-installation-observation-v1','execution_key':request['execution_key'],
                 'release_digest':request['release_digest'],'distribution_digest':request['distribution_digest'],
-                'isolation_bytes':_isolation_bytes(plan)}
+                'isolation_bytes':_isolation_bytes(plan),'role_facts_digest':_digest(role_facts)}
             _write_private(_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.installation.json'),installation,exclusive=True)
             return _observation(request,'passed',evidence=['installation:'+_digest({'key':request['execution_key'],'probe':probe})[7:]])
         except Exception:
@@ -548,6 +571,7 @@ _LOCAL_MODULES = {
 }
 _LOCAL_PROGRAM = r'''
 import io,json,sys,unittest
+from contextlib import redirect_stdout,redirect_stderr
 from pathlib import Path
 import partner_health_steward.production_core_service as production
 assert Path(production.__file__).resolve().is_relative_to(Path(sys.executable).resolve().parent.parent)
@@ -559,9 +583,12 @@ sys.path.pop(0)
 modules=json.loads(sys.argv[2])
 suite=unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(name) for name in modules)
 output=io.StringIO()
-result=unittest.TextTestRunner(stream=output,verbosity=0).run(suite)
+with redirect_stdout(output),redirect_stderr(output):
+    result=unittest.TextTestRunner(stream=output,verbosity=0).run(suite)
 print(json.dumps({'tests':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
- 'skips':len(result.skipped),'successful':result.wasSuccessful()},sort_keys=True))
+ 'skips':len(result.skipped),'successful':result.wasSuccessful(),
+ 'failure_tests':[test.id() for test,_ in result.failures],
+ 'error_tests':[test.id() for test,_ in result.errors]},sort_keys=True))
 raise SystemExit(0 if result.wasSuccessful() and result.testsRun>0 and not result.skipped else 1)
 '''
 
