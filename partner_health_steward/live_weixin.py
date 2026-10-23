@@ -449,7 +449,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             capability = "health-init"
         message = {**headers, "generation": preflight["current_generation"],
                    "requested_capability": capability, "body": body}
-        governed = self._model_bridge is not None and initialization is None
+        governed = (self._model_bridge is not None
+                    and preflight["initialization_phase"] == "enabled"
+                    and initialization is None)
         admitted = await self._command("governed-receive" if governed else "receive-weixin", {"message": message})
         response = admitted.get("response")
         if not governed and set(admitted) != {"response"}:
