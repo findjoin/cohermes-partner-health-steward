@@ -125,3 +125,8 @@ R7精确dd0faba、真实3.11已通过G01—G10及ND07，原V02随后在verifier�
 R8精确ce6d9cc已实际通过G01—G10/ND07与新解释器FD/loader断言；首次初始化projection查询被Core原EOF规则关闭。独立authority确认verifier两个client漏SHUT_WR，旧123严格协议及负向保持。原child524.229秒/1failure，无timeout、cleanup确认；非空原childraw及0字节stdout日志的来源区别见[证据75](../evidence/75-ticket128-coreport-eof-verifier-refreeze-20261024.md)。
 
 新checkpointfd45cc5d32eac87566171d781588055d105c1f48 / treef07e3590cc1907c5a725af12cbcae63e833be066仅两文件4insertions；fresh双PRE PASS无阻塞、已正常push原分支。Root接受窄重冻，继续同source真实3.11原V02与完整执行门；产品/旧门/预算/7family及V07三世界不变。新正式门/真实部署仍未通过，128保持claimed。
+
+
+## 2026-10-24 R9旧130回归与default调度组成收口
+
+R9精确1e53730原G02的637项中130 V05一项真实失败；proof未保存具体assert trace，不能认定为历史line651。单V05与整个130七项同闭包诊断另通过，均不清原红。独立源码确认128全局自动tick扩大旧130手动caller语义，按既有设计收口到可信default startup显式启用，通用Adapter缺省仍手动；同15秒/Core/原poller及全部守卫保持。产品commit bc1cbdb0f9a75801937bef5b45cb5fa5a7bbf73a仅两文件7insertions，冻结fd45cc5和全部旧门不变。[证据76](../evidence/76-ticket128-default-timer-composition-20261024.md)记录事实、独立分类及继续执行要求；新正式门/部署仍待实际，128保持claimed。

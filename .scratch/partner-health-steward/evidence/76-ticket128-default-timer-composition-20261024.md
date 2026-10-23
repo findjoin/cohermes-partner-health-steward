@@ -1,0 +1,21 @@
+# Ticket128：default启动的周期调度范围收口
+
+本票仍claimed，正式default未切换，真实模型POST/微信发送/主人初始化未发生。下述诊断或源码修复不是完整执行门/部署通过。
+
+R9精确1e5373095ae95cf8f002faf1e2bad8f9e306f534、fd45cc5冻结、真实Python3.11、9557文件，closure sha256:7f2405df7c6b66f59c97be21243134d1c93643b10fca1ae7c1cb2babed7fa13a。原V02 child308.421秒/parent312.524秒，1failure/0error/0skip，cleanup确认、无timeout。首次阻断是G02原637测试中的原130 V05一项失败，其余636通过；本轮未到G10、EOF修订或初始化行为。
+
+必须区分事实：现_LOCAL_PROGRAM只将failure_tests计入proof，StringIO原trace没有保存，因此不能把本轮具体失败断言认定为历史R4的line651。原R9日志/tmp/dmit-connection-audit/formal-1e53730-128-r9-v02.log和ticket128-r9-gates-progress-2.log保留。同闭包另外原样诊断V05单项PASS45.410秒、原130整个模块七项PASS224.130秒，23冻结及closure均不变；对应original130v05-diagnostic.log与original130module-diagnostic.log在同目录。这些诊断不清除原637红、不拼作正式绿色，也不伪造原assert trace。
+
+独立源码核对另确认兼容边界差额：已闭130 design第100行将系统timer安装留128，通用Adapter/registry caller承诺手动当前wake；128之前把自动15秒tick无条件加到所有带model bridge的Adapter，旧caller也可能在墙钟阈值后被插入review/投递。first-connect延迟15秒只能移动阈值，不能保证旧调用保持手动语义。独立报告/tmp/ticket128-timer-composition-compatibility-assessment.md SHA25632eb7e767bad19e11d0000ec45b004e1b8443c1cc64ee5d0f1266dea8676313e，明确不判本次具体assert、未审并行新实现。
+
+Root授权并接受最窄设计内修正：只有已_verify_sources/arm的default startup composition固定将内存_periodic_current_wake置True；通用Adapter严格bool缺省False，只有自动_wake_if_due早守卫。保留同一poller、原15秒/首次15秒、手动wake、Core/currentness/initialization/recovery/stop/unknown/once-only全部规则。不新增raw/CLI可选模式、daemon/poller/RPC/clock或业务状态，不识别test/provider/route/profile。该修正未假称已证明解决R9未知断言，后面必须新同source执行原G02及全部门。
+
+实施产品commit bc1cbdb0f9a75801937bef5b45cb5fa5a7bbf73a / tree 7f5589b9c445f8439aeb6374025aff83b759390a，parent1e53730；仅default_runtime.py与live_weixin.py。Root读完整7insertions差异、编译两产品源码并核原5新冻结逐字不变；旧18与全部测试/合同/设计/输入未改，active freeze仍fd45cc5d32eac87566171d781588055d105c1f48及其既有双PRE。没有新冻结或测试数量变化。源码SHA256：
+
+- partner_health_steward/default_runtime.py: 2c1860332379d151ca961eba8b0f8367e1bcaaed6643c6451a019973b18046b8
+
+- partner_health_steward/live_weixin.py: 76af798cbdad894137d0d44a28fffb7a6917d4081971a19f2b31fd08961f747e
+
+Root实际R9事后compileall98、冻结23、来源122、runtime9557全不变，再核无proc/mount引用后仅退役该次公开input runtime/pinned，保留源、原红/诊断日志、manifest及私有事实，正式default仍PID521/active/running。清理不修改历史失败。
+
+继续从最终clean/pushed候选正常重建真实3.11闭包，原V02、123/118、119七门、root30、原full discover808同父进程一次、compileall/diff/23冻结/完整性均实际通过后才fresh双post；随后才真实default与主人原生事实。local540、G11/ND12各300及完整首发/医学审核边界不变。当前未通过完整门、未部署，不提前记非诊断里程碑或闭票。
