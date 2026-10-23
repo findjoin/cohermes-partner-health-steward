@@ -44,6 +44,10 @@ Decision family在真实119 Seam使用boundary fake，只测固定决策。其�
 
 runner仅对本次owned代码copy归一公开读取权限，实际逐字节核原manifest；不放宽宿主原closure或健康key权限。测试从kernel mountinfo核 `/root/.hermes` 精确mount与本次物理backing，核actual manager PID同namespace及仅loopback；同FS bindmount不使用 `os.path.ismount` 的dev/ino假阴性。OS门对实际generated unit附固定verifier ExecStartPost与owned append输出，独立核实际MainPID/InvocationID/UID与kernel允许/拒绝；不依赖宿主journal标签。低UID公开读取用真实Core解释器/部署release/runtime路径，并核同正式closure字节。
 
+自有chroot的普通OS前提包含仅本次mount/IPC namespace内的`/dev/shm` tmpfs：在chroot前创建，64 MiB上限、mode1777、nosuid/nodev/noexec，不绑定宿主`/dev/shm`。既有namespace-preconditions仅记录其实际kernel mount、mode与capacity，不形成产品gate verdict。原129 V02真实3.11配对probe已证：缺席时在原`ctx.Event()`→`SemLock`报FileNotFoundError（1error，0.033秒），挂载自有tmpfs后原测试1PASS/0fail/error/skip（0.043秒），9557份runtime字节均未改；日志`/tmp/dmit-connection-audit/ticket128-r5-original129-private-shm-probe.log` SHA256 `d9133bc9acdb83da2e558ca43f55130f868497bc1ae1dd3b5161e9c0ec34daf6`。这是已证的verifier OS前提修正，不是产品CAS缺陷或放宽旧129；本次新helper的完整门仍待实际执行。
+
+完整family与单个生产gate分别计时。原V07先同步运行一轮G01—G10，再以新run重复同一前置；原V06也有该第二轮，bootstrap/rollback/G11家族最多四轮前置。R5原637项G02实际全PASS，G01→G02 receipt跨度344.464967832秒，至G04约400.114084037秒（均含准备/hash/工件，不冒称纯测试耗时）。因而第二轮尚未完成时用普通12秒等canary，及用480秒涵盖整个family，和源码可达的原样工作量不相容；此为源码加同一真实前置实证，**没有宣称实际发生timeout**。仅两处紧随`_run_background`的canary观察采用1200秒frontier上限，线程提前结束立即传播原error或完整report；`_join_report`30秒、其余普通观察12秒不变。family child5400秒（四轮1200秒及原技术窗口余量）、SYSTEM RuntimeMax5520秒、runner5550秒、父方法5610秒保持有限且为准备/清理留量；原KillMode、cleanup和真实退出判定不变。生产local gate540秒、G11/ND12各300秒、V07到期后90秒与安静65秒均不变，不缓存前置、不跳gate或减少任何原测试/正负断言。R5首失败仍是原G04的上述OS前提，未到G10/自然trigger；本修订不将其或旧结果冒称新门通过。
+
 唯一raw JSON是data-only：admission/raw消息和少量JSON pointer只定位当前public setup计划/真实私有能力，不提供判词、配置正文、批准、已读/反馈事实或任意命令。prepare允许固定default的 `--release/--run-id/--run-scope/--input`，输出有限非秘密planned/existing定位；这些定位要由真实kernel/字节/状态复核，不能当postchecked布尔。`execution_artifacts_root`只定位同119工件，不冻结其内部receipt codec。公开release/skill/rule路径允许可读；隔离断言只保护原host_private_paths、DB/head和真实init/daily/status HMAC，不能按字段拼写把所有path判为私密。
 
 八stage不是八个必须发生的效果。unknown/correction没有发生须None，不为填字段生成纠正或未知外发。只有实际非None的不同事实ref才必须不同；独立回应推断送达/行动须保存真实因果和来源语义，不只是换前缀。

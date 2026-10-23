@@ -228,7 +228,7 @@ class Ticket128DefaultDeploymentVerificationTests(unittest.TestCase):
             completed = subprocess.run([sys.executable, "-I", "-B", str(runner),
                 "--runtime-root", runtime, "--verifier-root", str(_REPOSITORY),
                 "--pinned-root", pinned, "--method", self.id()],
-                text=True, capture_output=True, timeout=600)
+                text=True, capture_output=True, timeout=5610)
             self.assertEqual(completed.returncode, 0,
                 "isolated family failed\n" + completed.stdout[-16000:] + completed.stderr[-16000:])
             return
@@ -1219,6 +1219,14 @@ class _FormalNamespace:
         thread.start()
         return thread, result, context
 
+    def _wait_background_canary(self, thread, result, send_start):
+        # A new run repeats the original local gates before G11. This is a
+        # frontier observation budget, never extra time for a production gate.
+        self._wait(lambda: len(self.http.sends) > send_start or not thread.is_alive(), seconds=1200)
+        if not thread.is_alive():
+            report = self._join_report(thread, result)
+            self.case.fail("real gate frontier terminated before its canary: " + _canonical(report).decode())
+
     def _join_report(self, thread, result):
         thread.join(timeout=30)
         self.case.assertFalse(thread.is_alive(), "bounded real gate wait did not terminate")
@@ -1243,7 +1251,7 @@ class _FormalNamespace:
         self.run_until()
         before_sends, before_posts = len(self.http.sends), self.http.model_posts()
         thread, result, context = self._run_background()
-        self._wait(lambda: len(self.http.sends) > before_sends)
+        self._wait_background_canary(thread, result, before_sends)
         action = self._actual_action(self.http.sends[before_sends:])
         # An arbitrary ordinary message, extended body and wrong challenge may
         # not become the limited action or cause an ordinary Agent model call.
@@ -1351,7 +1359,7 @@ class _FormalNamespace:
         self.run_until()
         before = len(self.http.sends)
         thread, result, context = self._run_background(stop_nd12=False)
-        self._wait(lambda: len(self.http.sends) > before)
+        self._wait_background_canary(thread, result, before)
         g11_action = self._actual_action(self.http.sends[before:])
         self.enqueue(g11_action, "nd12-g11-action", cursor="cursor:nd12-g11-action")
         self._wait(lambda: "cursor:nd12-g11-action" in self.http.cursors)

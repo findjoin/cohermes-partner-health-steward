@@ -108,7 +108,7 @@ def host(args):
     (base / 'operator-input.json').write_text(json.dumps(config))
     unit = 't128ns-family-' + uuid.uuid4().hex[:12]
     command = ['systemd-run', '--system', '--quiet', '--wait', '--pipe', '--collect',
-               '--unit=' + unit, '--property=Delegate=yes', '--property=KillMode=control-group', '--property=RuntimeMaxSec=540',
+               '--unit=' + unit, '--property=Delegate=yes', '--property=KillMode=control-group', '--property=RuntimeMaxSec=5520',
                '--', '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C.UTF-8',
                'unshare', '--mount', '--net', '--ipc', '--uts', '--cgroup', '--pid', '--fork',
                '--kill-child', '--propagation', 'private', '/usr/bin/python3', '-I', '-B', str(script), '--init', str(base)]
@@ -116,7 +116,7 @@ def host(args):
     result = None
     cleanup_confirmed = False
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=555)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=5550)
     finally:
         # Every exit path operates only on this invocation's random SYSTEM unit.
         # RuntimeMaxSec additionally bounds its lifetime if the client is killed.
@@ -219,6 +219,8 @@ def init(base):
     run(["mount", "-t", "cgroup2", "-o", "nosuid,nodev,noexec", "cgroup2", str(root / "sys/fs/cgroup")])
     for name, major, minor in (("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9)):
         run(["mknod", "-m", "666", str(root / "dev" / name), "c", str(major), str(minor)])
+    (root / "dev/shm").mkdir(mode=0o1777)
+    run(["mount", "-t", "tmpfs", "-o", "size=64m,mode=1777,nosuid,nodev,noexec", "tmpfs", str(root / "dev/shm")])
     (root / "dev/fd").symlink_to("/proc/self/fd")
     (root / "dev/log").symlink_to("/run/systemd/journal/dev-log")
     shutil.copyfile(base / "probe.py", data / "probe.py")
@@ -324,6 +326,9 @@ def inside():
                   "unit_invocation_id_if_retained": invocation or None,
                   "unit_output_lines": output_path.read_text().splitlines(),
                   "kernel_home_mount": home_mounts[0],
+                  "private_shm_mount": [fields for fields in mounts if fields[4] == "/dev/shm"],
+                  "private_shm_mode": oct(Path("/dev/shm").stat().st_mode & 0o7777),
+                  "private_shm_capacity_bytes": os.statvfs("/dev/shm").f_blocks * os.statvfs("/dev/shm").f_frsize,
                   "cgroup_view": Path("/proc/self/cgroup").read_text().strip(),
                   "pid_namespace": os.readlink("/proc/self/ns/pid"),
                   "network_namespace": os.readlink("/proc/self/ns/net")}
@@ -337,7 +342,7 @@ def inside():
                    PYTHONDONTWRITEBYTECODE='1')
         bootstrap = "import os,sys,types,unittest; from pathlib import Path; root=Path(sys.argv[1]); assert sys.version_info[:2]==(3,11); assert os.geteuid()==0; import partner_health_steward as p; assert Path(p.__file__).resolve().is_relative_to(Path(os.environ['TICKET123_RUNTIME_ROOT'])); tests=types.ModuleType('tests'); tests.__path__=[str(root/'tests')]; tests.__package__='tests'; tests.__file__=str(root/'tests/__init__.py'); sys.modules['tests']=tests; suite=unittest.defaultTestLoader.loadTestsFromName(sys.argv[2]); assert suite.countTestCases()==1; result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or bool(result.skipped))"
         python = str(Path(config['runtime_root']) / 'bin/python3')
-        child = subprocess.run([python, '-I', '-B', '-c', bootstrap, config['verifier_root'], config['method']], env=env, text=True, capture_output=True, timeout=480)
+        child = subprocess.run([python, '-I', '-B', '-c', bootstrap, config['verifier_root'], config['method']], env=env, text=True, capture_output=True, timeout=5400)
         (root / 'original-test.stdout').write_text(child.stdout)
         (root / 'original-test.stderr').write_text(child.stderr)
         print(child.stdout, end='', flush=True)
