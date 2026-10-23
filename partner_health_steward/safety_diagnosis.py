@@ -240,6 +240,18 @@ def scope_wire(
     *,
     acceptance_authorized: bool,
 ) -> dict[str, object]:
+    if assets.get("diagnostic_scope_bundle") is None:
+        # Absence is not a BMI scope, a medical release or activation evidence.
+        return {
+            "scope_id": None,
+            "bundle_hash": None,
+            "release_digest": None,
+            "persistent_state": "staged",
+            "effective_phase": "unavailable",
+            "acceptance_evidence_ref": None,
+            "synthetic": False,
+            "medical_use": False,
+        }
     scope = _mapping(assets.get("diagnostic_scope_bundle"), "diagnostic scope bundle")
     persistent = state["scope_state"]
     if persistent == "active" and diagnostic_prerequisites_current(assets):

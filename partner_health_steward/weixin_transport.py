@@ -343,3 +343,73 @@ class PinnedWeixinExportArtifactAdapter:
                 }}, token=self._token, timeout_ms=API_TIMEOUT_MS)
         finally:
             await session.close()
+
+
+class PinnedWeixinConversationSender:
+    """The admitted ordinary reply and two fixed technical messages only."""
+
+    def __init__(self, binding, policy, *, token, context_token_provider,
+                 ordinary_guard, technical_channel=None, session_factory=None):
+        from .admission import AdmissionPolicy
+        if (type(binding) is not WeixinTransportBinding or type(policy) is not AdmissionPolicy
+                or binding.account_id != policy.partner_id
+                or not callable(context_token_provider) or not callable(ordinary_guard)):
+            raise ValueError("invalid ordinary Weixin route")
+        self._binding, self._policy, self._token = binding, policy, _text(token)
+        self._context, self._guard = context_token_provider, ordinary_guard
+        self._technical, self._factory = technical_channel, session_factory
+
+    async def _send_once(self, text, client):
+        from gateway.platforms.weixin import _send_message
+        context = self._context(self._policy.owner_sender_id)
+        if context is not None:
+            context = _text(context)
+        session = _session(self._factory)
+        try:
+            return await _send_message(_BoundSession(session, self._binding),
+                base_url=self._binding.base_url, token=self._token,
+                to=self._policy.owner_sender_id, text=text, context_token=context, client_id=client)
+        finally:
+            await session.close()
+
+    async def _result(self, text, client):
+        status = "unknown"
+        try:
+            raw = await self._send_once(text, client)
+            if type(raw) is dict:
+                codes = [raw[key] for key in ("ret", "errcode") if key in raw]
+                if codes and all(type(value) is int for value in codes):
+                    status = "accepted" if all(value == 0 for value in codes) else "rejected"
+        except Exception:
+            pass
+        digest = stable_digest({"client_id": client, "status": status})[7:]
+        return OwnerDeliveryTransportResult(status, "weixin-result:" + digest,
+                                            "weixin-observation:" + digest).to_wire()
+
+    async def send_ordinary(self, chat_id, content, *, reply_to=None, metadata=None):
+        del reply_to, metadata
+        if (chat_id != self._policy.conversation_id or not self._guard(chat_id)
+                or type(content) is not str or not content or len(content) > 2000):
+            raise ValueError("ordinary Weixin conversation context required")
+        # One ordinary reply attempt. Unknown never receives a transport retry.
+        return await self._result(content, "ordinary-" + secrets.token_hex(16))
+
+    async def send_technical(self, attempt):
+        from .ticket128_technical import TechnicalAcceptanceChannel
+        if (type(self._technical) is not TechnicalAcceptanceChannel or type(attempt) is not dict
+                or self._technical.attempt(attempt.get("execution_key")) != attempt
+                or attempt.get("attempted_at_utc") is None or attempt.get("send_result") is not None):
+            raise ValueError("current technical Weixin attempt required")
+        challenge = attempt["challenge"]
+        if re.fullmatch(r"[0-9a-f]{32,64}", challenge) is None:
+            raise ValueError("invalid technical challenge")
+        if attempt["gate_id"] == "119-G11":
+            text = "连接测试：请独立回复以下完整指令，确认已看到并操作本次连接测试。\n`连接测试 " + challenge + "`"
+        elif attempt["gate_id"] == "128-ND12":
+            text = ("本次仅验收非诊断范围，诊断未启用。请在实际体验后独立回复以下完整反馈；"
+                    "拒绝、缺项或其他意见不会形成通过。\n`验收反馈 " + challenge + " 有用 清楚 可信`")
+        else:
+            raise ValueError("technical Weixin gate denied")
+        client = "technical-" + stable_digest({"execution_key": attempt["execution_key"],
+                                               "challenge": challenge, "gate_id": attempt["gate_id"]})[7:]
+        return await self._result(text, client)

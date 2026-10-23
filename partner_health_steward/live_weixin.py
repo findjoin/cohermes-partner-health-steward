@@ -66,17 +66,26 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         self._ingress = ingress_transport if ingress_transport is not None else extra.get("ingress_transport")
         self._delivery = delivery_transport if delivery_transport is not None else extra.get("delivery_transport")
         self._model_bridge = None
+        self._technical_model_binding = None
         if "nondiagnostic_model_binding" in extra:
             from .live_nondiagnostic import create_live_nondiagnostic_model_bridge
             model = extra["nondiagnostic_model_binding"]
             if type(model) is not dict or set(model) != {"route", "budget", "credential_provider"}:
                 raise _EntryUnavailable("health-entry-model-binding-required")
             self._model_bridge = create_live_nondiagnostic_model_bridge(self._core_port, **model)
+            self._technical_model_binding = model
+        self._technical = None
+        if "technical_acceptance" in extra:
+            from .ticket128_technical import TechnicalAcceptanceChannel
+            technical = extra["technical_acceptance"]
+            if type(technical) is not dict or set(technical) != {"root", "identity"}:
+                raise _EntryUnavailable("health-entry-technical-binding-required")
+            self._technical = TechnicalAcceptanceChannel(technical["root"], technical["identity"], self._policy)
         self._context_tokens = None
         if "weixin_transport_binding" in extra and (self._ingress is None or self._delivery is None):
             from .weixin_transport import (
                 WeixinTransportBinding, PinnedWeixinIngressTransport, PinnedWeixinOwnerDeliveryAdapter,
-                PinnedWeixinExportArtifactAdapter,
+                PinnedWeixinExportArtifactAdapter, PinnedWeixinConversationSender,
             )
             from .live_delivery import LiveWeixinDeliveryBridge
             from gateway.platforms.weixin import ContextTokenStore, get_hermes_home
@@ -103,12 +112,18 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                         context_token_provider=lambda recipient: tokens.get(binding.account_id, recipient))
                 self._delivery = LiveWeixinDeliveryBridge(
                     self._core_port, factory, clock=lambda: datetime.now(timezone.utc),
-                    export_wire_adapter_factory=export_factory)
+                    export_wire_adapter_factory=export_factory,
+                    conversation_sender=PinnedWeixinConversationSender(
+                        binding, self._policy, token=token,
+                        context_token_provider=lambda recipient: tokens.get(binding.account_id, recipient),
+                        ordinary_guard=self._ordinary_context,
+                        technical_channel=self._technical))
         self._template = None
         if "initialization_template" in extra:
             self._template = OwnerInitialization.from_storage(extra["initialization_template"])
             if self._template.owner_consent or self._template.first_hop_route_consent:
                 raise _EntryUnavailable("health-entry-template-cannot-consent")
+        self._ordinary_nonce = None
         self._cursor = ""
         self._poll_task = None
         self._poll_lock = asyncio.Lock()
@@ -232,10 +247,61 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             self._running = False
             self._last_reason = "health-entry-processing-unconfirmed"
 
+    async def _technical_model_canary(self, attempt):
+        # This fixed request is authorized by the target-local G11 permit. It
+        # carries no owner data and never claims a Core health effect grant.
+        from .model_adapter import (BoundResponsesTransport,
+            NonDiagnosticBudgetInputMeasurementStrategy, ProductionModelAdapter)
+        from .model_contract import (FirstHopRoute, ModelMessage,
+            NonDiagnosticOperationalBudget, StrictHealthLLM)
+        summary = {"status": "not-attempted", "terminal_proven": False,
+                   "actual_model_allowed": False, "accepted": False}
+        try:
+            binding = self._technical_model_binding
+            if type(binding) is not dict:
+                raise ValueError("technical model binding unavailable")
+            route = FirstHopRoute.from_wire(binding["route"])
+            budget = NonDiagnosticOperationalBudget.from_wire(binding["budget"])
+            strategy = NonDiagnosticBudgetInputMeasurementStrategy(budget)
+            request = strategy.prepare_request((ModelMessage("user",
+                "连接测试，仅验证非诊断结构，不含主人资料。请仅返回所要求的严格非诊断结构。"),), stage="answer")
+            adapter = ProductionModelAdapter(route, budget,
+                transport=BoundResponsesTransport(route, credential_provider=binding["credential_provider"]),
+                measurement_strategy=strategy)
+            summary["status"] = "unknown"
+            observed = await asyncio.to_thread(ProductionModelAdapter.execute, adapter, request.to_wire())
+            llm = StrictHealthLLM(route, budget, request.strict_schema_name,
+                                  request.strict_schema_digest, measurement_strategy=strategy)
+            outcome = llm.resolve_transport_result(request, observed)
+            summary = {"status": observed.status, "terminal_proven": observed.terminal_proven,
+                       "actual_model_allowed": observed.actual_model in budget.allowed_actual_models,
+                       "accepted": outcome.disposition == "candidate"}
+        except Exception:
+            pass
+        summary["result_ref"] = "technical-model:" + stable_digest({
+            "execution_key": attempt["execution_key"], "observation": summary})[7:]
+        return summary
+
     async def poll_once(self):
         async with self._poll_lock:
             if not self._running or self._recovery_only:
                 return False
+            if self._technical is not None:
+                # The only poller consumes a persisted once-only send boundary.
+                # Failure leaves that boundary in place; no new send is inferred.
+                try:
+                    model_attempt = self._technical.claim_model()
+                    if model_attempt is not None:
+                        model_result = await self._technical_model_canary(model_attempt)
+                        self._technical.mark_model(model_attempt["execution_key"], model_result)
+                    attempt = self._technical.claim_send()
+                except (OSError, ValueError):
+                    # Unavailable technical artifacts cannot authorize a send;
+                    # ingress still reaches Core before a receipt is attempted.
+                    attempt = None
+                if attempt is not None:
+                    result = await self._delivery.send_technical(attempt)
+                    self._technical.mark_sent(attempt["execution_key"], result)
             batch = await self._ingress.get_updates(self._cursor)
             if not self._running:
                 return False
@@ -483,6 +549,11 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                 handed_off = await self._governed_handoff(headers["causal_id"], outcome)
                 return (headers["causal_id"], True) if handed_off else (None, False)
         elif response.get("reason_code") == "ordinary-hermes-route":
+            if self._technical is not None:
+                handled = self._technical.handle(headers, body, response,
+                    initialization_phase=preflight["initialization_phase"])
+                if handled is not None:
+                    return None, handled
             await self._ordinary(headers, body)
             return None, True
         else:
@@ -518,14 +589,23 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                                    user_id=headers["sender_id"], message_id=headers["message_id"])
         event = MessageEvent(text=body, source=source, message_id=headers["message_id"],
                              raw_message={"message_id": headers["message_id"]})
-        token = _ORDINARY_SEND.set((id(self), headers["conversation_id"]))
+        nonce = uuid.uuid4().hex
+        self._ordinary_nonce = nonce
+        token = _ORDINARY_SEND.set((id(self), headers["conversation_id"], nonce))
         try:
             await handler(event)
         finally:
+            self._ordinary_nonce = None
             _ORDINARY_SEND.reset(token)
 
+    def _ordinary_context(self, chat_id):
+        # Child tasks inherit contextvars; revoke the turn nonce when the
+        # handler returns so a delayed task cannot retain ordinary send access.
+        return (self._running and self._ordinary_nonce is not None
+                and _ORDINARY_SEND.get() == (id(self), chat_id, self._ordinary_nonce))
+
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        if self._running and _ORDINARY_SEND.get() == (id(self), chat_id):
+        if self._ordinary_context(chat_id):
             ordinary = getattr(self._delivery, "send_ordinary", None)
             if callable(ordinary):
                 result = await ordinary(chat_id, content, reply_to=reply_to, metadata=metadata)

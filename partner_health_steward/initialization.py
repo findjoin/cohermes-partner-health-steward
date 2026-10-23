@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .admission import AdmissionPolicy
@@ -33,6 +34,7 @@ from .authority import (
 
 HEALTH_INIT_CANONICAL_NAME = "health-init"
 HEALTH_INIT_FRIENDLY_NAME = "健康管家初始化"
+ND_HOST_ONLY_DISCLOSURE_VERSION = "health-init-nd-host-only-v1"
 INITIAL_DATA_BOUNDARY = (
     "health-portrait",
     "health-evidence",
@@ -542,6 +544,21 @@ class InitializationDisclosureContent:
                 "发送尝试或进程存活冒充真实送达。"
             ),
         }
+        if asset.disclosure_version == ND_HOST_ONLY_DISCLOSURE_VERSION:
+            if initialization.support_contact is not None:
+                raise AuthorityValidationError("ND host-only contact approval unavailable")
+            resource = json.loads((Path(__file__).parent / "resources" / "non_diagnostic" / "runtime-resources.json").read_bytes())
+            if (type(resource) is not dict
+                    or resource.get("contract") != "ticket128-project-nondiagnostic-resources-v1"
+                    or resource.get("health_init_asset") != asset.to_storage()
+                    or resource.get("editorial_review", {}).get("status") != "approved"
+                    or resource.get("source", {}).get("ownership") != "project-original"):
+                raise AuthorityValidationError("ND initialization resource binding unavailable")
+            notices = tuple(InitializationDisclosureNotice.from_storage(item)
+                            for item in resource["disclosure_notices"])
+            if tuple(notice.topic for notice in notices) != INITIALIZATION_DISCLOSED_TOPICS:
+                raise AuthorityValidationError("ND initialization disclosure topics unavailable")
+            notice_texts = {notice.topic: notice.text for notice in notices}
         return cls(
             friendly_name=HEALTH_INIT_FRIENDLY_NAME,
             canonical_name=asset.canonical_name,
@@ -572,7 +589,11 @@ class InitializationDisclosureContent:
             or type(asset) is not HealthInitAsset
         ):
             return False
-        return self == self.for_initialization(asset, initialization)
+        try:
+            expected = self.for_initialization(asset, initialization)
+        except (AuthorityValidationError, OSError, ValueError, TypeError, KeyError):
+            return False
+        return self == expected
 
 
 @dataclass(frozen=True)

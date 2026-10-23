@@ -17,13 +17,33 @@ def _exact(value, fields):
 
 
 class LiveWeixinDeliveryBridge:
-    def __init__(self, core_port, wire_adapter_factory, *, clock, export_wire_adapter_factory=None):
+    def __init__(self, core_port, wire_adapter_factory, *, clock, export_wire_adapter_factory=None, conversation_sender=None):
         if (not callable(getattr(core_port, "request", None)) or not callable(wire_adapter_factory)
                 or not callable(clock) or export_wire_adapter_factory is not None and not callable(export_wire_adapter_factory)):
             raise ValueError("invalid live delivery dependencies")
         self._port, self._factory, self._clock = core_port, wire_adapter_factory, clock
         self._export_factory = export_wire_adapter_factory
+        self._conversation_sender = conversation_sender
         self._lock = asyncio.Lock()
+
+    async def send_ordinary(self, chat_id, content, reply_to=None, metadata=None):
+        from gateway.platforms.base import SendResult
+        if self._conversation_sender is None:
+            return SendResult(success=False, error="ordinary-delivery-unavailable", retryable=False)
+        try:
+            result = await self._conversation_sender.send_ordinary(
+                chat_id, content, reply_to=reply_to, metadata=metadata)
+            return SendResult(success=result["status"] == "accepted",
+                              message_id=result["result_ref"] if result["status"] == "accepted" else None,
+                              error=None if result["status"] == "accepted" else "ordinary-delivery-" + result["status"],
+                              retryable=False)
+        except Exception:
+            return SendResult(success=False, error="ordinary-delivery-unconfirmed", retryable=False)
+
+    async def send_technical(self, attempt):
+        if self._conversation_sender is None:
+            raise ValueError("technical transport unavailable")
+        return await self._conversation_sender.send_technical(attempt)
 
     async def _rpc(self, kind, name, payload):
         selector = "projection" if kind == "managed-read" else "operation"
