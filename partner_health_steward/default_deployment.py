@@ -375,13 +375,21 @@ def _permit(plan,request):
     return body
 
 
-def _consume(request):
+def _consumption(request):
     path=_HOME/'.ticket120-consumed-permits'/request['approval_ref'][7:]/(request['execution_key']+'.json')
-    _write_private(path,{'execution_key':request['execution_key'],'permit_digest':request['approval_ref'],
-                         'release_digest':request['release_digest']},exclusive=True)
+    fact={'execution_key':request['execution_key'],'permit_digest':request['approval_ref'],
+          'release_digest':request['release_digest']}
+    return path,fact
+
+
+def _consume(request):
+    path,fact=_consumption(request)
+    _write_private(path,fact,exclusive=True)
 
 
 def _observation(request,result,*,evidence=(),rollback_status='available',effect=None,reason='verified'):
+    if effect is None and request['gate_id'] in {'119-G11','128-ND12'}:
+        effect={stage:None for stage in _STAGES}
     source=Path(__file__).read_bytes()
     return {'contract':'ticket119-gate-observation-v1',
         **{k:request[k] for k in ('release_digest','distribution_digest','run_scope','run_id','gate_id','execution_key','environment_class')},
@@ -465,6 +473,20 @@ class DefaultAcceptanceGateExecutor:
         return _technical_gate(self,plan,request,approval)
 
     def _install(self,plan,request):
+        consumed,expected=_consumption(request)
+        if consumed.exists():
+            proof_path=_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.installation.json')
+            if _read_private(consumed)!=expected or not proof_path.exists():
+                return _observation(request,'cannot-confirm',reason='installation-attempt-unconfirmed')
+            proof=_read_private(proof_path)
+            actual=_release(plan['core_binding']['release_root'])
+            if (proof.get('execution_key')!=request['execution_key']
+                    or proof.get('distribution_digest')!=request['distribution_digest']
+                    or actual['release_digest']!=request['distribution_digest']
+                    or proof.get('isolation_bytes')!=_isolation_bytes(plan) or not _live_role_identity(plan)):
+                return _observation(request,'cannot-confirm',reason='installation-readback-unconfirmed')
+            _rpc(plan,'managed-read','health-entry-initialization')
+            return _observation(request,'passed',evidence=['installation:'+_digest(proof)[7:]])
         backup,body=_snapshot(plan,request['execution_key'])
         _consume(request)
         try:
@@ -562,6 +584,17 @@ def _run_local_gate(plan,request,manifest):
     environment={name:os.environ[name] for name in ('PATH','LANG','LC_ALL','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS') if name in os.environ}
     environment.update(PYTHONDONTWRITEBYTECODE='1',TICKET123_RUNTIME_ROOT=str(runtime),
         TICKET118_PINNED_HERMES_SOURCE=plan['facts']['pinned_hermes_root'])
+    proof_path=_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.local-proof.json')
+    if proof_path.exists():
+        proof=_read_private(proof_path)
+        if (proof.get('execution_key')!=request['execution_key'] or proof.get('distribution_digest')!=request['distribution_digest']
+                or proof.get('modules')!=list(modules) or proof.get('runtime_closure_digest')!=closure['closure_digest']):
+            raise ValueError('local execution proof mismatch')
+        result=proof['result']
+        passed=(proof['exit_status']==0 and result.get('successful') is True and result.get('tests',0)>0
+                and all(result.get(k)==0 for k in ('errors','failures','skips')))
+        return _observation(request,'passed' if passed else 'cannot-confirm',evidence=['local-proof:'+_digest(proof)[7:]],
+            reason='verified' if passed else 'local-verification-failed')
     if request['gate_id']=='119-G08':_consume(request)
     completed=subprocess.run([str(runtime/'bin/python3'),'-I','-B','-c',_LOCAL_PROGRAM,str(verifier),json.dumps(modules)],
         env=environment,capture_output=True,text=True,timeout=540)
@@ -659,7 +692,14 @@ def _technical_gate(self,plan,request,approval):
     identity={'release_digest':request['release_digest'],'distribution_digest':request['distribution_digest'],
         'run_id':request['run_id'],'run_scope':request['run_scope'],'target':'default'}
     channel=TechnicalAcceptanceChannel(_ARTIFACTS,identity)
-    _consume(request)
+    consumed,expected=_consumption(request)
+    if consumed.exists():
+        if _read_private(consumed)!=expected:raise ValueError('technical consumption mismatch')
+        # A consumption fact alone cannot authorize a new attempt. Resume is
+        # exclusively a readback of the original persisted technical attempt.
+        channel.attempt(request['execution_key'])
+    else:
+        _consume(request)
     deadline=time.monotonic()+300
     sequence_digest=None
     since=_now().isoformat()
@@ -672,8 +712,11 @@ def _technical_gate(self,plan,request,approval):
             facts=_sequence(plan,since)
             if facts.get('ready') is True:
                 sequence_digest=facts['sequence_digest']
-                _write_private(_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.sequence.json'),
-                    {'contract':'ticket128-nd-sequence-observation-v1','identity':identity,**facts},exclusive=True)
+                sequence_path=_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.sequence.json')
+                sequence={'contract':'ticket128-nd-sequence-observation-v1','identity':identity,**facts}
+                if sequence_path.exists():
+                    if _read_private(sequence_path)!=sequence:raise ValueError('sequence receipt changed')
+                else:_write_private(sequence_path,sequence,exclusive=True)
                 break
             time.sleep(.5)
         else:return _observation(request,'cannot-confirm',reason='native-sequence-unconfirmed',effect={k:None for k in _STAGES})
