@@ -26,6 +26,7 @@ from .initialization import (
 
 
 _ORDINARY_SEND = contextvars.ContextVar("health_weixin_ordinary_send", default=None)
+_WAKE_INTERVAL_SECONDS = 15.0
 _DIRECTIVE_FIELDS = {
     "source_causal_id", "native_cursor", "business_transition_id", "authority_generation",
 }
@@ -126,6 +127,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         self._ordinary_nonce = None
         self._cursor = ""
         self._poll_task = None
+        self._next_wake_monotonic = 0.0
         self._poll_lock = asyncio.Lock()
         self._rpc_lock = asyncio.Lock()
         self._connected_ingress = False
@@ -166,6 +168,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             return True
         try:
             self._recovery_only = False
+            self._next_wake_monotonic = 0.0
             for name in ("connect", "get_updates", "acknowledge_cursor", "disconnect"):
                 if not callable(getattr(self._ingress, name, None)):
                     raise _EntryUnavailable("health-entry-ingress-unavailable")
@@ -236,6 +239,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
     async def _poll_loop(self):
         try:
             while self._running:
+                await self._wake_if_due()
                 await self.poll_once()
                 # Receiving the same unacknowledged batch is not permission to
                 # repeat any model or delivery effect. Core/126 own that fact.
@@ -246,6 +250,33 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         except Exception:
             self._running = False
             self._last_reason = "health-entry-processing-unconfirmed"
+
+    async def _wake_if_due(self):
+        # The existing long poll returns within its native timeout. Recheck
+        # scheduled work between batches, including empty ones, in this same
+        # task; the Core still owns wall time, approvals and once-only effects.
+        async with self._poll_lock:
+            if not self._running or self._recovery_only or self._model_bridge is None:
+                return
+            now = asyncio.get_running_loop().time()
+            if now < self._next_wake_monotonic:
+                return
+            self._next_wake_monotonic = now + _WAKE_INTERVAL_SECONDS
+            try:
+                state = await self._read("health-entry-initialization")
+                if set(state) != {"initialization"}:
+                    raise _EntryUnavailable("health-entry-initialization-unconfirmed")
+                projection = InitializationProjection.from_storage(state["initialization"])
+                if projection.phase != "enabled" or not projection.enabled:
+                    return
+                runtime = await self._rpc("managed-read", {"projection": "health-runtime"})
+                if runtime.get("state") != "healthy":
+                    return
+                if self._running and not self._recovery_only:
+                    await self.wake_current()
+            except Exception:
+                self._running = False
+                self._last_reason = "health-entry-core-unavailable"
 
     async def _technical_model_canary(self, attempt):
         # This fixed request is authorized by the target-local G11 permit. It
