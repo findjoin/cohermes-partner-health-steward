@@ -228,7 +228,7 @@ class Ticket128DefaultDeploymentVerificationTests(unittest.TestCase):
             completed = subprocess.run([sys.executable, "-I", "-B", str(runner),
                 "--runtime-root", runtime, "--verifier-root", str(_REPOSITORY),
                 "--pinned-root", pinned, "--method", self.id()],
-                text=True, capture_output=True, timeout=5610)
+                text=True, capture_output=True, timeout=7410)
             self.assertEqual(completed.returncode, 0,
                 "isolated family failed\n" + completed.stdout[-16000:] + completed.stderr[-16000:])
             return
@@ -613,7 +613,7 @@ class _FormalNamespace:
                 result[relative] = ("dir", details.st_uid, details.st_gid, stat.S_IMODE(details.st_mode))
         return result
 
-    def _prepare(self, *, run_id=None, release=None):
+    def _prepare(self, *, run_id=None, release=None, operational_budget=None):
         from partner_health_steward.model_contract import FirstHopRoute, NonDiagnosticOperationalBudget
         now = datetime.now(timezone.utc)
         route = FirstHopRoute("jojo-responses-v1", "jojo", self.http.origin + "/v1", "responses",
@@ -621,6 +621,9 @@ class _FormalNamespace:
         budget = NonDiagnosticOperationalBudget("budget:ticket128-offline", "1", route, (route.requested_model,),
                 "owner-decision:contract-fixture-not-real-approval", (now - timedelta(hours=1)).isoformat(),
                 (now + timedelta(hours=1)).isoformat())
+        if operational_budget is not None:
+            budget = NonDiagnosticOperationalBudget.from_wire(operational_budget)
+            self.case.assertEqual(budget.route, route)
         raw = {"admission_policy": self.raw["admission_policy"], "route": route.to_wire(),
                "operational_budget": budget.to_wire(), "runtime_root": str(self.runtime_root),
                "pinned_hermes_root": str(self.pinned), "weixin_base_url": "https://ilinkai.weixin.qq.com",
@@ -1202,9 +1205,10 @@ class _FormalNamespace:
                 Path(roles[name]["unit_path"]).write_bytes(content)
             self._command(["systemctl", "--user", "daemon-reload"])
 
-    def _run_background(self, *, stop_nd12=True):
+    def _run_background(self, *, stop_nd12=True, operational_budget=None):
         self.http.default_answer = self._approved_candidate()
-        self._prepare(run_id="acceptance-run:ticket128-native-" + uuid.uuid4().hex)
+        self._prepare(run_id="acceptance-run:ticket128-native-" + uuid.uuid4().hex,
+                      operational_budget=operational_budget)
         context = copy.deepcopy(self.context)
         if stop_nd12:
             context["approval_refs"].pop("128-ND12", None)
@@ -1356,17 +1360,38 @@ class _FormalNamespace:
         self.case.assertEqual(totals[1], before_sends + 1, "one G11 Weixin canary only")
 
     def check_nd12(self):
+        # Budget validity is part of 131's authority digest. The three real
+        # windows share one policy established before the first initialization.
+        from dataclasses import replace
+        from partner_health_steward.model_contract import NonDiagnosticOperationalBudget
+        budget = NonDiagnosticOperationalBudget.from_wire(self.slot("live_binding")["operational_budget"])
+        budget = replace(budget, expires_at=(datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()).to_wire()
+        self._prepare(operational_budget=budget)
         self.run_until()
+        for scenario in ("all-success", "known-failed", "unresolved-unknown"):
+            self._check_nd12_sequence(scenario, budget)
+
+    def _check_nd12_sequence(self, scenario, budget):
+        # Each scenario is a real new run/window on the same initialized
+        # installation. No health state is reset or manufactured between runs.
+        case_ref = "nd12-" + scenario
+        initialization_before = self.initialized()
+        self.case.assertEqual(initialization_before["phase"],
+                              "uninitialized" if scenario == "all-success" else "enabled")
         before = len(self.http.sends)
-        thread, result, context = self._run_background(stop_nd12=False)
+        thread, result, context = self._run_background(stop_nd12=False, operational_budget=budget)
         self._wait_background_canary(thread, result, before)
         g11_action = self._actual_action(self.http.sends[before:])
-        self.enqueue(g11_action, "nd12-g11-action", cursor="cursor:nd12-g11-action")
-        self._wait(lambda: "cursor:nd12-g11-action" in self.http.cursors)
+        self.enqueue(g11_action, case_ref + "-g11-action", cursor="cursor:" + case_ref + "-g11-action")
+        self._wait(lambda: "cursor:" + case_ref + "-g11-action" in self.http.cursors)
         # The technical G11 action itself must never enable or count as the
         # owner's feedback. Native initialization is independently necessary.
-        self.case.assertEqual(self.initialized()["phase"], "uninitialized")
-        self.initialize()
+        self.case.assertEqual(self.initialized(), initialization_before)
+        if scenario == "all-success":
+            self.case.assertEqual(self.initialized()["phase"], "uninitialized")
+            self.initialize()
+        else:
+            self.case.assertTrue(self.initialized()["enabled"])
         self.case.assertTrue(thread.is_alive(), "enabled/model/accepted is not owner sequence acceptance")
         # Observe the feedback boundary BEFORE the sequence. A fast legal
         # handler may send immediately after its last actual business fact.
@@ -1378,12 +1403,13 @@ class _FormalNamespace:
                     self.http.candidates.append(("intake", intake))
                     if answer:
                         self.http.candidates.append(("answer", self.http.default_answer))
-            cursor = "cursor:nd12-" + suffix
-            self.enqueue(body, "nd12-" + suffix, cursor=cursor)
+            cursor = "cursor:" + case_ref + "-" + suffix
+            self.enqueue(body, case_ref + "-" + suffix, cursor=cursor)
             self._wait(lambda: len(self.http.sends) > start)
             if ack:
                 self._wait(lambda: cursor in self.http.cursors)
             return "\n".join(_RawTLS.text(item) for item in self.http.sends[start:])
+        baseline = self._core_public("facts")
         # A genuine source-bound record, not a schema-shaped empty answer.
         body = "我昨晚睡了六小时"
         record = {"operation": "record", "facts": [{"start": 0, "end": len(body), "quote": body,
@@ -1391,7 +1417,10 @@ class _FormalNamespace:
         turn(body, "record", record)
         facts = self._core_public("facts")
         self.case.assertGreater(facts["evidence_cards"], 0)
+        self.case.assertGreater(facts["evidence_cards"], baseline["evidence_cards"])
         self.case.assertGreater(facts["portrait_topics"], 0)
+        record_source = next(item["causal_id"] for item in facts["sources"]
+                             if item["message_id"] == "native128:" + case_ref + "-record")
         # Questions use actual release-owned governance claims/templates.
         question = "健康管家如何使用我的资料？"
         intake = {"operation": "question", "facts": [], "question": {"start": 0, "end": len(question), "quote": question}}
@@ -1400,11 +1429,18 @@ class _FormalNamespace:
         refusal = turn("请计算我的BMI并诊断我是否肥胖", "diagnosis-refusal")
         self.case.assertRegex(refusal, r"未启用|不.*诊断|范围|不可用")
         self.case.assertEqual(self.http.model_posts(), before_diagnosis)
-        # A real failed model response followed by a successful new source.
-        # No unresolved unknown is invented merely to fill a checklist.
-        turn("我今天精神很好", "known-failed", {"operation": "invalid", "facts": [], "question": None}, ack=False)
+        # Retain the real known-failed/recovery path, without making provider
+        # failure a prerequisite for the independent all-success sequence.
+        if scenario == "known-failed":
+            turn("我今天精神很好", "known-failed", {"operation": "invalid", "facts": [], "question": None}, ack=False)
         failed = self._core_public("facts")
-        self.case.assertGreater(failed["failed_model_effects"], 0)
+        if scenario == "known-failed":
+            self.case.assertGreater(failed["failed_model_effects"], 0)
+            self.case.assertGreater(failed["failed_model_effects"], baseline["failed_model_effects"])
+        else:
+            self.case.assertEqual(failed["failed_model_effects"], baseline["failed_model_effects"])
+            if scenario == "all-success":
+                self.case.assertEqual(failed["failed_model_effects"], 0)
         self.case.assertEqual(failed["unknown_model_effects"], 0)
         body2 = "我今天步行了十分钟"
         recovery = {"operation": "record", "facts": [{"start": 0, "end": len(body2), "quote": body2,
@@ -1457,10 +1493,13 @@ class _FormalNamespace:
         view = turn("/health-view 昨晚", "view")
         objects = json.JSONDecoder().raw_decode(view[view.index("["):])[0]
         self.case.assertTrue(objects)
-        target = next(item["object_ref"] for item in objects if "昨晚" in _canonical(item).decode())
+        target = next(item["object_ref"] for item in objects
+                      if record_source in item["source_refs"] and "昨晚" in _canonical(item).decode())
         correction_count = self._core_public("facts")["corrections"]
         turn("/health-correct " + target + " 我昨晚睡了七小时", "correct")
         self.case.assertGreater(self._core_public("facts")["corrections"], correction_count)
+        with self.http.lock:
+            self.http.ciphertext, self.http.media_ticket = None, None
         turn("/health-export", "export")
         self._wait(lambda: self.http.ciphertext is not None and self.http.media_ticket is not None)
         from gateway.platforms.weixin import _aes128_ecb_decrypt
@@ -1491,6 +1530,11 @@ class _FormalNamespace:
         self.case.assertTrue(all(value == "unavailable" for value in final_facts["contact_alert_statuses"]))
         self.case.assertTrue(all(send.get("msg", {}).get("to_user_id") == self.raw["admission_policy"]["owner_sender_id"]
                                  for send in self.http.sends[mark:]), "unconfigured contact has zero sends")
+        self.case.assertEqual(final_facts["unknown_model_effects"], 0)
+        if scenario != "known-failed":
+            self.case.assertEqual(final_facts["failed_model_effects"], baseline["failed_model_effects"])
+            if scenario == "all-success":
+                self.case.assertEqual(final_facts["failed_model_effects"], 0)
         feedback_sends = self._wait(lambda: [item for item in self.http.sends[mark:]
                                   if "验收反馈" in _RawTLS.text(item)], seconds=30)
         feedback = self._actual_action(feedback_sends)
@@ -1498,13 +1542,57 @@ class _FormalNamespace:
         self.case.assertNotEqual(feedback, g11_action)
         before_feedback = self.http.model_posts()
         before_feedback_head = self._authority_snapshot()
-        self.enqueue(g11_action, "nd12-borrowed-g11")
-        self.enqueue(re.sub(r"[0-9a-f]{32,64}", lambda match: "0" * len(match.group(0)), feedback), "nd12-wrong-challenge")
+        self.enqueue(g11_action, case_ref + "-borrowed-g11")
+        self.enqueue(re.sub(r"[0-9a-f]{32,64}", lambda match: "0" * len(match.group(0)), feedback), case_ref + "-wrong-challenge")
         time.sleep(0.1)
         self.case.assertTrue(thread.is_alive())
         self.case.assertEqual(self.http.model_posts(), before_feedback)
         self.case.assertEqual(self._authority_snapshot(), before_feedback_head, "technical feedback must not mutate health authority")
-        self.enqueue(feedback, "nd12-feedback", cursor="cursor:nd12-feedback")
+        feedback_cursor = "cursor:" + case_ref + "-feedback"
+        if scenario == "unresolved-unknown":
+            # All required facts and a real challenge already exist. A later
+            # raw lost terminal must block acceptance without a fake resolve.
+            before_unknown = self._core_public("facts")
+            before_unknown_posts = self.http.model_posts()
+            self.http.model_mode = "unknown"
+            unknown_body = "我今天晚上精神很好"
+            unknown_cursor = "cursor:" + case_ref + "-unknown-model"
+            self.enqueue(unknown_body, case_ref + "-unknown-model", cursor=unknown_cursor)
+            def persisted_unknown():
+                observed = self._core_public("facts")
+                return observed if observed["unknown_model_effects"] > before_unknown["unknown_model_effects"] else False
+            unknown_facts = self._wait(persisted_unknown)
+            self.case.assertEqual(unknown_facts["evidence_cards"], before_unknown["evidence_cards"])
+            self.case.assertEqual(unknown_facts["failed_model_effects"], before_unknown["failed_model_effects"])
+            self.case.assertEqual(self.http.model_posts(), before_unknown_posts + 1)
+            # The original single poller only requests its next batch after
+            # processing returns. No new unknown notice is prescribed here.
+            after_unknown_poll = len(self.http.cursors)
+            self._wait(lambda: len(self.http.cursors) > after_unknown_poll)
+            self.case.assertNotIn(unknown_cursor, self.http.cursors)
+            unknown_head = self._authority_snapshot()
+            self.enqueue(feedback, case_ref + "-feedback", cursor=feedback_cursor)
+            self._wait(lambda: not self.http.batches)
+            after_feedback_poll = len(self.http.cursors)
+            self._wait(lambda: len(self.http.cursors) > after_feedback_poll)
+            self.case.assertNotIn(feedback_cursor, self.http.cursors)
+            self.case.assertEqual(self._authority_snapshot(), unknown_head, "feedback cannot resolve unknown or mutate health authority")
+            self.case.assertEqual(self.http.model_posts(), before_unknown_posts + 1)
+            self._wait(lambda: not thread.is_alive(), seconds=330)
+            report = self._join_report(thread, result)
+            final = next(g for g in report["gates"] if g["gate_id"] == "128-ND12")
+            self.case.assertEqual(final["result"], "cannot-confirm")
+            self.case.assertIsNone(final["effect_stage_refs"]["read_or_action"])
+            self.case.assertNotIn("119-G12", [g["gate_id"] for g in report["gates"]])
+            self.case.assertEqual(report["diagnostic_scope_phase"], "staged")
+            self.case.assertNotEqual(report["product_acceptance"], "passed")
+            self.case.assertNotEqual(report["active"], "active")
+            self.case.assertEqual(self.http.model_posts(), before_unknown_posts + 1)
+            self.case.assertNotIn(feedback_cursor, self.http.cursors)
+            self.case.assertGreater(self._core_public("facts")["unknown_model_effects"], before_unknown["unknown_model_effects"])
+            self.case._assert_fixture_only(report)
+            return
+        self.enqueue(feedback, case_ref + "-feedback", cursor=feedback_cursor)
         report = self._join_report(thread, result)
         final = next(g for g in report["gates"] if g["gate_id"] == "128-ND12")
         self.case.assertEqual(final["result"], "passed")
@@ -1514,7 +1602,7 @@ class _FormalNamespace:
         self.case.assertNotEqual(report["active"], "active")
         self.case.assertIn("non-diagnostic-owner-usable", _canonical(report).decode())
         self.case.assertEqual(self.http.model_posts(), before_feedback)
-        self._wait(lambda: "cursor:nd12-feedback" in self.http.cursors)
+        self._wait(lambda: feedback_cursor in self.http.cursors)
         self.case.assertEqual(self._authority_snapshot(), before_feedback_head, "legal technical feedback must not mutate health authority")
         # Every event is an explicitly synthetic raw transport input. Even this
         # successful chain cannot claim an actual human/production acceptance.

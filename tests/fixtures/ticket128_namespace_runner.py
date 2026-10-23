@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -108,7 +110,7 @@ def host(args):
     (base / 'operator-input.json').write_text(json.dumps(config))
     unit = 't128ns-family-' + uuid.uuid4().hex[:12]
     command = ['systemd-run', '--system', '--quiet', '--wait', '--pipe', '--collect',
-               '--unit=' + unit, '--property=Delegate=yes', '--property=KillMode=control-group', '--property=RuntimeMaxSec=5520',
+               '--unit=' + unit, '--property=Delegate=yes', '--property=KillMode=control-group', '--property=RuntimeMaxSec=7320',
                '--', '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C.UTF-8',
                'unshare', '--mount', '--net', '--ipc', '--uts', '--cgroup', '--pid', '--fork',
                '--kill-child', '--propagation', 'private', '/usr/bin/python3', '-I', '-B', str(script), '--init', str(base)]
@@ -116,7 +118,7 @@ def host(args):
     result = None
     cleanup_confirmed = False
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=5550)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=7350)
     finally:
         # Every exit path operates only on this invocation's random SYSTEM unit.
         # RuntimeMaxSec additionally bounds its lifetime if the client is killed.
@@ -213,6 +215,18 @@ def init(base):
     (root / "var/tmp").mkdir(mode=0o1777)
     (root / "var/log").mkdir()
     (root / "run/systemd/system").mkdir(parents=True)
+    # The private manager needs the standard OS sources for InaccessiblePaths.
+    # Create only this chroot's mode-000 mask nodes; never bind the host's.
+    masks = root / "run/systemd/inaccessible"
+    masks.mkdir(mode=0o755)
+    (masks / "dir").mkdir(mode=0o000)
+    (masks / "reg").touch(mode=0o000)
+    os.mkfifo(masks / "fifo", mode=0o000)
+    os.mknod(masks / "chr", stat.S_IFCHR | 0o000, os.makedev(0, 0))
+    os.mknod(masks / "blk", stat.S_IFBLK | 0o000, os.makedev(0, 0))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as mask_socket:
+        mask_socket.bind(str(masks / "sock"))
+    (masks / "sock").chmod(0o000)
     run(["mount", "-t", "proc", "proc", str(root / "proc")])
     run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")])
     (root / "sys/fs/cgroup").mkdir(exist_ok=True)
@@ -329,6 +343,8 @@ def inside():
                   "private_shm_mount": [fields for fields in mounts if fields[4] == "/dev/shm"],
                   "private_shm_mode": oct(Path("/dev/shm").stat().st_mode & 0o7777),
                   "private_shm_capacity_bytes": os.statvfs("/dev/shm").f_blocks * os.statvfs("/dev/shm").f_frsize,
+                  "private_inaccessible_nodes": {path.name: oct(path.lstat().st_mode)
+                      for path in sorted(Path("/run/systemd/inaccessible").iterdir())},
                   "cgroup_view": Path("/proc/self/cgroup").read_text().strip(),
                   "pid_namespace": os.readlink("/proc/self/ns/pid"),
                   "network_namespace": os.readlink("/proc/self/ns/net")}
@@ -342,7 +358,7 @@ def inside():
                    PYTHONDONTWRITEBYTECODE='1')
         bootstrap = "import os,sys,types,unittest; from pathlib import Path; root=Path(sys.argv[1]); assert sys.version_info[:2]==(3,11); assert os.geteuid()==0; import partner_health_steward as p; assert Path(p.__file__).resolve().is_relative_to(Path(os.environ['TICKET123_RUNTIME_ROOT'])); tests=types.ModuleType('tests'); tests.__path__=[str(root/'tests')]; tests.__package__='tests'; tests.__file__=str(root/'tests/__init__.py'); sys.modules['tests']=tests; suite=unittest.defaultTestLoader.loadTestsFromName(sys.argv[2]); assert suite.countTestCases()==1; result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or bool(result.skipped))"
         python = str(Path(config['runtime_root']) / 'bin/python3')
-        child = subprocess.run([python, '-I', '-B', '-c', bootstrap, config['verifier_root'], config['method']], env=env, text=True, capture_output=True, timeout=5400)
+        child = subprocess.run([python, '-I', '-B', '-c', bootstrap, config['verifier_root'], config['method']], env=env, text=True, capture_output=True, timeout=7200)
         (root / 'original-test.stdout').write_text(child.stdout)
         (root / 'original-test.stderr').write_text(child.stderr)
         print(child.stdout, end='', flush=True)
