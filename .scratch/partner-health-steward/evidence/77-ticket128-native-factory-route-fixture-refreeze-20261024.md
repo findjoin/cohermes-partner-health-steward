@@ -1,0 +1,29 @@
+# Ticket128：R10实际Adapter构造失败与合成route窄修
+
+128仍claimed，真实default未切换，真实模型POST、微信发送及主人初始化均未发生。本记录不表示新门或部署通过。
+
+R10精确eb7a66cc99a724b267316e29a2550a2103c5f551/tree8a45d322e91f1000b41896a12bece79161ae748f，fd45cc5冻结、实际Python3.11，9557文件closure sha256:368b70da5a0cf7a477709bb888f15e9bcb6cbb20f0eefebb6c6b067832db4e25。原V02实际G01—G10及ND07均passed，local七组637/12/118/74/11/6/5全零failure/error/skip，解释器FD/loader/首次initialized RPC已通过；随后原12秒初始化无send断言失败。child529.726秒、parent534.100秒，各1failure，无error/skip、无outer timeout，owned cleanup confirmed。原stdout+stderr完整日志formal-eb7a66c-128-r10-v02.log保留，不能以局部前门通过表示V02通过。
+
+已结束的owned /opt/t128ns-family-56xcdqlx仅做无正文固定提取：trace platform_registry.create_adapter→hermes_host.adapter_factory→live_weixin.__init__→live_nondiagnostic.create_live_nondiagnostic_model_bridge→model_adapter.py:411；固定ModelContractViolation/invalid Responses transport route存在。合成Gateway binding api_mode=responses；Gateway进程running但health_weixin平台尚未建成，未进入native poll。未从已销毁内存伪造HTTP计数，未输出daemon正文/密钥/真实消息。
+
+独立verification authority及实现owner分开只读确认：FirstHopRoute仅验证模式文本非空，不代表任意文本受生产sender支持；已闭130与当前BoundResponsesTransport均严格要求codex_responses，原125route及131/130继承均为此模式，唯一128design复用该sender，不要求新增别名。仅纠正128 test唯一合成健康route该字面量，contract追加事实段，二文件3insertions/1deletion。全部其他test字节、断言、12秒等待、七family/full808、产品guard、唯一design/raw/helper/旧18及其余21份冻结不变。R10红保留；无产品改动、无新instrumentation、无fallback或延长时限。
+
+新checkpoint e3f2127d4b16972af88c8c7caaad58fb1e87b1a4/treeef4855409e1149ed11b802a7b90f3323822705eb，parenteb7a66c。test blobdac8fe6c25e0fda08d6a7adc6d6b4fde94f09eb2，SHA256dbe78f1c8efb6e44799969827dc9a57c94ba2556e4b1aaeb3051bc1fec1d3f24；contract blobd6ea5ac1a5797cb8291b5dd8bb9044ce5461d9b6，SHA256bda1d7cecbf5efaa92cea3733b6237640df8b8abf9e1540b8b070469376ed613。完整五file身份 /tmp/ticket128-route-api-mode-refreeze-checkpoint.json；source与边界均由root复核。
+
+证据 /tmp/dmit-connection-audit/formal-eb7a66c-128-r10-v02.log，SHA256 6e1ef4e2ed6607ef3957c9eb9e57a36d2b15e6da45f3404f772f42ae1c50e82a。
+
+证据 /tmp/dmit-connection-audit/ticket128-r10-bodyfree-trace-readonly.log，SHA256 8e675898ad6e67d8ad0e1f112e22b055920b786cf83fab6a025315abd1bbb4bb。
+
+证据 /tmp/dmit-connection-audit/ticket128-r10-route-reason-readonly.log，SHA256 6ae8356869f35df4313d3a94b835c2aa49b2728e4a6486cdd095ae97da06e8e1。
+
+证据 /tmp/dmit-connection-audit/formal-eb7a66c-128-r10-postcheck.log，SHA256 e2c21de9ad5c3e622eef24b5c953ff9c45586813279686255879621d7dbb453a。
+
+证据 /tmp/ticket128-r10-route-fixture-assessment.md，SHA256 05476382c61881722253ef91d0f836aee2e4ee1497f50c75b3f0837857a52ea0。
+
+Fresh Spec PRE PASS，无阻塞；/tmp/health-steward-reviews/128-pre-e3f2127-spec-fresh.txt，SHA256 40586007a9a8658f03cbebeb2696b5243caf1dc81c200aa4f91f87866f459697。
+
+Fresh Standards PRE PASS，无阻塞；/tmp/health-steward-reviews/128-pre-e3f2127-standards-fresh.txt，SHA256 1d356e0970c16678c76eb27218a7bfda75b562d389f74953ba1c691e4419e3d7。
+
+两轴fresh同checkpoint、互不读另一轴，只有静态有界审核，不替代正式3.11门。Root实际核GitHub findjoin/exactrepo权限/原origin/remoteparent及完整无秘密diff，普通push eb7a66c..e3f2127成功。Root接受此窄重冻，后续从最终clean/pushed同source正常构造新闭包，原V02、123/118、119七门、root30、原full discover808同父一次及compile/diff/23冻结/完整性全部绿后才fresh双POST与真实default步骤。
+
+R10后检查98compile/23冻结/122source/9557runtime同closure全部不变。完整manifest与无proc引用检查后，只退役该次公开input runtime/pinned，verifier、全部日志/清单及私有事实保留；真实default前后仍PID521/active/running。清理日志/tmp/dmit-connection-audit/ticket128-r10-retired-public-prune.log；当次free3638284288B。没有清理程序backup或恢复健康authority。生产local540、G11/ND12各300、实际主人确认及ND限制不变。

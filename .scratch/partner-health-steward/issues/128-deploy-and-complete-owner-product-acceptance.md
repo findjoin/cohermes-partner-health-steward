@@ -130,3 +130,10 @@ R8精确ce6d9cc已实际通过G01—G10/ND07与新解释器FD/loader断言；首
 ## 2026-10-24 R9旧130回归与default调度组成收口
 
 R9精确1e53730原G02的637项中130 V05一项真实失败；proof未保存具体assert trace，不能认定为历史line651。单V05与整个130七项同闭包诊断另通过，均不清原红。独立源码确认128全局自动tick扩大旧130手动caller语义，按既有设计收口到可信default startup显式启用，通用Adapter缺省仍手动；同15秒/Core/原poller及全部守卫保持。产品commit bc1cbdb0f9a75801937bef5b45cb5fa5a7bbf73a仅两文件7insertions，冻结fd45cc5和全部旧门不变。[证据76](../evidence/76-ticket128-default-timer-composition-20261024.md)记录事实、独立分类及继续执行要求；新正式门/部署仍待实际，128保持claimed。
+
+
+## 2026-10-24 R10原生入口factory与合成route窄重冻
+
+精确eb7a66c原V02在G01—G10/ND07及全local组通过后，首次初始化12秒无send失败。已结束合成日志的无正文trace明确Adapter factory在既有严格BoundResponsesTransport guard拒绝api_mode=responses，尚未建立health平台或native poll。独立authority确认fixture应与125/131/130既有codex_responses契约对齐，产品不增别名；R10失败事实保留。
+
+新checkpoint e3f2127d4b16972af88c8c7caaad58fb1e87b1a4/treeef4855409e1149ed11b802a7b90f3323822705eb仅该test字面量与contract事实段，fresh双PRE PASS无阻塞，正常push原分支；root接受窄重冻，继续最终同source真实3.11原执行门。设计/raw/helper/产品/其他断言时限与计数均不动。详见[证据77](../evidence/77-ticket128-native-factory-route-fixture-refreeze-20261024.md)。新正式门及真实部署尚未通过，128保持claimed。
