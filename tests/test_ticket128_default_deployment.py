@@ -617,7 +617,7 @@ class _FormalNamespace:
     def _prepare(self, *, run_id=None, release=None, operational_budget=None):
         from partner_health_steward.model_contract import FirstHopRoute, NonDiagnosticOperationalBudget
         now = datetime.now(timezone.utc)
-        route = FirstHopRoute("jojo-responses-v1", "jojo", self.http.origin + "/v1", "responses",
+        route = FirstHopRoute("jojo-responses-v1", "jojo", self.http.origin + "/v1", "codex_responses",
                               "ticket128-offline-model", 1, _digest({"source": "synthetic-boundary-input-only"}))
         budget = NonDiagnosticOperationalBudget("budget:ticket128-offline", "1", route, (route.requested_model,),
                 "owner-decision:contract-fixture-not-real-approval", (now - timedelta(hours=1)).isoformat(),
