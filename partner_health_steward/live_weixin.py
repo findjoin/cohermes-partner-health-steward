@@ -593,7 +593,13 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         self._ordinary_nonce = nonce
         token = _ORDINARY_SEND.set((id(self), headers["conversation_id"], nonce))
         try:
-            await handler(event)
+            response = await handler(event)
+            # The pinned primary handler returns Optional[str]. A completed
+            # streaming delivery returns None; only an unsent plain final text
+            # enters the same live conversation send boundary here.
+            if type(response) is str and response.strip():
+                await self.send(headers["conversation_id"], response,
+                                reply_to=headers["message_id"])
         finally:
             self._ordinary_nonce = None
             _ORDINARY_SEND.reset(token)
