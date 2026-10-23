@@ -194,18 +194,23 @@ def prepare_default(release_root, run_id, run_scope, facts):
             'roles':plan['roles']}
 
 
+def _systemd_environment():
+    environment=dict(os.environ)
+    environment.setdefault('XDG_RUNTIME_DIR','/run/user/0')
+    environment.setdefault('DBUS_SESSION_BUS_ADDRESS','unix:path=/run/user/0/bus')
+    return environment
+
+
 def _service(action, unit):
     if unit not in {'hermes-gateway.service','cohermes-default-core.service','cohermes-default-ordinary.service'}:
         raise ValueError('non-default service forbidden')
-    environment = dict(os.environ)
-    environment.setdefault('XDG_RUNTIME_DIR','/run/user/0')
-    environment.setdefault('DBUS_SESSION_BUS_ADDRESS','unix:path=/run/user/0/bus')
+    environment = _systemd_environment()
     return subprocess.run(['systemctl','--user',action,unit],env=environment,
                           capture_output=True,text=True,timeout=60).returncode == 0
 
 
 def _reload():
-    return subprocess.run(['systemctl','--user','daemon-reload'],capture_output=True,text=True,timeout=60).returncode == 0
+    return subprocess.run(['systemctl','--user','daemon-reload'],env=_systemd_environment(),capture_output=True,text=True,timeout=60).returncode == 0
 
 
 def _rpc(plan,kind,name,payload=None):
@@ -267,7 +272,7 @@ def _snapshot(plan,key):
             else: raise ValueError('unsupported program resource')
         metadata.append(entry)
     enabled={role['unit']:subprocess.run(['systemctl','--user','is-enabled',role['unit']],
-        capture_output=True,text=True,timeout=30).stdout.strip() for role in plan['roles']}
+        env=_systemd_environment(),capture_output=True,text=True,timeout=30).stdout.strip() for role in plan['roles']}
     body={'contract':'ticket128-program-backup-v1','release_digest':plan['release_digest'],
           'distribution_digest':plan['distribution_digest'],'execution_key':key,
           'resources':metadata,'enabled':enabled,'safe_isolated_baseline':_safe_baseline(plan),
@@ -296,7 +301,7 @@ def _isolation_bytes(plan):
 
 def _live_role_identity(plan):
     for role in plan['roles']:
-        completed=subprocess.run(['systemctl','--user','show',role['unit'],'--property=MainPID','--value'],capture_output=True,text=True,timeout=15)
+        completed=subprocess.run(['systemctl','--user','show',role['unit'],'--property=MainPID','--value'],env=_systemd_environment(),capture_output=True,text=True,timeout=15)
         pid=int(completed.stdout.strip())
         fields={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in Path('/proc/'+str(pid)+'/status').read_text().splitlines() if ':' in line}
         if (int(fields['Uid'].split()[1])!=role['uid'] or int(fields['Gid'].split()[1])!=role['gid']
@@ -659,6 +664,10 @@ def _technical_gate(self,plan,request,approval):
     sequence_digest=None
     since=_now().isoformat()
     if request['gate_id']=='128-ND12':
+        g11_key=_bound_execution_key(request['release_digest'],plan['run_context'],'119-G11')
+        prior_action=channel.action(g11_key)
+        if prior_action is None:raise ValueError('prior native action unavailable')
+        since=prior_action['observed_at_utc']
         while time.monotonic()<deadline:
             facts=_sequence(plan,since)
             if facts.get('ready') is True:
