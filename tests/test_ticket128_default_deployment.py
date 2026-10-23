@@ -1403,20 +1403,36 @@ class _FormalNamespace:
             "topic_ref": None, "time_start": 1, "time_end": 3}], "question": None}
         turn(body2, "recovered-record", recovery)
         self.case.assertGreater(self._core_public("facts")["evidence_cards"], facts["evidence_cards"])
-        # Real wall time: next local minute, no fake clock/ready flag. Core
-        # determines due work and the original bridge sends its exact grant.
+        # Only the actual startup may drive scheduled work. No verifier wake
+        # RPC or replacement bridge may stand in for the production lifecycle.
         from zoneinfo import ZoneInfo
-        due = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        due = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=1, seconds=15)).replace(second=0, microsecond=0)
         task_text = turn("/health-task-once " + due.strftime("%Y-%m-%d %H:%M") + " 离线单次喝水提醒", "due-task")
         task_id = re.search(r"/health-task-cancel (task:[^\s。`]+)", task_text)
         self.case.assertIsNotNone(task_id, "task_id must come from the actual creation reply")
+        self.case.assertLess(datetime.now(timezone.utc), due.astimezone(timezone.utc), "task creation must finish before its real due time")
         send_start = len(self.http.sends)
-        while datetime.now(timezone.utc) < due.astimezone(timezone.utc):
-            time.sleep(max(0.001, min(0.2, (due.astimezone(timezone.utc)-datetime.now(timezone.utc)).total_seconds())))
-        self.wake()
-        self._wait(lambda: any("一次提醒：离线单次喝水提醒" in _RawTLS.text(v) for v in self.http.sends[send_start:]))
-        self.wake()
-        self.case.assertEqual(sum("一次提醒：离线单次喝水提醒" in _RawTLS.text(v) for v in self.http.sends[send_start:]), 1)
+        def reminder_count():
+            with self.http.lock:
+                return sum("一次提醒：离线单次喝水提醒" in _RawTLS.text(v) for v in self.http.sends[send_start:])
+        def naturally_current():
+            count = reminder_count()
+            self.case.assertLessEqual(count, 1, "natural scheduling must not resend the single reminder")
+            if count == 0:
+                return False
+            self.case.assertGreaterEqual(datetime.now(timezone.utc), due.astimezone(timezone.utc))
+            current = self._core_public("facts")
+            return (task_id.group(1) in current["solved_tasks"]
+                    and datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat() in current["review_days"])
+        # Real-time observation budgets do not prescribe a timer implementation
+        # or cadence. Empty native polls must suffice, with no extra input.
+        until_due = max(0.0, (due.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+        self._wait(naturally_current, seconds=until_due + 90)
+        quiet_until = time.monotonic() + 65
+        while time.monotonic() < quiet_until:
+            self.case.assertEqual(reminder_count(), 1)
+            time.sleep(min(0.2, max(0.0, quiet_until - time.monotonic())))
+        self.case.assertEqual(reminder_count(), 1)
         cancelled = turn("/health-task-once 明天 09:00 离线待取消提醒", "cancel-task-create")
         cancel_id = re.search(r"/health-task-cancel (task:[^\s。`]+)", cancelled)
         self.case.assertIsNotNone(cancel_id)
