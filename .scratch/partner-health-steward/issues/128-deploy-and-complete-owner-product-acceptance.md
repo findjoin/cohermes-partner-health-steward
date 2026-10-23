@@ -1,7 +1,7 @@
 # 128 - 部署并完成主人产品验收
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Parent: [健康管家首发 TO、CAN 与 HOW 决策闭合路线](../map.md)
 Blocked by: [130 - 受控自然语言与主人操作真实入口](130-connect-governed-natural-language-daily-runtime.md), [122 - 实现 DynamoDB current-head 生产 Provider](122-implement-dynamodb-current-head-provider.md), [124 - 接通 pinned Hermes 的真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 实现 Partner 首跳模型与治理知识 Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [126 - 实现真实 Weixin 与支持联系人投递 Adapter](126-implement-live-weixin-and-support-contact-delivery-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 
@@ -76,3 +76,16 @@ Blocked by: [130 - 受控自然语言与主人操作真实入口](130-connect-go
 ### Verified default service scope
 
 2026-10-18 root只读现场核查已确认：DMIT实际default `hermes-gateway.service`属于root用户级systemd，而非系统级；只查系统级得到LoadState=not-found不能据此宣称实际网关已停止。既有无秘密metadata脚本为`/tmp/dmit-connection-audit/dmit_deployment_metadata.sh`；精确只读查询上下文为`env XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus systemctl --user show hermes-gateway.service`。2026-10-22独立源码复核更正此前controller判断：现有120 `_DefaultServiceController`在`release_deployment.py:635—645`已经调用`systemctl --user`，并非系统级。后继须绑定实际root用户总线/XDG上下文并验证真实执行，不能从已选用户scope直接推断SSH启动可用或业务健康。该记录仅更正事实，不执行service操作、不读取配置或秘密，不新增部署方案。
+
+
+## 2026-10-24 当前设计认领与唯一引用
+
+Status 已认领为 `claimed`。130已由root以 `b5c73f5b681858568d3428aa18c2052514e57330` 闭合，产品基线仍精确 `f21e8ad43bc92954da0a0ed5322cf421e48d0828`；这些离线绿色不代表128部署或主人验收。
+
+本票唯一增量设计草稿：[128 default 非诊断部署设计](../design/128-default-nondiagnostic-deployment-design.md)。当前仅characterization/设计，未冻结、未编码、未部署。草稿沿原119两个固定scope、真实资源/typed factory、新披露/无诊断scope投影、首次bootstrap与真实副本absence、原宿主启动/普通出站、root已选OS隔离、可回滚安装、G11原生因果与ND12真实主人事实收敛；既有纯合成反例已记录在该唯一文件。
+
+本文较早“可用HealthInitRuntime executor直接形成新披露”的输入经当前精确matches复核不成立：只换executor会被拒绝，须沿同Module增加严格新版本，旧111保持。普通出站目前仍缺真实send_ordinary装配；0400或allowed-root-UID也不证明普通Agent隔离。root已选择普通Agent整树低UID worker/原proxy API lifecycle、Gateway relay-only和独立无网络Core路线，临时原语probe不冒充生产通过。详细事实、最小新增Interface/状态、回滚与尚待真实来源的事实均只在上述唯一设计草稿维护；回滚启动前同样须证明普通Agent/健康私有材料隔离，已有健康状态时不得启动未隔离旧root基线，无法证明安全恢复则停入口并明确cannot-confirm。
+
+本次公开setup已收口为固定default私有操作binding与薄prepare/run；新scope生产链同时绑定118 host manifest与120 distribution两个已有digest，不能将旧无distribution报告借作current部署证据；旧v1 full字节不变。详细Interface及实算关系只在唯一设计维护。
+
+阶段A即使达成 `non-diagnostic-owner-usable` 也保持本票claimed；127及完整full验收要求保留。未修改产品/测试/Map/其他票或其冻结文件，未commit/push。

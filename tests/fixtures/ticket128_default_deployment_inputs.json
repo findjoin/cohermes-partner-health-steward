@@ -1,0 +1,33 @@
+{
+  "contract": "ticket128-verifier-raw-inputs-v1",
+  "admission_policy": {
+    "partner_id": "ticket128-offline-account",
+    "owner_sender_id": "ticket128-offline-owner",
+    "conversation_id": "ticket128-offline-owner",
+    "channel": "weixin",
+    "entrypoint": "health_weixin"
+  },
+  "messages": {
+    "ordinary_greeting": "你好",
+    "ordinary_tool": "请在普通工作区运行 TICKET128_TOOL_PROBE 并报告结果",
+    "health": "我昨晚睡了六小时，请记录",
+    "mixed": "你好，我昨晚睡了六小时，请记录",
+    "uncertain": "TICKET128_UNRECOGNIZED_无明确领域"
+  },
+  "binding_selectors": {
+    "run_context": "/run_context",
+    "live_binding": "/live_binding",
+    "service_binding": "/core_binding",
+    "head_binding": "/head_binding",
+    "gateway_config": "/gateway_config",
+    "roles": "/roles"
+  },
+  "prepare_selectors": {
+    "execution_artifacts_root": "/execution_artifacts_root"
+  },
+  "private_capability_selectors": [
+    "/init_attestor_path",
+    "/daily_attestor_path",
+    "/status_hmac_path"
+  ]
+}
