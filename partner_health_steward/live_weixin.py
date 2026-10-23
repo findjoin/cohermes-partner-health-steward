@@ -168,7 +168,7 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             return True
         try:
             self._recovery_only = False
-            self._next_wake_monotonic = 0.0
+            self._next_wake_monotonic = asyncio.get_running_loop().time() + _WAKE_INTERVAL_SECONDS
             for name in ("connect", "get_updates", "acknowledge_cursor", "disconnect"):
                 if not callable(getattr(self._ingress, name, None)):
                     raise _EntryUnavailable("health-entry-ingress-unavailable")
