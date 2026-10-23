@@ -1,7 +1,7 @@
 # 130 - 接通受控自然语言日常 Runtime
 
 Type: task
-Status: claimed
+Status: resolved
 Parent: [健康管家有限实施链](../map.md)
 Blocked by: [124 - 真实健康入口](124-connect-pinned-hermes-live-health-entry.md), [125 - 生产模型Adapter](125-implement-partner-model-and-governed-knowledge-adapter.md), [131 - 明确标识的非诊断模型操作预算](131-support-explicit-nondiagnostic-model-operational-budget.md)
 Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-acceptance.md)
@@ -73,3 +73,11 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Narrow verifier refreeze R2.7 (2026-10-24)
 
 [Evidence66](../evidence/66-ticket130-green-execution-and-preinit-ordinary-regression-20261024.md)保留精确eff03ae的20／801／root30全绿事实，并记录独立公开对照实证的初始化前普通分流回归。[Evidence67](../evidence/67-ticket130-preinit-ordinary-compatibility-refreeze-20261024.md)记录仅原V01增加“已装配模型桥时 ordinary 转交一次、health 仍拒绝”的有限兼容观察、真实预期红与fresh双轴PASS。当前唯一冻结checkpoint `2a347c91f7645fd656db9569f10ad63f1bf2e5bd` / tree `ffe13de7219d153450af7c254ecc75125c2831c0`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `fcaa70d0182f31500fd695079f95859b99f1f7c0`、verifier `6e1522e4e7e944dca379b0f8f2e0f12391d9ec09`取代R2.6对应项。七家族、其余16冻结bytes和健康初始化权限不变。root仅授权原Adapter分流兼容修复；完整精确新版本执行、实施后双轴、闭票与128部署仍待完成，不把旧801绿色覆盖新缺口。
+
+## Answer
+
+已按唯一R2.7冻结在精确产品 `f21e8ad43bc92954da0a0ed5322cf421e48d0828` / tree `bf1f91164b318c65d8f4d5d010911fac8e555834` 完成受控intake/answer、真实七Skill typed候选与唯一提交、Plugin侧125单次模型执行、同Core有限主人操作/任务/复盘及受管JSON附件链。原三类CorePort、64KiB帧、8MiB短寿命分片、当前grant/peer、unknown冻结和原126投递保留；初始化前普通分流兼容已恢复，健康仍需独立原生同意。
+
+[Evidence68](../evidence/68-ticket130-final-execution-review-and-closure-20261024.md)记录精确20组件、801全量、root30、91编译、91来源/18冻结/7467runtime闭包不变、干净普通push和fresh Spec/Standards双PASS；无未处置P0–P2 blocker。当前设计/合同/verifier blobs为 `b5df3ef47fde1993a72cc293d5e56edee4fb44dc` / `fcaa70d0182f31500fd695079f95859b99f1f7c0` / `6e1522e4e7e944dca379b0f8f2e0f12391d9ec09`。root只作元数据闭票，不把历史失败改写为当前绿色。
+
+解除128实现前提；真实default部署、权限隔离、初始化和主人可用验收继续由128完成，医学范围仍需127。本票没有实际外发、生产部署或产品验收声明。

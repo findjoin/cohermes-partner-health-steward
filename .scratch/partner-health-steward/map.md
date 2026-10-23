@@ -126,7 +126,7 @@ Type: wayfinder:map
 - [Ticket 128：部署并完成主人产品验收](issues/128-deploy-and-complete-owner-product-acceptance.md) — 只在用户的 default Hermes 分两阶段执行：先部署、初始化并验收非诊断健康管家；127 闭合后再激活 BMI、完成 G12 与完整首发，明确不触碰 partner Hermes。
 - [Ticket 129：实现 DMIT 宿主 SQLite current-head Provider](issues/129-implement-host-sqlite-current-head-provider.md#answer) — 已解决：已实现显式 bootstrap/open-existing 的宿主 SQLite CurrentHeadPort，跨进程 CAS/exact receipts、capability hash、lease/typed overlap、正常崩溃恢复与失败关闭；生产组合如实投影 host-sqlite。整机旧快照防回滚不提供，这是主人已接受的限制；真实provisioning及受管数据删除/迁移证据仍归128。（执行全绿及双轴PASS见票内Answer）。
 
-- [Ticket 130：接通受控自然语言日常 Runtime](issues/130-connect-governed-natural-language-daily-runtime.md) — 2026-10-18实查未有生产typed executor，且证据前抽取与现有模型授权阶段存在明确差额；在同一受控效果与唯一提交链中补齐，不以测试executor或有限parser冒充完整自然语言能力。
+- [Ticket 130：接通受控自然语言日常 Runtime](issues/130-connect-governed-natural-language-daily-runtime.md#answer) — 已解决：同源受控intake/answer、七Skill唯一提交、主人控制/任务/复盘与受管JSON附件接入原Core/125/126链；初始化前普通分流兼容保留。精确f21e8ad的20组件/801全量/root30、冻结18完整性及fresh双轴PASS见Answer；真实default部署、权限隔离与主人验收由128承接，诊断仍staged。
 - [Ticket 131：支持明确标识的非诊断模型操作预算](issues/131-support-explicit-nondiagnostic-model-operational-budget.md#answer) — 已解决：固定65536 final wire bytes／2048 output的显式ND预算，原Core单次模型授权／typed提交与持久报告保留“不提供共同上下文保证”，真实诊断源及执行均拒绝；旧严格容量证明模式保留。精确产品1fd554f的789全量及root独立18门／双轴PASS见Answer；真实自然语言／主人展示／部署与验收由130／128承接。
 
 ### 已完成的 staged 基线
