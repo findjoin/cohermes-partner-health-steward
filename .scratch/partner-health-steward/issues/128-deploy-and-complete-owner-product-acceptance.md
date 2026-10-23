@@ -111,3 +111,10 @@ R5实际G02原637、G03原12通过，G04止于旧129V02的SemLock错误；真实
 ## 2026-10-24 正常成功等价类与标准mask设施窄重冻
 
 R6前置原G01—G09/ND07全部通过，首次到G10 ordinary226；实际配对已证隔离环境缺标准mask设施，补齐同unit最小启动成功，未称完整G10绿。另核design§11既有“按实际发生者”被强制known_failure错误实现，独立verification保留旧恢复链、补全成功及ND12持久unknown负向。新checkpoint `42ccbb1a5abe478686710e094e00b15d024f8620` / tree `4389dd2a13390073633e09c35ccf176883c71664` 已普通push，fresh双pre PASS；[Evidence73](../evidence/73-ticket128-nd12-success-and-mask-refreeze-20261024.md)记录精确冻结/证据/仅既有Seam最小修复授权。新门未执行，未部署或主人验收。
+
+
+## 2026-10-24 R7真实G10与proc-exe路径重冻
+
+R7精确dd0faba、真实3.11已通过G01—G10及ND07，原V02随后在verifier读取proc-exe宿主backing文本时ENOENT，child518.694秒/1error、无timeout、cleanup确认。独立authority分类为verifier locator缺陷，未到loader行为，不能称V02或部署通过。[实际证据74](../evidence/74-ticket128-proc-exe-verifier-refreeze-20261024.md)记录原日志、事后98/23/122/9557完整性与正式PID521未变。
+
+新checkpoint87d24bdcfb91db2c28e33c56b2f2668d9fc45bda / tree8387cea647e720cff1b22fc9c8c8bd7b8571e796仅contract/test二文件修三处同因果actualexe定位，保持actual FD/devino/hash/UID/closure/kernel断言。fresh Spec/Standards均PASS无阻塞；已正常push原分支。Root接受窄重冻，继续原V02与完整执行门；design/raw/helper/旧18/产品/预算/七family不变，正式新门和真实部署仍未通过。128保持claimed。

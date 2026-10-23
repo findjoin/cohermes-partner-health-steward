@@ -1,0 +1,33 @@
+# Ticket128：R7真实启动通过与解释器路径验证修正
+
+本记录由root在同checkpoint双pre通过后归档。128仍claimed；正式default未切换，真实模型POST/微信发送/主人初始化均未发生。
+
+R7精确候选dd0faba145a4378ed8c7b2e6920e186f9693eb14，tree cd912ef58cced46ad5d7704076d0d9dab03318a6，使用42ccbb1冻结门、实际Python3.11与9557份运行文件，closure sha256:4bdc385d2da2d935ef54f4611384431ce68ab8395d97180502cafd0f47e53edc。原V02 parent523.350秒1failure，child518.694秒1error，0skip，无timeout，owned cleanup confirmed。实际G01—G10及ND07均passed，七local组637/12/118/74/11/6/5均零failure/error/skip。G10实际三角色启动与隔离通过，不等于V02全通过、ND12或真实部署通过。
+
+首失败位于冻结测试_core_public:838：实际Core已启动，verifier将/proc/MainPID/exe解析得到的宿主backing path再作为child chroot中的普通路径读取，报FileNotFoundError。1094角色closure containment和1135 ExecStartPost解释器定位有同一因果，尚未执行到这两处。独立verification authority分类为verifier locator错误，非产品启动/closure错误；记录/tmp/ticket128-r7-core-python-path-assessment.md SHA256 5ed9c82ddb21fd34b04493190526fff750344f44bb2cfce375ec722df84149fc。
+
+Root仅授权独立verifier改test与contract：读取实际/proc/MainPID/exe FD，将实际文件对象dev/ino/字节与已绑定声明closure/bin/python3核对，随后用已核的chroot可见声明路径执行。保持实际PID、UID/GID、caps/NNP、cmdline、closure、同unit kernel行为及原同解释器字节检查；不裁剪宿主前缀、不换controller解释器、不改产品、helper/raw/design/旧18、预算或测试计数。新门是否通过仍待同source实际3.11执行。
+
+R7事后compileall98、冻结23、来源122及运行9557逐字核对通过。无进程/挂载引用后，仅退役该次公开input runtime/pinned，保留verifier源码、全部执行日志、manifest与私有事实；正式default服务前后均PID521/active/running。该清理不改历史失败。
+
+原始日志与SHA256：
+
+- formal-dd0faba-128-r7-v02.log b06b58d27bdbd91675537d594936162697677d7dfcb1df2af1dee720b4e59233
+- ticket128-r7-gates-final-readonly.log e7ba5a7e45c5018f167694702562f0a25a8e6d444a4a8ec5ec41c165ce764ec6
+- formal-dd0faba-128-r7-postcheck.log 607e4c7dd92ed739cd46ef6d3b90d61f637070961fc155597934f6ded6c59245
+- ticket128-r7-retired-public-prune.log 2f0ac6e63820c32be25c70dfcdaeee5e9ce7598c6ef5a17f62a9600f515fa2bd
+
+上述日志位于/tmp/dmit-connection-audit/，它们是可定位执行证据，不是业务权威或实际主人事实。
+
+## 新checkpoint与双pre
+
+Checkpoint87d24bdcfb91db2c28e33c56b2f2668d9fc45bda / tree8387cea647e720cff1b22fc9c8c8bd7b8571e796，parentdd0faba。仅合同/test二文件，原design/raw/helper/旧18/产品不变。
+
+- contract blob55a18c503fb3061d091d6d4f398c5e9f463bbcb2 / SHA256 d53dc8dc3d6b174d5e71aa253799db10219bd7bcffaeda30f5b45d44440a74ae。
+- test blob252d7d35679a2767825c772a22d26ec4e5a679ce / SHA256 86088c0cd1be59f265a4825739481992eb44a3586699bc0c8ce27b0528ed9934。
+- Fresh Spec PASS、无阻塞：/tmp/health-steward-reviews/128-pre-87d24bd-spec-fresh.txt，SHA256696a7c9e9af02ce21f1d16c83730aa64a40ee9d573ee2871342b9cf6adb8b109。
+- Fresh Standards PASS、无阻塞：/tmp/health-steward-reviews/128-pre-87d24bd-standards-fresh.txt，SHA2569875b3ebd04741798a2203b19decfba13a2535d49f3114c7fc19e92fcfd9cb40。
+
+两轴fresh只读同checkpoint、互不读另一轴；均明确没有实际新门通过。Root已核findjoin账号、exactorigin/admin+push/remoteparent与无秘密二文件diff，正常push dd0faba..87d24bd到原codex/complete-health-steward成功；reviewer未自行联网核push，与root实际push证据区分。
+
+Root接受本次最窄verifier重冻。继续从clean/pushed最终候选正常构造实际3.11闭包，先原V02，再原123/118、119七门、root30与原full discover808同父进程一次，compileall/diff/冻结和完整性。全部实际零failure/error/skip后才fresh双post、真实default运行及主人原生步骤；不改产品预算、伪造主人事实或提前宣称阶段A/完整首发。
