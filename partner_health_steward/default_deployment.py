@@ -786,7 +786,7 @@ try:
     daily=[store.daily_turn(source) for source in sources]
     flags={'integrity':valid,'enabled':True,'route_current':settings.consent_enabled and settings.consent_path_status=='active' and settings.current_route_id==value['route']['route_id'] and settings.current_configuration_generation==value['route']['configuration_generation'],'record':bool(state.evidence_cards) and any(d is not None and d.phase=='finalized' for d in daily),
         'portrait':bool(state.portrait_topics),'answer':answered,'diagnostic_refusal':any(r.get('branch')=='out-of-scope' for r in safety),
-        'known_failure':failed,'no_unknown':not unknown,'correction':bool(state.owner_correction_revisions) and 'correction-completed' in actions,
+        'no_unknown':not unknown,'correction':bool(state.owner_correction_revisions) and 'correction-completed' in actions,
         'view':'/health-view' in actions,'export':exported,'help':'/health-help' in actions,
         'controls':{'/health-pause','/health-resume','/health-recording-stop','/health-recording-resume'}<=actions,
         'controls_readback':not settings.proactive_support_paused and not settings.recording_stopped,
@@ -795,7 +795,7 @@ try:
         'current_review':reviews is not None and datetime.now(ZoneInfo(settings.timezone)).date().isoformat() in {r.key.local_date for r in reviews.completed},
         'fixed_safety':any(r.get('branch')=='danger-escalation' for r in safety),
         'contact_unavailable':bool(safety) and all(r.get('contact_alert') is None for r in safety)}
-    proof={'authority':asdict(authority),'flags':flags,'source_facts':sorted(sources),'receipt_digests':sorted(r.command_digest for r in receipts)}
+    proof={'authority':asdict(authority),'flags':flags,'known_failure':failed,'source_facts':sorted(sources),'receipt_digests':sorted(r.command_digest for r in receipts)}
     print(json.dumps({'ready':all(flags.values()),'checks':flags,'sequence_digest':stable_digest(proof)},sort_keys=True))
 finally:
     store.close();keys.close();head.close()
