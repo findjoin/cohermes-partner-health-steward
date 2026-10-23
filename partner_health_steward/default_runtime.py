@@ -751,6 +751,7 @@ def provision_default_plan(plan):
     _write(ORDINARY / ".env", "".join(k + "=" + json.dumps(v) + "\n" for k, v in ordinary_env.items()).encode(),
         0o600, ordinary["uid"], ordinary["gid"])
     config.setdefault("gateway", {}).update(proxy_url=gateway["proxy_url"], multiplex_profiles=False)
+    config["multiplex_profiles"] = False
     config["quick_commands"] = {}
     config.setdefault("compression", {}).update(enabled=False)
     config["plugins"] = {"enabled": ["health-weixin"]}
@@ -810,15 +811,25 @@ async def _ordinary_main(binding):
         await adapter.disconnect()
 
 
+def _pin_default_gateway_environment(binding):
+    # dotenv is an operator credential input, not a profile/launch selector.
+    # Pin these after reading it, before importing any Hermes config loader.
+    os.environ.update(HOME="/root", HERMES_HOME=str(HOME),
+        HERMES_PROFILE="default", HERMES_PROFILE_NAME="default",
+        HERMES_CONFIG=str(HOME / "config.yaml"), HERMES_ENV=str(HOME / ".env"),
+        GATEWAY_MULTIPLEX_PROFILES="0", COHERMES_RELAY_ONLY="1",
+        GATEWAY_PROXY_URL=binding["proxy_url"],
+        GATEWAY_PROXY_KEY=Path(binding["proxy_key_path"]).read_text(),
+        HEALTH_WEIXIN_ALLOWED_USERS=binding["admission_policy"]["owner_sender_id"])
+
+
 async def _gateway_main(binding):
     release = _verify_sources(binding)
     if os.environ.get("COHERMES_RELAY_ONLY") != "1":
         raise ValueError("default Gateway requires relay-only mode")
-    os.environ["GATEWAY_PROXY_URL"] = binding["proxy_url"]
-    os.environ["GATEWAY_PROXY_KEY"] = Path(binding["proxy_key_path"]).read_text()
     from dotenv import load_dotenv
     load_dotenv(HOME / ".env", override=True)
-    os.environ["HEALTH_WEIXIN_ALLOWED_USERS"] = binding["admission_policy"]["owner_sender_id"]
+    _pin_default_gateway_environment(binding)
     from gateway.platforms.weixin import load_weixin_account
     account = load_weixin_account(str(HOME), binding["admission_policy"]["partner_id"])
     if type(account) is not dict or not account.get("token"):
