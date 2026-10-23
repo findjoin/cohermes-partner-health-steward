@@ -38,7 +38,7 @@ if __name__ == "__main__" and "--pinned-gate" in sys.argv:
     tests.__package__ = "tests"
     sys.modules["tests"] = tests
 
-from partner_health_steward.coordination import DailySkillBundle
+from partner_health_steward.coordination import CoarseMessageRouter, DailySkillBundle
 from partner_health_steward.authority import AuthorityValidationError
 from partner_health_steward.host_contract import _CorePortClient, _HostVerificationFailure
 from partner_health_steward.initialization import stable_digest, InitializationDisclosure, OwnerConsentEvidence
@@ -52,6 +52,7 @@ _PROJECTION = delivery_fixture._projection
 _CANONICAL = delivery_fixture._canonical
 _SHA = delivery_fixture._sha
 _TOPIC = "physical-function-and-experience/sleep"
+_PREINIT_GREETING = "你好，这是普通问候（合成130）"
 _NOW = datetime(2026, 8, 24, 1, 6, tzinfo=timezone.utc)
 _STAGE_FIELDS = {"response", "next_stage", "model_use_disclosure", "delivery_refs"}
 _GRANT_FIELDS = {"session_id", "lease_id", "effect_id", "intent_digest", "generation", "writer_fence"}
@@ -125,7 +126,7 @@ def _raw(route, candidate, *, status="completed", response_id="response:ticket13
 
 
 @contextmanager
-def _service(*, wide=False):
+def _service(*, wide=False, preinit_routing=False):
     """Reuse123/126 real publication and host facilities, replace no authority.
 
     The legacy126 fixture is closed before constructing the declared130 typed
@@ -152,7 +153,9 @@ def _service(*, wide=False):
                                         for a in base.daily.daily_bundle.assets))
         governed = GovernedNonDiagnosticRuntime(intake_llm, answer_llm, strategy,
             bundle=bundle, attestor=base.daily.daily_attestor, clock=lambda: clock[0])
-        runtime = LiveHealthRuntime(base.daily.policy, base.init, base.daily.router,
+        router = (CoarseMessageRouter(lambda body, capability: "ordinary" if body == _PREINIT_GREETING else "health")
+                  if preinit_routing else base.daily.router)
+        runtime = LiveHealthRuntime(base.daily.policy, base.init, router,
             asset_paths=paths, core_options=options, governed_nondiagnostic_runtime=governed)
         service = ProductionCoreService(base.binding, current_head=base.head, live_runtime=runtime)
         endpoint = service.start()
@@ -419,13 +422,19 @@ class Ticket130GovernedRuntimeVerificationTests(unittest.TestCase):
 
     def test_v130_01_published_registry_socket_intake_evidence_answer_unique_commit_and_visible_limits(self):
         self._modules()
-        with _service() as fixture:
+        with _service(preinit_routing=True) as fixture:
             result = self._run_child("trace", fixture)
             self.assertEqual(result["model_stages"], ["intake", "intake", "answer", "intake", "answer"])
             self.assertEqual(set(result["kinds"]), {"command", "managed-read", "controlled-effect"})
             self.assertTrue(result["initialized_message"])
-            self.assertEqual(result["ordinary_calls"], 0)
+            self.assertEqual(result["ordinary_calls"], 1)
             core = fixture.service._core
+            self.assertEqual(len(result["preinit_sources"]), 2)
+            self.assertEqual(len(set(result["preinit_sources"])), 2)
+            self.assertEqual(result["preinit_health_reason"], "initialization-required")
+            for source in result["preinit_sources"]:
+                self.assertIsNone(core.source_receipt(source))
+                self.assertIsNone(core.daily_turn_status(source))
             state = core.daily_state()
             self.assertEqual(len(state.evidence_cards), 2, "a question cannot turn into an owner fact")
             self.assertTrue(all("没有失眠" in card.content for card in state.evidence_cards))
@@ -1016,6 +1025,8 @@ async def _child(config):
     store = ContextTokenStore(os.environ["HERMES_HOME"])
     store.set(config["policy"]["partner_id"], config["policy"]["owner_sender_id"], "synthetic-context")
     ordinary = []
+    async def ordinary_handler(event):
+        ordinary.append(event)
     extra = {"admission_policy": config["policy"], "core_port": port,
              "initialization_template": config["initialization"],
              "weixin_transport_binding": {"account_id": config["policy"]["partner_id"],
@@ -1071,11 +1082,42 @@ async def _child(config):
     with patch("aiohttp.ClientSession", channel.factory), patch("httpx.HTTPTransport", models.factory):
         adapter = delivery_fixture._create_registered(extra)
         assert type(adapter) is LiveHealthWeixinAdapter
-        adapter.set_message_handler(lambda event: ordinary.append(event))
+        adapter.set_message_handler(ordinary_handler)
         assert await adapter.connect(is_reconnect=False)
         try:
             if gate == "trace":
                 assert ready() == "uninitialized"
+                ordinary_cursor = "cursor130:preinit-ordinary"
+                channel.enqueue(ordinary_cursor, _native(config, "preinit-ordinary", _PREINIT_GREETING))
+                await _wait(lambda: len(ordinary) == 1 and not channel.batches and ordinary_cursor in channel.cursors)
+                assert ordinary[0].text == _PREINIT_GREETING and ordinary[0].message_id == "native130:preinit-ordinary"
+                ordinary_messages = [value["payload"]["message"] for kind, value in port.calls
+                    if kind == "command" and value.get("operation") in {"receive-weixin", "governed-receive"}
+                    and value["payload"]["message"]["message_id"] == "native130:preinit-ordinary"]
+                assert len(ordinary_messages) == 1
+                ordinary_source = ordinary_messages[0]["causal_id"]
+                ordinary_results = [value["payload"]["response"] for value in port.responses
+                    if type(value.get("payload")) is dict and type(value["payload"].get("response")) is dict
+                    and value["payload"]["response"].get("causal_id") == ordinary_source]
+                assert len(ordinary_results) == 1 and ordinary_results[0]["status"] == "accepted"
+                assert ordinary_results[0]["reason_code"] == "ordinary-hermes-route"
+                assert ready() == "uninitialized" and not models.calls and not channel.sends
+                before_polls = len(channel.cursors)
+                health_cursor = "cursor130:preinit-health"
+                channel.enqueue(health_cursor, _native(config, "preinit-health", "我昨晚没有失眠"))
+                await _wait(lambda: len(channel.cursors) >= before_polls + 2 and not channel.batches)
+                health_messages = [value["payload"]["message"] for kind, value in port.calls
+                    if kind == "command" and value.get("operation") in {"receive-weixin", "governed-receive"}
+                    and value["payload"]["message"]["message_id"] == "native130:preinit-health"]
+                assert len(health_messages) == 1
+                health_source = health_messages[0]["causal_id"]
+                health_results = [value["payload"]["response"] for value in port.responses
+                    if type(value.get("payload")) is dict and type(value["payload"].get("response")) is dict
+                    and value["payload"]["response"].get("causal_id") == health_source]
+                assert len(health_results) == 1 and health_results[0]["status"] == "rejected"
+                assert health_results[0]["reason_code"] == "initialization-required"
+                assert health_cursor not in channel.cursors and len(ordinary) == 1
+                assert ready() == "uninitialized" and not models.calls and not channel.sends
                 await owner("/health-init", "init-request")
                 await _wait(lambda: any("/health-init-confirm" in value for value in channel.texts()))
                 assert ready() == "uninitialized" and not models.calls
@@ -1128,7 +1170,8 @@ async def _child(config):
                 assert set(replay_records) == set(records), "native alias minted another business record"
                 result = {"model_stages": [stage for stage, _ in models.calls],
                           "kinds": sorted({kind for kind, _ in port.calls}), "initialized_message": True,
-                          "ordinary_calls": len(ordinary), "effects": list(dict.fromkeys(port.effect_ids)),
+                          "ordinary_calls": len(ordinary), "preinit_sources": [ordinary_source, health_source],
+                          "preinit_health_reason": health_results[0]["reason_code"], "effects": list(dict.fromkeys(port.effect_ids)),
                           "results": port.results, "records": list(dict.fromkeys(records)), "replay_unchanged": True}
             elif gate == "seed":
                 text = "我昨晚没有失眠"
@@ -1433,7 +1476,8 @@ async def _child(config):
                 raise AssertionError(gate)
         finally:
             await adapter.disconnect()
-    assert not ordinary, "health/failed model/owner commands must not enter ordinary Hermes Session"
+    expected_ordinary = [("native130:preinit-ordinary", _PREINIT_GREETING)] if gate == "trace" else []
+    assert [(event.message_id, event.text) for event in ordinary] == expected_ordinary, "health/failed model/owner commands must not enter ordinary Hermes Session"
     assert all(msg["to_user_id"] == config["policy"]["owner_sender_id"] for msg in channel.sends)
     assert not models.errors, models.errors
     assert all(session.closed for session in channel.sessions)
