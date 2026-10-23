@@ -54,6 +54,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", None)
         if type(extra) is not dict or "admission_policy" not in extra:
             raise _EntryUnavailable("health-entry-admission-required")
+        self._periodic_current_wake = extra.get("_periodic_current_wake", False)
+        if type(self._periodic_current_wake) is not bool:
+            raise _EntryUnavailable("health-entry-periodic-wake-binding-required")
         self._policy = AdmissionPolicy.from_storage(extra["admission_policy"])
         super().__init__(config, Platform("health_weixin"))
         self._core_port = core_port if core_port is not None else extra.get("core_port")
@@ -252,6 +255,8 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             self._last_reason = "health-entry-processing-unconfirmed"
 
     async def _wake_if_due(self):
+        if not self._periodic_current_wake:
+            return
         # The existing long poll returns within its native timeout. Recheck
         # scheduled work between batches, including empty ones, in this same
         # task; the Core still owns wall time, approvals and once-only effects.

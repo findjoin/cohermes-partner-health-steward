@@ -845,6 +845,8 @@ async def _gateway_main(binding):
     arm_default_live_entry(release, binding, entry)
     config = load_gateway_config_for_runner()
     extra = {key: copy.deepcopy(binding[key]) for key in ("admission_policy", "core_port_endpoint", "initialization_template", "weixin_transport_binding")}
+    # Only this verified default composition installs the periodic tick.
+    extra["_periodic_current_wake"] = True
     extra["nondiagnostic_model_binding"] = {"route": copy.deepcopy(binding["route"]),
         "budget": copy.deepcopy(binding["budget"]),
         "credential_provider": lambda: load_default_health_credential(FirstHopRoute.from_wire(binding["route"]))}
