@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .acceptance_run import _bound_execution_key, _gates, _approval_gates
 from .initialization import stable_digest
@@ -590,18 +590,87 @@ _LOCAL_MODULES = {
     '119-G08': ('tests.test_ticket129_host_current_head',),
     '119-G09': ('tests.test_ticket126_live_delivery',),
 }
+
+
+def _verified_local_sources(runtime,release_root,modules):
+    # This ordinary file is already covered by the one runtime closure and
+    # current distribution attestation. It describes bytes, not a new approval.
+    runtime=Path(runtime).resolve()
+    snapshot_path=runtime/'source-snapshot.json'
+    details=snapshot_path.lstat()
+    if not stat.S_ISREG(details.st_mode) or snapshot_path.is_symlink():
+        raise ValueError('sealed source snapshot unavailable')
+    content=snapshot_path.read_bytes()
+    snapshot=_strict_json_bytes(content)
+    if (type(snapshot) is not dict or set(snapshot)!={'archive_sha256','git_commit','files'}
+            or type(snapshot['archive_sha256']) is not str or re.fullmatch(r'[0-9a-f]{64}',snapshot['archive_sha256']) is None
+            or type(snapshot['git_commit']) is not str or re.fullmatch(r'[0-9a-f]{40}',snapshot['git_commit']) is None
+            or type(snapshot['files']) is not list or not snapshot['files']):
+        raise ValueError('sealed source snapshot invalid')
+    declared={};directories=set();previous=''
+    for entry in snapshot['files']:
+        if type(entry) is not dict or set(entry)!={'path','sha256'}:
+            raise ValueError('sealed source entry invalid')
+        name,digest=entry['path'],entry['sha256']
+        if type(name) is not str or '\\' in name or '\x00' in name:
+            raise ValueError('sealed source path invalid')
+        path=PurePosixPath(name)
+        if (path.is_absolute() or not path.parts or path.as_posix()!=name
+                or any(part in {'.','..'} for part in path.parts) or name<=previous
+                or type(digest) is not str or re.fullmatch(r'[0-9a-f]{64}',digest) is None):
+            raise ValueError('sealed source entry invalid')
+        previous=name;declared[name]=digest
+        directories.update(parent.as_posix() for parent in path.parents if parent!=PurePosixPath('.'))
+    root=runtime.parent/'verifier'
+    if root.is_symlink() or not root.is_dir():raise ValueError('fixed verifier unavailable')
+    actual={}
+    for path in root.rglob('*'):
+        details=path.lstat();name=path.relative_to(root).as_posix()
+        if stat.S_ISDIR(details.st_mode):
+            if name not in directories:raise ValueError('undeclared verifier directory')
+        elif stat.S_ISREG(details.st_mode):
+            actual[name]=hashlib.sha256(path.read_bytes()).hexdigest()
+        else:raise ValueError('unsafe verifier source')
+    if actual!=declared:raise ValueError('actual verifier source drift')
+    product=runtime/'lib/python3.11/site-packages/partner_health_steward'
+    expected={name.removeprefix('partner_health_steward/'):digest for name,digest in declared.items()
+              if name.startswith('partner_health_steward/')}
+    installed={}
+    if product.is_symlink() or not product.is_dir():raise ValueError('runtime product unavailable')
+    for path in product.rglob('*'):
+        details=path.lstat()
+        if stat.S_ISREG(details.st_mode):
+            installed[path.relative_to(product).as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
+        elif not stat.S_ISDIR(details.st_mode):raise ValueError('unsafe runtime product source')
+    if not expected or installed!=expected:raise ValueError('verifier and runtime product differ')
+    required={'tests/__init__.py',*(name.split('.')[0]+'/'+name.split('.')[1]+'.py' for name in modules)}
+    if not required<=set(declared):raise ValueError('fixed verification modules unavailable')
+    # Reuse the Publisher's actual source/resource mapping rather than invent
+    # another package or requiring resources at an alternate release path.
+    from .release_deployment import HermesReleasePublisher
+    for name,data in HermesReleasePublisher(root)._source_bytes(resource_scope='non-diagnostic').items():
+        if (Path(release_root)/name).read_bytes()!=data:
+            raise ValueError('verification source differs from current distribution')
+    return root,{'source_snapshot_digest':'sha256:'+hashlib.sha256(content).hexdigest(),
+                 'source_commit':snapshot['git_commit']}
+
+
 _LOCAL_PROGRAM = r'''
 import io,json,sys,unittest
 from contextlib import redirect_stdout,redirect_stderr
 from pathlib import Path
 import partner_health_steward.production_core_service as production
-assert Path(production.__file__).resolve().is_relative_to(Path(sys.executable).resolve().parent.parent)
-root=Path(sys.argv[1]).resolve()
+import partner_health_steward.default_deployment as deployment
+runtime=Path(sys.argv[1]).resolve()
+assert Path(sys.executable).resolve().is_relative_to(runtime)
+assert Path(production.__file__).resolve().parent==runtime/'lib/python3.11/site-packages/partner_health_steward'
+modules=json.loads(sys.argv[3])
+deployment._runtime(runtime,sys.argv[2])
+root,source_identity=deployment._verified_local_sources(runtime,sys.argv[2],modules)
 sys.path.insert(0,str(root))
 import tests
 assert Path(tests.__file__).resolve()==root/'tests/__init__.py'
 sys.path.pop(0)
-modules=json.loads(sys.argv[2])
 suite=unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(name) for name in modules)
 output=io.StringIO()
 with redirect_stdout(output),redirect_stderr(output):
@@ -609,7 +678,7 @@ with redirect_stdout(output),redirect_stderr(output):
 print(json.dumps({'tests':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
  'skips':len(result.skipped),'successful':result.wasSuccessful(),
  'failure_tests':[test.id() for test,_ in result.failures],
- 'error_tests':[test.id() for test,_ in result.errors]},sort_keys=True))
+ 'error_tests':[test.id() for test,_ in result.errors],**source_identity},sort_keys=True))
 raise SystemExit(0 if result.wasSuccessful() and result.testsRun>0 and not result.skipped else 1)
 '''
 
@@ -626,9 +695,7 @@ def _run_local_gate(plan,request,manifest):
             'runtime-closure:'+closure['closure_digest'][7:]])
     modules=_LOCAL_MODULES.get(request['gate_id'])
     if modules is None:return _observation(request,'cannot-confirm',reason='local-gate-unavailable')
-    verifier=runtime/'lib/python3.11/site-packages'
-    if not (verifier/'tests/__init__.py').is_file():
-        return _observation(request,'cannot-confirm',reason='sealed-verifier-unavailable')
+    verifier,source_identity=_verified_local_sources(runtime,plan['release_root'],modules)
     environment={name:os.environ[name] for name in ('PATH','LANG','LC_ALL','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS') if name in os.environ}
     environment.update(PYTHONDONTWRITEBYTECODE='1',TICKET123_RUNTIME_ROOT=str(runtime),
         TICKET118_PINNED_HERMES_SOURCE=plan['facts']['pinned_hermes_root'])
@@ -636,7 +703,8 @@ def _run_local_gate(plan,request,manifest):
     if proof_path.exists():
         proof=_read_private(proof_path)
         if (proof.get('execution_key')!=request['execution_key'] or proof.get('distribution_digest')!=request['distribution_digest']
-                or proof.get('modules')!=list(modules) or proof.get('runtime_closure_digest')!=closure['closure_digest']):
+                or proof.get('modules')!=list(modules) or proof.get('runtime_closure_digest')!=closure['closure_digest']
+                or any(proof.get(name)!=value for name,value in source_identity.items())):
             raise ValueError('local execution proof mismatch')
         result=proof['result']
         passed=(proof['exit_status']==0 and result.get('successful') is True and result.get('tests',0)>0
@@ -644,16 +712,18 @@ def _run_local_gate(plan,request,manifest):
         return _observation(request,'passed' if passed else 'cannot-confirm',evidence=['local-proof:'+_digest(proof)[7:]],
             reason='verified' if passed else 'local-verification-failed')
     if request['gate_id']=='119-G08':_consume(request)
-    completed=subprocess.run([str(runtime/'bin/python3'),'-I','-B','-c',_LOCAL_PROGRAM,str(verifier),json.dumps(modules)],
+    completed=subprocess.run([str(runtime/'bin/python3'),'-I','-B','-c',_LOCAL_PROGRAM,str(runtime),plan['release_root'],json.dumps(modules)],
         env=environment,capture_output=True,text=True,timeout=540)
     try:result=json.loads(completed.stdout.strip())
     except (ValueError,TypeError):result={'successful':False,'tests':0,'errors':1,'failures':0,'skips':0}
-    passed=(completed.returncode==0 and result.get('successful') is True and result.get('tests',0)>0
+    passed=(completed.returncode==0 and all(result.get(name)==value for name,value in source_identity.items())
+            and result.get('successful') is True and result.get('tests',0)>0
             and all(result.get(k)==0 for k in ('errors','failures','skips')))
     proof={'contract':'ticket128-fixed-local-validation-v1','release_digest':request['release_digest'],
         'distribution_digest':request['distribution_digest'],'execution_key':request['execution_key'],
         'command_version':'ticket128-fixed-local-validation-v1','modules':list(modules),
-        'runtime_closure_digest':closure['closure_digest'],'exit_status':completed.returncode,'result':result}
+        'runtime_closure_digest':closure['closure_digest'],**source_identity,
+        'exit_status':completed.returncode,'result':result}
     _write_private(_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.local-proof.json'),proof,exclusive=True)
     return _observation(request,'passed' if passed else 'cannot-confirm',
         evidence=['local-proof:'+_digest(proof)[7:]],reason='verified' if passed else 'local-verification-failed')
