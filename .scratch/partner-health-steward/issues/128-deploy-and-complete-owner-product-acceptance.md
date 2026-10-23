@@ -118,3 +118,10 @@ R6前置原G01—G09/ND07全部通过，首次到G10 ordinary226；实际配对�
 R7精确dd0faba、真实3.11已通过G01—G10及ND07，原V02随后在verifier读取proc-exe宿主backing文本时ENOENT，child518.694秒/1error、无timeout、cleanup确认。独立authority分类为verifier locator缺陷，未到loader行为，不能称V02或部署通过。[实际证据74](../evidence/74-ticket128-proc-exe-verifier-refreeze-20261024.md)记录原日志、事后98/23/122/9557完整性与正式PID521未变。
 
 新checkpoint87d24bdcfb91db2c28e33c56b2f2668d9fc45bda / tree8387cea647e720cff1b22fc9c8c8bd7b8571e796仅contract/test二文件修三处同因果actualexe定位，保持actual FD/devino/hash/UID/closure/kernel断言。fresh Spec/Standards均PASS无阻塞；已正常push原分支。Root接受窄重冻，继续原V02与完整执行门；design/raw/helper/旧18/产品/预算/七family不变，正式新门和真实部署仍未通过。128保持claimed。
+
+
+## 2026-10-24 R8实际loader与请求EOF窄重冻
+
+R8精确ce6d9cc已实际通过G01—G10/ND07与新解释器FD/loader断言；首次初始化projection查询被Core原EOF规则关闭。独立authority确认verifier两个client漏SHUT_WR，旧123严格协议及负向保持。原child524.229秒/1failure，无timeout、cleanup确认；非空原childraw及0字节stdout日志的来源区别见[证据75](../evidence/75-ticket128-coreport-eof-verifier-refreeze-20261024.md)。
+
+新checkpointfd45cc5d32eac87566171d781588055d105c1f48 / treef07e3590cc1907c5a725af12cbcae63e833be066仅两文件4insertions；fresh双PRE PASS无阻塞、已正常push原分支。Root接受窄重冻，继续同source真实3.11原V02与完整执行门；产品/旧门/预算/7family及V07三世界不变。新正式门/真实部署仍未通过，128保持claimed。
