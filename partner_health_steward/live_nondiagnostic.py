@@ -8,6 +8,8 @@ from .bounded_transfer import (
     canonical_bytes, decode_canonical, decode_chunk,
     descriptor_for, encode_chunk, validate_bytes, validate_descriptor,
 )
+from .contract import DailyTurnMeta, Response
+from .authority import validate_opaque_text
 from .model_adapter import (
     BoundResponsesTransport, NonDiagnosticBudgetInputMeasurementStrategy,
     ProductionModelAdapter,
@@ -28,6 +30,41 @@ def _text(value):
     if type(value) is not str or not value or len(value.encode("utf-8")) > 16384:
         raise ValueError("invalid non-diagnostic metadata")
     return value
+
+
+def _record_finalization(value, source):
+    """Recognize only the Core's exact same-source committed result."""
+    try:
+        _exact(value, {"response", "next_stage", "model_use_disclosure", "delivery_refs"})
+        if value["next_stage"] is not None or type(value["delivery_refs"]) is not list:
+            return False
+        response = Response.from_wire(value["response"])
+        return (response.to_wire() == value["response"]
+            and response.status == "accepted"
+            and response.reason_code == "daily-turn-finalized"
+            and response.causal_id == source
+            and type(response.meta) is DailyTurnMeta
+            and response.meta.turn_result.source_causal_id == source)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _finalized_record_needs_binding(value, source):
+    return _record_finalization(value, source) and value["delivery_refs"] == []
+
+
+def _finalized_record_is_bound(value, source):
+    if not _record_finalization(value, source) or not value["delivery_refs"]:
+        return False
+    try:
+        for reference in value["delivery_refs"]:
+            _exact(reference, {"kind", "intent_id"})
+            if reference["kind"] != "owner-outbox":
+                return False
+            validate_opaque_text(reference["intent_id"], "live delivery intent")
+        return True
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
 class LiveNonDiagnosticModelBridge:
@@ -181,9 +218,18 @@ class LiveNonDiagnosticModelBridge:
             buffer.clear()
             observed = None
 
-    async def advance_source(self, source_causal_id):
+    async def advance_source(self, source_causal_id, *, _finalized_record=None):
         source = _text(source_causal_id)
         async with self._lock:
+            if _finalized_record is not None:
+                if not _finalized_record_needs_binding(_finalized_record, source):
+                    raise ValueError("non-diagnostic committed result unconfirmed")
+                # The Adapter already observed the committed result. Its next
+                # call is the sole continuation, even if that reply is lost.
+                outcome = await self._advance(source)
+                if not _finalized_record_is_bound(outcome, source):
+                    raise ValueError("non-diagnostic committed handoff unconfirmed")
+                return outcome
             outcome = await self._advance(source)
             stages = set()
             while outcome["next_stage"] is not None:
@@ -193,6 +239,12 @@ class LiveNonDiagnosticModelBridge:
                 stages.add(stage)
                 await self._stage(source, stage)
                 outcome = await self._advance(source)
+            if _finalized_record_needs_binding(outcome, source):
+                # A known committed large record needs only its original bind.
+                # Never return to model execution or repeat an uncertain call.
+                outcome = await self._advance(source)
+                if not _finalized_record_is_bound(outcome, source):
+                    raise ValueError("non-diagnostic committed handoff unconfirmed")
             return outcome
 
 

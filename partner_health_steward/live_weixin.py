@@ -18,6 +18,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 
 from .admission import AdmissionPolicy, RawWeixinMessage, validate_opaque_text
 from .host_contract import _CorePortClient
+from .live_nondiagnostic import _finalized_record_needs_binding
 from .initialization import (
     InitializationDisclosure, InitializationProjection, OwnerConsentEvidence,
     OwnerInitialization, stable_digest,
@@ -356,7 +357,9 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
                 or outcome["next_stage"] not in {None, "intake", "answer"}
                 or type(outcome["delivery_refs"]) is not list):
             raise _EntryUnavailable("health-entry-governed-result-unconfirmed")
-        if outcome["next_stage"] is not None:
+        if _finalized_record_needs_binding(outcome, source):
+            outcome = await self._model_bridge.advance_source(source, _finalized_record=outcome)
+        elif outcome["next_stage"] is not None:
             outcome = await self._model_bridge.advance_source(source)
         if type(outcome.get("response")) is not dict or type(outcome.get("delivery_refs")) is not list:
             raise _EntryUnavailable("health-entry-governed-result-unconfirmed")

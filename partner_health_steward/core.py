@@ -14856,32 +14856,38 @@ class HealthCore:
         return result
 
     def _governed_commit_draft(self, source, draft, candidate=None):
+        response, _ = self._governed_commit_draft_sized(source, draft, candidate)
+        return response
+
+    def _governed_commit_draft_sized(self, source, draft, candidate=None):
         from .plugin import HealthPlugin
+        prepare_size = None
         with self._lifecycle_lock:
             if self._closed:
-                return Response('unavailable',reason_code='current-writer-holder-missing')
+                return Response('unavailable',reason_code='current-writer-holder-missing'), prepare_size
             if self._lifecycle_blocks_normal_operations():
-                return Response('rejected',reason_code='lifecycle-frozen')
+                return Response('rejected',reason_code='lifecycle-frozen'), prepare_size
             if self._governed is None or type(draft) is not DailyTurnDraft or draft.source_causal_id != source:
-                return Response('rejected',reason_code='invalid-command-envelope')
+                return Response('rejected',reason_code='invalid-command-envelope'), prepare_size
             command=CommandEnvelope(peer='plugin',action='turn.prepare',source='daily_skill_runtime',
                 causal_id=HealthPlugin._daily_turn_causal_id('evidence-prepare' if draft.turn_kind=='evidence-stage' else 'complete-prepare',source),
                 generation=self._read_head().generation,scope=('turn:prepare',),payload=DailyTurnPreparePayload(draft,candidate))
             # This typed draft was formed inside Core, never received over RPC.
             # Re-enter the complete codec without changing any public frame cap.
             encoded=json.dumps(command.to_wire(),ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')
-            if len(encoded)>8388608:
-                return Response('rejected',reason_code='invalid-command-envelope')
+            prepare_size = len(encoded)
+            if prepare_size>8388608:
+                return Response('rejected',reason_code='invalid-command-envelope'), prepare_size
             command=CommandEnvelope.from_wire(json.loads(encoded))
             prepared=self._apply_canonical_command(command)
-        if prepared.status not in {'accepted','replayed'}: return prepared
+        if prepared.status not in {'accepted','replayed'}: return prepared, prepare_size
         while True:
             status=self._daily_turn_status_open(source)
-            if status is None: return Response('unavailable',source,'daily-turn-state-unavailable')
-            if status.phase in {'evidence-finalized','finalized'}: return Response('accepted',source,status.phase)
-            if status.phase not in {'prepared','unknown','committed'}: return Response('unavailable',source,'daily-turn-state-unavailable')
+            if status is None: return Response('unavailable',source,'daily-turn-state-unavailable'), prepare_size
+            if status.phase in {'evidence-finalized','finalized'}: return Response('accepted',source,status.phase), prepare_size
+            if status.phase not in {'prepared','unknown','committed'}: return Response('unavailable',source,'daily-turn-state-unavailable'), prepare_size
             transition=self.handle(HealthPlugin._daily_transition_command(status,'state.finalize' if status.phase=='committed' else 'state.commit'))
-            if transition.status not in {'accepted','replayed'}: return transition
+            if transition.status not in {'accepted','replayed'}: return transition, prepare_size
 
     def advance_governed_source(self, source_causal_id):
         from .contract import DailyTurnMeta
@@ -14908,13 +14914,16 @@ class HealthCore:
                     refs=self._governed_failure_notice(source_causal_id,status)
                     return {**result,'response':Response('unavailable',source_causal_id,status['reason_code'] or status['state']).to_wire(),'delivery_refs':refs}
                 daily=self._store.daily_turn(source_causal_id)
+                large_record_draft = False
+                finalized_large_record = False
                 if daily is None:
                     intake=self._governed_candidates.get((source_causal_id,'intake'))
                     if binding is None or intake is None: return result
                     settings=self._current_owner_settings(self._read_head())
                     draft=self._governed.evidence_stage(binding[0],self._store.daily_state(),intake,settings.timezone,recording_stopped=binding[2])
-                    committed=self._governed_commit_draft(source_causal_id,draft)
+                    committed, prepare_size=self._governed_commit_draft_sized(source_causal_id,draft)
                     if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
+                    large_record_draft = 65536 < prepare_size <= 8388608
                     daily=self._store.daily_turn(source_causal_id)
                 if daily.phase=='evidence-finalized':
                     intake=self._governed_candidates.get((source_causal_id,'intake'))
@@ -14940,9 +14949,17 @@ class HealthCore:
                     source=self._governed_source_open(source_causal_id)[0]
                     complete=self._governed.daily_runtime.complete(source,self._daily_turn_post_stage_state_open(source_causal_id),daily.draft,
                         model_answer_resolution=resolution,model_reply_atoms=atoms)
-                    committed=self._governed_commit_draft(source_causal_id,complete,candidate)
+                    committed, prepare_size=self._governed_commit_draft_sized(source_causal_id,complete,candidate)
                     if committed.status not in {'accepted','replayed'}: return {**result,'response':committed.to_wire()}
+                    finalized_large_record = (intake.operation == 'record'
+                        and (large_record_draft or 65536 < prepare_size <= 8388608))
                 turn=self._daily_turn_result_open(source_causal_id)
+                if finalized_large_record and turn is not None:
+                    # The original aggregate and result are already durable.
+                    # Only the original126 binding waits for one short call.
+                    self._release_governed_source_memory(source_causal_id)
+                    return {**result,'response':Response('accepted',source_causal_id,'daily-turn-finalized',DailyTurnMeta(turn)).to_wire()}
+
                 if turn is None:
                     # Ticket112 intentionally released the final reply body.
                     # Only its original durable126 handoff can release a new
