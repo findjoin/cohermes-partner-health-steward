@@ -275,6 +275,7 @@ class _FramePort:
             client.settimeout(8)
             client.connect(self.path)
             client.sendall(struct.pack(">I", len(raw)) + raw)
+            client.shutdown(socket.SHUT_WR)
             def exact(count):
                 result = b""
                 while len(result) < count:
@@ -1724,6 +1725,7 @@ try:
     encoded=json.dumps(wire,separators=(",",":"),sort_keys=True).encode()
     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:
         client.settimeout(3);client.connect(data["socket"]);client.sendall(struct.pack(">I",len(encoded))+encoded)
+        client.shutdown(socket.SHUT_WR)
         header=client.recv(4)
         if len(header)==4:
             count=struct.unpack(">I",header)[0];raw=b""
