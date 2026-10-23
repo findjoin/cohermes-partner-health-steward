@@ -69,3 +69,7 @@ Unblocks: [128 - 主人产品验收](128-deploy-and-complete-owner-product-accep
 ## Same-freeze full-suite resource failure (2026-10-22)
 
 [Evidence64](../evidence/64-ticket130-full-suite-resource-lifetime-failure-20261022.md)记录精确364943e正式组件20/20绿色但同快照全量801项出现7个真实FD耗尽error。独立sealed对照及产品作者public纯合成复现均证明原Service正常关闭与启动失败每轮遗留10个私有资源FD，另有临时provider遗留；不是仅fixture错误。root退回原authority/service自有资源生命周期内窄修，禁止提高limit、改冻结或拆全量绕过，R2.6十八冻结身份不变。当前票仍claimed，未开始实施后双轴或宣称全量／部署完成。
+
+## Narrow verifier refreeze R2.7 (2026-10-24)
+
+[Evidence66](../evidence/66-ticket130-green-execution-and-preinit-ordinary-regression-20261024.md)保留精确eff03ae的20／801／root30全绿事实，并记录独立公开对照实证的初始化前普通分流回归。[Evidence67](../evidence/67-ticket130-preinit-ordinary-compatibility-refreeze-20261024.md)记录仅原V01增加“已装配模型桥时 ordinary 转交一次、health 仍拒绝”的有限兼容观察、真实预期红与fresh双轴PASS。当前唯一冻结checkpoint `2a347c91f7645fd656db9569f10ad63f1bf2e5bd` / tree `ffe13de7219d153450af7c254ecc75125c2831c0`；design `b5df3ef47fde1993a72cc293d5e56edee4fb44dc`不变，contract `fcaa70d0182f31500fd695079f95859b99f1f7c0`、verifier `6e1522e4e7e944dca379b0f8f2e0f12391d9ec09`取代R2.6对应项。七家族、其余16冻结bytes和健康初始化权限不变。root仅授权原Adapter分流兼容修复；完整精确新版本执行、实施后双轴、闭票与128部署仍待完成，不把旧801绿色覆盖新缺口。
