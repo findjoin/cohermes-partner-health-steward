@@ -107,3 +107,7 @@ root将其分类为**测试oracle错误**，交独立verification仅修该断言
 ## 2026-10-24 隔离OS与整family观察前提窄重冻
 
 R5实际G02原637、G03原12通过，G04止于旧129V02的SemLock错误；真实3.11配对已证缺少隔离shm，补齐后原测试通过。独立verification仅修helper/test/合同的该前提与已证不相容的整family等待，新checkpoint `fd7e508b0438b4415842b948b2163aa61e5f7523` / tree `3c3abed3e8e768955ec7c43e8f356c5c20fe1d39` 已普通push，fresh Spec/Standards pre均PASS；身份、原生产预算和256断言保持、实际首失败/完整性及继续授权见[Evidence72](../evidence/72-ticket128-namespace-prerequisite-refreeze-20261024.md)。没有实际timeout，新helper完整门尚未执行，未到G10/自然trigger，不称部署或阶段A完成。
+
+## 2026-10-24 正常成功等价类与标准mask设施窄重冻
+
+R6前置原G01—G09/ND07全部通过，首次到G10 ordinary226；实际配对已证隔离环境缺标准mask设施，补齐同unit最小启动成功，未称完整G10绿。另核design§11既有“按实际发生者”被强制known_failure错误实现，独立verification保留旧恢复链、补全成功及ND12持久unknown负向。新checkpoint `42ccbb1a5abe478686710e094e00b15d024f8620` / tree `4389dd2a13390073633e09c35ccf176883c71664` 已普通push，fresh双pre PASS；[Evidence73](../evidence/73-ticket128-nd12-success-and-mask-refreeze-20261024.md)记录精确冻结/证据/仅既有Seam最小修复授权。新门未执行，未部署或主人验收。
