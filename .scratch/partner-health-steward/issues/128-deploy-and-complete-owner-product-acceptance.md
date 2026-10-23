@@ -103,3 +103,7 @@ root将其分类为**测试oracle错误**，交独立verification仅修该断言
 ## 2026-10-24 自然定时接线覆盖窄重冻
 
 实际default启动没有调用已交付的wake能力，原V07由verifier主动wake代办。独立verification窄修V07及对应合同的新checkpoint `8fa6edc0f21490239ef31630ea17d0311c01bd68` / tree `123194d27b6723e3f21e2afd7608f90b3c1b7a05` 已普通push，fresh Spec/Standards pre均PASS。新冻结身份、其余21冻结文件逐字保持、R2实际先失败于G02依赖打包、新自然触发red尚未执行及root最小继续实施授权见[Evidence71](../evidence/71-ticket128-natural-wake-refreeze-20261024.md)。未部署或主人验收，阶段A仍claimed，130/127/full不重开或伪造。
+
+## 2026-10-24 隔离OS与整family观察前提窄重冻
+
+R5实际G02原637、G03原12通过，G04止于旧129V02的SemLock错误；真实3.11配对已证缺少隔离shm，补齐后原测试通过。独立verification仅修helper/test/合同的该前提与已证不相容的整family等待，新checkpoint `fd7e508b0438b4415842b948b2163aa61e5f7523` / tree `3c3abed3e8e768955ec7c43e8f356c5c20fe1d39` 已普通push，fresh Spec/Standards pre均PASS；身份、原生产预算和256断言保持、实际首失败/完整性及继续授权见[Evidence72](../evidence/72-ticket128-namespace-prerequisite-refreeze-20261024.md)。没有实际timeout，新helper完整门尚未执行，未到G10/自然trigger，不称部署或阶段A完成。
