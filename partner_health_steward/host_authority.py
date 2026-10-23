@@ -91,6 +91,8 @@ class _DirectoryHandle:
     def __init__(self, path: Path) -> None:
         _require_linux()
         self.path = path
+        self._lock = threading.RLock()
+        self.fd: int | None = None
         self._broken = False
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
@@ -103,9 +105,7 @@ class _DirectoryHandle:
                 raise HostAuthorityUnavailable("host-private directory unavailable")
             self._identity = (opened.st_dev, opened.st_ino)
         except Exception as exc:
-            fd = getattr(self, "fd", None)
-            if fd is not None:
-                os.close(fd)
+            self.close()
             if isinstance(exc, HostAuthorityUnavailable):
                 raise
             raise HostAuthorityUnavailable(
@@ -113,31 +113,40 @@ class _DirectoryHandle:
             ) from None
 
     def check_current(self) -> None:
-        if self._broken:
-            raise HostAuthorityUnavailable("host-private directory unavailable")
-        try:
-            opened = os.fstat(self.fd)
-            current = os.stat(self.path, follow_symlinks=False)
-            _validate_directory_stat(opened)
-            _validate_directory_stat(current)
-            if (
-                (opened.st_dev, opened.st_ino) != self._identity
-                or not _same_identity(opened, current)
-            ):
+        with self._lock:
+            if self._broken:
+                raise HostAuthorityUnavailable("host-private directory unavailable")
+            try:
+                opened = os.fstat(self.fd)
+                current = os.stat(self.path, follow_symlinks=False)
+                _validate_directory_stat(opened)
+                _validate_directory_stat(current)
+                if (
+                    (opened.st_dev, opened.st_ino) != self._identity
+                    or not _same_identity(opened, current)
+                ):
+                    raise HostAuthorityUnavailable(
+                        "host-private directory unavailable"
+                    )
+            except Exception:
+                self._broken = True
                 raise HostAuthorityUnavailable(
                     "host-private directory unavailable"
-                )
-        except Exception:
-            self._broken = True
-            raise HostAuthorityUnavailable(
-                "host-private directory unavailable"
-            ) from None
+                ) from None
 
     def close(self) -> None:
-        fd = getattr(self, "fd", None)
-        if fd is not None:
-            self.fd = None  # type: ignore[assignment]
-            os.close(fd)
+        with self._lock:
+            self._broken = True
+            fd = self.fd
+            self.fd = None
+            if fd is not None:
+                os.close(fd)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _validate_private_file_stat(value: os.stat_result, *, max_size: int) -> None:
@@ -172,6 +181,9 @@ class _PinnedPrivateFile:
     def __init__(self, path: Path, *, max_size: int) -> None:
         _require_linux()
         self.path = path
+        self._lock = threading.RLock()
+        self.fd: int | None = None
+        self._directory: _DirectoryHandle | None = None
         self._max_size = max_size
         self._broken = False
         self._directory = _DirectoryHandle(path.parent)
@@ -192,53 +204,67 @@ class _PinnedPrivateFile:
             self._identity = (opened.st_dev, opened.st_ino)
             self._content_digest = hashlib.sha256(initial).digest()
         except Exception as exc:
-            fd = getattr(self, "fd", None)
-            if fd is not None:
-                os.close(fd)
-            self._directory.close()
+            self.close()
             if isinstance(exc, HostAuthorityUnavailable):
                 raise
             raise HostAuthorityUnavailable("host-private file unavailable") from None
 
     def read_current(self) -> bytes:
-        if self._broken:
-            raise HostAuthorityUnavailable("host-private file unavailable")
-        try:
-            self._directory.check_current()
-            opened = os.fstat(self.fd)
-            current = os.stat(
-                self.path.name,
-                dir_fd=self._directory.fd,
-                follow_symlinks=False,
-            )
-            _validate_private_file_stat(opened, max_size=self._max_size)
-            _validate_private_file_stat(current, max_size=self._max_size)
-            if (
-                (opened.st_dev, opened.st_ino) != self._identity
-                or not _same_identity(opened, current)
-            ):
+        with self._lock:
+            if self._broken:
                 raise HostAuthorityUnavailable("host-private file unavailable")
-            value = _pread_all(self.fd, opened.st_size)
-            if not hmac.compare_digest(
-                hashlib.sha256(value).digest(), self._content_digest
-            ):
-                raise HostAuthorityUnavailable("host-private file unavailable")
-            return value
-        except Exception:
-            self._broken = True
-            raise HostAuthorityUnavailable("host-private file unavailable") from None
+            try:
+                self._directory.check_current()
+                opened = os.fstat(self.fd)
+                current = os.stat(
+                    self.path.name,
+                    dir_fd=self._directory.fd,
+                    follow_symlinks=False,
+                )
+                _validate_private_file_stat(opened, max_size=self._max_size)
+                _validate_private_file_stat(current, max_size=self._max_size)
+                if (
+                    (opened.st_dev, opened.st_ino) != self._identity
+                    or not _same_identity(opened, current)
+                ):
+                    raise HostAuthorityUnavailable("host-private file unavailable")
+                value = _pread_all(self.fd, opened.st_size)
+                if not hmac.compare_digest(
+                    hashlib.sha256(value).digest(), self._content_digest
+                ):
+                    raise HostAuthorityUnavailable("host-private file unavailable")
+                return value
+            except Exception:
+                self._broken = True
+                raise HostAuthorityUnavailable("host-private file unavailable") from None
 
     @property
     def directory_fd(self) -> int:
-        self._directory.check_current()
-        return self._directory.fd
+        with self._lock:
+            if self._broken:
+                raise HostAuthorityUnavailable("host-private file unavailable")
+            self._directory.check_current()
+            return self._directory.fd
 
     def close(self) -> None:
-        fd = getattr(self, "fd", None)
-        if fd is not None:
-            self.fd = None  # type: ignore[assignment]
-            os.close(fd)
-        self._directory.close()
+        with self._lock:
+            self._broken = True
+            fd = self.fd
+            self.fd = None
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                directory = self._directory
+                self._directory = None
+                if directory is not None:
+                    directory.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _open_secret(path: Path) -> _PinnedPrivateFile:
@@ -362,6 +388,11 @@ class HostPrivateKeyProvider:
         except Exception:
             self._pinned.close()
             raise
+
+    def close(self) -> None:
+        """Release this provider's handles without destroying the data key."""
+        with self._lock:
+            self._pinned.close()
 
     @property
     def key_id(self) -> str:
@@ -615,6 +646,13 @@ class HostPrivateWriterFenceVault:
             self._master.close()
             raise
 
+    def close(self) -> None:
+        """Release vault pins; active holder sessions keep their own locks."""
+        try:
+            self._master.close()
+        finally:
+            self._locks.close()
+
     def prepare_fence_ref(
         self, installation_id: str, site: str, epoch_ref: str
     ) -> str:
@@ -788,6 +826,16 @@ class HostPrivateExecutionCapabilityVault:
             if execution is not None:
                 execution.close()
             raise
+
+    def close(self) -> None:
+        """Release vault pins without changing any completion capability."""
+        try:
+            self._writer_master.close()
+        finally:
+            try:
+                self._execution_master.close()
+            finally:
+                self._locks.close()
 
     def acquire_or_resume_session(
         self,

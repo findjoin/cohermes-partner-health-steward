@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import Mapping
@@ -753,6 +754,7 @@ class ProductionCoreService:
         self._lifecycle_ready = False
         self._effect_sessions: dict[str, tuple[EffectIntent, EffectExecutionGrant] | _TransientEffectSession] = {}
         self._request_peer_pid: int | None = None
+        self._authority_cleanup: ExitStack | None = None
 
     @staticmethod
     def _coerce_paths(value: object) -> HostPrivateFacilityPaths:
@@ -825,7 +827,7 @@ class ProductionCoreService:
             )
         return root, copy.deepcopy(manifest)
 
-    def _validated_resources(self) -> dict[str, object]:
+    def _validated_resources(self, ownership: ExitStack) -> dict[str, object]:
         binding = self._binding
         if set(binding) != _BINDING_FIELDS or binding.get("contract") != "ticket123-production-core-binding-v1":
             raise ValueError("invalid production core binding")
@@ -846,8 +848,11 @@ class ProductionCoreService:
             raise ValueError("current-head installation binding mismatch")
         paths = self._coerce_paths(binding["host_private_paths"])
         key_provider = HostPrivateKeyProvider(paths, installation_id)
+        ownership.callback(key_provider.close)
         writer_vault = HostPrivateWriterFenceVault(paths)
+        ownership.callback(writer_vault.close)
         execution_vault = HostPrivateExecutionCapabilityVault(paths)
+        ownership.callback(execution_vault.close)
         database = _absolute(binding["database_path"], "database path")
         parent = _secure_directory(database.parent, "database parent")
         if database.parent != parent or database.is_symlink() or (database.exists() and not database.is_file()):
@@ -951,13 +956,14 @@ class ProductionCoreService:
         with self._lock:
             if self._listener is not None or self._closing:
                 raise RuntimeError("production core service is already started")
-            resources = self._validated_resources()
-            live = self._live_runtime
-            if live is not None:
-                live.validate_release(self._binding["release_root"], resources["release"])
+            ownership = ExitStack()
             store: EncryptedStateStore | None = None
             core: HealthCore | None = None
             try:
+                resources = self._validated_resources(ownership)
+                live = self._live_runtime
+                if live is not None:
+                    live.validate_release(self._binding["release_root"], resources["release"])
                 store = EncryptedStateStore(str(resources["database"]), resources["key_provider"])  # type: ignore[arg-type]
                 core = HealthCore(
                     store,
@@ -983,16 +989,26 @@ class ProductionCoreService:
                 self._listener = listener
                 self._thread = threading.Thread(target=self._serve, name="ticket123-coreport", daemon=True)
                 self._thread.start()
+                self._authority_cleanup = ownership
                 return {
                     "transport": "af-unix",
                     "path": str(self._socket_path),
                     "protocol": "ticket118-core-port-v1",
                 }
             except Exception:
-                if core is not None:
-                    core.close()
-                if store is not None:
-                    store.close()
+                try:
+                    if core is not None:
+                        core.close()
+                finally:
+                    try:
+                        if store is not None:
+                            store.close()
+                    finally:
+                        ownership.close()
+                        if self._listener is not None:
+                            self._listener.close()
+                        self._listener = None
+                        self._thread = None
                 self._store = None
                 self._core = None
                 self._plugin = None
@@ -1008,6 +1024,7 @@ class ProductionCoreService:
                 and self._thread is None
                 and self._core is None
                 and self._store is None
+                and self._authority_cleanup is None
             ):
                 return
             listener, thread = self._listener, self._thread
@@ -1032,8 +1049,14 @@ class ProductionCoreService:
             self._effect_sessions.clear()
             if core is not None:
                 core.close()
-            if store is not None:
-                store.close()
+            try:
+                if store is not None:
+                    store.close()
+            finally:
+                ownership = self._authority_cleanup
+                self._authority_cleanup = None
+                if ownership is not None:
+                    ownership.close()
             path, identity = self._socket_path, self._socket_identity
             self._socket_path = None
             self._socket_identity = None
