@@ -389,10 +389,21 @@ class PinnedWeixinConversationSender:
     async def send_ordinary(self, chat_id, content, *, reply_to=None, metadata=None):
         del reply_to, metadata
         if (chat_id != self._policy.conversation_id or not self._guard(chat_id)
-                or type(content) is not str or not content or len(content) > 2000):
+                or type(content) is not str or not content or len(content.encode("utf-8")) > 131072):
             raise ValueError("ordinary Weixin conversation context required")
-        # One ordinary reply attempt. Unknown never receives a transport retry.
-        return await self._result(content, "ordinary-" + secrets.token_hex(16))
+        from gateway.platforms.weixin import _split_text_for_weixin_delivery
+        chunks = _split_text_for_weixin_delivery(content, 2000, False)
+        if not chunks:
+            raise ValueError("ordinary Weixin text unavailable")
+        result = None
+        for chunk in chunks:
+            if not self._guard(chat_id):
+                raise ValueError("ordinary Weixin conversation context expired")
+            result = await self._result(chunk, "ordinary-" + secrets.token_hex(16))
+            # Unknown stops the remaining text and is never retried.
+            if result["status"] != "accepted":
+                break
+        return result
 
     async def send_technical(self, attempt):
         from .ticket128_technical import TechnicalAcceptanceChannel
