@@ -19,6 +19,28 @@ from .host_contract import ReleaseManifest
 
 _GATES = tuple(f"119-G{index:02d}" for index in range(1, 13))
 _APPROVAL_GATES = frozenset({"119-G08", "119-G10", "119-G11", "119-G12"})
+_ND_GATES = (*_GATES[:6], "128-ND07", *_GATES[7:11], "128-ND12")
+_ND_APPROVAL_GATES = frozenset({"119-G08", "119-G10", "119-G11", "128-ND12"})
+_EFFECT_GATES = frozenset({"119-G11", "119-G12", "128-ND12"})
+
+
+def _gates(context):
+    return _ND_GATES if context.get("run_scope") == "non-diagnostic" else _GATES
+
+
+def _approval_gates(context):
+    return _ND_APPROVAL_GATES if context.get("run_scope") == "non-diagnostic" else _APPROVAL_GATES
+
+
+def _bound_execution_key(release_digest, context, gate_id):
+    if "run_scope" not in context:
+        return _execution_key(release_digest, context["run_id"], gate_id)
+    return "ticket119:" + _digest({
+        "contract": "ticket128-gate-execution-key-v1", "release_digest": release_digest,
+        "distribution_digest": context["distribution_digest"], "run_id": context["run_id"],
+        "run_scope": context["run_scope"], "target_ref": context["target_ref"], "gate_id": gate_id,
+    }).removeprefix("sha256:")
+
 _RESULTS = frozenset({"passed", "failed", "cannot-confirm", "not-authorized"})
 _EFFECT_STAGES = (
     "formed",
@@ -227,7 +249,7 @@ class AcceptanceRunContract:
 
         gates: list[dict[str, object]] = []
         frontier: str | None = None
-        for gate_id in _GATES:
+        for gate_id in _gates(context):
             approval_ref = context["approval_refs"].get(gate_id)
             if frontier is not None:
                 gates.append(
@@ -240,7 +262,7 @@ class AcceptanceRunContract:
                     )
                 )
                 continue
-            if gate_id in _APPROVAL_GATES and approval_ref is None:
+            if gate_id in _approval_gates(context) and approval_ref is None:
                 gate = self._not_authorized_gate(
                     gate_id,
                     manifest_wire["release_digest"],
@@ -282,7 +304,8 @@ class AcceptanceRunContract:
 
     @staticmethod
     def _context(value: Mapping[str, object]) -> dict[str, Any]:
-        if type(value) is not dict or set(value) != {
+        extra = {"run_scope", "distribution_digest"} if type(value) is dict and {"run_scope", "distribution_digest"} <= set(value) else set()
+        if type(value) is not dict or set(value) != extra | {
             "contract",
             "run_id",
             "executed_at_utc",
@@ -300,8 +323,11 @@ class AcceptanceRunContract:
         target_ref = _opaque_ref(value.get("target_ref"))
         if None in {run_id, executed_at_utc, environment_class, target_ref}:
             raise ValueError("acceptance run context is invalid")
+        if extra and (value["run_scope"] not in {"full", "non-diagnostic"} or _digest_ref(value["distribution_digest"]) is None):
+            raise ValueError("acceptance scope/distribution is invalid")
         approvals = value.get("approval_refs")
-        if type(approvals) is not dict or not set(approvals).issubset(_APPROVAL_GATES):
+        allowed_approvals = _APPROVAL_GATES | _ND_APPROVAL_GATES if extra else _APPROVAL_GATES
+        if type(approvals) is not dict or not set(approvals).issubset(allowed_approvals):
             raise ValueError("acceptance approval refs are invalid")
         normalized_approvals: dict[str, str] = {}
         for gate_id, approval_ref in approvals.items():
@@ -315,6 +341,7 @@ class AcceptanceRunContract:
         if existing is not None and type(existing) is not dict:
             raise ValueError("existing acceptance report is invalid")
         return {
+            **({"run_scope": value["run_scope"], "distribution_digest": value["distribution_digest"]} if extra else {}),
             "run_id": run_id,
             "executed_at_utc": executed_at_utc,
             "environment_class": environment_class,
@@ -336,12 +363,14 @@ class AcceptanceRunContract:
             "release_digest": release_digest,
             "run_id": context["run_id"],
             "gate_id": gate_id,
-            "execution_key": _execution_key(release_digest, context["run_id"], gate_id),
+            "execution_key": _bound_execution_key(release_digest, context, gate_id),
             "environment_class": context["environment_class"],
             "executed_at_utc": context["executed_at_utc"],
             "target_ref": context["target_ref"],
             "approval_ref": approval_ref,
         }
+        if "run_scope" in context:
+            request.update(run_scope=context["run_scope"], distribution_digest=context["distribution_digest"])
         try:
             observation = execute(copy.deepcopy(request))  # type: ignore[operator]
         except Exception:
@@ -364,7 +393,9 @@ class AcceptanceRunContract:
         context: Mapping[str, Any],
         approval_ref: str | None,
     ) -> dict[str, object]:
-        if type(observation) is not dict or frozenset(observation) != _OBSERVATION_FIELDS:
+        extra_fields = frozenset({"run_scope", "distribution_digest"}) if "run_scope" in context else frozenset()
+        if (type(observation) is not dict or frozenset(observation) != _OBSERVATION_FIELDS | extra_fields
+                or any(observation.get(key) != context[key] for key in extra_fields)):
             return self._cannot_confirm_gate(gate_id, release_digest, context, approval_ref)
         if (
             observation.get("contract") != "ticket119-gate-observation-v1"
@@ -411,7 +442,7 @@ class AcceptanceRunContract:
             return self._cannot_confirm_gate(gate_id, release_digest, context, approval_ref)
         if gate_id == "119-G08" and blocking_refs:
             result = "cannot-confirm"
-        if gate_id in {"119-G11", "119-G12"} and (
+        if gate_id in _EFFECT_GATES and (
             effect_refs["unknown"] is not None
             or (
                 effect_refs["interface_accepted"] is not None
@@ -445,14 +476,14 @@ class AcceptanceRunContract:
                 receipt_refs if gate_id == "119-G12" else None
             ),
             "effect_stage_refs": (
-                effect_refs if gate_id in {"119-G11", "119-G12"} else None
+                effect_refs if gate_id in _EFFECT_GATES else None
             ),
             "blocked_by_gate": None,
         }
 
     @staticmethod
     def _effect_stage_refs(value: object, gate_id: str) -> dict[str, str | None] | None:
-        if gate_id not in {"119-G11", "119-G12"}:
+        if gate_id not in _EFFECT_GATES:
             return {} if value is None else None
         if type(value) is not dict or set(value) != set(_EFFECT_STAGES):
             return None
@@ -508,7 +539,7 @@ class AcceptanceRunContract:
         return {
             "gate_id": gate_id,
             "result": "cannot-confirm",
-            "execution_key": _execution_key(release_digest, context["run_id"], gate_id),
+            "execution_key": _bound_execution_key(release_digest, context, gate_id),
             "target_ref": context["target_ref"],
             "approval_ref": approval_ref,
             "environment_class": context["environment_class"],
@@ -538,7 +569,7 @@ class AcceptanceRunContract:
         return {
             "gate_id": gate_id,
             "result": "blocked",
-            "execution_key": _execution_key(release_digest, context["run_id"], gate_id),
+            "execution_key": _bound_execution_key(release_digest, context, gate_id),
             "target_ref": context["target_ref"],
             "approval_ref": approval_ref,
             "environment_class": context["environment_class"],
@@ -592,7 +623,7 @@ class AcceptanceRunContract:
             "target_ref": context["target_ref"],
             "approval_refs": {
                 gate_id: context["approval_refs"].get(gate_id)
-                for gate_id in sorted(_APPROVAL_GATES)
+                for gate_id in sorted(_approval_gates(context))
             },
             "evidence_scope": scope,
             "gates": copy.deepcopy(gates),
@@ -608,7 +639,8 @@ class AcceptanceRunContract:
             "deployment": "passed" if target_local_complete else "evidence-required",
             "diagnostic_scope_phase": (
                 "activation-ready"
-                if scope == "target-local-attestation"
+                if context.get("run_scope", "full") == "full"
+                and scope == "target-local-attestation"
                 and gates[_GATES.index("119-G07")]["result"] == "passed"
                 else "staged"
             ),
@@ -619,6 +651,12 @@ class AcceptanceRunContract:
             "stable_operation": "evidence-required",
             "run_verdict": run_verdict,
         }
+        if "run_scope" in context:
+            base.update(run_scope=context["run_scope"], distribution_digest=context["distribution_digest"])
+            if context["run_scope"] == "non-diagnostic":
+                base.update(diagnostic_scope_phase="staged", active="evidence-required",
+                            product_acceptance="evidence-required",
+                            non_diagnostic_owner_usable=("non-diagnostic-owner-usable" if target_local_complete else "non-diagnostic-owner-usable:evidence-required"))
         base["report_digest"] = _digest(base)
         return base
 
@@ -628,7 +666,13 @@ class AcceptanceRunContract:
         manifest_wire: Mapping[str, object],
         context: Mapping[str, Any],
     ) -> bool:
-        if type(candidate) is not dict or frozenset(candidate) != _REPORT_FIELDS:
+        expected_fields = _REPORT_FIELDS
+        if "run_scope" in context:
+            expected_fields |= {"run_scope", "distribution_digest"}
+            if context["run_scope"] == "non-diagnostic":
+                expected_fields |= {"non_diagnostic_owner_usable"}
+        if (type(candidate) is not dict or frozenset(candidate) != expected_fields
+                or any(candidate.get(key) != context[key] for key in ("run_scope", "distribution_digest") if key in context)):
             return False
         candidate_digest = _digest_ref(candidate.get("report_digest"))
         if candidate_digest is None:
@@ -652,7 +696,7 @@ class AcceptanceRunContract:
         approvals = candidate.get("approval_refs")
         expected_approvals = {
             gate_id: context["approval_refs"].get(gate_id)
-            for gate_id in sorted(_APPROVAL_GATES)
+            for gate_id in sorted(_approval_gates(context))
         }
         if approvals != expected_approvals:
             return False
@@ -683,10 +727,10 @@ class AcceptanceRunContract:
         ):
             return False
         gates = candidate.get("gates")
-        if type(gates) is not list or len(gates) != len(_GATES):
+        if type(gates) is not list or len(gates) != len(_gates(context)):
             return False
         frontier: str | None = None
-        for gate_id, gate in zip(_GATES, gates, strict=True):
+        for gate_id, gate in zip(_gates(context), gates, strict=True):
             if not self._valid_gate(gate, gate_id, manifest_wire["release_digest"], context):
                 return False
             if frontier is not None:
@@ -712,7 +756,7 @@ class AcceptanceRunContract:
             value.get("gate_id") != gate_id
             or value.get("release_digest") not in {None, release_digest}
             or value.get("execution_key")
-            != _execution_key(release_digest, context["run_id"], gate_id)
+            != _bound_execution_key(release_digest, context, gate_id)
             or value.get("target_ref") != context["target_ref"]
             or value.get("approval_ref") != context["approval_refs"].get(gate_id)
             or value.get("environment_class") != context["environment_class"]
@@ -775,7 +819,7 @@ class AcceptanceRunContract:
             and _opaque_ref(value.get("next_step_ref")) is not None
             and (
                 value.get("effect_stage_refs") is None
-                if gate_id not in {"119-G11", "119-G12"}
+                if gate_id not in _EFFECT_GATES
                 else self._effect_stage_refs(value.get("effect_stage_refs"), gate_id)
                 is not None
             )
@@ -794,10 +838,10 @@ class AcceptanceRunContract:
     ) -> dict[str, object]:
         gates = [
             self._cannot_confirm_gate(
-                _GATES[0],
+                _gates(context)[0],
                 manifest_wire["release_digest"],
                 context,
-                context["approval_refs"].get(_GATES[0]),
+                context["approval_refs"].get(_gates(context)[0]),
             )
         ]
         gates.extend(
@@ -806,8 +850,8 @@ class AcceptanceRunContract:
                 manifest_wire["release_digest"],
                 context,
                 context["approval_refs"].get(gate_id),
-                _GATES[0],
+                _gates(context)[0],
             )
-            for gate_id in _GATES[1:]
+            for gate_id in _gates(context)[1:]
         )
         return self._report(manifest_wire, context, gates)

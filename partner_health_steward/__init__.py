@@ -5,6 +5,8 @@ It exposes only the synthetic Plugin -> health-core seam needed by Ticket 110.
 """
 
 from .acceptance_run import AcceptanceRunContract
+from .default_deployment import DefaultAcceptanceGateExecutor
+from .default_runtime import load_default_live_runtime
 from .core import HealthCore
 from .host_contract import HostReleaseContract
 from .plugin import HealthPlugin
@@ -19,4 +21,6 @@ __all__ = [
     "HostReleaseContract",
     "HermesReleasePublisher",
     "DefaultOnlyGateExecutor",
+    "DefaultAcceptanceGateExecutor",
+    "load_default_live_runtime",
 ]

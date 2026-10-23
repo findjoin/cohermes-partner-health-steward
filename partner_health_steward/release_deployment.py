@@ -355,7 +355,7 @@ class HermesReleasePublisher:
         if not self._repository_root.is_dir():
             raise ValueError("repository root is unavailable")
 
-    def _source_bytes(self) -> dict[str, bytes]:
+    def _source_bytes(self, resource_scope=None) -> dict[str, bytes]:
         package = self._repository_root / "partner_health_steward"
         source_files = {
             "product/hermes_host.py": package / "hermes_host.py",
@@ -398,6 +398,43 @@ class HermesReleasePublisher:
             ).encode("utf-8")
         for name in ("minimum-help", "knowledge", "safety", "diagnostic"):
             result[f"bundles/{name}.json"] = _static_json({"availability": "unavailable", "status": "staged"})
+        if resource_scope == "non-diagnostic":
+            resource_root = package / "resources" / "non_diagnostic"
+            resource_path = resource_root / "runtime-resources.json"
+            if resource_path.is_symlink() or not resource_path.is_file():
+                raise ValueError("non-diagnostic resources are unavailable")
+            resources = _strict_json_bytes(resource_path.read_bytes())
+            if (type(resources) is not dict
+                    or resources.get("contract") != "ticket128-project-nondiagnostic-resources-v1"
+                    or resources.get("editorial_review", {}).get("status") != "approved"):
+                raise ValueError("non-diagnostic resources require actual editorial review")
+            assets = [resources["health_init_asset"], *resources["daily_skill_assets"]]
+            if {item["canonical_name"] for item in assets} != set(_SKILLS):
+                raise ValueError("non-diagnostic resources are incomplete")
+            for asset in assets:
+                name = asset["canonical_name"]
+                path = resource_root / "skills" / name / "SKILL.md"
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("non-diagnostic Skill is unavailable")
+                content = path.read_bytes()
+                if _digest_bytes(content) != asset["asset_digest"]:
+                    raise ValueError("non-diagnostic Skill content drift")
+                result[f"skills/{name}/SKILL.md"] = content
+            result["assets/non-diagnostic/runtime-resources.json"] = resource_path.read_bytes()
+            result["assets/non-diagnostic/EDITORIAL-REVIEW.md"] = (resource_root / "EDITORIAL-REVIEW.md").read_bytes()
+            safety = resources["safety_diagnostic_assets"]
+            result["bundles/minimum-help.json"] = _static_json(safety["minimum_help_bundle"])
+            result["bundles/safety.json"] = _static_json(safety["safety_rule_bundle"])
+            result["bundles/knowledge.json"] = _static_json({"knowledge_releases": [], "availability": "absent"})
+            result["bundles/diagnostic.json"] = _static_json({"diagnostic_scope_bundle": None, "phase": "staged"})
+            # The same fixed source resources are needed by the installed
+            # initialization module; all bytes remain in this distribution.
+            for path in sorted(resource_root.rglob("*")):
+                if path.is_symlink():
+                    raise ValueError("non-diagnostic resource symlink")
+                if path.is_file():
+                    relative = path.relative_to(package).as_posix()
+                    result[f"plugin/health-weixin/partner_health_steward/{relative}"] = path.read_bytes()
         # Live Adapter imports must resolve within this same hash-bound release,
         # including on hosts with no checkout on sys.path. This copies only
         # source code; running profiles, databases and credentials are excluded.
@@ -421,14 +458,16 @@ class HermesReleasePublisher:
             "forbidden_secret_classes": list(_FORBIDDEN_SECRETS),
         }
 
-    def build(self, output_root: Path | str) -> PublishedRelease:
+    def build(self, output_root: Path | str, *, resource_scope=None) -> PublishedRelease:
+        if resource_scope not in {None, "non-diagnostic"}:
+            raise ValueError("unsupported release resource scope")
         output = Path(output_root).resolve()
         output.mkdir(parents=True, exist_ok=True)
         if not output.is_dir() or output.is_symlink():
             raise ValueError("release output is unavailable")
         staging = Path(tempfile.mkdtemp(prefix="ticket120-release-", dir=output))
         try:
-            for relative, content in self._source_bytes().items():
+            for relative, content in self._source_bytes(resource_scope).items():
                 _write_bytes(staging, relative, content)
             host_manifest = HostReleaseContract().build(self._release_sources(staging)).to_wire()
             _write_bytes(staging, "host-release-manifest.json", _canonical_bytes(host_manifest))
