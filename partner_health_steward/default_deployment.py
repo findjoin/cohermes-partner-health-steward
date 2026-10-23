@@ -345,7 +345,27 @@ def _safe_baseline(plan):
 
 
 def _restore(plan,backup,body):
-    for role in reversed(plan['roles']):_service('stop',role['unit'])
+    # A timed-out restart can leave ExecStartPost running even after its
+    # systemctl client exits. Never replace its program or remove authority
+    # material until both main and control processes are actually gone.
+    stopped={'contract':'ticket128-rollback-stop-observation-v1','roles':[],'confirmed':True}
+    for role in reversed(plan['roles']):
+        fact={'unit':role['unit'],'stop_succeeded':False,'terminated':False}
+        try:
+            fact['stop_succeeded']=_service('stop',role['unit'])
+            completed=subprocess.run(['systemctl','--user','show',role['unit'],
+                '--property=MainPID,ControlPID,ActiveState'],env=_systemd_environment(),
+                capture_output=True,text=True,timeout=30)
+            fields=dict(line.split('=',1) for line in completed.stdout.splitlines() if '=' in line)
+            fact['terminated']=(completed.returncode==0 and fields.get('MainPID')=='0'
+                and fields.get('ControlPID')=='0' and fields.get('ActiveState') in {'inactive','failed'})
+            fact['active_state']=fields.get('ActiveState')
+        except (OSError,ValueError,subprocess.SubprocessError) as error:
+            fact['error_kind']=type(error).__name__
+        stopped['roles'].append(fact)
+        if not fact['stop_succeeded'] or not fact['terminated']:stopped['confirmed']=False
+    _write_private(backup/'rollback-stop.json',stopped)
+    if not stopped['confirmed']:return False
     clean_genesis=body.get('authority_namespace_absent') is True and _fresh_genesis(plan)
     if clean_genesis:
         for path in (Path('/var/lib/cohermes-default-core'),Path('/run/cohermes-default')):
