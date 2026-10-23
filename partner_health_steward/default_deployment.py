@@ -595,11 +595,17 @@ _LOCAL_MODULES = {
 def _verified_local_sources(runtime,release_root,modules):
     # This ordinary file is already covered by the one runtime closure and
     # current distribution attestation. It describes bytes, not a new approval.
-    runtime=Path(runtime).resolve()
+    def safe(path,directory):
+        details=path.lstat()
+        expected=stat.S_ISDIR if directory else stat.S_ISREG
+        if details.st_uid!=0 or stat.S_IMODE(details.st_mode)&0o022 or not expected(details.st_mode):
+            raise ValueError('unsafe sealed source ownership or mode')
+        return details
+    runtime=Path(runtime).absolute()
+    for ancestor in (runtime,*runtime.parents):safe(ancestor,True)
+    runtime=runtime.resolve()
     snapshot_path=runtime/'source-snapshot.json'
-    details=snapshot_path.lstat()
-    if not stat.S_ISREG(details.st_mode) or snapshot_path.is_symlink():
-        raise ValueError('sealed source snapshot unavailable')
+    safe(snapshot_path,False)
     content=snapshot_path.read_bytes()
     snapshot=_strict_json_bytes(content)
     if (type(snapshot) is not dict or set(snapshot)!={'archive_sha256','git_commit','files'}
@@ -622,13 +628,15 @@ def _verified_local_sources(runtime,release_root,modules):
         previous=name;declared[name]=digest
         directories.update(parent.as_posix() for parent in path.parents if parent!=PurePosixPath('.'))
     root=runtime.parent/'verifier'
-    if root.is_symlink() or not root.is_dir():raise ValueError('fixed verifier unavailable')
+    safe(root,True)
     actual={}
     for path in root.rglob('*'):
         details=path.lstat();name=path.relative_to(root).as_posix()
         if stat.S_ISDIR(details.st_mode):
+            safe(path,True)
             if name not in directories:raise ValueError('undeclared verifier directory')
         elif stat.S_ISREG(details.st_mode):
+            safe(path,False)
             actual[name]=hashlib.sha256(path.read_bytes()).hexdigest()
         else:raise ValueError('unsafe verifier source')
     if actual!=declared:raise ValueError('actual verifier source drift')
@@ -636,12 +644,14 @@ def _verified_local_sources(runtime,release_root,modules):
     expected={name.removeprefix('partner_health_steward/'):digest for name,digest in declared.items()
               if name.startswith('partner_health_steward/')}
     installed={}
-    if product.is_symlink() or not product.is_dir():raise ValueError('runtime product unavailable')
+    safe(product,True)
     for path in product.rglob('*'):
         details=path.lstat()
         if stat.S_ISREG(details.st_mode):
+            safe(path,False)
             installed[path.relative_to(product).as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
-        elif not stat.S_ISDIR(details.st_mode):raise ValueError('unsafe runtime product source')
+        elif stat.S_ISDIR(details.st_mode):safe(path,True)
+        else:raise ValueError('unsafe runtime product source')
     if not expected or installed!=expected:raise ValueError('verifier and runtime product differ')
     required={'tests/__init__.py',*(name.split('.')[0]+'/'+name.split('.')[1]+'.py' for name in modules)}
     if not required<=set(declared):raise ValueError('fixed verification modules unavailable')
