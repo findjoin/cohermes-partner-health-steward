@@ -626,7 +626,7 @@ def _run_local_gate(plan,request,manifest):
             'runtime-closure:'+closure['closure_digest'][7:]])
     modules=_LOCAL_MODULES.get(request['gate_id'])
     if modules is None:return _observation(request,'cannot-confirm',reason='local-gate-unavailable')
-    verifier=runtime/'acceptance-source'
+    verifier=runtime/'lib/python3.11/site-packages'
     if not (verifier/'tests/__init__.py').is_file():
         return _observation(request,'cannot-confirm',reason='sealed-verifier-unavailable')
     environment={name:os.environ[name] for name in ('PATH','LANG','LC_ALL','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS') if name in os.environ}
