@@ -205,6 +205,7 @@ def _validate_fixed_plan(plan):
     # The private JSON selects this fixed program; it is not an authority for
     # arbitrary filesystem resources, identities, sockets or service commands.
     from .default_runtime import build_default_plan
+    _default_only(plan.get('facts'))
     expected=build_default_plan(Path(plan['release_root']),plan['facts'],
         {'installation_id':plan['core_binding']['installation_id'],'site':plan['core_binding']['site']})
     for name in ('core_binding','head_binding','live_binding','roles','program_resources','program_plan'):

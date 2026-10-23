@@ -6,7 +6,7 @@ from pathlib import Path
 
 from partner_health_steward import AcceptanceRunContract, DefaultAcceptanceGateExecutor, HostReleaseContract
 from partner_health_steward.default_deployment import (
-    _ARTIFACTS, _BINDING, _HOME, _bytes, _digest, _read_private, _release,
+    _ARTIFACTS, _BINDING, _HOME, _bytes, _default_only, _digest, _read_private, _release,
     _safe_directory, _write_private, prepare_default,
 )
 from partner_health_steward.release_deployment import HermesReleasePublisher
@@ -24,6 +24,7 @@ def main(argv=None):
     args=parser.parse_args(argv)
     if args.operation=='prepare':
         path=Path(args.input) if args.input else _HOME/'.ticket128-raw-input.json'
+        _default_only({'release_root':str(Path(args.release).absolute()),'runtime_root':str(path.absolute())})
         facts=_read_private(path)
         result=prepare_default(args.release,args.run_id,args.run_scope,facts)
     else:
