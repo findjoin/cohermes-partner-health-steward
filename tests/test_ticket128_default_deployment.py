@@ -824,6 +824,41 @@ class _FormalNamespace:
             Ticket111AdmissionInitializationTests(name).run(result)
             self.case.assertTrue(result.wasSuccessful(), result.errors + result.failures)
 
+    def _role_python(self, role, pid):
+        # proc-exe is a kernel file reference. Its displayed backing path may
+        # be outside this chroot, so compare file objects and execute only the
+        # declared, visible path proved to name that same interpreter.
+        self.case.assertGreater(pid, 1)
+        actual_path = Path(f"/proc/{pid}/exe")
+        declared_runtime = Path(role.get("runtime_root", self.slot("service_binding")["runtime_root"])).resolve()
+        expected = declared_runtime / "bin/python3"
+        self.case.assertTrue(expected.resolve(strict=True).is_relative_to(declared_runtime),
+                             "role interpreter escapes declared closure")
+        with os.fdopen(os.open(actual_path, os.O_RDONLY | os.O_CLOEXEC), "rb") as actual, \
+                os.fdopen(os.open(expected, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW), "rb") as declared:
+            actual_stat, declared_stat = os.fstat(actual.fileno()), os.fstat(declared.fileno())
+            self.case.assertTrue(stat.S_ISREG(actual_stat.st_mode) and stat.S_ISREG(declared_stat.st_mode))
+            self.case.assertEqual((actual_stat.st_dev, actual_stat.st_ino),
+                                  (declared_stat.st_dev, declared_stat.st_ino),
+                                  "actual role interpreter differs from its declared closure file")
+            actual_digest = hashlib.file_digest(actual, "sha256").digest()
+            self.case.assertEqual(actual_digest, hashlib.file_digest(declared, "sha256").digest())
+            self.case.assertEqual(actual_digest, hashlib.sha256(Path(sys.executable).read_bytes()).digest(),
+                                  "role helper must use the actual same closure interpreter bytes")
+            for stream, before in ((actual, actual_stat), (declared, declared_stat)):
+                after = os.fstat(stream.fileno())
+                self.case.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                                       after.st_mtime_ns, after.st_ctime_ns),
+                                      (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                                       before.st_mtime_ns, before.st_ctime_ns),
+                                      "role interpreter changed during its actual file observation")
+            for path, before in ((actual_path, actual_stat), (expected, declared_stat)):
+                current = path.stat()
+                self.case.assertEqual((current.st_dev, current.st_ino), (before.st_dev, before.st_ino),
+                                      "role interpreter path no longer names the observed file")
+        self.case.assertTrue(Path(os.readlink(actual_path)).name.startswith("python"))
+        return str(expected)
+
     def _core_public(self, operation, *, check=True):
         # Existing121/129 euid ownership checks are fixture preconditions.
         # Execute public reads under the actual running Core identity instead
@@ -834,10 +869,7 @@ class _FormalNamespace:
             fields = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in
                       Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line}
             self._core_identity = fields["Uid"].split()[1], fields["Gid"].split()[1]
-            self._core_python = str(Path(f"/proc/{pid}/exe").resolve())
-            self.case.assertEqual(hashlib.sha256(Path(self._core_python).read_bytes()).digest(),
-                                  hashlib.sha256(Path(sys.executable).read_bytes()).digest(),
-                                  "Core helper must use the actual same closure interpreter bytes")
+            self._core_python = self._role_python(role, pid)
         uid, gid = self._core_identity
         raw = {"release": self.slot("service_binding")["release_root"], "published": self.published,
                "live": self.slot("live_binding"), "service": self.slot("service_binding"),
@@ -1091,7 +1123,7 @@ class _FormalNamespace:
             identities[name] = (uid, gid, pid)
             self.case.assertEqual(int(fields["CapEff"], 16), 0)
             self.case.assertEqual(fields["NoNewPrivs"], "1")
-            executable = Path(f"/proc/{pid}/exe").resolve()
+            executable = Path(self._role_python(role, pid))
             role_interpreters[name] = str(executable)
             self.case.assertTrue(executable.name.startswith("python"))
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
@@ -1132,7 +1164,7 @@ class _FormalNamespace:
                 original_units[name] = path.read_bytes()
                 probe_outputs[name] = self.work / ("kernel-" + name + ".log")
                 text = original_units[name].decode()
-                role_python = str(Path(f"/proc/{identities[name][2]}/exe").resolve())
+                role_python = role_interpreters[name]
                 line = "StandardOutput=append:" + str(probe_outputs[name]) + "\nExecStartPost=" + shlex.join([role_python, "-I", "-B", str(public_probe), name, str(probe_input)]) + "\n"
                 self.case.assertIn("[Service]", text)
                 text = text.replace("[Service]\n", "[Service]\n" + line, 1)
