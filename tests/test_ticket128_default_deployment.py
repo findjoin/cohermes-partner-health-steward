@@ -1447,10 +1447,10 @@ class _FormalNamespace:
         self.case.assertIn("我昨晚睡了七小时", plaintext.decode())
         self.case.assertTrue(any(item.get("type") == 4 for send in self.http.sends[mark:]
             for item in send.get("msg", {}).get("item_list", [])), "actual export must be a file attachment")
-        # Real export becomes a real managed artifact. Enumeration must handle
-        # that lifecycle state as well as V03's actual initial absence; no 14
-        # placeholder files or invented purge receipt is supplied.
-        self.case.assertTrue(list(Path(self.slot("service_binding")["managed_replica_root"]).iterdir()))
+        # The actual Core stores the authenticated export in its existing
+        # encrypted SQLite store and streams that blob to the attachment above.
+        # It does not create an external replica file or a purge receipt.
+        self.case.assertEqual(list(Path(self.slot("service_binding")["managed_replica_root"]).iterdir()), [])
         self.case.assertTrue(self._core_public("replicas")["configured"])
         turn("/health-help", "minimum-help")
         resources = self._core_public("resources")

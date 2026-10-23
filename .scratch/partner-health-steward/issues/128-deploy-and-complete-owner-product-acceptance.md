@@ -89,3 +89,9 @@ Status 已认领为 `claimed`。130已由root以 `b5c73f5b681858568d3428aa18c205
 本次公开setup已收口为固定default私有操作binding与薄prepare/run；新scope生产链同时绑定118 host manifest与120 distribution两个已有digest，不能将旧无distribution报告借作current部署证据；旧v1 full字节不变。详细Interface及实算关系只在唯一设计维护。
 
 阶段A即使达成 `non-diagnostic-owner-usable` 也保持本票claimed；127及完整full验收要求保留。未修改产品/测试/Map/其他票或其冻结文件，未commit/push。
+
+## 2026-10-24 编码前R1审查与窄修
+
+同一候选checkpoint `56d9e9010caa25bf4e6bd40442b8fbbd58898bcf` / tree `5499dada9e0f8e6f8322360c7e25fe682c12b7d8` 已普通推送，包含唯一设计、独立合同/test/raw/helper和[实际调查证据69](../evidence/69-ticket128-characterization-and-deployment-inputs-20261024.md)。fresh Standards pre PASS、无finding；fresh Spec pre FAIL，仅P2 `128-SPEC-01`：V07错误要求成功JSON导出后外部managed root非空，和唯一设计§6及当前原加密store/内存chunk发送链冲突。成功附件并不要求新增磁盘副本，不能为测试绿制造额外健康副本。
+
+root将其分类为**测试oracle错误**，交独立verification仅修该断言及合同对应事实；不是产品缺陷、未知恢复豁免或架构变更。原记录 `/tmp/health-steward-reviews/128-pre-56d9e90-{spec,standards}.txt` 保留。需新同一checkpoint与fresh双pre再授权编码；当前尚未冻结授权、未改产品、未部署。原119full、七family的其他正/负向及真实来源要求不变。
