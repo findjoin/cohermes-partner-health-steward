@@ -22,22 +22,84 @@ from partner_health_steward.host_contract import (
 # fixed upstream checkout makes the legacy/native gateway paths unavailable to
 # the health release, while the platform registry remains the only selection
 # point for the current health entry.
-HERMES_REQUIRED_PATCH_BYTES = b"""diff --git a/gateway/run.py b/gateway/run.py
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -13598,6 +13598,11 @@
-         \"\"\"Create the appropriate adapter for a platform.
-
-         Checks the platform_registry first (plugin adapters), then falls
-         through to the built-in if/elif chain for core platforms.
-         \"\"\"
-+        # The health release never permits legacy or native health paths.
-+        if getattr(platform, \"value\", None) in {
-+            \"weixin\", \"medical\", \"health-autonomy\", \"health-guard\"
-+        }:
-+            return None
-         if hasattr(config, \"extra\") and isinstance(config.extra, dict):
-"""
+HERMES_REQUIRED_PATCH_BYTES = (
+    b'diff --git a/gateway/run.py b/gateway/run.py\n'
+    b'--- a/gateway/run.py\n'
+    b'+++ b/gateway/run.py\n'
+    b'@@ -13600,6 +13600,11 @@\n'
+    b'         Checks the platform_registry first (plugin adapters), then falls\n'
+    b'         through to the built-in if/elif chain for core platforms.\n'
+    b'         """\n'
+    b'+        # The health release never permits legacy or native health paths.\n'
+    b'+        if getattr(platform, "value", None) in {\n'
+    b'+            "weixin", "medical", "health-autonomy", "health-guard"\n'
+    b'+        }:\n'
+    b'+            return None\n'
+    b'         if hasattr(config, "extra") and isinstance(config.extra, dict):\n'
+    b'             config.extra.setdefault(\n'
+    b'                 "group_sessions_per_user",\n'
+    b'@@ -14216,6 +14221,9 @@\n'
+    b'         6. Run agent conversation\n'
+    b'         7. Return response\n'
+    b'         """\n'
+    b'+        if os.environ.get("COHERMES_RELAY_ONLY") == "1":\n'
+    b'+            if bool(getattr(event, "internal", False)) or (event.text or "").lstrip().startswith("/"):\n'
+    b'+                return "Relay commands disabled."\n'
+    b'         source = event.source\n'
+    b' \n'
+    b'         # \xf0\x9f\x94\xb4 Cross-session leak guard. This handler runs inside a per-message\n'
+    b'@@ -16483,7 +16491,7 @@\n'
+    b'         #    by 30-50% on code/JSON-heavy sessions, but that just\n'
+    b'         #    means hygiene fires a bit early \xe2\x80\x94 safe and harmless.\n'
+    b'         # -----------------------------------------------------------------\n'
+    b'-        if history and len(history) >= 4:\n'
+    b'+        if history and len(history) >= 4 and os.environ.get("COHERMES_RELAY_ONLY") != "1":\n'
+    b'             from agent.model_metadata import (\n'
+    b'                 estimate_messages_tokens_rough,\n'
+    b'                 get_model_context_length_async,\n'
+    b'@@ -23489,6 +23497,11 @@\n'
+    b'         Checks GATEWAY_PROXY_URL env var first (convenient for Docker),\n'
+    b'         then ``gateway.proxy_url`` in config.yaml.\n'
+    b'         """\n'
+    b'+        if os.environ.get("COHERMES_RELAY_ONLY") == "1":\n'
+    b'+            url = os.environ.get("GATEWAY_PROXY_URL", "")\n'
+    b'+            if url != "http://127.0.0.1:8642":\n'
+    b'+                raise RuntimeError("relay-only Gateway proxy is unavailable")\n'
+    b'+            return url\n'
+    b'         url = os.getenv("GATEWAY_PROXY_URL", "").strip()\n'
+    b'         if url:\n'
+    b'             return url.rstrip("/")\n'
+    b'@@ -26643,7 +26656,7 @@\n'
+    b'             runner._draining or runner._external_drain_active\n'
+    b'         )\n'
+    b'     cron_thread = threading.Thread(\n'
+    b'-        target=cron_provider.start,\n'
+    b'+        target=(lambda *_args, **_kwargs: cron_stop.wait()) if os.environ.get("COHERMES_RELAY_ONLY") == "1" else cron_provider.start,\n'
+    b'         args=(cron_stop,),\n'
+    b'         kwargs=cron_start_kwargs,\n'
+    b'         daemon=True,\n'
+    b'@@ -26655,7 +26668,7 @@\n'
+    b'     # sweep, curator) \xe2\x80\x94 runs independently of which cron provider is active.\n'
+    b'     # Shares cron_stop as the shutdown signal.\n'
+    b'     housekeeping_thread = threading.Thread(\n'
+    b'-        target=_start_gateway_housekeeping,\n'
+    b'+        target=(lambda *_args, **_kwargs: cron_stop.wait()) if os.environ.get("COHERMES_RELAY_ONLY") == "1" else _start_gateway_housekeeping,\n'
+    b'         args=(cron_stop,),\n'
+    b'         kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},\n'
+    b'         daemon=True,\n'
+    b'diff --git a/run_agent.py b/run_agent.py\n'
+    b'--- a/run_agent.py\n'
+    b'+++ b/run_agent.py\n'
+    b'@@ -508,6 +508,8 @@\n'
+    b'         requested_provider: str = None,\n'
+    b'     ):\n'
+    b'         """Forwarder \xe2\x80\x94 see ``agent.agent_init.init_agent``."""\n'
+    b'+        if os.environ.get("COHERMES_RELAY_ONLY") == "1":\n'
+    b'+            raise RuntimeError("relay-only Gateway cannot construct AIAgent")\n'
+    b'         if tool_delay is not None:\n'
+    b'             warnings.warn(\n'
+    b'                 "tool_delay is deprecated and ignored; sequential tool calls "\n'
+)
 
 NATIVE_HEALTH_DISABLED_ASSERTION_BYTES = (
     b'{"contract":"native-health-disabled-v1","entry":"health_weixin",'
@@ -231,4 +293,5 @@ def register(ctx: object) -> None:
         label="Health Weixin",
         adapter_factory=adapter_factory,
         check_fn=check_fn,
+        allowed_users_env="HEALTH_WEIXIN_ALLOWED_USERS",
     )

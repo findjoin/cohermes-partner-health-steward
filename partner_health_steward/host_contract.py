@@ -130,6 +130,53 @@ class _HostVerificationFailure(ValueError):
         self.reason_code = reason_code
 
 
+class _DefaultProcessCredentialObservation:
+    """No-value evidence from the actual limited root Gateway process."""
+
+    def __init__(self, endpoint):
+        self._endpoint = copy.deepcopy(endpoint)
+
+    def observe(self):
+        try:
+            fields = {line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+                      for line in Path("/proc/self/status").read_text().splitlines() if ":" in line}
+            if (os.geteuid() != 0 or int(fields["CapEff"], 16) != 0
+                    or fields["NoNewPrivs"] != "1" or os.environ.get("COHERMES_RELAY_ONLY") != "1"):
+                raise ValueError("Gateway process containment missing")
+            for private in ("/var/lib/cohermes-default-core/capabilities/data-key",
+                            "/var/lib/cohermes-default-core/current-head.sqlite"):
+                try:
+                    descriptor = os.open(private, os.O_RDONLY | os.O_NOFOLLOW)
+                except (PermissionError, FileNotFoundError):
+                    continue
+                else:
+                    os.close(descriptor)
+                    raise ValueError("Gateway private resource isolation missing")
+            observed = _CorePortClient(self._endpoint).request("command", {"operation": "health-runtime-probe"})
+            if observed.get("status") != "accepted":
+                raise ValueError("Gateway CorePort ACL unavailable")
+            return {"peer": "plugin", "service": "health-core", "acl": "allowed",
+                    "enforcement": "linux-process-observation-v1", "effective_uid": 0,
+                    "effective_capabilities": 0, "no_new_privileges": True}
+        except Exception as exc:
+            raise _HostVerificationFailure("credential-process-containment-failed") from exc
+
+
+def arm_default_live_entry(release, binding, entry):
+    """Arm the original registry only after real current-process checks."""
+    from .production_core_service import _validate_active_release
+    if (type(release) is not dict or release.get("state") != "current"
+            or type(binding) is not dict or binding.get("contract") != "ticket128-default-gateway-binding-v1"
+            or _validate_active_release(Path(binding["release_root"])) != release):
+        raise _HostVerificationFailure("default-live-release-invalid")
+    HostReleaseContract._validate_credential({"credential_adapter": _DefaultProcessCredentialObservation(binding["core_port_endpoint"])})
+    check = getattr(entry, "check_fn", None)
+    arm = getattr(check, "_ticket118_arm", None)
+    if not callable(arm):
+        raise _HostVerificationFailure("health-weixin-activation-missing")
+    arm(_CURRENT_PROCESS_ACTIVATION_CAPABILITY, _activation_proof(release["host_release_digest"]))
+
+
 def _canonical_bytes(value: Mapping[str, object]) -> bytes:
     return json.dumps(
         value,
@@ -789,6 +836,9 @@ class HostReleaseContract:
     @staticmethod
     def _validate_credential(source: Mapping[str, object]) -> None:
         adapter = source.get("credential_adapter")
+        if type(adapter) is _DefaultProcessCredentialObservation:
+            adapter.observe()
+            return
         observe = getattr(adapter, "observe", None)
         if not callable(observe):
             raise _HostVerificationFailure("credential-observation-missing")

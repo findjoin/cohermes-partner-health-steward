@@ -377,8 +377,15 @@ class FilesystemManagedReplicaAdapter:
         self._installation_id = validate_opaque_text(installation_id, "installation_id")
         if type(bindings) is not dict or set(bindings) != set(LIFECYCLE_PURGE_BINDINGS):
             raise ValueError("managed replica bindings are incomplete")
+        # None is a coverage declaration for a family with no external
+        # objects. It is not a file, nor evidence that a purge took place.
+        self._empty_declared = all(value is None for value in bindings.values())
+        if not self._empty_declared and any(value is None for value in bindings.values()):
+            raise ValueError("mixed managed replica declarations")
         normalized: dict[str, Path] = {}
         for binding in LIFECYCLE_PURGE_BINDINGS:
+            if self._empty_declared:
+                continue
             path = _absolute(bindings[binding], "managed replica path")
             normalized[binding] = path
         if type(remains_unproven) not in (tuple, list) or not all(type(item) is str and item for item in remains_unproven):
@@ -389,6 +396,11 @@ class FilesystemManagedReplicaAdapter:
         self._remains_unproven = tuple(remains_unproven)
         self._purge_receipt = self._root / _MANAGED_PURGE_RECEIPT
         self._lock = threading.RLock()
+        self._validate_inventory()
+        if self._empty_declared:
+            if self._purge_receipt_exists():
+                self._read_purge_receipt()
+            return
         present = self._replica_presence()
         if all(present):
             if self._purge_receipt_exists():
@@ -397,6 +409,14 @@ class FilesystemManagedReplicaAdapter:
             raise ValueError("managed replica is unavailable")
         else:
             self._read_purge_receipt()
+
+    def _validate_inventory(self) -> None:
+        allowed = set(self._bindings.values()) | {self._purge_receipt}
+        parents = {parent for path in self._bindings.values() for parent in path.parents
+                   if parent != self._root and self._root in parent.parents}
+        for path in self._root.rglob("*"):
+            if path.is_symlink() or (path.is_dir() and path not in parents) or (not path.is_dir() and path not in allowed):
+                raise ValueError("undeclared managed replica object")
 
     def _replica_presence(self) -> tuple[bool, ...]:
         present: list[bool] = []
@@ -528,7 +548,8 @@ class FilesystemManagedReplicaAdapter:
             raise ValueError("managed replica installation mismatch")
         with self._lock:
             _secure_directory(self._root, "managed replica root")
-            if not all(self._replica_presence()) or self._purge_receipt_exists():
+            self._validate_inventory()
+            if (not self._empty_declared and not all(self._replica_presence())) or self._purge_receipt_exists():
                 raise ValueError("managed replica is unavailable")
             return {
                 "configured": list(LIFECYCLE_PURGE_BINDINGS),
@@ -539,6 +560,7 @@ class FilesystemManagedReplicaAdapter:
         operation_ref, authority, transition_id = self._request(request)
         with self._lock:
             _secure_directory(self._root, "managed replica root")
+            self._validate_inventory()
             if self._purge_receipt_exists() or not all(self._replica_presence()):
                 raise ValueError("managed replica is unavailable")
             checked: list[tuple[Path, os.stat_result]] = []
@@ -557,8 +579,11 @@ class FilesystemManagedReplicaAdapter:
         operation_ref, authority, transition_id = self._request(request)
         with self._lock:
             _secure_directory(self._root, "managed replica root")
+            self._validate_inventory()
+            if self._empty_declared and not self._purge_receipt_exists():
+                return {"status": "absent", "remains_unproven": list(self._remains_unproven)}
             present = self._replica_presence()
-            if all(present):
+            if present and all(present):
                 if self._purge_receipt_exists():
                     raise ValueError("managed replica purge receipt conflicts with live replicas")
                 return {"status": "present", "remains_unproven": list(self._remains_unproven)}
@@ -1856,6 +1881,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ticket 123 production HealthCore service")
     parser.add_argument("--binding", required=True, help="canonical, non-secret service binding")
     parser.add_argument("--head-binding", help="explicit production provider binding; defaults to sibling current-head.json")
+    parser.add_argument("--live-binding", help="fixed default typed live dependency binding")
     args = parser.parse_args(argv)
     binding_path = Path(args.binding)
     binding = _load_binding(binding_path)
@@ -1889,14 +1915,20 @@ def _main(argv: list[str] | None = None) -> int:
         raise ValueError("unsupported explicit current-head provider")
     stop = threading.Event()
     previous = {}
-    service = ProductionCoreService(binding, current_head=head)
+    service = None
     try:
+        live = None
+        if args.live_binding is not None:
+            from .default_runtime import load_default_live_runtime
+            live = load_default_live_runtime(binding["release_root"], _load_binding(Path(args.live_binding)))
+        service = ProductionCoreService(binding, current_head=head, live_runtime=live)
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous[signum] = signal.signal(signum, lambda *_: stop.set())
         service.start()
         stop.wait()
     finally:
-        service.close()
+        if service is not None:
+            service.close()
         close_provider()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
