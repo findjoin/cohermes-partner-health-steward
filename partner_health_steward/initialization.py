@@ -35,6 +35,7 @@ from .authority import (
 HEALTH_INIT_CANONICAL_NAME = "health-init"
 HEALTH_INIT_FRIENDLY_NAME = "健康管家初始化"
 ND_HOST_ONLY_DISCLOSURE_VERSION = "health-init-nd-host-only-v1"
+ND_HOST_ONLY_NOTICE_DIGEST = "sha256:95cec72b40509ea72139a7e98a782f7945cd9b89acb51b9c8568e789a98951bf"
 INITIAL_DATA_BOUNDARY = (
     "health-portrait",
     "health-evidence",
@@ -547,12 +548,16 @@ class InitializationDisclosureContent:
         if asset.disclosure_version == ND_HOST_ONLY_DISCLOSURE_VERSION:
             if initialization.support_contact is not None:
                 raise AuthorityValidationError("ND host-only contact approval unavailable")
-            resource = json.loads((Path(__file__).parent / "resources" / "non_diagnostic" / "runtime-resources.json").read_bytes())
+            resource_path = Path(__file__).parent / "resources" / "non_diagnostic" / "runtime-resources.json"
+            resource = json.loads(resource_path.read_bytes())
             if (type(resource) is not dict
                     or resource.get("contract") != "ticket128-project-nondiagnostic-resources-v1"
                     or resource.get("health_init_asset") != asset.to_storage()
-                    or resource.get("editorial_review", {}).get("status") != "approved"
-                    or resource.get("source", {}).get("ownership") != "project-original"):
+                    or type(resource.get("editorial_review")) is not dict
+                    or resource["editorial_review"].get("status") != "approved"
+                    or type(resource.get("source")) is not dict
+                    or resource["source"].get("ownership") != "project-original"
+                    or stable_digest(resource.get("disclosure_notices")) != ND_HOST_ONLY_NOTICE_DIGEST):
                 raise AuthorityValidationError("ND initialization resource binding unavailable")
             notices = tuple(InitializationDisclosureNotice.from_storage(item)
                             for item in resource["disclosure_notices"])
