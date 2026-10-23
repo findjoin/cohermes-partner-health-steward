@@ -772,7 +772,23 @@ def provision_default_plan(plan):
     return plan
 
 
+def _ordinary_process_environment():
+    # A root user manager can retain credentials, agent sockets, secret-store
+    # locations or provider overrides under arbitrary names. Start with only
+    # process presentation and public CA settings, then load this role's own
+    # projected provider file. An inherited credential is never a fallback.
+    retained = {name: os.environ[name] for name in (
+        "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    ) if name in os.environ}
+    os.environ.clear()
+    os.environ.update(retained)
+    os.environ.update(HOME=str(ORDINARY), HERMES_HOME=str(ORDINARY),
+        PATH="/usr/bin:/bin", PYTHONDONTWRITEBYTECODE="1")
+
+
 async def _ordinary_main(binding):
+    _ordinary_process_environment()
     _verify_sources(binding)
     from dotenv import load_dotenv
     load_dotenv(ORDINARY / ".env", override=True)
