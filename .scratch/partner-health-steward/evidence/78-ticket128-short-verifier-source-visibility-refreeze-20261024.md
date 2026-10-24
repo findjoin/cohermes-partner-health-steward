@@ -1,0 +1,47 @@
+# Ticket128：R11微信初始化通过、原回归与短验证根可见性修正
+
+128保持claimed；真实default未切换，真实模型POST、微信发送、主人初始化与体验反馈均未发生。本记录不表示full或部署已通过。
+
+R11精确4490a6f660aeffffc3c05eb9f2b1685cdec3621f/tree40789144e5d4813ed75540e219e4c500d7b49d6c，active freeze e3f2127，实际Python3.11，9557文件closure sha256:dcb9698d329ee7678f6269ea483757fb38d608c678018fb61c716ae5a75ed99a。原V02独立1项实际PASS527.773秒、零failure/error/skip，原23冻结与runtime字节不变。已实际越过原native初始化、完整披露、独立确认与篡改拒绝等原断言；不是实际本人或微信外部服务通过。
+
+随后原baseline123七项26.001秒有两FAIL：wrong-UID child在connect处被pathname权限阻挡，V06真实__file__导出的nested verifier不满足原/opt/t123v-8hex。原118七项41.838秒PASS，但它fresh child丢弃PYTHONDONTWRITEBYTECODE且无-B，sitecustomize加载自身及其前置stdlib导入时生成23启动pyc；后续第一次short-root原123在6.857秒有6error，首因均runtime closure file set drifted，未构成干净的短根正向。实际diff明确9557声明文件无变/无缺，仅23额外startup cache；失败与原始日志全部保留。
+
+现场stat证原normal-builder短TMP两祖先均0700（umask077压缩mkdir0711且未随后chmod）。Root依据原123合同另建真实fresh0700 /opt/t123v-30bee3d2，122份公开源码逐hash与原fixed sibling完全相同，通用TEMP/TMPDIR恢复标准/tmp。23个额外缓存先封存原字节、路径/hash清单及receipt，再仅移除该23，原runtime manifest从未重写。private mount namespace仅把runtime/lib/python3.11代码子树bind只读，runtime根仍可写，保留原123V06的undeclared实际输入负向；源码/manifest tamper修改独立clone，不受该mount削弱。无Python版本、module.__file__、importlib、测试方法或expected值patch。
+
+在正确operator环境中，原123七项PASS31.592秒，随后原118七项PASS42.385秒；各零failure/error/skip、23冻结、原9557closure前后不变。原119七项另PASS0.042秒；六原模块124/125/129/126/131/130共30项PASS271.176秒，零failure/error/skip，旧130V05提醒与独立控制也PASS。事后compile98、23冻结、来源122与runtime9557同closure均不变。这些是精确R11的事实，不重标为未来新checkpoint全量证据。原full discover808尚未执行。
+
+独立verification authority确认原123的真实短root与128 LocalGate固定runtime.parent/verifier是两个并存的既有要求。若full同父从短root加载128，原helper只将同一public-verifier挂到config verifier_root，chroot中的fixed sibling会缺席；这是可定位的源码可见性差额，尚未执行预测full红。不能通过伪造__file__、module替换、symlink、改validator或racing外部挂载解决。
+
+新checkpoint442b0d4a57ef7a62b2e1d553207fffda3e5607f7/tree61d837f14d1b127b4145768277c5bd0e0817f5d4，parent4490a6f。仅helper新增8行与contract一段事实：两路径不同时，将同一已逐hash核验的owned public-verifier再只读bind至精确fixed sibling，并按实际mountinfo拒绝target与任一既有子mount互相覆盖；同path不新增mount。不新增输入、第二源码copy/权威、可写映射、产品alias或validator例外。产品/设计/test/raw/旧18及其余21冻结不变，原7family/full808、断言与所有时限不动。helper blobceb07c5bc79d302805cfac7b59879a811b704f14 / SHA256a395659d800327c85c4ccabd25d91950b580f8ca15bbab9b2b90ec244b61af02；contract blob8f0a915614acc2a8791e8d4a8146ce76ba1dcd85 / SHA25695349d920fe3c86e08c0511e0b1aba66c8486483f33540b1f94fa1c62bb603f1。完整五file身份/tmp/ticket128-short-verifier-refreeze-checkpoint.json。
+
+Root已核完整二文件无秘密diff及原分支正常前驱，普通push4490a6f..442b0d4成功。后续仍从最终clean/pushed同source正常构造新闭包，额外真实0700短源码副本逐hash，原V02从短根实际执行新helper双路径，随后原123/118、119七门、root30与full808同父一次、compile/diff/23冻结/完整性全绿后才fresh双POST和实际default步骤。正常builder882a7be60928f281371b1c03a7aa96d90ac841d1811068867443d4f1563c2bba不改；root operator仅选择真实短目录/标准tmp/已实证的私有code-ro包装。v2派生器当前SHA c74319d1777c221f21e416e4b47fc98e42ed7d2fa3a26b4ca37075897415cb8c已独立窄静态核对，非新增产品审查门，不冒称新candidate执行。
+
+R11结束且完整manifest/无proc引用检查后，仅退役该次公开input runtime与pinned；verifier、全部日志、原清单、缓存证据与私有事实保留。真实0700短公开副本在122文件/精确目录集合与无引用核验后清理，固定源副本保留。真实default前后仍PID521/active/running；当次free3586920448B。未删除program backup/健康资料或恢复authority。生产local540、G11/ND12各300及真实本人操作要求不变。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-v02.log SHA256 5be926b072528dc884fc63d3a505c4a8f9c4a3668fee77af811f38b94364d408。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-baseline.log SHA256 4d98bcbfc3024d57cd9e45db5da71b0f64be4aae0a53ea48b674f07f745093ab。
+
+证据 /tmp/dmit-connection-audit/ticket128-r11-short-verifier-prepare.log SHA256 aa8c4080891df4a62924a303a734747c55426e36f369309d657360d107483b7f。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-original123-short-root.log SHA256 bd892acfbff1aef04d32e772df6aff79bd122bf9f66ffd7658ba8a573beabae9。
+
+证据 /tmp/dmit-connection-audit/ticket128-r11-runtime-drift-readonly.log SHA256 da1a17f4bbc098cd12a8b5ebb3da9ed25110f87b7c05a9029f187f80c167d78c。
+
+证据 /tmp/dmit-connection-audit/ticket128-r11-generated-cache-retirement.log SHA256 351c9313598cff99df7d1c993b600e036f9e9662c9163eebabebfa8deb026d9b。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-original123118-short-code-ro.log SHA256 829dc1c7ae6361c57c06e33d64882a83437fe4f5672634cff6954139a10c3310。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-original119-root30-short-code-ro.log SHA256 8a4da0ccb5635e033c2228fc86965562405cf01485a3faaf6c58c566eaeb06c7。
+
+证据 /tmp/dmit-connection-audit/formal-4490a6f-128-r11-postcheck.log SHA256 b3585abab3df7dc745735b6c6f891516442a1312a7c1a03aa8d7cc7e247d79f9。
+
+证据 /tmp/dmit-connection-audit/ticket128-r11-retired-public-prune.log SHA256 3ff07d34ca40a7e25b9abca9d10c12d49bc717ea22163d05e3ec0fb8d9f8df55。
+
+证据 /tmp/dmit-connection-audit/ticket128-r11-short-public-source-retire.log SHA256 77c6ec29f6ff77d63792857bd89419a70a3089f1bfbd97b1a7ab4f5c1fdfe22f。
+
+Fresh Spec PRE PASS、无阻塞：/tmp/health-steward-reviews/128-pre-442b0d4-spec-fresh.txt SHA256 72bfc73d9e735536d4147db0fdeffeaba3cdf57628283f5fbcf662b72dd71c0f。
+
+Fresh Standards PRE PASS、无阻塞：/tmp/health-steward-reviews/128-pre-442b0d4-standards-fresh.txt SHA256 68930e0fd771711534d5df59efc175dd20200c0e0f62fc9c0fdf51eb92d22473。
+
+两轴fresh同checkpoint、只读且不读取另一轴报告；仅有界编码前审核，不表示新helper或full已通过。Root接受本次最窄重冻，实际新执行门仍须全部完成。

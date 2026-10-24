@@ -137,3 +137,10 @@ R9精确1e53730原G02的637项中130 V05一项真实失败；proof未保存具�
 精确eb7a66c原V02在G01—G10/ND07及全local组通过后，首次初始化12秒无send失败。已结束合成日志的无正文trace明确Adapter factory在既有严格BoundResponsesTransport guard拒绝api_mode=responses，尚未建立health平台或native poll。独立authority确认fixture应与125/131/130既有codex_responses契约对齐，产品不增别名；R10失败事实保留。
 
 新checkpoint e3f2127d4b16972af88c8c7caaad58fb1e87b1a4/treeef4855409e1149ed11b802a7b90f3323822705eb仅该test字面量与contract事实段，fresh双PRE PASS无阻塞，正常push原分支；root接受窄重冻，继续最终同source真实3.11原执行门。设计/raw/helper/产品/其他断言时限与计数均不动。详见[证据77](../evidence/77-ticket128-native-factory-route-fixture-refreeze-20261024.md)。新正式门及真实部署尚未通过，128保持claimed。
+
+
+## 2026-10-24 R11原生初始化通过与真实短验证根兼容
+
+精确4490a6f原V02已PASS527.773秒；正确0700短根/标准tmp/私有code-ro环境下原123与118各7PASS、1197PASS、root30全部30PASS及post98/23/122/9557不变。旧123布局红与后继23startup cache漂移红完整保留，缓存原件封存、原manifest不改；不能将局部通过当full。原full808未执行。
+
+独立authority确认同父full需要原123真实短root与128 fixed sibling同时在namespace可见。新checkpoint442b0d4a57ef7a62b2e1d553207fffda3e5607f7/tree61d837f14d1b127b4145768277c5bd0e0817f5d4只在helper增加同publicsource第二只读bind及碰撞拒绝，contract补实际事实。fresh双PRE PASS、正常push原分支；root接受最窄重冻，继续新最终同source实际V02/原回归/full808及完整性门。产品/唯一design/test/raw/其他21冻结/断言时限计数不变，新helper正式门未通过。详见[证据78](../evidence/78-ticket128-short-verifier-source-visibility-refreeze-20261024.md)。128仍claimed，真实default/本人步骤未发生。
