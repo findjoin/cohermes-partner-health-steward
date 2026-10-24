@@ -67,14 +67,25 @@ class TechnicalAcceptanceChannel:
             raise ValueError("technical private artifact directory unavailable")
 
     def _read(self, path):
+        return self._read_bounded(path, 65536)
+
+    def _read_current_binding(self):
+        # The fixed operation plan embeds the complete runtime manifest.
+        # It is separate from the small technical attempt/receipt artifacts.
+        return self._read_bounded(self.root.parent / ".ticket128-deployment-binding.json", 8 * 1024 * 1024)
+
+    def _read_bounded(self, path, limit):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             details = os.fstat(fd)
             if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid()
-                    or stat.S_IMODE(details.st_mode) != 0o600 or details.st_size > 65536):
+                    or stat.S_IMODE(details.st_mode) != 0o600 or details.st_size > limit):
                 raise ValueError("technical artifact unavailable")
             with os.fdopen(fd, "rb", closefd=False) as stream:
-                value = json.loads(stream.read())
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("technical artifact unavailable")
+            value = json.loads(data)
             if type(value) is not dict:
                 raise ValueError("technical artifact unavailable")
             return value
@@ -158,8 +169,7 @@ class TechnicalAcceptanceChannel:
             raise ValueError("technical current binding unavailable")
         self._path(attempt["execution_key"], "attempt")
         # prepare's current run must still be the owner of this attempt.
-        binding = self.root.parent / ".ticket128-deployment-binding.json"
-        current = self._read(binding)
+        current = self._read_current_binding()
         for name in ("run_id", "run_scope", "release_digest", "distribution_digest"):
             actual = current.get(name, current.get("run_context", {}).get(name))
             if actual != identity[name]:
