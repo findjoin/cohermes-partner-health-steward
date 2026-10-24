@@ -653,7 +653,8 @@ def _verified_local_sources(runtime,release_root,modules):
         elif stat.S_ISDIR(details.st_mode):safe(path,True)
         else:raise ValueError('unsafe runtime product source')
     if not expected or installed!=expected:raise ValueError('verifier and runtime product differ')
-    required={'tests/__init__.py',*(name.split('.')[0]+'/'+name.split('.')[1]+'.py' for name in modules)}
+    required={'tests/__init__.py','tools/ticket128_local_gate.py',
+              *(name.split('.')[0]+'/'+name.split('.')[1]+'.py' for name in modules)}
     if not required<=set(declared):raise ValueError('fixed verification modules unavailable')
     # Reuse the Publisher's actual source/resource mapping rather than invent
     # another package or requiring resources at an alternate release path.
@@ -663,34 +664,6 @@ def _verified_local_sources(runtime,release_root,modules):
             raise ValueError('verification source differs from current distribution')
     return root,{'source_snapshot_digest':'sha256:'+hashlib.sha256(content).hexdigest(),
                  'source_commit':snapshot['git_commit']}
-
-
-_LOCAL_PROGRAM = r'''
-import io,json,sys,unittest
-from contextlib import redirect_stdout,redirect_stderr
-from pathlib import Path
-import partner_health_steward.production_core_service as production
-import partner_health_steward.default_deployment as deployment
-runtime=Path(sys.argv[1]).resolve()
-assert Path(sys.executable).resolve().is_relative_to(runtime)
-assert Path(production.__file__).resolve().parent==runtime/'lib/python3.11/site-packages/partner_health_steward'
-modules=json.loads(sys.argv[3])
-deployment._runtime(runtime,sys.argv[2])
-root,source_identity=deployment._verified_local_sources(runtime,sys.argv[2],modules)
-sys.path.insert(0,str(root))
-import tests
-assert Path(tests.__file__).resolve()==root/'tests/__init__.py'
-sys.path.pop(0)
-suite=unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(name) for name in modules)
-output=io.StringIO()
-with redirect_stdout(output),redirect_stderr(output):
-    result=unittest.TextTestRunner(stream=output,verbosity=0).run(suite)
-print(json.dumps({'tests':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
- 'skips':len(result.skipped),'successful':result.wasSuccessful(),
- 'failure_tests':[test.id() for test,_ in result.failures],
- 'error_tests':[test.id() for test,_ in result.errors],**source_identity},sort_keys=True))
-raise SystemExit(0 if result.wasSuccessful() and result.testsRun>0 and not result.skipped else 1)
-'''
 
 
 def _run_local_gate(plan,request,manifest):
@@ -707,8 +680,6 @@ def _run_local_gate(plan,request,manifest):
     if modules is None:return _observation(request,'cannot-confirm',reason='local-gate-unavailable')
     verifier,source_identity=_verified_local_sources(runtime,plan['release_root'],modules)
     environment={name:os.environ[name] for name in ('PATH','LANG','LC_ALL','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS') if name in os.environ}
-    environment.update(PYTHONDONTWRITEBYTECODE='1',TICKET123_RUNTIME_ROOT=str(runtime),
-        TICKET118_PINNED_HERMES_SOURCE=plan['facts']['pinned_hermes_root'])
     proof_path=_ARTIFACTS/(request['execution_key'].split(':')[-1]+'.local-proof.json')
     if proof_path.exists():
         proof=_read_private(proof_path)
@@ -722,7 +693,8 @@ def _run_local_gate(plan,request,manifest):
         return _observation(request,'passed' if passed else 'cannot-confirm',evidence=['local-proof:'+_digest(proof)[7:]],
             reason='verified' if passed else 'local-verification-failed')
     if request['gate_id']=='119-G08':_consume(request)
-    completed=subprocess.run([str(runtime/'bin/python3'),'-I','-B','-c',_LOCAL_PROGRAM,str(runtime),plan['release_root'],json.dumps(modules)],
+    completed=subprocess.run([str(runtime/'bin/python3'),'-I','-B',str(verifier/'tools/ticket128_local_gate.py'),
+        str(runtime),plan['release_root'],json.dumps(modules),plan['facts']['pinned_hermes_root']],
         env=environment,capture_output=True,text=True,timeout=540)
     try:result=json.loads(completed.stdout.strip())
     except (ValueError,TypeError):result={'successful':False,'tests':0,'errors':1,'failures':0,'skips':0}
