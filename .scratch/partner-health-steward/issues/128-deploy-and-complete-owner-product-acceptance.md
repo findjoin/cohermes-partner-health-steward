@@ -153,3 +153,9 @@ R9精确1e53730原G02的637项中130 V05一项真实失败；proof未保存具�
 独立checkpoint e42e250781290f1b02bc7ce9010b3fb2ed0df30b/treea2cd0a42a9a0784f843975456a58f55584e21d59仅test/contract两文件修confirm真实cursor完成前沿及V03/V04自然quiet-review稳定baseline，fresh双PRE PASS，root接受，23冻结身份详见[证据79](../evidence/79-ticket128-initialization-frontier-and-binding-repair-20261024.md)。产品e6db2a7移固定local runner至已核验外部tools以遵守原120唯一marker例外；af3bf3b0ba294f17cf285625859588ffd7e9b60e/tree1a0b9e244219a17a1838eb136cd0f2da97966fdf只在固定binding用独立8MiB有界读，普通技术工件65536及当前run/permit/once-only保持。已正常push，产品修复不改冻结。
 
 Root保存全部原红、缺失因果与最窄后继授权；R13仅生成后废弃未执行，须从最终clean/pushed source正常新构造并原样通过完整执行门，才fresh双POST及真实default步骤。128仍claimed，阶段A/127/full不称完成；真实联系偏好、本人原生同意和体验反馈仍待本人提供。
+
+## 2026-10-24 R14实际连接准备失败与固定消息修复
+
+精确df8d187原120V01、V02已PASS；直接受影响原V07实际1failure/0error/skip，child1190.251秒、cleanup confirmed。两轮G02/G10均PASS，随后G11 model-canary-unconfirmed：原attempt为not-attempted/terminal false、模型claim已持久、native send未claim，尚未HTTP/发送/ND12。事后99编译、23冻结、123source、9557runtime/e375闭包保持；新full808未执行。R12原红不改写，详见[证据80](../evidence/80-ticket128-r14-model-canary-preparation-repair-20261024.md)。
+
+独立真实producer/strategy无网络复现固定canary仅user，违反既有生产wire必需system+input，固定reason为incomplete production model input。Root授权8522887e610ca6479ca7d01a6383dc4d8610b7d7单文件4增1删，仅前置固定非诊断system，原user/通用guard/schema/预算/once/unknown和23冻结不变。局部prepare/preflight通过不算接口绿灯，须从最终clean/pushed source正常新构造并完成原执行门后才fresh双POST/真实部署。128保持claimed。
