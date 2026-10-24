@@ -771,9 +771,12 @@ class _FormalNamespace:
         self._wait(lambda: not self.http.batches)
         time.sleep(0.1)
         self.case.assertEqual(self.initialized()["phase"], "uninitialized")
-        self.enqueue(command.group(0), "confirm-init")
+        confirm_cursor = "cursor:confirm-init:" + uuid.uuid4().hex
+        self.enqueue(command.group(0), "confirm-init", cursor=confirm_cursor)
         self._wait(lambda: self.initialized()["phase"] == "enabled")
         self.case.assertTrue(self.initialized()["enabled"])
+        # The next native poll follows the real handoff and Core cursor result.
+        self._wait(lambda: confirm_cursor in self.http.cursors)
 
     def check_live(self):
         # prepare itself may not create health key/head/attestors or enable.
@@ -896,6 +899,12 @@ class _FormalNamespace:
                 "next_steps": ids["next-step"], "claim_ids": [item for group in ids.values() for item in group],
                 "template_id": template["template_id"]}
 
+    def _wait_naturally_current(self):
+        from zoneinfo import ZoneInfo
+        owner_zone = ZoneInfo(self.setup["facts"]["timezone"])
+        self._wait(lambda: datetime.now(owner_zone).date().isoformat()
+                   in self._core_public("facts")["review_days"], seconds=30)
+
     def _authority_snapshot(self):
         return self._core_public("head")
 
@@ -965,6 +974,7 @@ class _FormalNamespace:
         self._wait(lambda: self.initialized()["phase"] == "uninitialized")
         self.case.assertEqual(self._private_snapshot(), keys)
         self.initialize()
+        self._wait_naturally_current()
         advanced = self._authority_snapshot()
         self.case.assertGreater(advanced["generation"], first["generation"])
         self._prepare(run_id="acceptance-run:ticket128-rebootstrap-" + uuid.uuid4().hex)
@@ -1050,6 +1060,7 @@ class _FormalNamespace:
             setup_path.write_bytes(original)
         self.run_until()
         self.initialize()
+        self._wait_naturally_current()
         head, keys = self._authority_snapshot(), self._private_snapshot()
         old_context = copy.deepcopy(self.context)
         alternate = self._second_distribution()
