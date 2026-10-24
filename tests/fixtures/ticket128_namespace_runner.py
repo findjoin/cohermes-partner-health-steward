@@ -253,6 +253,14 @@ def init(base):
     for kind, source in (('runtime_root', base / 'public-runtime'), ('verifier_root', verifier_copy), ('pinned_root', Path(config['pinned_root']))):
         target = root / Path(config[kind]).relative_to('/')
         bind(source, target, readonly=True)
+    fixed_verifier = Path(config['runtime_root']).parent / 'verifier'
+    if fixed_verifier != Path(config['verifier_root']):
+        target = root / fixed_verifier.relative_to('/')
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            mounted = Path(line.split()[4])
+            if mounted != root and mounted.is_relative_to(root):
+                assert not (target.is_relative_to(mounted) or mounted.is_relative_to(target)), 'fixed verifier overlaps an existing mount'
+        bind(verifier_copy, target, readonly=True)
     # A second mount namespace keeps /proc/1's namespace distinct from the
     # controller/manager, while PID namespace isolation hides host processes.
     os.chroot(root)
