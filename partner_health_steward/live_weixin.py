@@ -299,7 +299,10 @@ class LiveHealthWeixinAdapter(BasePlatformAdapter):
             route = FirstHopRoute.from_wire(binding["route"])
             budget = NonDiagnosticOperationalBudget.from_wire(binding["budget"])
             strategy = NonDiagnosticBudgetInputMeasurementStrategy(budget)
-            request = strategy.prepare_request((ModelMessage("user",
+            request = strategy.prepare_request((
+                ModelMessage("system", "Return only the required strict non-diagnostic JSON structure for this "
+                    "connection test. Do not use owner data or add other content."),
+                ModelMessage("user",
                 "连接测试，仅验证非诊断结构，不含主人资料。请仅返回所要求的严格非诊断结构。"),), stage="answer")
             adapter = ProductionModelAdapter(route, budget,
                 transport=BoundResponsesTransport(route, credential_provider=binding["credential_provider"]),
