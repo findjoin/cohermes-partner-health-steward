@@ -144,3 +144,12 @@ R9精确1e53730原G02的637项中130 V05一项真实失败；proof未保存具�
 精确4490a6f原V02已PASS527.773秒；正确0700短根/标准tmp/私有code-ro环境下原123与118各7PASS、1197PASS、root30全部30PASS及post98/23/122/9557不变。旧123布局红与后继23startup cache漂移红完整保留，缓存原件封存、原manifest不改；不能将局部通过当full。原full808未执行。
 
 独立authority确认同父full需要原123真实短root与128 fixed sibling同时在namespace可见。新checkpoint442b0d4a57ef7a62b2e1d553207fffda3e5607f7/tree61d837f14d1b127b4145768277c5bd0e0817f5d4只在helper增加同publicsource第二只读bind及碰撞拒绝，contract补实际事实。fresh双PRE PASS、正常push原分支；root接受最窄重冻，继续新最终同source实际V02/原回归/full808及完整性门。产品/唯一design/test/raw/其他21冻结/断言时限计数不变，新helper正式门未通过。详见[证据78](../evidence/78-ticket128-short-verifier-source-visibility-refreeze-20261024.md)。128仍claimed，真实default/本人步骤未发生。
+
+
+## 2026-10-24 R12完整运行、初始化完成前沿与固定binding读取修复
+
+精确a38fc0b原V02、123/118/119及root30已PASS；原full808已实际结束7198.475秒、6failure、0error/skip，原120V01与128V03—V07失败保持，事后98/23/122/9557完整性均不变。原同序637另一次串行诊断PASS353.666秒不替代V05原门。V06第二G10 Gateway失败/rollback completed，具体inner因果缺失；V07第二G10实际PASS、G11在attempt形成前被错误64KiB binding读取限额拒绝，并非已执行模型或发送。
+
+独立checkpoint e42e250781290f1b02bc7ce9010b3fb2ed0df30b/treea2cd0a42a9a0784f843975456a58f55584e21d59仅test/contract两文件修confirm真实cursor完成前沿及V03/V04自然quiet-review稳定baseline，fresh双PRE PASS，root接受，23冻结身份详见[证据79](../evidence/79-ticket128-initialization-frontier-and-binding-repair-20261024.md)。产品e6db2a7移固定local runner至已核验外部tools以遵守原120唯一marker例外；af3bf3b0ba294f17cf285625859588ffd7e9b60e/tree1a0b9e244219a17a1838eb136cd0f2da97966fdf只在固定binding用独立8MiB有界读，普通技术工件65536及当前run/permit/once-only保持。已正常push，产品修复不改冻结。
+
+Root保存全部原红、缺失因果与最窄后继授权；R13仅生成后废弃未执行，须从最终clean/pushed source正常新构造并原样通过完整执行门，才fresh双POST及真实default步骤。128仍claimed，阶段A/127/full不称完成；真实联系偏好、本人原生同意和体验反馈仍待本人提供。
